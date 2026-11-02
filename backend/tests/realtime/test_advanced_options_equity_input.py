@@ -118,6 +118,20 @@ def test_two_underlying_dependencies_are_exact_and_ready():
     assert result["lane_context"]["OS2"]["member_count"] == 36
 
 
+def test_continuous_dependencies_can_reuse_the_same_equity_history_source():
+    equity, binding = _dependencies()
+    result = validate_advanced_options_equity_dependencies_cursor(
+        _Cursor(), equity_plan=equity, equity_input=binding,
+        history_source_cohort_id=equity.cohort_id,
+        underlyings=("QQQ", "SPY"), allow_shared_history_source=True,
+    )
+    assert result["status"] == "READY"
+    assert all(
+        row["status"] == "AVAILABLE"
+        for row in result["lane_context"].values()
+    )
+
+
 def test_missing_qqq_context_blocks_only_declared_lanes_before_provider_work():
     equity, binding = _dependencies()
     result = validate_advanced_options_equity_dependencies_cursor(

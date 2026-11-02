@@ -1,7 +1,9 @@
 from dataclasses import replace
+from contextlib import nullcontext
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from uuid import UUID
+from types import SimpleNamespace
 
 import pytest
 
@@ -11,6 +13,8 @@ from test_advanced_options_control_plane import _plan as _control_plane
 from test_advanced_options_producers import _producer_plan
 from realtime.advanced_options_input import (
     MAX_ADVANCED_OPTIONS_INPUT_BYTES,
+    AdvancedOptionsInputDependencyEvidence,
+    AdvancedOptionsInputDependencyStatus,
     build_advanced_options_input_closure,
     build_advanced_options_input_gate_plan,
     decode_advanced_options_input_closure,
@@ -24,6 +28,7 @@ from realtime.option_cycle_input import (
 )
 from realtime.orchestration_repository import OPTIONS_INPUT_READY
 from realtime.preflight import ProviderTier
+from realtime import advanced_options_postgres as postgres_module
 
 
 UTC = timezone.utc
@@ -33,6 +38,45 @@ BATCH = UUID("66666666-7777-8888-9999-aaaaaaaaaaaa")
 EQUITY_RECEIPT = UUID("bbbbbbbb-cccc-dddd-eeee-ffffffffffff")
 WINDOW = UUID("12121212-3434-5656-7878-909090909090")
 EQUITY_WINDOW = UUID("abababab-cdcd-efef-1212-343434343434")
+
+
+def test_native_blocker_returns_blocked_preflight_instead_of_ready_shape(monkeypatch):
+    evidence = (
+        AdvancedOptionsInputDependencyEvidence(
+            member_kind="NATIVE", member_key="INPUTS",
+            status=AdvancedOptionsInputDependencyStatus.BLOCKED,
+            evidence_sha256="a" * 64, reason_codes=("NATIVE_INPUTS_NOT_READY",),
+        ),
+    )
+    plan = SimpleNamespace(
+        plan_id=WINDOW, reference_producer_plan=None, rolling_producer_plan=None,
+        mark_producer_plan=None, native_input_plan=None,
+    )
+    port = SimpleNamespace(
+        _scope=SimpleNamespace(input_ready_plan=plan),
+        _input_ready_context_cursor=lambda *_args, **_kwargs: None,
+        _load_input_facts_unit=lambda *_args: None,
+        _persisted_mark_reasons_cursor=lambda *_args: (),
+        _input_ready_evidence=lambda **_kwargs: evidence,
+    )
+    for name in (
+        "assemble_advanced_options_reference_state_cursor",
+        "assemble_advanced_options_rolling_state_cursor",
+        "assemble_advanced_options_marks_cursor",
+        "assemble_advanced_options_native_inputs_cursor",
+    ):
+        monkeypatch.setattr(
+            postgres_module, name, lambda *_args: SimpleNamespace(marks=()),
+        )
+    unit = SimpleNamespace(
+        cursor=object(),
+        connection=SimpleNamespace(cursor=lambda **_kwargs: nullcontext(object())),
+    )
+    result = postgres_module.PostgresAdvancedOptionsCanonicalRuntimePort._assemble_input_ready(
+        port, unit, lock_window=False,
+    )
+    assert result.status is AdvancedOptionsInputDependencyStatus.BLOCKED
+    assert result.evidence == evidence
 
 
 def _cycle_input(control=None):

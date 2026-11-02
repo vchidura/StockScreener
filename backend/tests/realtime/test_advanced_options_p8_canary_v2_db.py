@@ -21,6 +21,7 @@ from psycopg2.extras import RealDictCursor, execute_batch
 from websockets.asyncio.server import serve
 
 from option_flow_support import advanced_policy, policy
+from options.calendar import OptionExchangeCalendar
 from options.config import load_valuation_policy
 from realtime.advanced_gateway import (
     AdvancedGateway,
@@ -1188,7 +1189,9 @@ def test_p8_provider_free_ingestion_to_canary_alert_publication(
                 known_at=cutoff,
                 valid_until=expires,
                 discovery_scheduled_cycle=cutoff,
-                prior_oi_session=control.session_date - timedelta(days=1),
+                prior_oi_session=OptionExchangeCalendar("XNYS").previous_session_date(
+                    control.session_date
+                ),
                 model_version="black-scholes-merton-v1",
                 history_source_cohort_id=history_cohort_id,
             )
@@ -1794,7 +1797,18 @@ def test_p8_provider_free_ingestion_to_canary_alert_publication(
             outcomes = {
                 row.detector.value: row for row in cycle.outcomes
             }
-            assert set(outcomes) == {"O1", "O2", "O3"}
+            assert set(outcomes) == {
+                detector.value for detector in control.manifest_policy.required_detectors
+            }
+            for name, lane in (
+                ("OS1", native_preflight.bundle.os1),
+                ("OS2", native_preflight.bundle.os2),
+            ):
+                if lane.blocked_reason_codes:
+                    assert outcomes[name].state.value == "BLOCKED"
+                    assert outcomes[name].reason_codes == lane.blocked_reason_codes
+                else:
+                    assert outcomes[name].state.value.startswith("COMPLETE")
             assert outcomes["O2"].state.value == "UNAVAILABLE"
             assert outcomes["O2"].reason_codes == (
                 "O2_MODEL_NOT_ACCEPTED",
@@ -2122,8 +2136,8 @@ def test_p8_provider_free_ingestion_to_canary_alert_publication(
 
             with pytest.raises(
                 RuntimeError,
-                match="P8_FORCED_RELEASE_ROLLBACK",
-            ):
+                match="PORTAL_PUBLICATION_RUNTIMEERROR",
+            ) as publication_failure:
                 _publish(
                     publisher_database,
                     publisher_config,
@@ -2134,12 +2148,13 @@ def test_p8_provider_free_ingestion_to_canary_alert_publication(
                     checked_at=cutoff + timedelta(minutes=3),
                     release_repository=fail_release,
                 )
+            assert str(publication_failure.value.__cause__) == "P8_FORCED_RELEASE_ROLLBACK"
             assert _query(
                 database_pool,
                 "SELECT count(*) FROM rt.snapshot_catalog "
                 "WHERE snapshot_id=%s",
                 (str(rollback_snapshot.snapshot_id),),
-            )[0][0] == 0
+            )[0][0] == 1
             assert _pointer(
                 database_pool,
                 control.cohort_id,

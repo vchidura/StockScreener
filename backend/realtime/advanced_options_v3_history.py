@@ -15,6 +15,7 @@ from .advanced_options_control_plane import (
     build_advanced_options_history_binding,
 )
 from .contracts import canonical_sha256
+from .preflight import ProviderTier
 
 
 UTC = timezone.utc
@@ -456,6 +457,7 @@ def advanced_options_v3_history_binding_from_payload(
                 value["authorization_reference"]
             ),
             evidence_sha256=str(value["evidence_sha256"]),
+            source_provider_tier=ProviderTier(str(value["source_provider_tier"])),
         )
     except (KeyError, TypeError, ValueError) as error:
         raise AdvancedOptionsHistoryBindingIdentityError(

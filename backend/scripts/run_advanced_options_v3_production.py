@@ -1109,8 +1109,10 @@ def _prepare_waiting(args) -> dict[str, object]:
     return report
 
 
-def _authorize_window(args) -> dict[str, object]:
-    state = LegacyArtifactSessionStateAdapter(
+def _authorize_window(
+    args, *, state=None, provider=None, prepared_at=None
+) -> dict[str, object]:
+    state = state or LegacyArtifactSessionStateAdapter(
         package_path=args.package,
         bundle_path=args.bundle,
         json_loader=_load,
@@ -1145,7 +1147,9 @@ def _authorize_window(args) -> dict[str, object]:
         target_plan_id = control.plan_id
         target_cohort_id = control.cohort_id
         history_binding_sha256 = binding.history.binding_sha256
-    provider, pool = _provider()
+    pool = None
+    if provider is None:
+        provider, pool = _provider()
     try:
         window = PostgresOrchestrationRepository(
             provider
@@ -1163,17 +1167,17 @@ def _authorize_window(args) -> dict[str, object]:
         with provider.transaction(APP_ROLE) as unit:
             unit.cursor.execute(
                 "SELECT receipt.created_at,receipt.cutoff,"
-                "receipt.receipt_kind,window.state,"
+                "receipt.receipt_kind,window_run.state,"
                 "receipt.reference_generation,receipt.universe_sha256,"
                 "receipt.input_sha256,receipt.build_id,"
-                "window.window_id::text,window.cohort_id::text,"
+                "window_run.window_id::text,window_run.cohort_id::text,"
                 "(SELECT stage.state FROM rt.stage_runs AS stage "
                 "WHERE stage.window_id=receipt.window_id "
                 "AND stage.stage_id='EQUITY_MATERIALIZE' "
                 "ORDER BY stage.attempt DESC LIMIT 1) "
                 "AS materialize_state "
                 "FROM rt.cycle_receipts AS receipt "
-                "JOIN rt.window_runs AS window USING(window_id) "
+                "JOIN rt.window_runs AS window_run USING(window_id) "
                 "WHERE receipt.receipt_id=%s",
                 (str(args.equity_receipt_id),),
             )
@@ -1213,7 +1217,7 @@ def _authorize_window(args) -> dict[str, object]:
                 maximum_age_seconds=300,
                 authorization_reference=args.authorization_reference,
             )
-            prepared_at = datetime.now(UTC)
+            prepared_at = prepared_at or datetime.now(UTC)
             options_cutoff = args.options_cutoff
             authority = build_window_cycle_authorization(
                 session,
@@ -1281,7 +1285,8 @@ def _authorize_window(args) -> dict[str, object]:
                     "V3 stored window authority identity changed"
                 )
     finally:
-        pool.closeall()
+        if pool is not None:
+            pool.closeall()
     return _report({
         "contract": "advanced-options-v3-window-authorization-v1",
         "status": "AUTHORIZED",

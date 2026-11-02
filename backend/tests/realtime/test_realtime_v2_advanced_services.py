@@ -515,6 +515,7 @@ def test_continuous_native_and_compose_own_the_same_c8_topology(
         "equity-ingress": "realtime-v2-advanced-ingress",
         "options-lifecycle": "realtime-v3-options-lifecycle",
         "options-acquisition": "realtime-v3-options-acquisition",
+        "options-scheduler": "realtime-v3-options-scheduler",
         "bridge": "realtime-v2-advanced-bridge",
         "finalizer": "realtime-v2-advanced-finalizer",
         "scheduler": "realtime-v2-advanced-scheduler",
@@ -613,7 +614,7 @@ def test_v3_profile_services_do_not_leak_through_compose_extends():
         "realtime-v2-options-p8-window",
     }
     assert not extending & effective
-    assert len(effective) == len(ADVANCED_REALTIME_V3_ROLES) == 19
+    assert len(effective) == len(ADVANCED_REALTIME_V3_ROLES) == 20
 
 
 @pytest.mark.skipif(
@@ -652,7 +653,7 @@ def test_rendered_v3_profile_has_exactly_the_runtime_role_services():
 
     assert completed.returncode == 0, completed.stderr[-2000:]
     services = set(completed.stdout.split())
-    assert len(services) == len(ADVANCED_REALTIME_V3_ROLES) == 19
+    assert len(services) == len(ADVANCED_REALTIME_V3_ROLES) == 20
     assert not any(
         name.startswith("realtime-v2-options-p8") for name in services
     )

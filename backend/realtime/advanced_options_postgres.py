@@ -389,17 +389,25 @@ class PostgresAdvancedOptionsCanonicalRuntimePort(
         expected = (
             control.cohort_sha256,
             str(control.manifest_id),
-            context.plan.config_sha256,
+            (
+                context.plan.config_sha256
+                if control.stored_identity is None
+                else control.stored_identity.configuration_sha256
+            ),
             control.pins.model_bundle_sha256,
             control.pins.valuation_policy_sha256,
-            "SHADOW",
+            "SHADOW" if control.stored_identity is None else control.stored_identity.mode,
             control.manifest_sha256,
             control.universe.sha256,
             control.session_date,
             str(control.profile_id),
             "MARKET_OPTIONS",
             len(control.universe.option_underlyings),
-            control.manifest_policy.sha256,
+            (
+                control.manifest_policy.sha256
+                if control.stored_identity is None
+                else control.stored_identity.allocation_policy_sha256
+            ),
             control.profile_sha256,
             ProviderTier.MASSIVE_ADVANCED.value,
         )
@@ -942,7 +950,11 @@ class PostgresAdvancedOptionsCanonicalRuntimePort(
             service.plan_id != input_plan.service_plan_id
             or service.cohort_id != control.cohort_id
             or service.session_date != control.session_date
-            or service.config_sha256 != input_plan.enrollment.enrollment_sha256
+            or service.config_sha256 != (
+                input_plan.enrollment.enrollment_sha256
+                if control.stored_identity is None
+                else control.stored_identity.service_plan_sha256
+            )
             or window.plan_id != service.plan_id
             or window.cohort_id != control.cohort_id
             or window.provider_tier != control.binding.options_tier.value
@@ -1103,8 +1115,13 @@ class PostgresAdvancedOptionsCanonicalRuntimePort(
             ("OS2", native.bundle.os2),
         ):
             reasons = tuple(lane.blocked_reason_codes)
+            accepted_unavailable = (
+                bool(reasons) and native.status is NativeInputPlanStatus.READY
+            )
             status = (
-                AdvancedOptionsInputDependencyStatus.BLOCKED
+                AdvancedOptionsInputDependencyStatus.UNAVAILABLE
+                if accepted_unavailable
+                else AdvancedOptionsInputDependencyStatus.BLOCKED
                 if reasons
                 else AdvancedOptionsInputDependencyStatus.AVAILABLE
                 if lane.invocations
@@ -1122,6 +1139,7 @@ class PostgresAdvancedOptionsCanonicalRuntimePort(
                     reasons,
                 ),
                 reasons=reasons,
+                accepted_unavailable=accepted_unavailable,
             ))
         rows.append(self._input_dependency(
             "OPTIONAL",
@@ -1244,7 +1262,6 @@ class PostgresAdvancedOptionsCanonicalRuntimePort(
                 and not row.accepted_unavailable
             )
             for row in evidence
-            if row.member_kind != "NATIVE"
         )
         if blocked:
             digest = canonical_sha256({

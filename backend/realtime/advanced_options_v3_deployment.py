@@ -482,6 +482,39 @@ def validate_advanced_options_v3_runtime_identity(
     package: Mapping[str, object],
     bundle: Mapping[str, object],
 ) -> None:
+    if package.get("schema") == "advanced-options-v3-continuous-session-v1":
+        from .advanced_options_p8_runtime import (
+            build_p8_preopen_session_binding,
+            p8_preopen_session_binding_from_payload,
+            validate_p8_execution_bundle_document,
+        )
+        from .advanced_options_acquisition_runtime import acquisition_binding_from_payload
+
+        unsigned = dict(package)
+        digest = unsigned.pop("package_sha256", None)
+        if digest != canonical_sha256(unsigned):
+            raise ValueError("continuous Options package identity changed")
+        validate_p8_execution_bundle_document(package, bundle)
+        acquisition = acquisition_binding_from_payload(bundle.get("acquisition_binding"))
+        session_binding = p8_preopen_session_binding_from_payload(
+            bundle.get("session_binding")
+        )
+        if (
+            session_binding != build_p8_preopen_session_binding(
+                package=package, acquisition_binding=acquisition
+            )
+            or bundle.get("orchestration", {}).get("catalog_version")
+            != STAGE_CATALOG_VERSION_V5
+            or bundle.get("orchestration", {}).get("stage_order")
+            != list(OPTIONS_V3_STAGE_ORDER)
+            or sorted(package.get("v3_admitted_contracts") or ())
+            != list(acquisition.contract_tickers)
+            or not set(package.get("cohort", {}).get("underlyings", ())).issubset(
+                acquisition.equity_tickers
+            )
+        ):
+            raise ValueError("continuous Options runtime scope changed")
+        return
     deployment = package.get("v3_deployment")
     orchestration = bundle.get("orchestration")
     production = bundle.get("production_binding")

@@ -501,7 +501,11 @@ def _verify_scope(
     expected = (
         control.cohort_sha256,
         str(control.manifest_id),
-        plan.enrollment.enrollment_sha256,
+        (
+            plan.enrollment.enrollment_sha256
+            if control.stored_identity is None
+            else control.stored_identity.configuration_sha256
+        ),
         control.manifest_sha256,
         str(control.profile_id),
         control.profile_sha256,
@@ -904,6 +908,7 @@ def _load_equity_context(
         equity_cutoff=plan.equity_input_receipt.cutoff,
         requirements=plan.equity_context_requirements,
         underlyings=plan.control_plane.universe.option_underlyings,
+        allow_shared_history_source=plan.control_plane.stored_identity is not None,
     )
     reasons_by_lane = {}
     identities = []

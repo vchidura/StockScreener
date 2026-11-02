@@ -17,10 +17,7 @@ BACKEND_DIR = Path(__file__).resolve().parent.parent
 if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
-from realtime.contracts import (  # noqa: E402
-    EQUITY_VALIDATION_UNIVERSE,
-    canonical_sha256,
-)
+from realtime.contracts import canonical_sha256  # noqa: E402
 from realtime.database_access_v2 import (  # noqa: E402
     APP_ROLE,
     V2AccessConfig,
@@ -30,20 +27,18 @@ from realtime.migrations import (  # noqa: E402
     EXPECTED_V2_DATABASE_NAME,
     validate_target_database_v2,
 )
-from realtime.reference_adapters import TreasuryReferenceAdapter  # noqa: E402
 from realtime.reference_repository import (  # noqa: E402
     persist_reference_facts_cursor,
 )
-from realtime.reference_service import ReferenceSeedRequest  # noqa: E402
-from realtime.reference_transports import (  # noqa: E402
-    ReferenceTransportLimits,
-    RequestsReferenceHttpTransport,
-    TreasuryReferenceTransport,
+from realtime.treasury_refresh import (  # noqa: E402
+    BoundedTreasuryHttp,
+    TREASURY_RESPONSE_BYTE_LIMIT,
+    TreasuryAuthorizationFence,
+    collect_treasury_facts,
+    required_treasury_rate_date,
+    verify_treasury_curve_cursor,
 )
 from scripts.realtime_script_support import write_report  # noqa: E402
-from scripts.refresh_realtime_v2_references import (  # noqa: E402
-    PacedAccountingReferenceTransport,
-)
 
 
 UTC = timezone.utc
@@ -54,12 +49,16 @@ def parse_args(argv=None):
     parser.add_argument("--database", required=True)
     parser.add_argument("--confirm-database-name", required=True)
     parser.add_argument("--session-date", type=date.fromisoformat, required=True)
-    parser.add_argument("--authorized-until", type=datetime.fromisoformat, required=True)
-    parser.add_argument("--maximum-provider-requests", type=int, required=True)
-    parser.add_argument("--response-byte-limit", type=int, required=True)
-    parser.add_argument("--authorization-reference", required=True)
-    parser.add_argument("--report-path", type=Path, required=True)
-    parser.add_argument("--execute", action="store_true")
+    parser.add_argument("--required-rate-date", type=date.fromisoformat)
+    parser.add_argument("--authorized-until", type=datetime.fromisoformat)
+    parser.add_argument("--maximum-provider-requests", type=int)
+    parser.add_argument("--response-byte-limit", type=int)
+    parser.add_argument("--authorization-reference")
+    parser.add_argument("--report-path", type=Path)
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--execute", action="store_true")
+    mode.add_argument("--verify", action="store_true",
+                      help="Read stored evidence only; no provider calls, writes or migrations")
     args = parser.parse_args(argv)
     validate_target_database_v2(
         args.database,
@@ -68,18 +67,26 @@ def parse_args(argv=None):
     )
     if args.database != EXPECTED_V2_DATABASE_NAME:
         parser.error("Treasury repair targets stocks_realtime_v2")
-    if (
-        args.authorized_until.tzinfo is None
+    expected_date = required_treasury_rate_date(args.session_date)
+    if args.required_rate_date is not None and args.required_rate_date != expected_date:
+        parser.error("--required-rate-date must be the exact prior XNYS session")
+    args.required_rate_date = expected_date
+    if not args.verify and (
+        args.authorized_until is None
+        or args.authorized_until.tzinfo is None
         or args.authorized_until.utcoffset() is None
         or args.maximum_provider_requests != 1
-        or args.response_byte_limit != 2_000_000
-        or not args.authorization_reference.strip()
+        or args.response_byte_limit != TREASURY_RESPONSE_BYTE_LIMIT
+        or not (args.authorization_reference or "").strip()
+        or args.report_path is None
     ):
         parser.error("Treasury repair scope or budget is invalid")
-    args.authorized_until = args.authorized_until.astimezone(UTC)
-    args.report_path = args.report_path.resolve()
-    if args.report_path.exists():
-        parser.error("--report-path must be new")
+    if args.authorized_until is not None:
+        args.authorized_until = args.authorized_until.astimezone(UTC)
+    if args.report_path is not None:
+        args.report_path = args.report_path.resolve()
+        if args.report_path.exists():
+            parser.error("--report-path must be new")
     return args
 
 
@@ -107,6 +114,25 @@ def _provider():
 def main(argv=None) -> int:
     args = parse_args(argv)
     checked_at = datetime.now(UTC)
+    if args.verify:
+        provider, pool = _provider()
+        try:
+            with provider.transaction(
+                APP_ROLE, read_only=True, isolation_level="REPEATABLE READ",
+            ) as unit:
+                report = verify_treasury_curve_cursor(
+                    unit.cursor, session_date=args.session_date, checked_at=checked_at,
+                )
+        finally:
+            pool.closeall()
+        report.update({
+            "mode": "VERIFY", "database": args.database,
+            "provider_requests": 0, "database_writes": 0, "migrations": 0,
+        })
+        if args.report_path is not None:
+            write_report(args.report_path, report)
+        print(json.dumps(report, sort_keys=True))
+        return 0 if report["status"] == "VERIFIED" else 1
     if not checked_at <= args.authorized_until <= checked_at + timedelta(hours=1):
         raise ValueError("Treasury authorization is outside its TTL")
     plan = {
@@ -114,6 +140,7 @@ def main(argv=None) -> int:
         "mode": "EXECUTE" if args.execute else "PLAN",
         "database": args.database,
         "session_date": args.session_date.isoformat(),
+        "required_rate_date": args.required_rate_date.isoformat(),
         "source": "us_treasury_par_yield_v1",
         "maximum_provider_requests": args.maximum_provider_requests,
         "response_byte_limit": args.response_byte_limit,
@@ -130,61 +157,33 @@ def main(argv=None) -> int:
         write_report(args.report_path, report)
         print(json.dumps(report, sort_keys=True))
         return 0
-    accounting = PacedAccountingReferenceTransport(
-        RequestsReferenceHttpTransport(timeout_seconds=30),
-        maximum_requests=1,
-        minimum_interval_seconds=0.5,
-        authorized_until=args.authorized_until,
-    )
-    transport = TreasuryReferenceTransport(
-        accounting,
-        limits=ReferenceTransportLimits(
-            maximum_requests=1,
-            maximum_response_bytes=args.response_byte_limit,
-            maximum_total_bytes=args.response_byte_limit,
-            maximum_rows=1_000,
-            maximum_pages=1,
-        ),
-    )
-    request = ReferenceSeedRequest(
-        EQUITY_VALIDATION_UNIVERSE,
-        args.session_date,
-        checked_at,
-        checked_at,
-        args.authorized_until,
-    )
-    generation = TreasuryReferenceAdapter(
-        transport.fetch_xml,
-        metrics=transport,
-    ).collect(request)
-    if generation.provider_requests != 1 or not generation.facts:
-        raise RuntimeError("Treasury generation identity changed")
-    rate_dates = {
-        dict(fact.values)["rate_date"]
-        for fact in generation.facts
-    }
-    if (
-        len(rate_dates) != 1
-        or next(iter(rate_dates)) > args.session_date
-    ):
-        raise ValueError("Treasury curve is not causal for the session")
     provider, pool = _provider()
     try:
-        with provider.transaction(APP_ROLE) as unit:
-            persist_reference_facts_cursor(
-                unit.cursor,
-                generation.facts,
+        http = BoundedTreasuryHttp(authorized_until=args.authorized_until)
+        facts = collect_treasury_facts(
+            required_rate_date=args.required_rate_date, http=http,
+            checked_at=lambda: datetime.now(UTC),
+        )
+        with provider.transaction(
+            APP_ROLE, fence=TreasuryAuthorizationFence(args.authorized_until),
+        ) as unit:
+            persist_reference_facts_cursor(unit.cursor, facts)
+            verification = verify_treasury_curve_cursor(
+                unit.cursor, session_date=args.session_date, checked_at=datetime.now(UTC),
             )
+            if verification["status"] != "VERIFIED":
+                raise ValueError("Persisted Treasury curve did not verify")
     finally:
         pool.closeall()
     report = {
         **plan,
         "status": "COMPLETE",
-        "rate_date": next(iter(rate_dates)).isoformat(),
-        "provider_requests": generation.provider_requests,
-        "provider_response_bytes": generation.response_bytes,
-        "database_writes": len(generation.facts),
-        "fact_sha256": canonical_sha256(generation.facts),
+        "rate_date": args.required_rate_date.isoformat(),
+        "provider_requests": http.requests,
+        "provider_response_bytes": http.response_bytes,
+        "database_writes": len(facts),
+        "fact_sha256": canonical_sha256(facts),
+        "verification": verification,
         "credentials_exposed": False,
     }
     report["semantic_sha256"] = canonical_sha256(report)

@@ -311,8 +311,10 @@ def binding_from_selection_capture(
         datetime.fromisoformat(str(evidence["valid_until_utc"])),
         "selection valid_until",
     )
-    prices = []
-    for selected in capture.selection.selected:
+    prices_by_ticker = {}
+    for selected in sorted(
+        capture.selection.selected, key=lambda row: row.contract_ticker
+    ):
         raw = capture.selected_snapshots[selected.contract_ticker]
         underlying = raw.get("underlying_asset")
         if not isinstance(underlying, Mapping):
@@ -325,7 +327,7 @@ def binding_from_selection_capture(
             market_time - selected_at
         ).total_seconds() > MAXIMUM_PROVIDER_CLOCK_SKEW_SECONDS:
             raise ValueError("P8 underlying provider clock skew exceeded")
-        prices.append(UnderlyingSnapshotPrice(
+        price = UnderlyingSnapshotPrice(
             ticker=str(underlying.get("ticker", "")),
             session_date=selected_at.date(),
             price=_decimal(
@@ -337,7 +339,18 @@ def binding_from_selection_capture(
             selected_contract_ticker=selected.contract_ticker,
             selected_contract_source_sha256=selected.source_sha256,
             underlying_payload_sha256=canonical_sha256(underlying),
-        ))
+        )
+        previous = prices_by_ticker.get(price.ticker)
+        if previous is not None:
+            if (
+                previous.market_time == price.market_time
+                and previous.price != price.price
+            ):
+                raise ValueError("underlying prices diverge at the same market clock")
+            if previous.market_time >= price.market_time:
+                continue
+        prices_by_ticker[price.ticker] = price
+    prices = tuple(prices_by_ticker.values())
     valid_until = min(
         selection_valid_until,
         *(

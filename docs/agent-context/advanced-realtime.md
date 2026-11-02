@@ -566,8 +566,9 @@ hot paths perform no chain/calendar work or v2-v3 profile comparison.
 
 ## Post-C8 Market-Readiness Corrections
 
-Status: **NOT CODE_READY for the recorded universe; NOT READY_FOR_SUPERVISED_RUN**
-(2026-11-02 review below supersedes the earlier code-level claim).
+Status: **Focused corrections tested; deployment pending; NOT READY_FOR_SUPERVISED_RUN**
+until the section 8 migration/image/secrets/startup steps are separately approved
+and verified. No full-session or unattended-operation claim.
 
 ### First-Run Readiness Review (2026-11-02)
 
@@ -575,16 +576,44 @@ Evidence matrix, decisions and first-run plan:
 [ADVANCED_REALTIME_V3_FIRST_RUN_READINESS_2026-11-02.md](../ADVANCED_REALTIME_V3_FIRST_RUN_READINESS_2026-11-02.md).
 Section 11 holds the implementation brief and its status.
 
-Implementation status: items 1-9 are done in the working tree on `0b1e009`, not
-committed or deployed, and there is no live evidence. B2-B5 and D1/D4 have code
-fixes; B1 still needs the live migration; B6-B8 remain. Migration chain is now 046,
-with the old 045 ledger row accepted only by exact version and full checksum. The
-full-size Options test reached `ACTIVE` after five activation defects were fixed
-(contract-order identity in three places, slot priority order, and an empty
-reference state). New go-live items: the live Treasury curve ends 2026-10-29 and
-must reach 2026-10-30 before activation; no Compose role attaches per-E downstream
-bindings, so expect no Options WINDOW or products; roles after a real automatic
-activation are unexercised. Warmup is 4,401 chunks, estimated 25-45 min.
+Items 1-9 remain recorded in readiness section 11. Additional corrections:
+
+- The user authorized one October 30 Treasury refresh: 14 tenors verified,
+  source update 2026-11-02 01:02:04Z, real receipt 09:43:10.994274Z. This is the
+  only new live effect. Scheduled end-of-day/catch-up ownership is implemented in
+  `options-lifecycle`, with bounded durable retries; deployment is pending.
+- Reference `known_at` uses the real activation clock, not the compatibility
+  pre-open timestamp. A curve arriving after open and frozen capture now unblocks
+  activation without backdating or reallocating.
+- The user approved `options-scheduler` as the twentieth native/Compose role.
+  `backend/scripts/run_advanced_options_v3_scheduler.py` derives session/E scope,
+  snapshots only frozen contracts and appends durable per-E authority/bindings.
+  WINDOW reloads each exact binding; continuous control/history identities are
+  preserved without routine qualification-artifact gates.
+- Scheduler replay now uses persisted `requested_to` (original selection time),
+  never ledger completion time. Dedicated no-retry HTTP transport accounts for
+  failed/partial bytes and checks the E/O deadline. Frozen batches are <=250
+  contracts, <=1,000 total; request budgets are `3*B`/interval and `234*B`/session,
+  reserving 2,000,001 bytes/request including the oversize probe. Follow-up:
+  107 offline passed plus advancing-clock/failed-byte PostgreSQL regression.
+  This does not certify full expanded-universe products or live operation.
+- Focused runtime/topology/input tests: 224 provider-blocked passed; Treasury,
+  lifecycle and rates: 117 passed. Disposable DB: 27 passed, including full-size
+  activation, append recovery, two E bindings and frozen cohort/service-plan
+  fences. Native-plan blockers remain blocking; accepted lane-local unavailable
+  evidence no longer produces a contradictory READY preflight.
+- Additional combined canary passed backend stored publication/rollback/API
+  assertions but failed in its bundled Node process (`0xC0000096`, also reproduced
+  by direct Node execution). No complete frontend/canary PASS claim.
+- Section 8 is the sole current operator sequence: safe-start target 13:00 UTC,
+  member boundary 14:15 UTC. Warmup remains 4,401 chunks, estimated 25-45 min;
+  replace the estimate with observed throughput. Render 20, not 19, services.
+- B1 migrations, immutable build/configuration and retention startup remain
+  deployment work; D5 finite stream-ceiling approval is still required.
+  Compose-only/native retention, one-session frontend cohort
+  handling, throughput and reboot/history repair remain supervised-run limits.
+  Stored publication validation is included; browser/Options UI and rollover
+  validation are deferred. Established-member dividend refresh remains unresolved.
 
 Blockers as found by the review, in execution order:
 

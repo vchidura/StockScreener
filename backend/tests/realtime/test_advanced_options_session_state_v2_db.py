@@ -15,10 +15,17 @@ import pytest
 from options.calendar import OptionExchangeCalendar
 from options.data.polygon_http import PolygonHttpResponse
 from psycopg2 import errors
-from psycopg2.extras import Json
+from psycopg2.extras import Json, RealDictCursor
 
 from realtime.advanced_options_acquisition_runtime import (
     build_acquisition_binding,
+)
+from realtime.advanced_equity_control_plane import (
+    build_advanced_equity_control_plane_plan,
+    persist_advanced_equity_control_plane_cursor,
+)
+from realtime.advanced_options_continuous_scheduler import (
+    run_continuous_options_schedule_cycle,
 )
 from realtime.advanced_options_control_plane import (
     ADVANCED_OPTIONS_REST_LANES,
@@ -350,6 +357,7 @@ def _seed_session(
     extra_equity_tickers: tuple[str, ...] = (),
     options_ready: bool = True,
     materialize_desired_snapshot: bool = True,
+    canonical_equity: bool = False,
 ):
     desired_cohort_id = insert_cohort(
         cursor,
@@ -424,6 +432,23 @@ def _seed_session(
                 equity_instrument_ids[ticker],
             ),
         )
+
+    if canonical_equity:
+        equity = build_advanced_equity_control_plane_plan(
+            session_date=SESSION_DATE,
+            security_ids=security_ids,
+            entitlement_evidence_sha256=_digest("canonical-equity-entitlement"),
+            authorization_reference="c8-canonical-equity",
+            checked_at=OPENING - timedelta(minutes=30),
+            expires_at=OptionExchangeCalendar("XNYS").session_close(
+                SESSION_DATE
+            ) + timedelta(minutes=30),
+            schema_sha256=_digest("canonical-schema"),
+            security_policy_sha256=_digest("canonical-security"),
+        )
+        persist_advanced_equity_control_plane_cursor(cursor, equity)
+        desired_cohort_id = equity.cohort_id
+        desired_manifest_id = equity.manifest_id
 
     revision_id = uuid5(NAMESPACE_URL, "c5-desired-revision")
     recorded_at = OPENING - timedelta(minutes=30)
@@ -2685,6 +2710,7 @@ def test_c8_real_executor_activates_from_full_size_paginated_chains(
             seed = _seed_session(
                 database_cursor,
                 options_ready=False,
+                canonical_equity=True,
             )
             _seed_c8_equity_history(database_cursor, seed)
             _seed_c8_minute_spots(database_cursor, seed)
@@ -2768,10 +2794,10 @@ def test_c8_real_executor_activates_from_full_size_paginated_chains(
                         SESSION_DATE
                     )
                     database_cursor.execute(
-                        "SELECT evidence_document FROM "
-                        "rt.advanced_options_preparation_attempts "
-                        "WHERE stage='CAPACITY_SHARDS' AND state='COMPLETE' "
-                        "ORDER BY completed_at DESC LIMIT 1"
+                        "SELECT evidence FROM "
+                        "rt.advanced_options_preparation_work "
+                        "WHERE stage='CAPACITY_SHARDS' AND status='COMPLETE' "
+                        "ORDER BY ticker LIMIT 1"
                     )
                     frozen_capture = database_cursor.fetchone()[0]
                     _seed_c8_treasury_curve(
@@ -2875,7 +2901,7 @@ def test_c8_real_executor_activates_from_full_size_paginated_chains(
         assert reference.known_at == now["value"]
         assert reference.known_at > replacement_received_at
         assert all(
-            rate.first_observed_at == replacement_received_at
+            rate.received_at == replacement_received_at
             for valuation in reference.valuation_inputs
             for rate in valuation.rate_observations
         )
@@ -2890,10 +2916,285 @@ def test_c8_real_executor_activates_from_full_size_paginated_chains(
         assert restarted.load_c6_selection_plan() is not None
         acquisition = restarted.load_acquisition_binding()
         assert len(acquisition.contract_tickers) == sum(selected.values())
+        assert frozen_capture is not None
+        captured_at = preparation_module.datetime.fromisoformat(
+            frozen_capture["capture"]["captured_at_utc"]
+        )
+        assert replacement_received_at > captured_at
+        assert acquisition.source_sha256 == frozen_capture["capture"][
+            "semantic_sha256"
+        ]
+        assert all(
+            row.received_at == captured_at
+            for row in reference.open_interest
+            if row.availability is ReferenceAvailability.AVAILABLE
+        )
         assert restarted.load_package()["v3_admitted_contracts"]
         assert restarted.load_preopen_session_binding(
             restarted.load_bundle_document()
         ) is not None
+        _exercise_continuous_scheduler(pool, seed, restarted, now["value"], monkeypatch)
+
+
+def _exercise_continuous_scheduler(pool, seed, state, activated_at, monkeypatch):
+    session = state.load_preopen_session_binding(state.load_bundle_document())
+    tickers = state.load_acquisition_binding().contract_tickers
+    clock = {"value": activated_at}
+    calls = []
+    interrupted_bindings = []
+
+    def advancing_clock():
+        value = clock["value"]
+        clock["value"] += timedelta(milliseconds=5)
+        return value
+    with cursor(pool) as database_cursor:
+        database_cursor.execute(
+            "SELECT rt.ensure_partitions('rt.raw_payloads',%s)",
+            (SESSION_DATE,),
+        )
+        database_cursor.execute(
+            "SELECT rt.ensure_partitions('rt.raw_payload_chunks',%s)",
+            (SESSION_DATE,),
+        )
+        database_cursor.connection.commit()
+
+    class SnapshotTransport:
+        def __init__(self, _api_key, **_kwargs):
+            pass
+
+        def get(self, url, params):
+            calls.append((url, params))
+            assert tuple(params["ticker.any_of"].split(",")) == tickers
+            rows = [
+                row
+                for ticker in FULL_SIZE_SPOTS
+                for row in _full_size_chain(
+                    ticker, clock["value"], underlying_at=clock["value"]
+                )
+                if row["details"]["ticker"] in tickers
+            ]
+            return PolygonHttpResponse(
+                200, json.dumps({"status": "OK", "results": rows}).encode()
+            )
+
+    first_cutoff = activated_at.replace(
+        minute=(activated_at.minute // 5) * 5, second=0, microsecond=0,
+    ) + timedelta(minutes=5)
+    for sequence in (1, 2):
+        cutoff = first_cutoff + timedelta(minutes=5 * (sequence - 1))
+        clock["value"] = cutoff + timedelta(seconds=20)
+        with cursor(pool) as database_cursor:
+            window_id, receipt_id = uuid4(), uuid4()
+            database_cursor.execute(
+                "INSERT INTO rt.window_runs (window_id,plan_id,cohort_id,"
+                "provider_tier,window_key,release_at,cutoff,deadline,state) "
+                "VALUES (%s,%s,%s,'MASSIVE_ADVANCED',%s,%s,%s,%s,'COMPLETE')",
+                (str(window_id), str(seed["equity_plan_id"]),
+                 str(seed["desired_cohort_id"]), f"continuous-E-{sequence}",
+                 cutoff, cutoff, cutoff + timedelta(minutes=5)),
+            )
+            database_cursor.execute(
+                "SELECT universe_sha256 FROM rt.subscription_manifests "
+                "WHERE manifest_id=%s", (str(seed["desired_manifest_id"]),),
+            )
+            universe_sha256 = database_cursor.fetchone()[0]
+            database_cursor.execute(
+                "INSERT INTO rt.cycle_receipts (receipt_id,window_id,cohort_id,"
+                "receipt_kind,cutoff,reference_generation,universe_sha256,"
+                "input_sha256,build_id,created_at) "
+                "VALUES (%s,%s,%s,'INPUT_READY',%s,1,%s,%s,'continuous-E',%s)",
+                (str(receipt_id), str(window_id), str(seed["desired_cohort_id"]),
+                 cutoff, universe_sha256, _digest(f"continuous-E-{sequence}"),
+                 cutoff + timedelta(seconds=10)),
+            )
+            database_cursor.execute(
+                "INSERT INTO rt.stage_runs (stage_run_id,window_id,stage_id,"
+                "stage_version,state,finished_at) "
+                "SELECT %s,%s,stage_id,version,'COMPLETE',%s "
+                "FROM rt.stage_catalog WHERE stage_id='EQUITY_MATERIALIZE' "
+                "ORDER BY version DESC LIMIT 1",
+                (str(uuid4()), str(window_id), clock["value"]),
+            )
+            database_cursor.connection.commit()
+        if sequence == 1:
+            def interrupted_attach(*_args, **_kwargs):
+                interrupted_bindings.append(_args[2])
+                raise RuntimeError("interrupted before downstream append")
+
+            with monkeypatch.context() as interruption:
+                interruption.setattr(
+                    PostgresContinuousSessionStateRepository,
+                    "attach_downstream_binding", interrupted_attach,
+                )
+                with pytest.raises(RuntimeError, match="interrupted before"):
+                    run_continuous_options_schedule_cycle(
+                        _provider(pool), session_date=SESSION_DATE, api_key="provider-free",
+                        clock=advancing_clock, transport_factory=SnapshotTransport,
+                    )
+            clock["value"] += timedelta(seconds=1)
+            with cursor(pool) as database_cursor:
+                database_cursor.execute(
+                    "SELECT requested_to,completed_at FROM rt.provider_request_ledger "
+                    "WHERE endpoint_class='OPTIONS_UNIFIED_SNAPSHOT'"
+                )
+                selected_at, completed_at = database_cursor.fetchone()
+                assert selected_at < completed_at
+        result = run_continuous_options_schedule_cycle(
+            _provider(pool), session_date=SESSION_DATE, api_key="provider-free",
+            clock=advancing_clock, transport_factory=SnapshotTransport,
+        )
+        assert result["status"] == "ATTACHED"
+        assert result["sequence"] == sequence
+        assert run_continuous_options_schedule_cycle(
+            _provider(pool), session_date=SESSION_DATE, api_key="provider-free",
+            clock=advancing_clock, transport_factory=SnapshotTransport,
+        )["status"] == "ALREADY_ATTACHED"
+    assert len(calls) == 2
+    chain = PostgresContinuousSessionStateRepository(
+        _provider(pool), session_date=SESSION_DATE,
+    ).load_downstream_bindings(session)
+    assert len(chain) == 2
+    assert chain[0] == interrupted_bindings[0]
+    assert chain[1].previous_binding_sha256 == chain[0].binding_sha256
+    from realtime.advanced_options_p8_production import (
+        load_v3_pending_window_bindings, p8_production_binding_from_payload,
+    )
+    template = p8_production_binding_from_payload(chain[0].production_binding)
+    pending = load_v3_pending_window_bindings(
+        provider=_provider(pool), binding=template,
+        bundle=state.load_bundle_document(),
+        available_at=clock["value"] + timedelta(minutes=5),
+    )
+    assert len(pending) == 2
+    assert [row.enrollment for row in pending] == [
+        p8_production_binding_from_payload(row.production_binding).enrollment
+        for row in chain
+    ]
+    from realtime.advanced_options_p8_roles import _contract_scope
+    from realtime.advanced_options_flow_policy import load_advanced_options_flow_policy
+    from realtime.option_source_flow import persist_option_contract_scope_cursor
+    from realtime.advanced_options_reference_producer import (
+        PostgresAdvancedOptionsReferenceProducer,
+        build_advanced_options_reference_producer_plan,
+    )
+    for window in pending:
+        from realtime.advanced_options_postgres import (
+            PostgresAdvancedOptionsCanonicalRuntimePort,
+        )
+        control = window.enrollment.control_plane
+        with cursor(pool) as database_cursor:
+            PostgresAdvancedOptionsCanonicalRuntimePort._verify_control_plane_cursor(
+                SimpleNamespace(_scope=SimpleNamespace(control_plane=control)),
+                database_cursor,
+                SimpleNamespace(plan=SimpleNamespace(
+                    config_sha256=control.stored_identity.service_plan_sha256,
+                )),
+            )
+            input_plan = SimpleNamespace(
+                window_id=window.window_id, control_plane=control,
+                enrollment=window.enrollment, service_plan_id=control.plan_id,
+                cutoff=control.receipts.options_input_ready.spec.cutoff,
+            )
+            context = PostgresAdvancedOptionsCanonicalRuntimePort._input_ready_context_cursor(
+                SimpleNamespace(_scope=SimpleNamespace(input_ready_plan=input_plan)),
+                database_cursor, lock_window=False,
+            )
+            assert context.plan.config_sha256 == control.stored_identity.service_plan_sha256
+        scope = _contract_scope(window, load_advanced_options_flow_policy())
+        with cursor(pool) as database_cursor:
+            persist_option_contract_scope_cursor(database_cursor, scope)
+            database_cursor.execute(
+                "SELECT COALESCE(MAX(reference_generation),0)+1 "
+                "FROM rt.advanced_options_reference_states"
+            )
+            generation = int(database_cursor.fetchone()[0])
+            database_cursor.connection.commit()
+        plan = build_advanced_options_reference_producer_plan(
+            enrollment=window.enrollment, contract_scope=scope,
+            reference_generation=generation,
+            known_at=window.enrollment.control_plane.receipts.options_input_ready.spec.cutoff,
+            valid_until=window.enrollment.control_plane.expires_at,
+            discovery_scheduled_cycle=window.enrollment.control_plane.planned_at,
+            prior_oi_session=OptionExchangeCalendar("XNYS").previous_session_date(SESSION_DATE),
+            model_version="black-scholes-merton-v1",
+            history_source_cohort_id=window.history.source_cohort_id,
+        )
+        reference = PostgresAdvancedOptionsReferenceProducer(
+            _provider(pool), plan,
+        ).produce()
+        assert reference.reference_generation == generation
+        assert len(reference.open_interest) == len(tickers)
+        from realtime.advanced_options_equity_input import (
+            initial_advanced_options_equity_context_requirements,
+        )
+        from realtime.advanced_options_native_loader import _load_equity_context
+        from realtime.preflight import DetectorFamily
+        with cursor(pool) as database_cursor:
+            with database_cursor.connection.cursor(
+                cursor_factory=RealDictCursor
+            ) as context_cursor:
+                reasons, _, _ = _load_equity_context(
+                    context_cursor,
+                    SimpleNamespace(
+                        enrollment=window.enrollment,
+                        control_plane=window.enrollment.control_plane,
+                        history_source_cohort_id=window.history.source_cohort_id,
+                        equity_input_receipt=SimpleNamespace(
+                            cutoff=window.equity_input.equity_cutoff,
+                        ),
+                        equity_context_requirements=(
+                            initial_advanced_options_equity_context_requirements()
+                        ),
+                    ),
+                    [],
+                )
+        assert set(reasons) == {
+            DetectorFamily.O1, DetectorFamily.O3, DetectorFamily.OS1, DetectorFamily.OS2,
+        }
+    from realtime import advanced_options_continuous_scheduler as scheduler_module
+
+    failed_calls = []
+    error_body = b'{"error":"provider-free failure"}'
+
+    class FailedSnapshotTransport:
+        def __init__(self, _api_key, **_kwargs):
+            pass
+
+        def get(self, url, params):
+            failed_calls.append((url, params))
+            return PolygonHttpResponse(503, error_body)
+
+    acquisition = state.load_acquisition_binding()
+    budget = scheduler_module._scheduler_budget(
+        acquisition, state.load_package()["authorization_reference"],
+    )
+    failed_receipt = (str(uuid4()), first_cutoff + timedelta(minutes=5))
+
+    def failed_capture():
+        return scheduler_module._capture(
+            _provider(pool), state=state, receipt=failed_receipt,
+            budget=budget, api_key="provider-free", clock=advancing_clock,
+            transport_factory=FailedSnapshotTransport,
+            deadline=failed_receipt[1] + timedelta(seconds=300),
+        )
+
+    for _ in range(3):
+        with pytest.raises(RuntimeError, match="HTTP 503"):
+            failed_capture()
+    with pytest.raises(RuntimeError, match="retry budget exhausted"):
+        failed_capture()
+    assert len(failed_calls) == 3
+    with cursor(pool) as database_cursor:
+        database_cursor.execute(
+            "SELECT count(*),SUM(response_bytes),MIN(http_status),"
+            "count(payload_id),MIN(reserved_response_bytes) "
+            "FROM rt.provider_request_ledger "
+            "WHERE endpoint_class='OPTIONS_UNIFIED_SNAPSHOT' AND state='FAILED'"
+        )
+        assert database_cursor.fetchone() == (
+            3, 3 * len(error_body), 503, 3,
+            scheduler_module.ACCOUNTED_RESPONSE_BYTE_CEILING,
+        )
 
 
 def test_c8_stale_capture_refresh_survives_restart_before_allocation_freeze():

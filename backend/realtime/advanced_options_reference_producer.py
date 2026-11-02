@@ -609,10 +609,18 @@ def _load_active_scope(
     expected = (
         control.cohort_sha256,
         str(control.manifest_id),
-        plan.enrollment.enrollment_sha256,
+        (
+            plan.enrollment.enrollment_sha256
+            if control.stored_identity is None
+            else control.stored_identity.configuration_sha256
+        ),
         control.pins.model_bundle_sha256,
         control.pins.valuation_policy_sha256,
-        "SHADOW",
+        (
+            "SHADOW"
+            if control.stored_identity is None
+            else control.stored_identity.mode
+        ),
         control.manifest_sha256,
         control.universe.sha256,
         str(control.profile_id),

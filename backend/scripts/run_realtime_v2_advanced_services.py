@@ -428,6 +428,17 @@ def build_commands(args):
             "--continuous",
             "--execute",
         ],
+        "options-scheduler": [
+            str(PYTHON),
+            "-B",
+            str(BACKEND_DIR / "scripts" / "run_advanced_options_v3_scheduler.py"),
+            "--database",
+            "stocks_realtime_v2",
+            "--confirm-database-name",
+            "stocks_realtime_v2",
+            "--continuous",
+            "--execute",
+        ],
         **{
             role: [
                 str(PYTHON),
@@ -505,6 +516,7 @@ def build_commands(args):
             "publication-retry",
             "options-lifecycle",
             "options-acquisition",
+            "options-scheduler",
             "options-ingress",
             "options-market-state",
             "options-flow",

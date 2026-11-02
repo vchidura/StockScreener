@@ -621,6 +621,53 @@ services:
       retries: 6
       start_period: 20s
 
+  realtime-v3-options-scheduler:
+    <<: *backend-service
+    profiles: ["advanced-realtime-v3"]
+    container_name: stock-screener-realtime-v3-options-scheduler
+    restart: unless-stopped
+    command:
+      - python
+      - -B
+      - scripts/run_realtime_v2_container.py
+      - --component
+      - options-scheduler
+      - --app-dsn-file
+      - /run/secrets/realtime_v2_app_dsn
+      - --provider-key-file
+      - /run/secrets/realtime_v2_provider_key
+      - --
+      - python
+      - -B
+      - scripts/run_advanced_options_v3_scheduler.py
+      - --database
+      - stocks_realtime_v2
+      - --confirm-database-name
+      - stocks_realtime_v2
+      - --continuous
+      - --execute
+    environment:
+      REALTIME_V2_EQUITY_PIPELINE: MASSIVE_ADVANCED
+      REALTIME_V2_OPTIONS_PIPELINE: MASSIVE_ADVANCED
+      REALTIME_V2_ROLE_PREFIX: ${REALTIME_V2_ROLE_PREFIX:-stocks_realtime_v2}
+    secrets:
+      - realtime_v2_app_dsn
+      - realtime_v2_provider_key
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -B
+        - scripts/check_advanced_realtime_v3_service.py
+        - --app-dsn-file
+        - /run/secrets/realtime_v2_app_dsn
+        - --role
+        - options-scheduler
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 20s
+
   realtime-v3-options-p8-ingress:
     <<: *backend-service
     profiles: ["realtime-v3-options", "advanced-realtime-v3"]

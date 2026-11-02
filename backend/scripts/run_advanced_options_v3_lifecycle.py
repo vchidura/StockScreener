@@ -53,6 +53,7 @@ from realtime.migrations import (  # noqa: E402
     EXPECTED_V2_DATABASE_NAME,
     validate_target_database_v2,
 )
+from realtime.treasury_refresh import TreasuryRefreshOwner  # noqa: E402
 
 
 UTC = timezone.utc
@@ -321,6 +322,7 @@ def main(argv=None) -> int:
         ),
     )
     owner_id = uuid4()
+    treasury = TreasuryRefreshOwner(provider, owner_id=owner_id)
     planner = AdvancedEquityLifecyclePlanner()
     stop = threading.Event()
     signal.signal(signal.SIGINT, lambda *_: stop.set())
@@ -334,6 +336,7 @@ def main(argv=None) -> int:
                     args.completion_budget_seconds
                 ),
             )
+            treasury_status = treasury.tick(lifecycle.preparation_session_date)
             with provider.transaction(
                 APP_ROLE,
                 isolation_level="SERIALIZABLE",
@@ -364,9 +367,10 @@ def main(argv=None) -> int:
                 )
             payload = _status_payload(status, lifecycle)
             payload["stage_cycle"] = cycle
-            payload["provider_requests_this_cycle"] = cycle.get(
-                "provider_requests",
-                0,
+            payload["treasury_refresh"] = treasury_status
+            payload["provider_requests_this_cycle"] = (
+                cycle.get("provider_requests", 0)
+                + treasury_status["provider_requests_this_cycle"]
             )
             print(
                 json.dumps(

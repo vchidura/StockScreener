@@ -1004,6 +1004,77 @@ class MassiveAdvancedOptionsSelectionSource:
         )
 
 
+def combine_exact_contract_captures(
+    captures: tuple[P8ActivitySelectionCapture, ...],
+    *,
+    contract_tickers: tuple[str, ...],
+) -> P8ActivitySelectionCapture:
+    tickers = tuple(sorted(contract_tickers))
+    selected = tuple(row for capture in captures for row in capture.selection.selected)
+    if (
+        not captures or not tickers
+        or len(set(tickers)) != len(tickers)
+        or len(selected) != len(tickers)
+        or {row.contract_ticker for row in selected} != set(tickers)
+    ):
+        raise ValueError("batched exact-contract capture membership changed")
+    if len(captures) == 1:
+        return captures[0]
+    reviewed_at = max(capture.selection.reviewed_at for capture in captures)
+    if any(
+        capture.selection.valid_until is None
+        or capture.selection.valid_until <= reviewed_at
+        for capture in captures
+    ):
+        raise ValueError("batched exact-contract capture clocks do not overlap")
+    underlyings = tuple(sorted({row.underlyer for row in selected}))
+    policy = (
+        P8_SELECTION_POLICY
+        if underlyings == P8_SELECTION_POLICY.underlyings
+        else P7TransportSelectionPolicy(
+            version="advanced-options-c6-configured-capture-v1",
+            underlyings=underlyings, minimum_dte=0, maximum_dte=60,
+        )
+    )
+    selection = _select_exact_call_put_contracts(
+        selected, reviewed_at=reviewed_at, policy=policy,
+    )
+    batches = [
+        {
+            "selection_sha256": capture.evidence["selection_sha256"],
+            "source_snapshot_sha256": capture.evidence["source_snapshot_sha256"],
+            "selected_at_utc": capture.selection.reviewed_at.isoformat(),
+            "contracts": sorted(capture.selection.contracts),
+        }
+        for capture in captures
+    ]
+    request_count = sum(capture.request_count for capture in captures)
+    decoded_bytes = sum(capture.decoded_bytes for capture in captures)
+    source_snapshot_at = min(capture.source_snapshot_at for capture in captures)
+    evidence = {
+        "schema": "advanced-options-p8-exact-contract-batches-v1",
+        "endpoint": "/v3/snapshot",
+        "source_snapshot_at_utc": source_snapshot_at.isoformat(),
+        "selected_at_utc": reviewed_at.isoformat(),
+        "valid_until_utc": selection.valid_until.isoformat(),
+        "policy_sha256": policy.sha256,
+        "source_snapshot_sha256": canonical_sha256(batches),
+        "batches": batches,
+        "request_count": request_count, "decoded_bytes": decoded_bytes,
+        "pages": request_count, "pagination_requests": 0, "contracts": list(tickers),
+    }
+    evidence["selection_sha256"] = canonical_sha256(evidence)
+    return P8ActivitySelectionCapture(
+        selection=selection, request_count=request_count,
+        decoded_bytes=decoded_bytes, pages=request_count, pagination_requests=0,
+        source_snapshot_at=source_snapshot_at, evidence=evidence,
+        selected_snapshots={
+            ticker: raw for capture in captures
+            for ticker, raw in capture.selected_snapshots.items()
+        },
+    )
+
+
 class MassiveAdvancedOptionsExactContractSource:
     """One unified snapshot request for configured admitted contracts."""
 

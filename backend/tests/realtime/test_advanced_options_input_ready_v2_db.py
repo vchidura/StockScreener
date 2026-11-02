@@ -802,7 +802,23 @@ def test_owp4f_input_ready_action_and_disposable_readiness(monkeypatch):
                 row.member_key
                 for row in preflight.evidence
                 if row.accepted_unavailable
-            } == {"O2", "IV_SURFACE", "DARK_POOL"}
+            } == {
+                "O2", "IV_SURFACE", "DARK_POOL",
+                *(
+                    detector
+                    for detector, lane in (
+                        ("O1", native_preflight.bundle.o1),
+                        ("O3", native_preflight.bundle.o3),
+                        ("OS1", native_preflight.bundle.os1),
+                        ("OS2", native_preflight.bundle.os2),
+                    )
+                    if lane.blocked_reason_codes
+                ),
+            }
+            assert all(
+                row.status is AdvancedOptionsInputDependencyStatus.UNAVAILABLE
+                for row in preflight.evidence if row.accepted_unavailable
+            )
             frozen = freeze_advanced_options_input_ready_plan(
                 candidate,
                 preflight,

@@ -45,6 +45,7 @@ OWNED_SECRETS = {
     "canonical-stock-alerts": frozenset({"app_dsn"}),
     "publication-retry": frozenset({"app_dsn"}),
     "options-lifecycle": frozenset({"app_dsn", "provider_key"}),
+    "options-scheduler": frozenset({"app_dsn", "provider_key"}),
     "options-v3-acquisition": frozenset({
         "app_dsn",
         "provider_key",
@@ -73,6 +74,7 @@ FENCED_ROLE_NAMES = {
     "canonical-stock-alerts": "canonical-stock-alerts",
     "publication-retry": "publication-retry",
     "options-lifecycle": "options-lifecycle",
+    "options-scheduler": "options-scheduler",
     "options-v3-acquisition": "options-acquisition",
     "options-p8-ingress": "options-ingress",
     "options-p8-market-state": "options-market-state",

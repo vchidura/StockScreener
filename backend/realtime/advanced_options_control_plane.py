@@ -499,6 +499,35 @@ class AdvancedOptionsReceiptSet:
 
 
 @dataclass(frozen=True, slots=True)
+class AdvancedOptionsStoredControlIdentity:
+    profile_id: UUID
+    profile_sha256: str
+    manifest_id: UUID
+    manifest_sha256: str
+    cohort_id: UUID
+    cohort_sha256: str
+    universe_sha256: str
+    configuration_sha256: str
+    mode: str
+    service_plan_sha256: str
+    allocation_policy_sha256: str
+
+    def __post_init__(self) -> None:
+        for name in ("profile_id", "manifest_id", "cohort_id"):
+            value = getattr(self, name)
+            if not isinstance(value, UUID) or not value.int:
+                raise ValueError("stored Options control identity is invalid")
+        for name in (
+            "profile_sha256", "manifest_sha256", "cohort_sha256",
+            "universe_sha256", "configuration_sha256",
+            "service_plan_sha256", "allocation_policy_sha256",
+        ):
+            _sha256(getattr(self, name), name)
+        if self.mode not in {"LIVE", "SHADOW"}:
+            raise ValueError("stored Options cohort mode is invalid")
+
+
+@dataclass(frozen=True, slots=True)
 class AdvancedOptionsControlPlanePlan:
     plan_id: UUID
     plan_sha256: str
@@ -532,6 +561,7 @@ class AdvancedOptionsControlPlanePlan:
     stage_catalog_versions: tuple[str, ...] = PRESERVED_STAGE_CATALOGS
     runtime_enabled: bool = False
     options_cycle_bound: bool = False
+    stored_identity: AdvancedOptionsStoredControlIdentity | None = None
 
     @property
     def capability_only(self) -> bool:
@@ -582,7 +612,9 @@ class AdvancedOptionsHistoryBinding:
             self.target_cohort_id.int == 0
             or self.source_cohort_id.int == 0
             or self.target_cohort_id == self.source_cohort_id
-            or self.source_provider_tier is not ProviderTier.MASSIVE_DEVELOPER
+            or self.source_provider_tier not in {
+                ProviderTier.MASSIVE_DEVELOPER, ProviderTier.MASSIVE_ADVANCED,
+            }
         ):
             raise ValueError(
                 "Advanced Options history binding scope is invalid"
@@ -636,12 +668,13 @@ def build_advanced_options_history_binding(
     source_manifest_sha256: str,
     authorization_reference: str,
     evidence_sha256: str | None = None,
+    source_provider_tier: ProviderTier = ProviderTier.MASSIVE_DEVELOPER,
 ) -> AdvancedOptionsHistoryBinding:
     body = {
         "contract_version": ADVANCED_OPTIONS_HISTORY_BINDING_VERSION,
         "target_cohort_id": str(target_cohort_id),
         "source_cohort_id": str(source_cohort_id),
-        "source_provider_tier": ProviderTier.MASSIVE_DEVELOPER.value,
+        "source_provider_tier": source_provider_tier.value,
         "history_before": _utc(
             history_before,
             "history_before",
@@ -663,7 +696,7 @@ def build_advanced_options_history_binding(
     return AdvancedOptionsHistoryBinding(
         target_cohort_id=target_cohort_id,
         source_cohort_id=source_cohort_id,
-        source_provider_tier=ProviderTier.MASSIVE_DEVELOPER,
+        source_provider_tier=source_provider_tier,
         history_before=datetime.fromisoformat(str(body["history_before"])),
         source_manifest_sha256=str(body["source_manifest_sha256"]),
         authorization_reference=str(body["authorization_reference"]),
@@ -971,6 +1004,7 @@ def build_advanced_options_control_plane_plan(
     runtime_authorization: AdvancedOptionsRuntimeAuthorization | None = None,
     authorized_cohort_id: UUID | None = None,
     authorized_plan_id: UUID | None = None,
+    stored_identity: AdvancedOptionsStoredControlIdentity | None = None,
 ) -> AdvancedOptionsControlPlanePlan:
     _validate_equity_source(equity_plan)
     if (
@@ -1093,6 +1127,12 @@ def build_advanced_options_control_plane_plan(
     )
     if not universe.option_underlyings:
         raise ValueError("Advanced Options requires exact underlying membership")
+    if stored_identity is not None and (
+        not isinstance(stored_identity, AdvancedOptionsStoredControlIdentity)
+        or stored_identity.universe_sha256 != universe.sha256
+        or stored_identity.cohort_id != authorized_cohort_id
+    ):
+        raise ValueError("stored Options control scope changed")
     if (
         receipt_inputs.reference_state.session_date
         != equity_plan.session_date
@@ -1119,6 +1159,9 @@ def build_advanced_options_control_plane_plan(
         NAMESPACE_URL,
         f"stockscreener:advanced-options-profile:{profile_sha256}",
     )
+    if stored_identity is not None:
+        profile_id = stored_identity.profile_id
+        profile_sha256 = stored_identity.profile_sha256
     manifest_identity = {
         "contract": "market-options-manifest-v1",
         "source_equity_manifest_sha256": equity_plan.manifest.sha256,
@@ -1131,6 +1174,9 @@ def build_advanced_options_control_plane_plan(
         NAMESPACE_URL,
         f"stockscreener:market-options-manifest:{manifest_sha256}",
     )
+    if stored_identity is not None:
+        manifest_id = stored_identity.manifest_id
+        manifest_sha256 = stored_identity.manifest_sha256
 
     provisional_slot_set = SlotSetVersion(
         cohort_id=_NIL_UUID,
@@ -1165,6 +1211,8 @@ def build_advanced_options_control_plane_plan(
         NAMESPACE_URL,
         f"stockscreener:advanced-options-cohort:{cohort_sha256}",
     )
+    if stored_identity is not None:
+        cohort_sha256 = stored_identity.cohort_sha256
     if cohort_id == equity_plan.cohort_id:
         raise ValueError("Advanced Options cannot relabel the Equity-only cohort")
     slot_set = SlotSetVersion(
@@ -1348,6 +1396,7 @@ def build_advanced_options_control_plane_plan(
         source_flow=source_flow,
         receipts=receipts,
         runtime_authorization=authorization,
+        stored_identity=stored_identity,
     )
 
 

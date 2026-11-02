@@ -243,13 +243,17 @@ def load_advanced_options_equity_context_cursor(
     equity_cutoff,
     requirements: tuple[AdvancedOptionsEquityContextRequirement, ...],
     underlyings: tuple[str, ...],
+    allow_shared_history_source: bool = False,
 ) -> tuple[AdvancedOptionsLaneEquityContext, ...]:
     if not isinstance(equity_plan, AdvancedEquityControlPlanePlan):
         raise TypeError("Options Equity dependency plan is invalid")
     if (
         not isinstance(history_source_cohort_id, UUID)
         or history_source_cohort_id.int == 0
-        or history_source_cohort_id == equity_plan.cohort_id
+        or (
+            history_source_cohort_id == equity_plan.cohort_id
+            and not allow_shared_history_source
+        )
     ):
         raise ValueError("Options H reference source is invalid")
     policy = advanced_options_equity_context_requirements_payload(requirements)
@@ -406,6 +410,7 @@ def validate_advanced_options_equity_dependencies_cursor(
     history_source_cohort_id,
     underlyings: tuple[str, ...],
     requirements: tuple[AdvancedOptionsEquityContextRequirement, ...] | None = None,
+    allow_shared_history_source: bool = False,
 ) -> dict[str, object]:
     if not isinstance(equity_input, AdvancedOptionsEquityInputBinding):
         raise TypeError("Options Equity input binding is invalid")
@@ -423,6 +428,7 @@ def validate_advanced_options_equity_dependencies_cursor(
         equity_cutoff=equity_input.equity_cutoff,
         requirements=selected,
         underlyings=underlyings,
+        allow_shared_history_source=allow_shared_history_source,
     )
     lane_context = {
         row.lane.value: {

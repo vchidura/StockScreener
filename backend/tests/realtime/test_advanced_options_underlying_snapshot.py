@@ -125,6 +125,23 @@ def test_snapshot_binding_rejects_delayed_or_stale_underlying_data():
         )
 
 
+def test_snapshot_binding_coalesces_frozen_multi_contract_underlyings():
+    capture = _capture()
+    extra = SimpleNamespace(
+        underlyer="QQQ", contract_ticker="O:QQQ261021P00715000",
+        source_sha256="7" * 64,
+    )
+    capture.selection.selected += (extra,)
+    capture.selected_snapshots[extra.contract_ticker] = _raw(
+        "QQQ", extra.contract_ticker, 715,
+    )
+    binding = binding_from_selection_capture(capture)
+    assert tuple(row.ticker for row in binding.prices) == ("QQQ", "SPY")
+    capture.selected_snapshots[extra.contract_ticker]["underlying_asset"]["price"] = 716
+    with pytest.raises(ValueError, match="diverge"):
+        binding_from_selection_capture(capture)
+
+
 def test_snapshot_binding_accepts_bounded_provider_clock_skew():
     capture = _capture()
     future_ns = int(

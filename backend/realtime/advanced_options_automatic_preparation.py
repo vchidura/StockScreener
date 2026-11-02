@@ -11,6 +11,7 @@ from psycopg2.extras import Json, RealDictCursor
 from dataclasses import replace
 
 from options.calendar import OptionExchangeCalendar
+from options.config import load_valuation_policy
 from options.data.polygon_http import RequestsPolygonHttpTransport
 
 from scripts.apply_advanced_options_p8_catalog_hydration import (
@@ -112,7 +113,8 @@ from .advanced_options_v3_authority import (
     build_session_acquisition_authorization,
     prospective_opening_admission_payload,
 )
-from .contracts import canonical_sha256
+from .contracts import UniverseManifest, canonical_sha256
+from .preflight import ProviderTier
 from .database_access_v2 import APP_ROLE, V2ConnectionProvider
 from .option_source_flow import persist_option_flow_policy_cursor
 from .provider_budget import (
@@ -144,7 +146,10 @@ _C6_STRATEGY_POLICY_PATH = (
     / "strategy_o3_credit_v2.json"
 )
 _C8_MODEL_BUNDLE_SHA256 = canonical_sha256({"model": "C8_OPTIONS_V3"})
-_C8_VALUATION_POLICY_SHA256 = canonical_sha256({"valuation": "C8_OPTIONS_V3"})
+_C8_VALUATION_POLICY_SHA256 = load_valuation_policy(
+    Path(__file__).resolve().parents[1]
+    / "options" / "policies" / "valuation_advanced_nbbo_v1.json"
+).policy_sha256
 
 
 def _utc(value: datetime, name: str) -> datetime:
@@ -1251,6 +1256,7 @@ class PostgresAutomaticOptionsPreparationExecutor(
         )
         package = {
             "schema": "advanced-options-v3-continuous-session-v1",
+            "authorization_reference": authorization_reference,
             "validation_mode": "PRODUCTION_STRICT",
             "package_nonce": str(package_nonce),
             "window": {
@@ -1307,6 +1313,13 @@ class PostgresAutomaticOptionsPreparationExecutor(
                     history_binding
                 ),
                 "evidence": history_evidence,
+            },
+            "history_binding": {
+                "source_cohort_id": str(history_binding.source_cohort_id),
+                "source_manifest_sha256": (
+                    history_binding.source_manifest_sha256
+                ),
+                "history_before_utc": history_binding.history_before.isoformat(),
             },
             "v3_pre_session_authority": pre_session_authority,
             "v3_authorities": {
@@ -1418,26 +1431,32 @@ class PostgresAutomaticOptionsPreparationExecutor(
                 "JOIN rt.realtime_desired_member_bindings AS binding "
                 "USING(intent_id) "
                 "WHERE intent.revision_id=%s "
-                "AND intent.ticker=ANY(%s) "
-                "AND intent.member_kind IN ('EQUITY','SECTOR_ETF')",
+                "AND intent.member_kind IN ('EQUITY','SECTOR_ETF') "
+                "AND EXISTS (SELECT 1 FROM rt.cohorts AS source "
+                "JOIN rt.subscription_members AS member USING(manifest_id) "
+                "WHERE source.cohort_id=%s "
+                "AND member.instrument_id=binding.instrument_id "
+                "AND member.channel='AM')",
                 (
                     str(claim.revision_id),
-                    list(claim.option_underlyings),
+                    str(claim.source_equity_cohort_id),
                 ),
             )
             equity_instruments = {
                 str(row[0]): int(row[1]) for row in cursor.fetchall()
             }
-            if set(equity_instruments) != set(
-                claim.option_underlyings
-            ):
+            if not set(claim.option_underlyings).issubset(equity_instruments):
                 raise AdvancedOptionsPreparationRetryable(
                     "READY Equity instrument bindings are incomplete"
                 )
-            universe_sha256 = canonical_sha256({
-                "session_date": claim.session_date,
-                "underlyings": claim.option_underlyings,
-            })
+            universe_sha256 = UniverseManifest(
+                version=(
+                    f"market-options-{len(equity_instruments)}-"
+                    f"{len(claim.option_underlyings)}-v1"
+                ),
+                equity_tickers=tuple(sorted(equity_instruments)),
+                option_underlyings=claim.option_underlyings,
+            ).sha256
             profile_id = uuid5(
                 NAMESPACE_URL,
                 f"stockscreener:c8-options-profile:{claim.revision_id}",
@@ -1643,6 +1662,9 @@ class PostgresAutomaticOptionsPreparationExecutor(
                 ),
                 authorization_reference=authorization_reference,
                 evidence_sha256=history_evidence["evidence_sha256"],
+                source_provider_tier=ProviderTier(
+                    history_evidence["source_manifest"]["provider_tier"]
+                ),
             )
             cursor.execute(
                 "INSERT INTO rt.cohort_history_bindings ("
@@ -1654,7 +1676,7 @@ class PostgresAutomaticOptionsPreparationExecutor(
                 "ON CONFLICT (target_cohort_id) DO NOTHING",
                 (
                     str(options_cohort_id),
-                    str(claim.source_equity_cohort_id),
+                    str(history_binding.source_cohort_id),
                     history_binding.source_provider_tier.value,
                     history_binding.history_before,
                     history_binding.source_manifest_sha256,
@@ -1703,10 +1725,12 @@ class PostgresAutomaticOptionsPreparationExecutor(
             )
         source_cohort_id = next(iter(source_cohort_ids))
         cursor.execute(
-            "SELECT manifest.manifest_sha256 "
+            "SELECT manifest.manifest_sha256,profile.provider_tier "
             "FROM rt.cohorts AS cohort "
             "JOIN rt.subscription_manifests AS manifest "
-            "USING(manifest_id) WHERE cohort.cohort_id=%s",
+            "USING(manifest_id) "
+            "JOIN rt.capability_profiles AS profile USING(profile_id) "
+            "WHERE cohort.cohort_id=%s",
             (source_cohort_id,),
         )
         source_manifest = cursor.fetchone()
@@ -1722,6 +1746,7 @@ class PostgresAutomaticOptionsPreparationExecutor(
             "known_at_utc": prepared_at.isoformat(),
             "source_manifest": {
                 "manifest_sha256": str(source_manifest[0]),
+                "provider_tier": str(source_manifest[1]),
             },
             "coverage": {
                 "underlyings": list(claim.option_underlyings),

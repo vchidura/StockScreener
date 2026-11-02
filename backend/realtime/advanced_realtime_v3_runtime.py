@@ -96,6 +96,12 @@ ADVANCED_REALTIME_V3_ROLES = (
         app_database=True,
     ),
     AdvancedRealtimeRoleSpec(
+        "options-scheduler",
+        AdvancedRealtimeRoleGroup.PROVIDER,
+        provider_credential=True,
+        app_database=True,
+    ),
+    AdvancedRealtimeRoleSpec(
         "bridge",
         AdvancedRealtimeRoleGroup.PROCESSING,
         app_database=True,

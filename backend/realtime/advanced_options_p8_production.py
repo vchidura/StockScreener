@@ -27,6 +27,7 @@ from .advanced_options_control_plane import (
     AdvancedOptionsPolicyPins,
     AdvancedOptionsReceiptInputs,
     AdvancedOptionsSocketBudget,
+    AdvancedOptionsStoredControlIdentity,
     advanced_options_equity_input_binding_payload,
     advanced_options_history_binding_payload,
     build_advanced_options_control_plane_plan,
@@ -80,6 +81,11 @@ from .advanced_options_v3_authority import (
 from .advanced_options_v3_history import (
     AdvancedOptionsHistoryBindingIdentityError,
 )
+from .advanced_options_reference_repository import (
+    PostgresAdvancedOptionsReferenceStateRepository,
+)
+from .advanced_options_flow_policy import load_advanced_options_flow_policy
+from .option_flow.conditions import load_default_live_semantics
 from .contracts import MarketChannel
 from .database_access import (
     RealtimeDatabasePrincipal,
@@ -446,6 +452,20 @@ def run_v3_serial_window(
     authorities = bundle.get("v3_authorities")
     references = bundle.get("v3_authority_references")
     if (
+        references is None
+        and package.get("schema") == "advanced-options-v3-continuous-session-v1"
+    ):
+        from .advanced_options_v3_deployment import (
+            build_advanced_options_v3_authority_references,
+            validate_advanced_options_v3_runtime_identity,
+        )
+        validate_advanced_options_v3_runtime_identity(package, bundle)
+        references = build_advanced_options_v3_authority_references(
+            authorities.get("session_acquisition")
+            if isinstance(authorities, Mapping) else None,
+            target_window_id=binding.window_id,
+        )
+    if (
         not isinstance(authorities, Mapping)
         or set(authorities) != {"session_acquisition"}
         or not isinstance(references, Mapping)
@@ -627,12 +647,12 @@ def load_v3_pending_window_bindings(
         unit.cursor.execute(
             "SELECT cycle.target_window_id::text "
             "FROM rt.advanced_options_window_cycle_authorizations AS cycle "
-            "JOIN rt.window_runs AS window "
-            "ON window.window_id=cycle.target_window_id "
+            "JOIN rt.window_runs AS window_run "
+            "ON window_run.window_id=cycle.target_window_id "
             "WHERE cycle.session_authorization_id=%s "
             "AND cycle.target_cohort_id=%s "
-            "AND window.state IN ('PENDING','RUNNING') "
-            "AND window.release_at<=%s "
+            "AND window_run.state IN ('PENDING','RUNNING') "
+            "AND window_run.release_at<=%s "
             "ORDER BY cycle.options_cutoff,cycle.target_window_id",
             (
                 str(session.authorization_id),
@@ -645,6 +665,29 @@ def load_v3_pending_window_bindings(
         )
         values = []
         for window_id in window_ids:
+            unit.cursor.execute(
+                "SELECT binding_document FROM "
+                "rt.advanced_options_downstream_bindings "
+                "WHERE target_window_id=%s",
+                (str(window_id),),
+            )
+            downstream = unit.cursor.fetchone()
+            if downstream is not None:
+                from .advanced_options_p8_runtime import (
+                    p8_downstream_binding_from_payload,
+                )
+                attached = p8_downstream_binding_from_payload(downstream[0])
+                exact = p8_production_binding_from_payload(
+                    dict(attached.production_binding)
+                )
+                if (
+                    exact.window_id != window_id
+                    or exact.enrollment.control_plane.cohort_id
+                    != binding.enrollment.control_plane.cohort_id
+                ):
+                    raise ValueError("stored per-E production binding changed")
+                values.append(exact)
+                continue
             equity_input = load_advanced_options_equity_input_binding_cursor(
                 unit.cursor,
                 window_id,
@@ -866,6 +909,16 @@ def _production_binding_payload(
             )
         ),
     }
+    if control.stored_identity is not None:
+        identity = control.stored_identity
+        value["control"]["stored_identity"] = {
+            name: (
+                str(getattr(identity, name))
+                if name.endswith("_id")
+                else getattr(identity, name)
+            )
+            for name in identity.__dataclass_fields__
+        }
     value["binding_sha256"] = canonical_sha256(value)
     return value
 
@@ -1050,6 +1103,14 @@ def p8_production_binding_from_payload(value):
             control_value["authorized_cohort_id"]
         ),
         authorized_plan_id=UUID(control_value["authorized_plan_id"]),
+        stored_identity=(
+            None
+            if control_value.get("stored_identity") is None
+            else AdvancedOptionsStoredControlIdentity(**{
+                name: UUID(item) if name.endswith("_id") else item
+                for name, item in control_value["stored_identity"].items()
+            })
+        ),
     )
     selection = option_activity_selection_from_payload(
         value["selection"],
@@ -1089,6 +1150,9 @@ def p8_production_binding_from_payload(value):
             ]["authorization_reference"],
             "evidence_sha256": value["history_binding"].get(
                 "evidence_sha256"
+            ),
+            "source_provider_tier": ProviderTier(
+                value["history_binding"]["source_provider_tier"]
             ),
         }),
         build_advanced_options_equity_input_binding(**{
@@ -1510,10 +1574,13 @@ class _P8ProductionCapture:
                 unit.cursor,
                 binding.source_cohort_id,
             )
-            validate_active_target9_equity_source_cursor(
-                unit.cursor,
-                plan,
-            )
+            if self._package.get("schema") != (
+                "advanced-options-v3-continuous-session-v1"
+            ):
+                validate_active_target9_equity_source_cursor(
+                    unit.cursor,
+                    plan,
+                )
             unit.cursor.execute(
                 "SELECT receipt.window_id::text,receipt.cohort_id::text,"
                 "receipt.receipt_kind,receipt.cutoff,"
@@ -1535,6 +1602,10 @@ class _P8ProductionCapture:
                 )),
                 underlyings=tuple(
                     self._package["cohort"]["underlyings"]
+                ),
+                allow_shared_history_source=(
+                    self._package.get("schema")
+                    == "advanced-options-v3-continuous-session-v1"
                 ),
             )
         if (
@@ -1576,6 +1647,7 @@ class _P8ProductionCapture:
         equity_input,
         *,
         target_window_id=None,
+        continuous=None,
     ):
         package = self._package
         stop = datetime.fromisoformat(str(package["window"]["stop_utc"]))
@@ -1591,22 +1663,43 @@ class _P8ProductionCapture:
             underlying_price_binding.valid_until,
         )
         contracts = self._catalog(capture, checked_at)
+        if continuous is not None:
+            cycle_cutoff = min(
+                cycle_cutoff,
+                equity_input.equity_cutoff
+                + timedelta(seconds=equity_input.maximum_age_seconds),
+            )
+            if cycle_cutoff <= checked_at:
+                raise ValueError("continuous Options E/O deadline expired")
+        policy = (
+            _p8_manifest_policy()
+            if continuous is None
+            else continuous.policy
+        )
         selection = OptionActivitySelectionRecord(
             authorization_reference=package["authorization_reference"],
             reviewed_at=capture.selection.reviewed_at,
             valid_until=capture.selection.valid_until,
             policy_sha256=capture.selection.policy.sha256,
             source_sha256=capture.selection.source_sha256,
-            quote_ceiling=4,
+            quote_ceiling=policy.maximum_option_quote_contracts,
             contracts=contracts,
         )
-        oi_sha256 = _open_interest_sha256(
-            capture.selection.selected
+        oi_sha256 = (
+            _open_interest_sha256(capture.selection.selected)
+            if continuous is None
+            else continuous.reference.open_interest_sha256
         )
         reference = build_advanced_options_prospective_reference_identity(
-            reference_generation=1,
+            reference_generation=(
+                1 if continuous is None
+                else continuous.reference.reference_generation
+            ),
             session_date=checked_at.date(),
-            known_at=capture.source_snapshot_at,
+            known_at=(
+                capture.source_snapshot_at if continuous is None
+                else continuous.reference.known_at
+            ),
             valid_until=stop + timedelta(minutes=30),
             underlyings=tuple(package["cohort"]["underlyings"]),
             open_interest_sha256=oi_sha256,
@@ -1621,8 +1714,10 @@ class _P8ProductionCapture:
             raise RuntimeError(
                 "P8 completed Equity input is stale for Options"
             )
-        hashes = package["policy_hashes"]
-        policy = _p8_manifest_policy()
+        hashes = (
+            package["policy_hashes"] if continuous is None
+            else continuous.hashes
+        )
         slots = tuple(
             SlotSetMember(
                 row.instrument_id,
@@ -1633,7 +1728,7 @@ class _P8ProductionCapture:
             )
             for row in contracts
             for channel in (MarketChannel.TRADE, MarketChannel.QUOTE)
-        )
+        ) if continuous is None else continuous.slots
         receipt = AdvancedOptionsReceiptInputs(
             cutoff=cycle_cutoff,
             reference_state=reference,
@@ -1649,7 +1744,10 @@ class _P8ProductionCapture:
             projection_sha256=canonical_sha256((package["package_sha256"], "projection")),
             build_id=BUILD_ID,
         )
-        ingress = package["websocket_ingress"]
+        ingress = (
+            package["websocket_ingress"] if continuous is None
+            else continuous.ingress
+        )
         control = build_advanced_options_control_plane_plan(
             equity_plan=equity,
             entitlement=ProductEntitlementProfile(
@@ -1667,13 +1765,19 @@ class _P8ProductionCapture:
             planned_at=checked_at,
             manifest_policy=policy,
             slot_members=slots,
-            slot_effective_at=checked_at,
+            slot_effective_at=(
+                checked_at if continuous is None
+                else continuous.slot_effective_at
+            ),
             feed_scope=AdvancedOptionsFeedScope(),
             pins=AdvancedOptionsPolicyPins(
                 condition_semantics_sha256=hashes["condition_semantics_sha256"],
                 flow_policy_sha256=hashes["flow_policy_sha256"],
                 valuation_policy_sha256=hashes["valuation_policy_sha256"],
-                model_bundle_sha256=canonical_sha256((package["package_sha256"], "model")),
+                model_bundle_sha256=(
+                    canonical_sha256((package["package_sha256"], "model"))
+                    if continuous is None else continuous.model_bundle_sha256
+                ),
                 catalog_sha256=canonical_sha256(tuple(
                     row.catalog_payload_sha256 for row in contracts
                 )),
@@ -1696,20 +1800,23 @@ class _P8ProductionCapture:
                 decoded_byte_ceiling=100_000_000,
                 lanes=ADVANCED_OPTIONS_REST_LANES,
                 authorized_until=stop,
-            ),
+            ) if continuous is None else continuous.budget,
             owners=AdvancedOptionsOwnerNames(),
             journal_generation=uuid5(
                 NAMESPACE_URL,
                 f"p8-journal:{package['package_nonce']}",
-            ),
+            ) if continuous is None else continuous.acquisition.authority.journal_generation,
             stream_session_ids=(uuid5(
                 NAMESPACE_URL,
                 f"p8-stream:{package['package_nonce']}",
-            ),),
+            ),) if continuous is None else continuous.stream_session_ids,
             receipt_inputs=receipt,
             equity_input_cutoff=equity_input.equity_cutoff,
             authorized_cohort_id=UUID(str(package["cohort"]["cohort_id"])),
             authorized_plan_id=UUID(str(package["orchestration"]["plan_id"])),
+            stored_identity=(
+                None if continuous is None else continuous.identity
+            ),
         )
         enrollment = build_advanced_options_enrollment_plan(
             control_plane=control,
@@ -1726,6 +1833,12 @@ class _P8ProductionCapture:
             ),
             source_manifest_sha256=history_manifest,
             authorization_reference=package["authorization_reference"],
+            source_provider_tier=(
+                ProviderTier.MASSIVE_DEVELOPER if continuous is None
+                else ProviderTier(package["v3_history_binding"]["binding"][
+                    "source_provider_tier"
+                ])
+            ),
             evidence_sha256=(
                 None
                 if package.get("v3_history_binding") is None
@@ -1778,6 +1891,121 @@ class _P8ProductionCapture:
             raise RuntimeError(
                 "P8 production binding did not round-trip exactly"
             )
+        return binding
+
+    def bind_continuous_selection(
+        self, *, session_state, capture, equity_input, budget, checked_at
+    ):
+        acquisition = session_state.load_acquisition_binding()
+        selection = session_state.load_c6_selection_plan()
+        if selection is None or set(capture.selection.contracts) != {
+            row.contract_ticker for row in selection.members
+        }:
+            raise ValueError("continuous Options selection changed")
+        with self._provider.transaction(APP_ROLE, read_only=True) as unit:
+            unit.cursor.execute(
+                "SELECT profile.profile_id::text,profile.profile_sha256,"
+                "manifest.manifest_id::text,manifest.manifest_sha256,"
+                "cohort.cohort_id::text,cohort.cohort_sha256,"
+                "manifest.universe_sha256,cohort.configuration_sha256,"
+                "cohort.mode,cohort.model_bundle_sha256,cohort.valuation_sha256,"
+                "version.effective_at,version.policy_sha256,"
+                "plan.config_sha256,manifest.allocation_policy_sha256 "
+                "FROM rt.cohorts AS cohort "
+                "JOIN rt.subscription_manifests AS manifest USING(manifest_id) "
+                "JOIN rt.capability_profiles AS profile USING(profile_id) "
+                "JOIN rt.service_plans AS plan ON plan.cohort_id=cohort.cohort_id "
+                "AND plan.plan_id=%s "
+                "JOIN rt.slot_set_current AS current "
+                "ON current.cohort_id=cohort.cohort_id "
+                "JOIN rt.slot_set_versions AS version "
+                "ON version.cohort_id=current.cohort_id "
+                "AND version.version=current.version WHERE cohort.cohort_id=%s",
+                (
+                    str(self._package["orchestration"]["plan_id"]),
+                    str(acquisition.authority.cohort_id),
+                ),
+            )
+            row = unit.cursor.fetchone()
+            if row is None:
+                raise ValueError("continuous Options control is unavailable")
+            identity = AdvancedOptionsStoredControlIdentity(
+                UUID(row[0]), row[1], UUID(row[2]), row[3],
+                UUID(row[4]), row[5], row[6], row[7], row[8],
+                row[13], row[14],
+            )
+            unit.cursor.execute(
+                "SELECT instrument_id,channel,purpose,priority,catalog_version_id "
+                "FROM rt.slot_set_members WHERE cohort_id=%s AND version=1 "
+                "ORDER BY instrument_id,channel",
+                (str(acquisition.authority.cohort_id),),
+            )
+            slots = tuple(
+                SlotSetMember(int(item[0]), MarketChannel(item[1]),
+                              SlotSetPurpose(item[2]), int(item[3]), int(item[4]))
+                for item in unit.cursor.fetchall()
+            )
+        reference = PostgresAdvancedOptionsReferenceStateRepository(
+            self._provider
+        ).load_for_session(acquisition.authority.session_date, known_at=checked_at)
+        if reference is None:
+            raise ValueError("continuous Options reference is unavailable")
+        equity, equity_input = self._equity_source(checked_at, equity_input)
+        policy = replace(
+            _p8_manifest_policy(),
+            version=selection.admission_profile_version or "continuous-exact-four-v1",
+            maximum_dte=60,
+            strikes_per_side_per_expiry=(
+                selection.capacity.active_quote_contract_budget
+            ),
+            maximum_contracts_per_underlying=(
+                2 * selection.capacity.active_quote_contract_budget
+            ),
+            maximum_option_quote_contracts=(
+                selection.capacity.active_quote_contract_budget
+            ),
+            reserved_option_quote_contracts=0,
+        )
+        continuous = SimpleNamespace(
+            identity=identity, policy=policy, slots=slots,
+            slot_effective_at=row[11], reference=reference, budget=budget,
+            model_bundle_sha256=row[9], acquisition=acquisition,
+            stream_session_ids=(acquisition.stream_session_id,),
+            hashes={
+                "condition_semantics_sha256": (
+                    load_default_live_semantics().semantics_sha256
+                ),
+                "flow_policy_sha256": load_advanced_options_flow_policy().sha256,
+                "valuation_policy_sha256": row[10],
+                "cohort_template_sha256": row[12],
+            },
+            ingress={
+                "product": "OPTIONS", "stream_sessions": 1,
+                "connection_attempts": acquisition.connection_attempt_ceiling,
+                "reconnects": acquisition.connection_attempt_ceiling - 1,
+                "decoded_messages": acquisition.decoded_message_ceiling,
+                "decoded_bytes": acquisition.decoded_byte_ceiling,
+            },
+        )
+        binding = self._binding(
+            capture, checked_at,
+            self._package["history_binding"]["source_manifest_sha256"],
+            equity, equity_input,
+            target_window_id=equity_input.target_options_window_id,
+            continuous=continuous,
+        )
+        expected = {
+            (item.contract_ticker, item.contract_id, item.catalog_version_id)
+            for item in selection.members
+        }
+        if {
+            (item.contract_ticker, item.contract_id, item.catalog_version_id)
+            for item in binding.enrollment.activity_selection.contracts
+        } != expected:
+            raise ValueError("continuous Options frozen catalog changed")
+        self.binding = binding
+        self.checked_at = checked_at
+        self.selection_capture = capture
         return binding
 
     def _capture_selection(
@@ -1935,7 +2163,7 @@ class _P8ProductionCapture:
             target_window_id=target_window_id,
         )
 
-    def persist_selection_cursor(self, cursor, binding):
+    def persist_selection_cursor(self, cursor, binding, *, persist_open_interest=True):
         capture = self.selection_capture
         if capture is None or self.checked_at is None:
             raise RuntimeError("P8 selection persistence lacks live capture")
@@ -1962,8 +2190,9 @@ class _P8ProductionCapture:
                     f"{binding.window_id}:{underlyer}"
                 ),
             )
-            lower = candidate.spot * Decimal("0.95")
-            upper = candidate.spot * Decimal("1.05")
+            corridor = control.manifest_policy.strike_corridor_fraction
+            lower = candidate.spot * (1 - corridor)
+            upper = candidate.spot * (1 + corridor)
             evidence_sha256 = canonical_sha256({
                 "selection_sha256": capture.evidence["selection_sha256"],
                 "underlyer": underlyer,
@@ -1980,7 +2209,7 @@ class _P8ProductionCapture:
                 "completed_at,page_count,row_count,response_bytes,"
                 "evidence_sha256) VALUES ("
                 "%s,%s,%s,%s,%s,'MASSIVE_ADVANCED','massive',%s,%s,"
-                "%s,%s,2,%s,0.05,%s,%s,%s,%s,%s,%s,1,1,%s,%s) "
+                "%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,1,%s,%s,%s) "
                 "ON CONFLICT (discovery_batch_id) DO NOTHING",
                 (
                     str(batch_id),
@@ -1991,18 +2220,25 @@ class _P8ProductionCapture:
                     underlyer,
                     control.planned_at,
                     control.session_date,
-                    control.session_date + timedelta(days=2),
+                    control.session_date + timedelta(
+                        days=control.manifest_policy.maximum_dte
+                    ),
+                    control.manifest_policy.maximum_dte,
                     candidate.spot,
+                    corridor,
                     lower,
                     upper,
                     capture.evidence["source_snapshot_sha256"],
                     control.manifest_policy.sha256,
                     capture.source_snapshot_at,
                     self.checked_at,
-                    max(1, capture.decoded_bytes // 2),
+                    sum(row.underlyer == underlyer for row in selected.values()),
+                    max(1, capture.decoded_bytes // len(control.universe.option_underlyings)),
                     evidence_sha256,
                 ),
             )
+        if not persist_open_interest:
+            return
         for ticker, candidate in selected.items():
             contract = contracts[ticker]
             baseline_id = uuid5(

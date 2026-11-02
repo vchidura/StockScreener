@@ -10,6 +10,7 @@ from types import SimpleNamespace
 from uuid import NAMESPACE_URL, UUID, uuid5
 
 from options.config import load_valuation_policy
+from options.calendar import OptionExchangeCalendar
 
 from .advanced_options_input import (
     AdvancedOptionsInputDependencyStatus,
@@ -489,14 +490,25 @@ def build_and_run_p8_serial_window(
         else window_cutoff
     )
     expires = control.expires_at
+    reference_generation = 1
+    if control.stored_identity is not None:
+        with provider.transaction(APP_ROLE, read_only=True) as unit:
+            unit.cursor.execute(
+                "SELECT COALESCE(MAX(reference_generation),0)+1 "
+                "FROM rt.advanced_options_reference_states"
+            )
+            reference_generation = int(unit.cursor.fetchone()[0])
+    prior_session = OptionExchangeCalendar("XNYS").previous_session_date(
+        control.session_date
+    )
     reference_plan = build_advanced_options_reference_producer_plan(
         enrollment=binding.enrollment,
         contract_scope=contract_scope,
-        reference_generation=1,
+        reference_generation=reference_generation,
         known_at=cutoff,
         valid_until=expires,
         discovery_scheduled_cycle=control.planned_at,
-        prior_oi_session=control.session_date - timedelta(days=1),
+        prior_oi_session=prior_session,
         model_version="black-scholes-merton-v1",
         history_source_cohort_id=binding.history.source_cohort_id,
     )
@@ -606,7 +618,7 @@ def build_and_run_p8_serial_window(
             market_cutoff=cutoff,
             known_at=cutoff,
             authorized_until=control.provider_budget.authorized_until,
-            prior_oi_session=control.session_date - timedelta(days=1),
+            prior_oi_session=prior_session,
         ),
         endpoint_response_byte_limits={
             DISCOVERY_ENDPOINT: 20_000_000,
