@@ -68,6 +68,8 @@ class OptionFlowStore:
                     "effective_at": NOW,
                 }]
             return
+        if sql.startswith("SELECT cohort_id, provider_tier, updated_at"):
+            return
         if sql.startswith("SELECT manifest.option_underlying_count"):
             self.result = [{"option_underlying_count": self.option_underlying_count}]
             return

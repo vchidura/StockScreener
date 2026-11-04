@@ -24,6 +24,7 @@ from .contracts import canonical_sha256
 from .equity_portal_history import build_realtime_equity_portal_history_plan
 from .lineage_head import inputs_bar_lineage_sha256, inputs_sha256, reference_set, require_bounded_manifest
 from .portal_projection import build_portal_snapshot
+from .reference_continuity import source_manifest_continuity_fields
 from .screening_projection import RealtimeScreeningInput
 
 
@@ -567,6 +568,7 @@ def produce_realtime_stock_alerts(
             else retained["input_binding"]["input_receipt_id"]
         ),
     )
+    manifest.update(source_manifest_continuity_fields(inputs))
     require_bounded_manifest(manifest, name="Stock Alerts")
     return build_portal_snapshot(
         cohort_id=inputs.cohort_id, provider_tier=inputs.provider_tier,
@@ -872,6 +874,7 @@ def _produce_canonical_realtime_stock_alerts(
         "late_catch_up": late_catch_up,
         "deliverable": deliverable,
     }
+    manifest.update(source_manifest_continuity_fields(inputs))
     require_bounded_manifest(manifest, name="Stock Alerts")
     return build_portal_snapshot(
         cohort_id=inputs.cohort_id,

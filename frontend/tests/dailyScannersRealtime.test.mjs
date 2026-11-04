@@ -119,12 +119,18 @@ test('hourly navigation retains compatible pins and interval selection clears on
 
 function mockApi() {
   const calls = []
-  let current = 'old', failRoute, mismatch, absent, missingBasis, research, legacy, actionReview, evaluationFault
+  let current = 'old', failRoute, mismatch, absent, missingBasis, research, legacy, actionReview, evaluationFault, strategyUnavailable
   const api = compiler(read('../src/services/api.ts'), path.join(root, 'services', 'api.ts'), {
-    axios: { default: { create: () => ({
+    axios: { default: { isAxiosError: error => error?.isAxiosError === true, create: () => ({
       get: async (url, { params } = {}) => {
         calls.push([url, params])
         if (url === failRoute) throw new Error('Stored scanner unavailable')
+        if (url === '/strategies/daily' && strategyUnavailable) {
+          throw Object.assign(new Error('No retained independent daily strategy release'), {
+            isAxiosError: true,
+            response: { status: 503, data: { detail: 'No retained independent daily strategy release' } },
+          })
+        }
         const id = params?.snapshot_id ?? current
         if (!['old', 'new'].includes(id)) throw new Error('Explicit pin unavailable')
         const pub = { ...publication(id), strategy_ticker_available: !legacy }
@@ -180,11 +186,17 @@ function mockApi() {
           scanner_basis: missingBasis ? undefined : basis } }
       },
     }) } },
+    './portalIdentity': {
+      realtimeCohortId: () => globalThis.__dailyEnvironment.VITE_REALTIME_COHORT_ID?.trim() || undefined,
+      realtimeOptionsCohortId: () => undefined,
+      realtimeOptionsReadsEnabled: () => false,
+    },
   })
   return { api, calls, rotate: () => { current = 'new' },
     fail: route => { failRoute = route }, mismatch: value => { mismatch = value },
     absent: value => { absent = value }, missingBasis: value => { missingBasis = value },
     research: () => { research = true }, legacy: () => { legacy = true }, actionReview: () => { actionReview = true },
+    strategyUnavailable: () => { strategyUnavailable = true },
     evaluationFault: fault => { evaluationFault = fault } }
 }
 
@@ -342,8 +354,11 @@ test('six service contracts preserve canonical arguments and add realtime cohort
   }
   globalThis.__dailyEnvironment = { VITE_REALTIME_ONLY: 'true' }
   calls.length = 0
-  for (const fn of functions) await assert.rejects(fn(), /requires VITE_REALTIME_COHORT_ID/)
-  assert.equal(calls.length, 0)
+  for (const fn of functions) await fn()
+  calls.forEach(([, params]) => {
+    assert.equal(params.cohort_id, undefined)
+    assert.equal(params.snapshot_id, 'old')
+  })
 })
 
 test('atomic default page reads pin metadata and every scanner, including FVG, across rotation', async () => {
@@ -382,6 +397,22 @@ test('atomic default page reads pin metadata and every scanner, including FVG, a
   mock.absent(false)
   mock.missingBasis(true)
   await assert.rejects(mock.api.getDailyScannerPublication('gaps', 'old'), /research basis/)
+})
+
+test('absent independent strategy release falls back only to the exact retained Dashboard publication', async () => {
+  globalThis.__dailyEnvironment = { VITE_REALTIME_ONLY: 'true', VITE_REALTIME_COHORT_ID: 'exact-cohort' }
+  const mock = mockApi()
+  mock.strategyUnavailable()
+  const result = await mock.api.getDailyScannerPublication('gaps', 'old')
+  assert.equal(result.publication.snapshot_id, 'old')
+  assert.ok(result.data)
+  assert.ok(result.fvgData)
+  assert.deepEqual(mock.calls.map(([route]) => route), [
+    '/strategies/daily',
+    '/latest-price-date',
+    '/scan/gaps',
+    '/scan/fvg',
+  ])
 })
 
 test('shared query executes atomic commit only on success and retains old data/clocks on refresh failure', async () => {

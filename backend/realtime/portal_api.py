@@ -9,6 +9,7 @@ from uuid import UUID
 import logging
 
 from fastapi import FastAPI, HTTPException, Query, Request
+from starlette.concurrency import run_in_threadpool
 from equity.calendar import market_notification_window
 from options.discovery import CONTRACT_FILTERS, EligibleChainQuery
 from options.strategies.registry import build_discovery_catalog
@@ -26,6 +27,12 @@ from .advanced_equity_preparation import (
 )
 from .database_access import RealtimeDatabaseRole
 from .migrations import EXPECTED_DATABASE_NAME
+from .portal_identity import PortalIdentity, PortalIdentityRepository
+from .retained_market_context import (
+    retained_market_conditions,
+    retained_market_regime,
+    retained_sector_intelligence,
+)
 from .portal_compatibility_repository import (
     RealtimeOptionAlertRepository, RealtimeOptionFlowRepository, RealtimeOptionScreenerRepository,
     RealtimeOptionsAlertsPageRepository,
@@ -64,6 +71,49 @@ class RealtimePortalRepositories:
     equity_preparation: (
         AdvancedEquityPreparationStatusRepository | None
     ) = None
+    portal_identity: PortalIdentityRepository | None = None
+
+
+# Routes that never read a publication, so they need no current cohort.
+_IDENTITY_FREE_PATHS = frozenset({
+    "/api/realtime/health",
+    "/api/realtime/portal/current",
+    "/api/realtime/options-v2/status",
+    "/api/realtime/equity-preparation",
+    "/api/equity/notification-window",
+})
+
+
+def _is_options_read(path: str) -> bool:
+    return (
+        path == "/api/realtime/option-alerts"
+        or path.startswith("/api/realtime/options-v2/")
+        or (
+            path.startswith("/api/options/")
+            and not path.startswith("/api/options/calendar/")
+        )
+    )
+
+
+def _current_cohort(
+    identity: PortalIdentity,
+    path: str,
+    session_date: str | None,
+    *,
+    options_reads_enabled: bool,
+) -> UUID | None:
+    """Each product has its own per-session cohort; a requested session is served
+    from the cohort that holds it. Options stays unresolved while its reads are off,
+    because its page readers follow the release pointer directly."""
+    if _is_options_read(path):
+        return (
+            None
+            if identity.options is None or not options_reads_enabled
+            else identity.options.cohort_id
+        )
+    if session_date in identity.session_cohorts:
+        return identity.session_cohorts[session_date]
+    return None if identity.equity is None else identity.equity.cohort_id
 
 
 def build_realtime_portal_repositories(
@@ -82,6 +132,14 @@ def build_realtime_portal_repositories(
     def cursor_factory():
         with database.transaction(
             dict_cursor=True,
+            isolation_level="REPEATABLE READ",
+        ) as cursor:
+            yield cursor
+
+    @contextmanager
+    def positional_cursor_factory():
+        # The preparation status reader indexes its rows by position.
+        with database.transaction(
             isolation_level="REPEATABLE READ",
         ) as cursor:
             yield cursor
@@ -127,8 +185,9 @@ def build_realtime_portal_repositories(
             require_read_pin=True,
         ),
         equity_preparation=AdvancedEquityPreparationStatusRepository(
-            cursor_factory,
+            positional_cursor_factory,
         ),
+        portal_identity=PortalIdentityRepository(cursor_factory),
     )
 
 
@@ -347,6 +406,93 @@ def create_realtime_portal_app(
             detail=f"Realtime portal projection unavailable: {type(error).__name__}",
         )
 
+    @app.middleware("http")
+    async def serve_current_publication(request: Request, call_next):
+        """A reader naming no cohort gets the current publication. An explicit
+        cohort is always honored exactly, and is never substituted."""
+        cohort_id = None
+        if (
+            repositories.portal_identity is not None
+            and request.url.path.startswith("/api/")
+            and request.url.path not in _IDENTITY_FREE_PATHS
+            and "cohort_id" not in request.query_params
+        ):
+            try:
+                identity = await run_in_threadpool(
+                    repositories.portal_identity.current,
+                    available_by=cutoff(),
+                )
+            except DatabaseError:
+                # The route itself reports the unavailable read.
+                logging.getLogger(__name__).exception(
+                    "Realtime portal identity read failed"
+                )
+            else:
+                cohort_id = _current_cohort(
+                    identity,
+                    request.url.path,
+                    request.query_params.get("session_date"),
+                    options_reads_enabled=advanced_options_v2_enabled,
+                )
+                if cohort_id is not None:
+                    request.state.portal_identity = identity
+                    query = request.scope["query_string"]
+                    request.scope["query_string"] = (
+                        query + (b"&" if query else b"")
+                        + b"cohort_id=" + str(cohort_id).encode("ascii")
+                    )
+        response = await call_next(request)
+        if cohort_id is not None:
+            response.headers["X-Realtime-Cohort-Id"] = str(cohort_id)
+        return response
+
+    @app.get("/api/realtime/portal/current")
+    def portal_current():
+        if repositories.portal_identity is None:
+            raise HTTPException(503, "Realtime portal identity is unavailable")
+        available_by = cutoff()
+        try:
+            return repositories.portal_identity.current(
+                available_by=available_by,
+            ).payload(
+                available_by,
+                options_reads_enabled=advanced_options_v2_enabled,
+            )
+        except DatabaseError as error:
+            raise unavailable(error) from error
+
+    def across_sessions(request: Request, cohort_id: UUID, read):
+        """Closing sessions span cohorts for a reader naming no cohort, because
+        each session has its own. An explicit cohort lists only that cohort."""
+        identity = getattr(request.state, "portal_identity", None)
+        if identity is None:
+            return read(cohort_id)
+        results = []
+        unavailable_error = None
+        for cohort in dict.fromkeys(
+            (cohort_id, *identity.session_cohorts.values())
+        ):
+            try:
+                results.append(read(cohort))
+            except TickerPublicationUnavailable as error:
+                unavailable_error = error
+        if not results:
+            raise unavailable_error
+        snapshots = {}
+        for result in reversed(results):
+            snapshots.update(result.get("snapshots") or {})
+        return {
+            **results[0],
+            "sessions": sorted(
+                {
+                    session
+                    for result in results
+                    for session in result["sessions"]
+                }
+            ),
+            "snapshots": snapshots,
+        }
+
     @app.get("/api/realtime/health")
     def health():
         return {
@@ -391,13 +537,13 @@ def create_realtime_portal_app(
     def notification_window():
         return market_notification_window(cutoff())
 
-    def screening_read(method, request=None, cohort_id=None):
+    def screening_read(method, request=None, cohort_id=None, **params):
         if repositories.screening is None:
             raise HTTPException(503, "Realtime screening repository is unavailable")
         try:
             reader = getattr(repositories.screening, method)
             args = (request,) if request is not None else ()
-            return reader(*args, available_by=cutoff(), cohort_id=cohort_id)
+            return reader(*args, available_by=cutoff(), cohort_id=cohort_id, **params)
         except ScreeningPublicationUnavailable as error:
             raise HTTPException(404, str(error)) from error
         except ScreeningQueryRejected as error:
@@ -411,16 +557,35 @@ def create_realtime_portal_app(
         return screening_read("catalog", cohort_id=cohort_id)
 
     @app.post("/api/stocks/screening/query")
-    def screening_query(request: ScreeningQuery, cohort_id: UUID | None = None):
-        return screening_read("query", request, cohort_id)
+    def screening_query(
+        request: ScreeningQuery,
+        cohort_id: UUID | None = None,
+        read_mode: Literal["current", "retained"] = "current",
+    ):
+        return screening_read("query", request, cohort_id, read_mode=read_mode)
+
+    @app.get("/api/stocks/screening/status")
+    def screening_status(
+        cohort_id: UUID | None = None,
+        read_mode: Literal["current", "retained"] = "retained",
+    ):
+        return screening_read("status", cohort_id=cohort_id, read_mode=read_mode)
 
     @app.post("/api/stocks/screening/gap-details")
-    def screening_gap_details(request: GapDetailRequest, cohort_id: UUID | None = None):
-        return screening_read("gap_details", request, cohort_id)
+    def screening_gap_details(
+        request: GapDetailRequest,
+        cohort_id: UUID | None = None,
+        read_mode: Literal["current", "retained"] = "current",
+    ):
+        return screening_read("gap_details", request, cohort_id, read_mode=read_mode)
 
     @app.post("/api/stocks/screening/hourly-details")
-    def screening_hourly_details(request: SnapshotRowRequest, cohort_id: UUID | None = None):
-        return screening_read("hourly_details", request, cohort_id)
+    def screening_hourly_details(
+        request: SnapshotRowRequest,
+        cohort_id: UUID | None = None,
+        read_mode: Literal["current", "retained"] = "current",
+    ):
+        return screening_read("hourly_details", request, cohort_id, read_mode=read_mode)
 
     def stock_alert_read(method, cohort_id, **filters):
         if repositories.stock_alert_views is None:
@@ -566,11 +731,13 @@ def create_realtime_portal_app(
             raise unavailable(error) from error
 
     @app.get("/api/tickers/sessions")
-    def all_ticker_closing_sessions(cohort_id: UUID):
+    def all_ticker_closing_sessions(request: Request, cohort_id: UUID):
         if repositories.ticker_workspace is None:
             raise HTTPException(503, "Realtime Ticker Workspace repository is unavailable")
         try:
-            return repositories.ticker_workspace.workspace_closing_sessions(available_by=cutoff(), cohort_id=cohort_id)
+            return across_sessions(request, cohort_id, lambda cohort: repositories.ticker_workspace.workspace_closing_sessions(
+                available_by=cutoff(), cohort_id=cohort,
+            ))
         except TickerPublicationUnavailable as error:
             raise HTTPException(503, str(error)) from error
         except ValueError as error:
@@ -604,11 +771,13 @@ def create_realtime_portal_app(
             raise unavailable(error) from error
 
     @app.get("/api/chart-patterns/sessions")
-    def pattern_watch_closing_sessions(cohort_id: UUID):
+    def pattern_watch_closing_sessions(request: Request, cohort_id: UUID):
         if repositories.ticker_workspace is None:
             raise HTTPException(503, "Realtime Ticker Workspace repository is unavailable")
         try:
-            return repositories.ticker_workspace.pattern_closing_sessions(available_by=cutoff(), cohort_id=cohort_id)
+            return across_sessions(request, cohort_id, lambda cohort: repositories.ticker_workspace.pattern_closing_sessions(
+                available_by=cutoff(), cohort_id=cohort,
+            ))
         except TickerPublicationUnavailable as error:
             raise HTTPException(503, str(error)) from error
         except ValueError as error:
@@ -626,8 +795,20 @@ def create_realtime_portal_app(
         return ticker_read(ticker, "publication", cohort_id, snapshot_id=snapshot_id, read_mode=read_mode, session_date=session_date)
 
     @app.get("/api/stock/{ticker}/sessions")
-    def ticker_closing_sessions(ticker: str, cohort_id: UUID):
-        return ticker_read(ticker, "sessions", cohort_id)
+    def ticker_closing_sessions(request: Request, ticker: str, cohort_id: UUID):
+        if repositories.ticker_workspace is None:
+            raise HTTPException(503, "Realtime Ticker Workspace repository is unavailable")
+        try:
+            return across_sessions(request, cohort_id, lambda cohort: repositories.ticker_workspace.read(
+                ticker, "sessions", available_by=cutoff(), cohort_id=cohort,
+            ))
+        except TickerPublicationUnavailable as error:
+            raise HTTPException(503, str(error)) from error
+        except ValueError as error:
+            raise HTTPException(422, str(error)) from error
+        except Exception as error:
+            logging.getLogger(__name__).exception("Realtime ticker closing-session lookup failed")
+            raise unavailable(error) from error
 
     @app.get("/api/stock/{ticker}/trade-setup/multi")
     def ticker_multi(ticker: str, refresh: bool = False, cohort_id: UUID | None = None, snapshot_id: UUID | None = None, read_mode: Literal["current", "retained", "session_close"] = "current"):
@@ -756,6 +937,43 @@ def create_realtime_portal_app(
     ):
         return option_alert_page_read("preview", cohort_id, candidate_id=candidate_id,
             preview_request=request.model_dump())
+
+    def retained_workspace_summary(cohort_id):
+        if repositories.ticker_workspace is None:
+            raise HTTPException(503, "Realtime Ticker Workspace repository is unavailable")
+        try:
+            return repositories.ticker_workspace.workspace_publication(
+                available_by=cutoff(),
+                cohort_id=cohort_id,
+                read_mode="retained",
+            )
+        except TickerPublicationUnavailable as error:
+            raise HTTPException(503, str(error)) from error
+        except ValueError as error:
+            raise HTTPException(422, str(error)) from error
+        except Exception as error:
+            logging.getLogger(__name__).exception(
+                "Realtime retained market context read failed"
+            )
+            raise unavailable(error) from error
+
+    @app.get("/api/stocks/market-conditions")
+    def market_conditions(cohort_id: UUID | None = None):
+        return retained_market_conditions(retained_workspace_summary(cohort_id))
+
+    @app.get("/api/sector-intelligence")
+    def sector_intelligence(
+        leader_limit: int = Query(5, ge=1, le=20),
+        cohort_id: UUID | None = None,
+    ):
+        return retained_sector_intelligence(
+            retained_workspace_summary(cohort_id),
+            leader_limit=leader_limit,
+        )
+
+    @app.get("/api/market-regime")
+    def market_regime(cohort_id: UUID | None = None):
+        return retained_market_regime(retained_workspace_summary(cohort_id))
 
     def dashboard_read(contract, cohort_id, snapshot_id=None, **params):
         if repositories.dashboard is None:

@@ -5,12 +5,15 @@ from datetime import datetime
 from typing import Callable, Mapping
 from uuid import UUID
 
+from psycopg2.extras import RealDictCursor
+
 from equity.domain import (
     BarAvailabilityMode,
     BarSessionScope,
     BarSourceKind,
     EquityBarRevision,
 )
+from options.calendar import OptionExchangeCalendar
 from options.stock_bar_detection import (
     ADVANCED_OPTIONS_STOCK_BAR_SIGNAL_POLICY_SHA256,
 )
@@ -23,6 +26,8 @@ from .advanced_equity_detector_consumer import (
 from .advanced_equity_detector_shadow import detector_shadow_input_sha256
 from .detector_adapters import run_canonical_stock_signal_adapter
 from .detector_evidence import RealtimeDetectorInput
+from .equity_history import load_equity_history_cursor
+from .equity_interval_finalizer import _bar_revision
 from .preflight import ProviderTier
 
 
@@ -102,55 +107,22 @@ def _load_bars_cursor(
         "revision.source_revision_ids,revision.supersedes_revision_id,"
         "revision.session_scope,revision.created_at "
     )
-    cursor.execute(
-        "SELECT " + columns
-        + "FROM rt.bar_current AS current "
-        "JOIN rt.bar_revisions AS revision "
-        "ON revision.bar_revision_id=current.bar_revision_id "
-        "AND revision.observed_at=current.observed_at "
-        "AND revision.cohort_id=current.cohort_id "
-        "AND revision.provider_tier=current.provider_tier "
-        "AND revision.instrument_id=current.instrument_id "
-        "AND revision.interval=current.interval "
-        "AND revision.bar_start=current.bar_start "
-        "AND revision.session_scope=current.session_scope "
-        "AND revision.adjustment_basis=current.adjustment_basis "
-        "LEFT JOIN rt.cohort_history_bindings AS binding "
-        "ON binding.target_cohort_id=%s "
-        "WHERE ((revision.cohort_id=%s "
-        "AND revision.availability_mode='LIVE_OBSERVED') "
-        "OR (revision.cohort_id=binding.source_cohort_id "
-        "AND revision.provider_tier=binding.source_provider_tier "
-        "AND binding.created_at<=%s "
-        "AND revision.bar_end<binding.history_before "
-        "AND revision.availability_mode='HISTORICAL_RECONSTRUCTED')) "
-        "AND revision.security_id=%s "
-        "AND revision.interval='1d' AND revision.is_final "
-        "AND revision.adjustment_basis='RAW_UNADJUSTED' "
-        "AND revision.session_scope='RTH' "
-        "AND revision.session_date<%s "
-        "AND revision.observed_at<=%s AND revision.created_at<=%s "
-        "AND (revision.replay_available_at IS NULL "
-        "OR revision.replay_available_at<=%s) "
-        "AND (revision.provider_published_at IS NULL "
-        "OR revision.provider_published_at<=%s) "
-        "ORDER BY revision.bar_end DESC LIMIT 15",
-        (
-            str(record.cohort_id),
-            str(record.cohort_id),
-            record.observed_at,
-            str(record.security_id),
-            record.bar_end.date(),
-            record.observed_at,
-            record.observed_at,
-            record.observed_at,
-            record.observed_at,
-        ),
-    )
-    daily = tuple(reversed(tuple(
-        advanced_options_bar_revision_from_row(row)
-        for row in cursor.fetchall()
-    )))
+    with cursor.connection.cursor(
+        cursor_factory=RealDictCursor,
+    ) as history_cursor:
+        history = load_equity_history_cursor(
+            history_cursor,
+            cohort_id=record.cohort_id,
+            security_id=record.security_id,
+            ticker=record.ticker,
+            interval="1d",
+            adjusted=False,
+            sessions=OptionExchangeCalendar().trailing_sessions_before(
+                record.bar_end.date(), 15,
+            ),
+            checked_at=record.observed_at,
+        )
+    daily = tuple((_bar_revision(row), row["created_at"]) for row in history.rows)
     cursor.execute(
         "SELECT " + columns
         + "FROM rt.bar_current AS current "

@@ -38,7 +38,7 @@ from .lineage_head import (
     assemble_lineage_head, group_head, reference_set, require_bounded_manifest, require_bounded_payload,
     revision_chain_sha256, rows_identity, workspace_set,
 )
-from .reference_continuity import reference_continuity_manifest_fields
+from .reference_continuity import source_manifest_continuity_fields
 from .preflight import ProviderTier
 from .portal_projection import build_portal_snapshot
 from .screening_projection import RealtimeScreeningInput, produce_realtime_screening
@@ -832,7 +832,7 @@ def _project_realtime_ticker_workspace(
                 and row["provider_tier"]
                 == inputs.history_source_provider_tier.value
                 and row["bar_end"] < inputs.history_before
-            )
+            ) or any(scope.matches(row) for scope in inputs.history_scopes)
             replay, published, created = (
                 row.get("replay_available_at"), row.get("provider_published_at"), row.get("created_at"))
             if (
@@ -891,16 +891,24 @@ def _project_realtime_ticker_workspace(
             calendar, intraday_plan, inputs.session, inputs.cutoff, "5m",
         )
         if five:
-            if len(five) != five_expected:
+            five_visible_expected = _intraday_expected_count(
+                calendar,
+                intraday_plan,
+                inputs.session,
+                min(inputs.cutoff, five[-1].revision.bar_end),
+                "5m",
+            )
+            if len(five) != five_visible_expected:
                 missing["raw_history"] = "NATIVE_5M_HISTORY_INCOMPLETE"
             elif tuple(sorted({fact.revision.session_date for fact in five})) != five_sessions:
                 raise ValueError("Ticker native 5m sessions drift")
             elif any(
                 fact.revision.source_kind not in native_source_kinds
                 and not (
+                    # Stream sessions keep their derived 5m. The identity gate above bounds each
+                    # row to this cohort or its bound history, and the lineage check below proves it.
                     provider_tier == "MASSIVE_ADVANCED"
-                    and partial_session
-                    and fact.revision.session_date == inputs.session
+                    and fact.provider_tier == inputs.provider_tier
                     and fact.revision.source_kind is BarSourceKind.DERIVED
                     and len(fact.revision.source_bar_revision_ids) == 5
                 )
@@ -909,6 +917,8 @@ def _project_realtime_ticker_workspace(
                 raise ValueError("Ticker 5m history source drift")
             else:
                 available["5m"] = five
+                if five_visible_expected < five_expected:
+                    missing["raw_history"] = "LATEST_5M_FINALIZATION_PENDING"
         else:
             missing["raw_history"] = "NATIVE_5M_HISTORY_NOT_RETAINED"
         one = groups[("1m", "RAW_UNADJUSTED")]
@@ -933,6 +943,30 @@ def _project_realtime_ticker_workspace(
         adjusted = groups[("1d", "ADJUSTED")]
         segment = uuid5(NAMESPACE_URL, f"ticker-lineage-check:{inputs.cohort_id}:{security.ticker}")
         verifier = _DerivationVerifier(state, security, inputs, segment)
+        stream_five = tuple(
+            fact for fact in five
+            if fact.revision.source_kind is BarSourceKind.DERIVED
+        )
+        if stream_five:
+            # The source closure holds the parents of sessions older than the 1m chart window.
+            stream_sessions = {fact.revision.session_date for fact in stream_five}
+            stream_minutes = tuple(sorted(
+                (
+                    fact for fact in buckets.get(("1m", False), ())
+                    if fact.revision.session_date in stream_sessions
+                    and fact.revision.source_kind in native_source_kinds
+                ),
+                key=lambda fact: fact.revision.bar_start,
+            ))
+            if {fact.revision.session_date for fact in stream_minutes} != stream_sessions:
+                raise ValueError("Ticker derived 5m requires native minute history")
+            verifier.verify_sessions(
+                "5m",
+                "1m:session",
+                stream_minutes,
+                "5m:session",
+                stream_five,
+            )
         complete_raw_sessions = len(intraday_plan.raw_sessions) - int(partial_session)
         if (
             "5m" in available
@@ -1247,7 +1281,7 @@ def _project_realtime_ticker_workspace(
                 ),
                 history_before=inputs.history_before.isoformat(),
             )
-        source_manifest.update(reference_continuity_manifest_fields(inputs))
+        source_manifest.update(source_manifest_continuity_fields(inputs))
         require_bounded_manifest(source_manifest, name=f"Ticker workspace {security.ticker}")
         require_bounded_payload(payload, name=f"Ticker workspace {security.ticker}")
         snapshots.append(build_portal_snapshot(
@@ -1322,7 +1356,7 @@ def produce_realtime_pattern_watch_publication(inputs, snapshots):
         reference_set=reference_set(references), workspace_set=workspace_set(workspaces),
         window_policy="realtime-pattern-watch-input-v1", primary_window=300,
     )
-    manifest.update(reference_continuity_manifest_fields(inputs))
+    manifest.update(source_manifest_continuity_fields(inputs))
     require_bounded_manifest(manifest, name="Pattern Watch")
     return build_portal_snapshot(
         cohort_id=inputs.cohort_id, provider_tier=inputs.provider_tier,
@@ -1414,7 +1448,7 @@ def produce_realtime_ticker_workspace_summary(inputs, snapshots, charts):
         source_manifest_sha256=inputs.source_manifest_sha256,
         reference_set=reference_set(references), workspace_set=workspace_set(workspaces),
     )
-    manifest.update(reference_continuity_manifest_fields(inputs))
+    manifest.update(source_manifest_continuity_fields(inputs))
     require_bounded_manifest(manifest, name="Ticker Workspace summary")
     return build_portal_snapshot(
         cohort_id=inputs.cohort_id, provider_tier=inputs.provider_tier,

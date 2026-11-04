@@ -218,6 +218,15 @@ def test_registry_invariants_and_role_separation():
         "rt.job_barrier_members", "rt.option_volume_checkpoints"}
 
 
+def test_continuous_controller_can_create_authorizations_without_owner_privileges():
+    name = "rt.advanced_stream_authorizations"
+    assert RELATIONS[name].writes == "MUTABLE"
+    assert grants()[name] == {"SELECT": (APP_ROLE,), "INSERT": (APP_ROLE,), "UPDATE": (APP_ROLE,)}
+    sql = _all_sql()
+    assert "advanced stream authorization scope is immutable" in sql
+    assert "invalid advanced authorization transition" in sql
+
+
 def test_relation_rejects_grants_that_break_the_role_model():
     with pytest.raises(ValueError):
         Relation("shared", "BOUNDED", writes="APPEND", delete=True)

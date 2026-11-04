@@ -117,11 +117,19 @@ def test_equity_input_binding_persists_exact_completed_source():
                 maximum_age_seconds=300,
                 authorization_reference="p8-equity-input-test",
             )
+            history_cohort = uuid4()
+            database_cursor.execute(
+                "INSERT INTO rt.cohorts (cohort_id,cohort_sha256,manifest_id,"
+                "configuration_sha256,model_bundle_sha256,valuation_sha256,effective_at,mode) "
+                "SELECT %s,%s,manifest_id,configuration_sha256,model_bundle_sha256,"
+                "valuation_sha256,effective_at,mode FROM rt.cohorts WHERE cohort_id=%s",
+                (str(history_cohort), uuid4().hex + uuid4().hex, str(equity.cohort_id)),
+            )
             readiness = validate_advanced_options_equity_dependencies_cursor(
                 database_cursor,
                 equity_plan=equity,
                 equity_input=binding,
-                history_source_cohort_id=uuid4(),
+                history_source_cohort_id=history_cohort,
                 underlyings=("SPY",),
             )
             assert readiness["status"] == "READY"

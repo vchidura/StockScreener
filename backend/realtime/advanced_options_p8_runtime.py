@@ -44,6 +44,12 @@ from .advanced_options_service import (
     build_owp3_advanced_options_resident_plan,
 )
 from .advanced_options_selection_c6 import C6SelectionPlan
+from .advanced_realtime_fencing import (
+    DurableRuntimeLease,
+    claim_durable_runtime_lease_cursor,
+    renew_durable_runtime_lease_cursor,
+)
+from .migrations import EXPECTED_V2_DATABASE_NAME
 from .advanced_options_underlying_snapshot import (
     underlying_snapshot_binding_payload,
 )
@@ -63,6 +69,7 @@ UTC = timezone.utc
 P8_EXECUTION_BUNDLE_SCHEMA = "advanced-options-p8-execution-bundle-v3"
 P8_EXECUTION_BUNDLE_MAX_BYTES = 1_048_576
 P8_HEARTBEAT_INTERVAL_SECONDS = 10
+P8_SERVICE_LEASE_SECONDS = 30
 P8_EFFECT_DENIALS = {
     "dispatch": False,
     "delivery": False,
@@ -1988,6 +1995,32 @@ def _validate_downstream_binding_evidence(value: object) -> None:
             )
 
 
+def _claim_service_lease_cursor(
+    cursor,
+    service: Mapping[str, object],
+    *,
+    checked_at: datetime,
+) -> DurableRuntimeLease | None:
+    """Hold this service's lease, adopting one this owner still holds after a restart."""
+    resource_key = str(service["lease_resource_key"])
+    owner_id = UUID(str(service["owner_id"]))
+    cursor.execute(
+        "SELECT owner_id::text,owner_epoch,lease_until "
+        "FROM rt.worker_leases WHERE resource_key=%s",
+        (resource_key,),
+    )
+    row = cursor.fetchone()
+    if row is not None and str(row[0]) == str(owner_id) and row[2] > checked_at:
+        return DurableRuntimeLease(resource_key, owner_id, int(row[1]), row[2])
+    return claim_durable_runtime_lease_cursor(
+        cursor,
+        resource_key=resource_key,
+        owner_id=owner_id,
+        checked_at=checked_at,
+        lease_seconds=P8_SERVICE_LEASE_SECONDS,
+    )
+
+
 def run_p8_docker_service(
     kind: AdvancedOptionsProcessKind,
     package_path: Path,
@@ -2108,9 +2141,19 @@ def run_p8_docker_service(
     connection = psycopg2.connect(
         service_environment["REALTIME_V2_APP_DSN"],
         application_name=f"advanced_options_p8_{kind.value.casefold()}",
-        options="-c timezone=UTC",
+        # The login role has no schema access of its own; this connection reads as the app role.
+        options=f"-c timezone=UTC -c role={EXPECTED_V2_DATABASE_NAME}_app",
     )
     try:
+        with connection:
+            with connection.cursor() as cursor:
+                lease = _claim_service_lease_cursor(
+                    cursor,
+                    service,
+                    checked_at=_utc(clock(), "clock"),
+                )
+        if lease is None:
+            raise RuntimeError(f"P8 {kind.value} lease ownership changed")
         role_thread.start()
         while not stop.is_set():
             observed = _utc(clock(), "clock")
@@ -2119,18 +2162,13 @@ def run_p8_docker_service(
                 break
             with connection:
                 with connection.cursor() as cursor:
-                    cursor.execute(
-                        "SELECT owner_id::text,owner_epoch,lease_until "
-                        "FROM rt.worker_leases WHERE resource_key=%s",
-                        (service["lease_resource_key"],),
+                    lease = renew_durable_runtime_lease_cursor(
+                        cursor,
+                        lease,
+                        checked_at=observed,
+                        lease_seconds=P8_SERVICE_LEASE_SECONDS,
                     )
-                    lease = cursor.fetchone()
-            if (
-                lease is None
-                or str(lease[0]) != service["owner_id"]
-                or int(lease[1]) < 1
-                or lease[2] <= observed
-            ):
+            if lease is None:
                 raise RuntimeError(
                     f"P8 {kind.value} lease ownership changed"
                 )
@@ -2165,8 +2203,8 @@ def run_p8_docker_service(
                     if not role_thread.is_alive()
                     else current_state
                 ),
-                owner_epoch=int(lease[1]),
-                lease_until=lease[2],
+                owner_epoch=lease.owner_epoch,
+                lease_until=lease.lease_until,
                 role_evidence=role_result or None,
                 downstream_binding=downstream_binding,
             )

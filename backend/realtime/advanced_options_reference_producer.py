@@ -47,6 +47,7 @@ from .advanced_options_reference_state import (
 )
 from .contracts import canonical_json, canonical_sha256
 from .database_access_v2 import APP_ROLE, V2ConnectionProvider
+from .equity_history import equity_history_coordinates, load_equity_history_cursor
 from .reference_repository import load_dividend_reference_cursor
 
 
@@ -770,6 +771,10 @@ _OI_SEMANTIC_FIELDS = (
     "observed_session",
 )
 
+_OI_SCOPE_FIELDS = tuple(
+    name for name in _OI_SEMANTIC_FIELDS if name != "open_interest"
+)
+
 
 def _coalesce_terminal_open_interest(candidates, observed_session):
     superseded = {
@@ -785,19 +790,32 @@ def _coalesce_terminal_open_interest(candidates, observed_session):
     )
     if len(terminal) <= 1:
         return terminal
-    identities = {
-        tuple(row[name] for name in _OI_SEMANTIC_FIELDS)
+    scopes = {
+        tuple(row[name] for name in _OI_SCOPE_FIELDS)
         for row in terminal
     }
-    if len(identities) != 1:
+    if len(scopes) != 1:
         return terminal
+    latest_clock = max(
+        (row["received_at"], row["observed_at"])
+        for row in terminal
+    )
+    latest = tuple(
+        row
+        for row in terminal
+        if (row["received_at"], row["observed_at"]) == latest_clock
+    )
+    if len(latest) <= 1:
+        return latest
+    identities = {
+        tuple(row[name] for name in _OI_SEMANTIC_FIELDS)
+        for row in latest
+    }
+    if len(identities) != 1:
+        return latest
     return (max(
-        terminal,
-        key=lambda row: (
-            row["received_at"],
-            row["observed_at"],
-            str(row["baseline_id"]),
-        ),
+        latest,
+        key=lambda row: str(row["baseline_id"]),
     ),)
 
 
@@ -1065,41 +1083,33 @@ def _load_bars_and_metrics(
     )
     for ticker in plan.control_plane.universe.option_underlyings:
         security_id = spots[ticker][1]
-        cursor.execute(
-            "SELECT current.bar_revision_id::text,current.updated_at,"
-            "revision.security_id::text,revision.ticker,"
-            "revision.session_date,revision.bar_end,revision.close_price,"
-            "revision.volume,revision.source_kind,"
-            "revision.adjustment_basis,revision.is_final,"
-            "revision.observed_at,revision.source_revision_ids,"
-            "revision.supersedes_revision_id::text,revision.payload_sha256 "
-            "FROM rt.bar_current AS current "
-            "JOIN rt.bar_revisions AS revision "
-            "ON revision.bar_revision_id=current.bar_revision_id "
-            "AND revision.observed_at=current.observed_at "
-            "WHERE current.cohort_id=%s AND revision.security_id=%s "
-            "AND revision.ticker=%s AND current.interval='1d' "
-            "AND current.adjustment_basis='ADJUSTED' "
-            "AND revision.is_final AND revision.session_date<%s "
-            "AND revision.observed_at<=%s "
-            "ORDER BY revision.session_date DESC LIMIT 31",
-            (
-                str(
-                    plan.history_source_cohort_id
-                    or plan.enrollment.equity_plan.cohort_id
-                ),
-                str(security_id),
-                ticker,
-                plan.control_plane.session_date,
-                plan.known_at,
+        history = load_equity_history_cursor(
+            cursor,
+            cohort_id=(
+                plan.history_source_cohort_id
+                or plan.enrollment.equity_plan.cohort_id
             ),
+            security_id=security_id,
+            ticker=ticker,
+            interval="1d",
+            adjusted=True,
+            sessions=required_sessions,
+            checked_at=plan.known_at,
         )
-        rows = tuple(reversed(cursor.fetchall()))
+        rows = history.rows
         if (
             len(rows) != 31
             or len({row["session_date"] for row in rows}) != 31
             or tuple(row["session_date"] for row in rows)
             != required_sessions
+            or any(row["stale_adjustment_lineage"] for row in rows)
+            or any(
+                (row["bar_start"], row["bar_end"])
+                != equity_history_coordinates(
+                    OptionExchangeCalendar(), "1d", row["session_date"],
+                )[0]
+                for row in rows
+            )
         ):
             missing = True
             evidence.append(_evidence(
@@ -1133,6 +1143,7 @@ def _load_bars_and_metrics(
                     "bar_end": row["bar_end"],
                     "observed_at": row["observed_at"],
                     "current_updated_at": row["updated_at"],
+                    "history_binding_sha256": history.binding_sha256,
                 }),
                 payload_sha256=str(row["payload_sha256"]),
             )

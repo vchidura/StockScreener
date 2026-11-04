@@ -1,4 +1,6 @@
 from datetime import datetime, timedelta, timezone
+from dataclasses import asdict
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 from uuid import UUID
 
@@ -7,6 +9,7 @@ import pytest
 from realtime.advanced_equity_detector_consumer import (
     AdvancedEquityDetectorSourceRecord,
 )
+from realtime import advanced_options_os1_os2_shadow as shadow
 from realtime.advanced_options_os1_os2_shadow import (
     _uuid_array,
     build_os1_os2_consumer_config,
@@ -115,12 +118,20 @@ def _record(revision, offset):
 def test_existing_os1_os2_models_bind_to_advanced_5m_shadow(
     detector_id,
     intraday,
+    monkeypatch,
 ):
     cursor = MagicMock()
-    cursor.fetchall.side_effect = (
-        tuple(_row(value) for value in reversed(daily_history())),
-        tuple(_row(value) for value in reversed(intraday)),
-    )
+    cursor.fetchall.return_value = tuple(_row(value) for value in reversed(intraday))
+    historical = tuple({
+        **asdict(value),
+        "observed_at": value.system_observed_at,
+        "created_at": value.system_observed_at,
+        "adjustment_basis": "RAW_UNADJUSTED",
+        "source_revision_ids": value.source_bar_revision_ids,
+        "supersedes_revision_id": value.supersedes_bar_revision_id,
+    } for value in daily_history())
+    history_reader = MagicMock(return_value=SimpleNamespace(rows=historical))
+    monkeypatch.setattr(shadow, "load_equity_history_cursor", history_reader)
     source = _record(intraday[-1], offset=len(intraday) * 5)
     evaluator = os1_os2_evaluator_cursor(
         cursor,
@@ -130,7 +141,6 @@ def test_existing_os1_os2_models_bind_to_advanced_5m_shadow(
     )
 
     decision = evaluator(source, source.detector_inputs())
-    daily_statement, daily_params = cursor.execute.call_args_list[0].args
 
     assert decision.disposition == "DETECTED"
     assert decision.direction in {-1, 1}
@@ -139,13 +149,11 @@ def test_existing_os1_os2_models_bind_to_advanced_5m_shadow(
     assert len(decision.additional_inputs) == (
         15 + len(intraday) - 1
     )
-    assert "rt.cohort_history_bindings" in daily_statement
-    assert "revision.cohort_id=binding.source_cohort_id" in daily_statement
-    assert "binding.created_at<=%s" in daily_statement
-    assert "revision.bar_end<binding.history_before" in daily_statement
-    assert "HISTORICAL_RECONSTRUCTED" in daily_statement
-    assert daily_params[:2] == (str(COHORT), str(COHORT))
-    assert daily_params[2] == source.observed_at
+    assert history_reader.call_args.kwargs["cohort_id"] == COHORT
+    assert history_reader.call_args.kwargs["checked_at"] == source.observed_at
+    assert history_reader.call_args.kwargs["interval"] == "1d"
+    assert history_reader.call_args.kwargs["adjusted"] is False
+    assert len(history_reader.call_args.kwargs["sessions"]) == 15
     assert os1_os2_requirements(detector_id)["trigger_interval"] == "5m"
     config = build_os1_os2_consumer_config(
         detector_id=detector_id,

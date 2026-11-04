@@ -29,6 +29,7 @@ from realtime.advanced_realtime_v3_runtime import (  # noqa: E402
     ADVANCED_REALTIME_V3_FINALITY_DELAY_SECONDS,
 )
 from realtime.advanced_options_lifecycle import (  # noqa: E402
+    OPTIONS_REFRESH_OPEN_FLOOR_SECONDS,
     reconcile_advanced_options_lifecycle_cursor,
     run_advanced_options_preparation_cycle,
 )
@@ -60,8 +61,11 @@ UTC = timezone.utc
 DEFAULT_CONNECTION_ATTEMPT_CEILING = 12
 DEFAULT_DECODED_MESSAGE_CEILING = 1_000_000
 DEFAULT_DECODED_BYTE_CEILING = 1_073_741_824
-GENERALIZED_PROVIDER_REQUESTS_PER_UNDERLYING = 32
+# Twice the most pages one underlying has used (SPY 6, QQQ 5 on 2026-11-03).
+GENERALIZED_PROVIDER_REQUESTS_PER_UNDERLYING = 12
 EXACT_FOUR_PROVIDER_REQUESTS_PER_UNDERLYING = 4
+CAPTURE_POLICY_AT_OPEN = "AT_OPEN"
+CAPTURE_POLICY_EARLIEST = "EARLIEST"
 
 
 def parse_args(argv=None):
@@ -236,6 +240,20 @@ def _maximum_provider_requests_per_underlying(environment) -> int:
     )
 
 
+def _capture_after_open_seconds(environment) -> int | None:
+    policy = str(
+        environment.get("REALTIME_V3_OPTIONS_CAPTURE_POLICY") or ""
+    ).strip().upper() or CAPTURE_POLICY_AT_OPEN
+    if policy not in {CAPTURE_POLICY_AT_OPEN, CAPTURE_POLICY_EARLIEST}:
+        raise ValueError("Options capture policy is invalid")
+    if (
+        policy == CAPTURE_POLICY_EARLIEST
+        or _exact_four_compatibility(environment)
+    ):
+        return None
+    return OPTIONS_REFRESH_OPEN_FLOOR_SECONDS
+
+
 def main(argv=None) -> int:
     args = parse_args(argv)
     provider, pool = _provider()
@@ -281,6 +299,7 @@ def main(argv=None) -> int:
             )).strip()
         ),
         exact_four_compatibility=_exact_four_compatibility(environment),
+        capture_after_open_seconds=_capture_after_open_seconds(environment),
         active_quote_contract_budget=(
             _optional_positive_environment_int(
                 environment,

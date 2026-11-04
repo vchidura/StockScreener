@@ -6,10 +6,13 @@ from uuid import UUID
 
 import pytest
 
+from options.data.polygon_http import SingleAttemptPolygonHttpTransport
 from realtime import advanced_options_lifecycle as lifecycle_module
 from realtime.advanced_options_lifecycle import (
+    AdvancedOptionsPreparationProviderFailed,
     AdvancedOptionsPreparationRefreshRequired,
     AdvancedOptionsPreparationRetryable,
+    AdvancedOptionsProviderRequestAttempt,
     AdvancedOptionsStageResult,
     advanced_options_preparation_retry_schedule,
     expire_obsolete_advanced_options_preparation_cursor,
@@ -165,6 +168,7 @@ def test_options_preparation_budget_has_local_and_shared_ceilings():
 
     assert budget is not None
     assert budget.scope.request_ceiling == 120
+    assert budget.underlying_request_ceiling == 12
     assert budget.scope.decoded_byte_ceiling == 750_000_000
     assert budget.scope.effective_account_request_ceiling == (
         MASSIVE_ADVANCED_ACCOUNT_REQUEST_CEILING
@@ -669,3 +673,95 @@ def test_stage_worker_records_retryable_interruption_without_success():
     assert report["status"] == "RETRY"
     assert provider.cursor.failed is True
     assert provider.cursor.completed is False
+
+
+def test_catalog_discovery_makes_one_accounted_http_attempt_per_slot():
+    executor = object.__new__(PostgresAutomaticOptionsPreparationExecutor)
+    executor._selection_source_factory = None
+    executor._admission_profile_version = ACTIVITY_MOMENTUM_PROFILE_VERSION
+    executor._enabled_strategies = ()
+    executor._api_key = "provider-free"
+    executor._byte_limit = 25_000_000
+    executor._request_limit = 32
+    executor._exact_four_compatibility = False
+    executor._provider = object()
+    executor._clock = lambda: CHECKED
+    executor._catalog_capture = None
+    claim = SimpleNamespace(
+        ticker="QQQ",
+        session_date=CHECKED.date(),
+        source_equity_cohort_id=REVISION_ID,
+    )
+
+    source = executor._source(claim)
+
+    assert isinstance(source._transport, SingleAttemptPolygonHttpTransport)
+    assert source.provider_attempts == ()
+    assert executor.provider_attempts(claim) is None
+    executor._catalog_capture = (claim, source)
+    assert executor.provider_attempts(claim) == ()
+
+
+def test_capture_attempts_never_settle_a_different_claim():
+    """A later stage holds no reservations for an earlier capture's requests."""
+    executor = object.__new__(PostgresAutomaticOptionsPreparationExecutor)
+    catalog_claim = SimpleNamespace(stage="CATALOG_QUOTE")
+    executor._catalog_capture = (
+        catalog_claim,
+        SimpleNamespace(provider_attempts=(
+            SimpleNamespace(
+                http_status=200,
+                response_bytes=10,
+                row_count=1,
+            ),
+        )),
+    )
+
+    assert executor.provider_attempts(catalog_claim) == (
+        AdvancedOptionsProviderRequestAttempt(200, 10, 1),
+    )
+    assert executor.provider_attempts(
+        SimpleNamespace(stage="SESSION_ACTIVATION")
+    ) is None
+
+
+def test_provider_failure_retries_on_schedule_without_crashing_the_role():
+    provider = _Provider("HISTORY")
+
+    class _FailedExecutor(_Executor):
+        def execute(self, claim, *, provider_request_ids):
+            raise AdvancedOptionsPreparationProviderFailed(
+                "NO_USABLE_CONTRACTS:QQQ:rows=0"
+            )
+
+    report = run_advanced_options_preparation_cycle(
+        provider,
+        _FailedExecutor(),
+        owner_id=OWNER_ID,
+        checked_at=CHECKED,
+        clock=lambda: CHECKED,
+    )
+
+    assert report["status"] == "RETRY"
+    assert report["reason"] == "NO_USABLE_CONTRACTS:QQQ:rows=0"
+    assert report["retry_at_utc"] is not None
+    assert provider.cursor.failed is True
+    assert provider.cursor.completed is False
+
+
+@pytest.mark.parametrize(
+    ("http_status", "outcome"),
+    (
+        (None, "TIMEOUT"),
+        (429, "HTTP_429"),
+        (503, "HTTP_ERROR"),
+        (200, "INVALID"),
+    ),
+)
+def test_failed_attempt_outcome_follows_its_real_response(
+    http_status,
+    outcome,
+):
+    attempt = AdvancedOptionsProviderRequestAttempt(http_status, 10)
+
+    assert attempt.outcome.value == outcome

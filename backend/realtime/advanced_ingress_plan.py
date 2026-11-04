@@ -217,6 +217,9 @@ class AdvancedIngressBudgets:
 
 
 AUTOMATIC_CATCH_UP_MAXIMUM_ATTEMPTS = 2
+# Each hole can cost one request per member per attempt, and a session can have
+# several: November 2 2026 had two before any repair ran.
+AUTOMATIC_CATCH_UP_MAXIMUM_HOLES = 4
 AUTOMATIC_CATCH_UP_RESPONSE_BYTE_LIMIT = 1024 * 1024
 AUTOMATIC_CATCH_UP_EXPECTED_COST = (
     "included Massive Advanced aggregate entitlement"
@@ -237,7 +240,9 @@ def automatic_advanced_ingress_budgets(
         maximum=400,
     )
     request_ceiling = (
-        target * AUTOMATIC_CATCH_UP_MAXIMUM_ATTEMPTS
+        target
+        * AUTOMATIC_CATCH_UP_MAXIMUM_ATTEMPTS
+        * AUTOMATIC_CATCH_UP_MAXIMUM_HOLES
     )
     return AdvancedIngressBudgets(
         stream_sessions=stream_sessions,

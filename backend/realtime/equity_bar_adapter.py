@@ -41,6 +41,12 @@ class AdvancedMinuteFinality:
             raise TypeError("Advanced minute finality gap_free must be boolean")
 
 
+# Each session's cohort binds to the one before it, so this is about three months
+# of sessions. Every level costs a lookup per read, so chains should be compacted
+# before they get close to this rather than this being raised further.
+MAXIMUM_HISTORY_BINDING_DEPTH = 64
+
+
 @dataclass(frozen=True, slots=True)
 class RealtimeEquityBarFact:
     cohort_id: UUID

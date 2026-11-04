@@ -95,6 +95,25 @@ from .stage_runners_v2 import (
 UTC = timezone.utc
 
 
+def _resident_owner_epoch(flow: Mapping[str, object]) -> int:
+    owner_epoch = flow.get("owner_epoch")
+    if type(owner_epoch) is not int or owner_epoch <= 0:
+        raise RuntimeError("P8 flow resident owner epoch changed")
+    return owner_epoch
+
+
+def _journal_owner_epoch(flow_environment) -> int:
+    try:
+        owner_epoch = (
+            flow_environment.options_flow_source.registration.owner_epoch
+        )
+    except AttributeError as error:
+        raise RuntimeError("P8 journal owner epoch changed") from error
+    if type(owner_epoch) is not int or owner_epoch <= 0:
+        raise RuntimeError("P8 journal owner epoch changed")
+    return owner_epoch
+
+
 def _resident_shard_expectations(
     market: Mapping[str, object],
     flow: Mapping[str, object],
@@ -518,6 +537,7 @@ def build_and_run_p8_serial_window(
     ).produce()
     market = dependency_evidence["MARKET_STATE"]
     flow = dependency_evidence["FLOW"]
+    owner_epoch = _journal_owner_epoch(flow_environment)
     if (
         market["normalized_end_offset"]
         != dependency_evidence["INGRESS"]["normalized_end_offset"]
@@ -546,7 +566,7 @@ def build_and_run_p8_serial_window(
         contract_scope=contract_scope,
         reference_state=reference,
         source_flow=source_flow,
-        owner_epoch=1,
+        owner_epoch=owner_epoch,
         market_state_committed_offset=int(
             market["normalized_end_offset"]
         ),

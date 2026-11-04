@@ -100,6 +100,7 @@ def parse_args(argv=None):
     parser.add_argument("--history-binding-report", type=Path)
     parser.add_argument("--history-binding-file-sha256")
     parser.add_argument("--publish", action="store_true")
+    parser.add_argument("--continuous-publication", action="store_true")
     parser.add_argument("--publication-reference", default="")
     parser.add_argument("--publication-authority", type=Path)
     parser.add_argument("--publication-authority-semantic-sha256")
@@ -138,6 +139,10 @@ def parse_args(argv=None):
         args.reuse_input_receipt or args.reuse_portal_receipt
     ) and not args.window_key_suffix:
         parser.error("receipt reuse requires a durable retry identity")
+    if args.publish and args.continuous_publication:
+        parser.error(
+            "--continuous-publication replaces the one-shot --publish path"
+        )
     if args.publish and not args.publication_reference.strip():
         parser.error("--publish requires --publication-reference")
     if not args.publish and args.publication_reference.strip():
@@ -184,7 +189,7 @@ def parse_args(argv=None):
         stages.append("STOCK_ALERTS")
     if args.include_strategies:
         stages.append("STRATEGY_PUBLISH")
-    if args.publish:
+    if args.publish or args.continuous_publication:
         stages.append("PORTAL_PUBLISH")
     args.enabled_stages = tuple(stages)
     args.report_path = args.report_path.resolve()
@@ -309,7 +314,7 @@ def _validation_policy(args, environment):
     if (
         policy.validation_mode
         is AdvancedOptionsValidationMode.DEVELOPMENT_DIAGNOSTIC
-        and args.publish
+        and (args.publish or args.continuous_publication)
     ):
         raise RuntimeError(
             "development diagnostic Equity windows cannot publish"
@@ -356,44 +361,104 @@ def _load_stock_alert_projection(provider, request):
         )
 
 
-def _ensure_reference_readiness(provider, repository, args):
-    with provider.transaction(APP_ROLE, read_only=True) as unit:
-        cursor = unit.cursor
-        cursor.execute(
-            "SELECT seed.seed_id,seed.status,seed.effective_at,"
-            "seed.valid_until "
-            "FROM rt.seed_current AS current "
-            "JOIN rt.seed_manifests AS seed USING(seed_id) "
-            "WHERE current.scope IN ("
-            "'EQUITY_VALIDATION_REFERENCES',"
-            "'ADVANCED_SPY_REFERENCES') "
-            "ORDER BY "
-            "(current.scope='EQUITY_VALIDATION_REFERENCES') DESC "
-            "LIMIT 1"
+def _continuous_reference_evidence_cursor(cursor, args):
+    """Prove a continuous desired-state cohort from its members' own facts.
+
+    C4 owns these facts per member, while a global seed is a separate
+    short-lived manual refresh that no continuous service renews. Returns None
+    for any other cohort, which must still present a current global seed.
+    """
+    cursor.execute(
+        "SELECT snapshot_sha256 "
+        "FROM rt.realtime_desired_session_snapshots "
+        "WHERE cohort_id=%s AND session_date=%s AND materialized_at<=%s",
+        (str(args.cohort_id), args.session_date, args.cutoff),
+    )
+    snapshot = cursor.fetchone()
+    if snapshot is None:
+        return None
+    cursor.execute(
+        "SELECT manifest.stock_count,"
+        "count(DISTINCT instrument.instrument_id),"
+        "(SELECT count(*) FROM rt.subscription_members AS declared "
+        "WHERE declared.manifest_id=manifest.manifest_id "
+        "AND declared.channel='AM') "
+        "FROM rt.cohorts AS cohort "
+        "JOIN rt.subscription_manifests AS manifest USING(manifest_id) "
+        "JOIN rt.subscription_members AS member USING(manifest_id) "
+        "JOIN rt.instruments AS instrument USING(instrument_id) "
+        "JOIN ref.security_revisions AS reference USING(security_id) "
+        "WHERE cohort.cohort_id=%s AND member.channel='AM' "
+        "AND reference.active AND reference.effective_from<=%s "
+        "AND (reference.effective_to IS NULL "
+        "OR reference.effective_to>%s) "
+        "AND reference.observed_at<=%s "
+        "AND NOT EXISTS ("
+        "SELECT 1 FROM unnest(ARRAY['SPLIT','DIVIDEND']) "
+        "AS required(action_type) "
+        "WHERE NOT EXISTS ("
+        "SELECT 1 FROM ref.corporate_action_coverage AS coverage "
+        "WHERE coverage.security_id=reference.security_id "
+        "AND coverage.action_type=required.action_type "
+        "AND coverage.window_start<=%s AND coverage.window_end>=%s "
+        "AND coverage.observed_at>=reference.effective_from "
+        "AND coverage.received_at<=%s"
+        ")) "
+        "GROUP BY manifest.manifest_id,manifest.stock_count",
+        (
+            str(args.cohort_id),
+            args.cutoff,
+            args.cutoff,
+            args.cutoff,
+            args.session_date,
+            args.session_date,
+            args.cutoff,
+        ),
+    )
+    members = cursor.fetchone()
+    if members is None or len({int(value) for value in members}) != 1:
+        raise ValueError(
+            "Advanced continuous member references are unavailable"
         )
-        seed = cursor.fetchone()
-        cursor.execute(
-            "SELECT manifest.stock_count,"
-            "count(DISTINCT reference.ticker) "
-            "FROM rt.cohorts AS cohort "
-            "JOIN rt.subscription_manifests AS manifest USING(manifest_id) "
-            "JOIN rt.subscription_members AS member USING(manifest_id) "
-            "JOIN rt.instruments AS instrument USING(instrument_id) "
-            "JOIN ref.security_revisions AS reference USING(security_id) "
-            "WHERE cohort.cohort_id=%s AND member.channel='AM' "
-            "AND reference.active AND reference.effective_from<=%s "
-            "AND (reference.effective_to IS NULL "
-            "OR reference.effective_to>%s) "
-            "AND reference.observed_at<=%s "
-            "GROUP BY manifest.stock_count",
-            (
-                str(args.cohort_id),
-                args.cutoff,
-                args.cutoff,
-                args.cutoff,
-            ),
-        )
-        reference_row = cursor.fetchone()
+    return f"advanced-reference-c4:{snapshot[0]}"
+
+
+def _seed_reference_evidence_cursor(cursor, args):
+    cursor.execute(
+        "SELECT seed.seed_id,seed.status,seed.effective_at,"
+        "seed.valid_until "
+        "FROM rt.seed_current AS current "
+        "JOIN rt.seed_manifests AS seed USING(seed_id) "
+        "WHERE current.scope IN ("
+        "'EQUITY_VALIDATION_REFERENCES',"
+        "'ADVANCED_SPY_REFERENCES') "
+        "ORDER BY "
+        "(current.scope='EQUITY_VALIDATION_REFERENCES') DESC "
+        "LIMIT 1"
+    )
+    seed = cursor.fetchone()
+    cursor.execute(
+        "SELECT manifest.stock_count,"
+        "count(DISTINCT reference.ticker) "
+        "FROM rt.cohorts AS cohort "
+        "JOIN rt.subscription_manifests AS manifest USING(manifest_id) "
+        "JOIN rt.subscription_members AS member USING(manifest_id) "
+        "JOIN rt.instruments AS instrument USING(instrument_id) "
+        "JOIN ref.security_revisions AS reference USING(security_id) "
+        "WHERE cohort.cohort_id=%s AND member.channel='AM' "
+        "AND reference.active AND reference.effective_from<=%s "
+        "AND (reference.effective_to IS NULL "
+        "OR reference.effective_to>%s) "
+        "AND reference.observed_at<=%s "
+        "GROUP BY manifest.stock_count",
+        (
+            str(args.cohort_id),
+            args.cutoff,
+            args.cutoff,
+            args.cutoff,
+        ),
+    )
+    reference_row = cursor.fetchone()
     if (
         seed is None
         or seed[1] != "READY"
@@ -402,13 +467,30 @@ def _ensure_reference_readiness(provider, repository, args):
         or int(reference_row[0]) != int(reference_row[1])
     ):
         raise ValueError("Advanced reference readiness is unavailable")
+    return f"advanced-reference:{seed[0]}"
+
+
+def _ensure_reference_readiness(provider, repository, args):
+    with provider.transaction(APP_ROLE, read_only=True) as unit:
+        continuous_evidence = _continuous_reference_evidence_cursor(
+            unit.cursor,
+            args,
+        )
+        evidence_ref = (
+            continuous_evidence
+            or _seed_reference_evidence_cursor(unit.cursor, args)
+        )
+    if args.continuous_publication and continuous_evidence is None:
+        raise ValueError(
+            "continuous publication requires a desired-snapshot cohort"
+        )
     repository.upsert_readiness(
         args.cohort_id,
         "REFERENCE",
         STAGE_CATALOG_VERSION_V3,
         "READY",
         (),
-        f"advanced-reference:{seed[0]}",
+        evidence_ref,
         datetime.now(timezone.utc),
     )
 
@@ -481,7 +563,11 @@ def main(argv=None) -> int:
         )
         scope_reference = (
             f"{args.authorization_reference}:"
-            f"{args.publication_reference or 'UNPUBLISHED'}"
+            + (
+                "CONTINUOUS-PUBLICATION"
+                if args.continuous_publication
+                else args.publication_reference or "UNPUBLISHED"
+            )
         )
         config_sha256 = canonical_sha256(
             {
@@ -495,7 +581,7 @@ def main(argv=None) -> int:
                 "validation_mode": (
                     validation_policy.validation_mode.value
                 ),
-                "publication": args.publish,
+                "publication": args.publish or args.continuous_publication,
                 "publication_authority_sha256": (
                     None
                     if publication_authority is None
@@ -538,6 +624,14 @@ def main(argv=None) -> int:
             plan_id = existing.plan_id
             window = existing
             retained_plan = repository.load_plan(plan_id)
+            if (
+                args.continuous_publication
+                and retained_plan.enabled_stages == frozenset(BASE_STAGES)
+            ):
+                # A window planned before publication finishes as planned;
+                # the next window advances the pointer.
+                args.continuous_publication = False
+                args.enabled_stages = BASE_STAGES
             if (
                 retained_plan.stage_catalog_version
                 != STAGE_CATALOG_VERSION_V3
@@ -661,6 +755,15 @@ def main(argv=None) -> int:
                 raise RuntimeError(
                     "P11 failed publication advanced the pointer"
                 )
+        elif args.continuous_publication:
+            # A late backlog window is stored without moving the pointer, so
+            # the pointer is reported here and never required to advance.
+            with provider.transaction(APP_ROLE, read_only=True) as unit:
+                pointer = load_portal_release_pointer_cursor(
+                    unit.cursor,
+                    cohort_id=args.cohort_id,
+                    provider_tier=ProviderTier.MASSIVE_ADVANCED,
+                )
         result = {
             "status": report.status,
             "window_state": report.window_state,
@@ -686,6 +789,8 @@ def main(argv=None) -> int:
             "publication_mode": (
                 "COHORT_LOCAL_PORTAL_PUBLISH"
                 if args.publish
+                else "CONTINUOUS_PORTAL_PUBLISH"
+                if args.continuous_publication
                 else "PROJECTION_ONLY"
             ),
             "publication_advanced": args.publish,

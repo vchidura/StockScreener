@@ -58,12 +58,13 @@ test('both deployment modes retain the full portal shell and shared realtime ada
   assert.doesNotMatch(app, /RealtimeOptionsAlertsPage/)
 })
 
-test('realtime screener restores the original page and only adds explicit cohort scope', () => {
+test('realtime screener restores the original page with explicit retained cohort scope', () => {
   const screening = readFileSync(new URL('../src/services/screening.ts', import.meta.url), 'utf8')
   assert.equal(app.match(/path="\/stocks\/screener" element=\{<StockScreenerPage \/>\}/g)?.length, 2)
   assert.doesNotMatch(app + mapped, /RealtimeStockScreeningPage/)
   assert.match(screening, /VITE_REALTIME_ONLY !== 'true'/)
-  assert.match(screening, /Realtime screening requires VITE_REALTIME_COHORT_ID/)
+  assert.match(screening, /realtimeCohortId/)
+  assert.match(screening, /read_mode: 'retained'/)
   assert.equal(screening.match(/params: screeningParams\(\)/g)?.length, 4)
   for (const route of ['catalog', 'query', 'gap-details', 'hourly-details']) {
     assert.ok(screening.includes(`/stocks/screening/${route}`))
@@ -73,6 +74,7 @@ test('realtime screener restores the original page and only adds explicit cohort
 test('all four original screening requests preserve bodies and abort signals in both deployment modes', async () => {
   const source = readFileSync(new URL('../src/services/screening.ts', import.meta.url), 'utf8')
     .replace("import api from './api'", 'const api = globalThis.__screeningApi')
+    .replace("import { realtimeCohortId } from './portalIdentity'", 'const realtimeCohortId = () => globalThis.__screeningCohort')
     .replaceAll('import.meta.env', 'globalThis.__screeningEnvironment')
   const compiled = ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 } })
   const calls = []
@@ -86,6 +88,7 @@ test('all four original screening requests preserve bodies and abort signals in 
     const request = { predicate: { filters: [] }, offset: 0 }
     for (const realtime of [false, true]) {
       globalThis.__screeningEnvironment = { VITE_REALTIME_ONLY: String(realtime), VITE_REALTIME_COHORT_ID: 'cohort' }
+      globalThis.__screeningCohort = 'cohort'
       calls.length = 0
       assert.equal(await module.getScreeningCatalog(signal), 'payload')
       await module.queryScreening(request, signal)
@@ -97,16 +100,18 @@ test('all four original screening requests preserve bodies and abort signals in 
       for (const call of calls) {
         const config = call.at(-1)
         assert.equal(config.signal, signal)
-        assert.deepEqual(config.params, realtime ? { cohort_id: 'cohort' } : undefined)
+        assert.deepEqual(config.params, realtime ? { cohort_id: 'cohort', read_mode: 'retained' } : undefined)
       }
     }
     calls.length = 0
     globalThis.__screeningEnvironment = { VITE_REALTIME_ONLY: 'true' }
-    await assert.rejects(module.getScreeningCatalog(), /requires VITE_REALTIME_COHORT_ID/)
-    assert.equal(calls.length, 0)
+    globalThis.__screeningCohort = undefined
+    assert.equal(await module.getScreeningCatalog(), 'payload')
+    assert.deepEqual(calls[0].at(-1).params, { read_mode: 'retained' })
   } finally {
     delete globalThis.__screeningApi
     delete globalThis.__screeningEnvironment
+    delete globalThis.__screeningCohort
   }
 })
 

@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Mapping
 
@@ -192,10 +192,15 @@ def _registry_identity() -> dict[str, object]:
         for name, spec in RELATIONS.items()
         if name not in POST024_RELATIONS
     }
+    authorization_table = "rt.advanced_stream_authorizations"
+    baseline[authorization_table] = replace(baseline[authorization_table], writes="NONE")
     baseline_grants = {
         name: privileges
         for name, privileges in grants().items()
         if name in baseline
+    }
+    baseline_grants[authorization_table] = {
+        "SELECT": baseline_grants[authorization_table]["SELECT"],
     }
     return {
         "contract_id": CONTRACT_ID,

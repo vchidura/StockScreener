@@ -14,7 +14,9 @@ from realtime.canonical_stock_alert_product import (
 )
 from realtime.canonical_stock_alert_repository import _membership_cursor
 from realtime.contracts import canonical_sha256
+from realtime.equity_history import EquityHistoryScope
 from realtime.preflight import ProviderTier
+from realtime.reference_continuity import source_manifest_identity
 from realtime.screening_projection import RealtimeScreeningInput
 from realtime.stock_alert_projection import (
     produce_realtime_stock_alerts,
@@ -221,6 +223,58 @@ def test_e_context_provides_market_only_and_retains_spy_lineage():
     } == spy_ids
 
 
+def test_stream_bars_without_publication_clocks_provide_market_context():
+    """Live stream bars carry no provider or replay publication clocks."""
+    inputs = _inputs()
+    for absent in (
+        lambda row: {
+            **row,
+            "provider_published_at": None,
+            "replay_available_at": None,
+        },
+        lambda row: {
+            name: value
+            for name, value in row.items()
+            if name not in {"provider_published_at", "replay_available_at"}
+        },
+    ):
+        contexts = canonical_stock_alert_contexts(replace(
+            inputs,
+            bars=tuple(absent(row) for row in inputs.bars),
+        ))
+
+        for context in contexts.values():
+            assert context.market_trend is not None
+            assert context.available_at == CUTOFF
+            assert context.received_at == CUTOFF + timedelta(seconds=1)
+
+
+def test_bars_without_any_optional_clock_fall_back_to_bar_end():
+    inputs = _inputs()
+    optional = {
+        "provider_published_at",
+        "replay_available_at",
+        "observed_at",
+        "created_at",
+    }
+
+    contexts = canonical_stock_alert_contexts(replace(
+        inputs,
+        bars=tuple(
+            {
+                name: value
+                for name, value in row.items()
+                if name not in optional
+            }
+            for row in inputs.bars
+        ),
+    ))
+
+    for context in contexts.values():
+        assert context.available_at == CUTOFF
+        assert context.received_at == CUTOFF
+
+
 def test_missing_sector_and_event_context_retains_unavailable_alert_rows():
     inputs = _inputs()
     batch = produce_canonical_stock_alert_batch(
@@ -310,6 +364,49 @@ def test_canonical_portal_snapshot_exposes_unavailable_reasons():
         and row["non_actionable"] is True
         for row in page["rows"]
     )
+
+
+def test_canonical_portal_snapshot_carries_chained_history_identity():
+    scopes = (
+        EquityHistoryScope(
+            uuid5(NAMESPACE_URL, "canonical-history-1"),
+            ProviderTier.MASSIVE_DEVELOPER,
+            CUTOFF - timedelta(days=60),
+            "c" * 64,
+        ),
+        EquityHistoryScope(
+            uuid5(NAMESPACE_URL, "canonical-history-2"),
+            ProviderTier.MASSIVE_DEVELOPER,
+            CUTOFF - timedelta(days=365),
+            "d" * 64,
+        ),
+    )
+    chain = [scope.payload() for scope in scopes]
+    inputs = replace(
+        _inputs(),
+        source_manifest_sha256=source_manifest_identity(
+            cohort_manifest_sha256="e" * 64,
+            history_binding_sha256=canonical_sha256(chain),
+        ),
+        history_source_cohort_id=scopes[0].cohort_id,
+        history_source_provider_tier=scopes[0].provider_tier,
+        history_before=scopes[0].history_before,
+        history_binding_sha256=scopes[0].binding_sha256,
+        history_scopes=scopes,
+    )
+    batch = produce_canonical_stock_alert_batch(
+        inputs,
+        window_id=WINDOW,
+        input_receipt_id=RECEIPT,
+        receipt_input_sha256="b" * 64,
+    )
+
+    snapshot = produce_realtime_stock_alerts(
+        inputs,
+        retained_projection=_retained_projection(batch),
+    )
+
+    assert snapshot.source_manifest["history_scope_chain"] == chain
 
 
 def test_variable_membership_and_one_warming_member_are_partial_not_blocked():

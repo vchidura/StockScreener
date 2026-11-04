@@ -14,7 +14,12 @@ from .dashboard_projection import (
 )
 from .database_access import RealtimeDatabaseRole
 from .lineage_head import require_member_set
-from .portal_compatibility_repository import SNAPSHOT_RELATION, _RealtimeCompatibilityRepository, _utc
+from .portal_compatibility_repository import (
+    SNAPSHOT_RELATION,
+    _RealtimeCompatibilityRepository,
+    _utc,
+    action_evidence_until,
+)
 from .portal_projection_repository import (
     RELEASE_CLASS_SESSION_CLOSE, RETENTION_HOT_AND_KEPT, persist_portal_snapshot_cursor,
     portal_session_date, publish_portal_release_cursor,
@@ -269,12 +274,13 @@ class RealtimeDashboardRepository(_RealtimeCompatibilityRepository):
                         or revisions[0]["payload_sha256"] != reference["payload_sha256"]):
                         raise DashboardPublicationUnavailable("Dashboard reference changed; republish required")
                 ids = [str(reference["security_id"]) for reference in references]
+                until = action_evidence_until(stored["generated_at"], cutoff)
                 cursor.execute(
                     "SELECT EXISTS (SELECT 1 FROM ref.corporate_action_revisions "
                     "WHERE security_id=ANY(%s::uuid[]) AND received_at>%s AND received_at<=%s) "
                     "OR EXISTS (SELECT 1 FROM ref.corporate_action_coverage "
                     "WHERE security_id=ANY(%s::uuid[]) AND received_at>%s AND received_at<=%s) AS action_drift",
-                    (ids, stored["generated_at"], cutoff, ids, stored["generated_at"], cutoff),
+                    (ids, stored["generated_at"], until, ids, stored["generated_at"], until),
                 )
                 if cursor.fetchone()["action_drift"]:
                     raise DashboardPublicationUnavailable("Dashboard action evidence changed; republish required")
@@ -307,6 +313,7 @@ class RealtimeDashboardRepository(_RealtimeCompatibilityRepository):
                 oldest_stale_market_time=payload["market_time"] if stale else None,
                 stale_intervals=["1d"] if stale else [], pipeline_active=False,
                 active_intervals=[], active_runs=[],
+                retained_setup_generated_at=payload["generated_at"],
                 intervals={"1d": dict(
                     market_time=payload["market_time"], published_at=payload["generated_at"],
                     expected_market_time=expected.isoformat(), **state,

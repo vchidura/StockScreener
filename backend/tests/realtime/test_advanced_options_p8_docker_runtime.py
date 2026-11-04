@@ -348,6 +348,8 @@ def test_flow_resident_targets_raw_and_normalized_offsets_independently(
 
 def test_window_separates_market_and_flow_shard_expectations():
     from realtime.advanced_options_p8_window import (
+        _journal_owner_epoch,
+        _resident_owner_epoch,
         _resident_shard_expectations,
     )
 
@@ -356,10 +358,28 @@ def test_window_separates_market_and_flow_shard_expectations():
         "shard_map_sha256": "a" * 64,
     }
     flow = {
+        "owner_epoch": 4,
         "shard_ids": [0],
         "shard_map_sha256": "b" * 64,
     }
 
+    assert _resident_owner_epoch(flow) == 4
+    with pytest.raises(
+        RuntimeError,
+        match="flow resident owner epoch changed",
+    ):
+        _resident_owner_epoch({})
+    journal_environment = SimpleNamespace(
+        options_flow_source=SimpleNamespace(
+            registration=SimpleNamespace(owner_epoch=3),
+        ),
+    )
+    assert _journal_owner_epoch(journal_environment) == 3
+    with pytest.raises(
+        RuntimeError,
+        match="journal owner epoch changed",
+    ):
+        _journal_owner_epoch(SimpleNamespace())
     assert _resident_shard_expectations(
         market,
         flow,
@@ -383,6 +403,78 @@ def test_window_separates_market_and_flow_shard_expectations():
             {},
             flow_shard_count=1,
         )
+
+
+def test_acquisition_terminal_clock_accepts_stopped_socket():
+    ended_at = datetime(2026, 11, 3, 15, 53, 1, tzinfo=timezone.utc)
+    status = {
+        "state": "COMPLETE",
+        "socket_state": "STOPPED",
+        "last_market_event_at_utc": ended_at.isoformat(),
+    }
+
+    assert roles_module._acquisition_terminal_ended_at(status) == ended_at
+    assert roles_module._acquisition_terminal_ended_at({
+        **status,
+        "state": "LIVE",
+    }) is None
+
+
+def test_ingress_reconciles_session_without_pending_window(monkeypatch):
+    binding = object()
+    waited = []
+    monkeypatch.setattr(
+        roles_module,
+        "_wait_v3_binding",
+        lambda *_args: waited.append(True),
+    )
+
+    assert roles_module._v3_role_binding(
+        object(),
+        binding,
+        {},
+        threading.Event(),
+        AdvancedOptionsProcessKind.INGRESS,
+    ) is binding
+    assert not waited
+
+    roles_module._v3_role_binding(
+        object(),
+        binding,
+        {},
+        threading.Event(),
+        AdvancedOptionsProcessKind.FLOW,
+    )
+    assert waited == [True]
+
+
+def test_terminal_journal_reconciliation_is_exact_and_write_free():
+    registration = SimpleNamespace(
+        status="DRAINED",
+        raw_committed_offset=100,
+        normalized_committed_offset=90,
+        sealed_files_sha256="a" * 64,
+    )
+
+    assert roles_module._terminal_journal_is_exact(
+        registration,
+        raw_offset=100,
+        event_offset=90,
+    )
+    with pytest.raises(
+        RuntimeError,
+        match="terminal journal offsets changed",
+    ):
+        roles_module._terminal_journal_is_exact(
+            registration,
+            raw_offset=101,
+            event_offset=90,
+        )
+    assert not roles_module._terminal_journal_is_exact(
+        SimpleNamespace(status="WRITING"),
+        raw_offset=100,
+        event_offset=90,
+    )
 
 
 def test_unavailable_flow_discovers_quiet_period_target_on_cadence(

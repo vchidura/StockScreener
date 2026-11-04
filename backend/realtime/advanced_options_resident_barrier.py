@@ -279,8 +279,8 @@ def load_ready_resident_window_targets_cursor(
         "JOIN rt.advanced_options_session_acquisition_authorizations "
         "AS session ON session.authorization_id="
         "cycle.session_authorization_id "
-        "JOIN rt.window_runs AS window "
-        "ON window.window_id=cycle.target_window_id "
+        "JOIN rt.window_runs AS window_run "
+        "ON window_run.window_id=cycle.target_window_id "
         "LEFT JOIN rt.advanced_options_resident_completions AS done "
         "ON done.target_window_id=cycle.target_window_id "
         "AND done.member=%s "
@@ -289,7 +289,11 @@ def load_ready_resident_window_targets_cursor(
         "AND EXISTS ("
         "SELECT 1 FROM rt.stream_sessions AS stream "
         "WHERE stream.journal_generation=session.journal_generation "
-        "AND stream.event_time_watermark>=cycle.options_cutoff"
+        # A stopped stream cannot add anything, so its journal already holds
+        # all it will ever hold at any later cutoff.
+        "AND (stream.event_time_watermark>=cycle.options_cutoff "
+        "OR (stream.status='STOPPED' "
+        "AND stream.ended_at<=cycle.options_cutoff))"
         ") ORDER BY cycle.options_cutoff,cycle.target_window_id",
         (member.value, str(session_authorization_id)),
     )
@@ -540,11 +544,11 @@ def advanced_options_v3_session_status_cursor(
         for name, offset in cursor.fetchall()
     }
     cursor.execute(
-        "SELECT cycle.target_window_id::text,window.window_key,"
-        "cycle.equity_cutoff,cycle.options_cutoff,window.state "
+        "SELECT cycle.target_window_id::text,window_run.window_key,"
+        "cycle.equity_cutoff,cycle.options_cutoff,window_run.state "
         "FROM rt.advanced_options_window_cycle_authorizations AS cycle "
-        "JOIN rt.window_runs AS window "
-        "ON window.window_id=cycle.target_window_id "
+        "JOIN rt.window_runs AS window_run "
+        "ON window_run.window_id=cycle.target_window_id "
         "WHERE cycle.session_authorization_id=%s "
         "ORDER BY cycle.options_cutoff,cycle.target_window_id",
         (str(session_authorization_id),),

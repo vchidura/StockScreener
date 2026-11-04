@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import InitVar, dataclass
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Mapping
 from uuid import UUID
@@ -16,13 +16,16 @@ from equity.screening_projection import finalize, project_security
 from research.screening import FIELDS, GAP_CATALOG, HOURLY_CATALOG, HOURLY_FIELDS, PATTERNS, digest
 
 from .contracts import canonical_sha256
+from .equity_bar_adapter import MAXIMUM_HISTORY_BINDING_DEPTH
 from .equity_screening_history import REALTIME_SCREENING_HISTORY_POLICY
+from .equity_history import EquityHistoryScope
 from .lineage_head import (
     assemble_lineage_head, bar_group_head, id_set_identity, inputs_sha256, require_bounded_screening_manifest,
     revision_chain_sha256,
 )
 from .portal_projection import RealtimeScreeningGeneration, build_screening_generation
 from .preflight import ProviderTier
+from .reference_continuity import source_manifest_continuity_fields
 
 SCREENING_LINEAGE_VERSION = "screening_lineage_head_v1"
 DAILY_ADJUSTED_GROUP = "1d:ADJUSTED"
@@ -60,7 +63,8 @@ class RealtimeScreeningInput:
 
     `known_by` is an InitVar on purpose: it is not a dataclass field, so it stays out of equality, repr and
     `canonical_json`/`canonical_sha256` (every input hash and payload hash is byte-identical with and without
-    it), yet `dataclasses.replace` carries it (it reads the instance attribute set below)."""
+    it), yet `dataclasses.replace` carries it (it reads the instance attribute set below).
+    History scopes use the shared binding-depth bound and must match the first bound source."""
 
     cohort_id: UUID
     provider_tier: ProviderTier
@@ -78,8 +82,9 @@ class RealtimeScreeningInput:
     history_binding_sha256: str | None = None
     identity_continuity_sha256: str | None = None
     known_by: InitVar[datetime | None] = None
+    history_scopes: InitVar[tuple[EquityHistoryScope, ...]] = ()
 
-    def __post_init__(self, known_by):
+    def __post_init__(self, known_by, history_scopes):
         if self.cutoff.tzinfo is None or self.cutoff.utcoffset() is None:
             raise ValueError("Screening cutoff must be timezone-aware")
         object.__setattr__(self, "cutoff", self.cutoff.astimezone(timezone.utc))
@@ -90,6 +95,16 @@ class RealtimeScreeningInput:
             if known_by < self.cutoff:
                 raise ValueError("Screening known_by must not precede the cutoff")
         object.__setattr__(self, "known_by", known_by)
+        if len(history_scopes) > MAXIMUM_HISTORY_BINDING_DEPTH or (
+            history_scopes and (
+                history_scopes[0].cohort_id != self.history_source_cohort_id
+                or history_scopes[0].provider_tier != self.history_source_provider_tier
+                or history_scopes[0].history_before != self.history_before
+                or history_scopes[0].binding_sha256 != self.history_binding_sha256
+            )
+        ):
+            raise ValueError("Screening history scope chain diverged")
+        object.__setattr__(self, "history_scopes", tuple(history_scopes))
 
     @property
     def recorded_by(self) -> datetime:
@@ -155,7 +170,7 @@ def _validate_bars(rows, member, inputs):
             and row["provider_tier"]
             == inputs.history_source_provider_tier.value
             and row["bar_end"] < inputs.history_before
-        )
+        ) or any(scope.matches(row) for scope in inputs.history_scopes)
         if (
             not (target_identity or history_identity)
             or str(row["security_id"]) != str(member["security_id"])
@@ -178,8 +193,26 @@ def _validate_bars(rows, member, inputs):
             if any(source is None for source in sources):
                 raise ValueError("Derived screening causal source is missing")
             sources.sort(key=lambda source: source["bar_start"])
+            contiguous = not any(a["bar_end"] != b["bar_start"] for a, b in zip(sources, sources[1:]))
+            if row["interval"] in {"1wk", "1mo"}:
+                session = row["session_date"]
+                if row["interval"] == "1wk":
+                    first = session - timedelta(days=session.weekday())
+                    last = first + timedelta(days=4)
+                else:
+                    first = session.replace(day=1)
+                    last = date(session.year + session.month // 12, session.month % 12 + 1, 1) - timedelta(days=1)
+                calendar = exchange_calendars.get_calendar("XNYS")
+                expected = tuple(
+                    (calendar.session_open(day).to_pydatetime(), calendar.session_close(day).to_pydatetime())
+                    for day in calendar.sessions_in_range(str(first), str(last))
+                )
+                contiguous = (
+                    all(source["interval"] == "1d" for source in sources)
+                    and tuple((source["bar_start"], source["bar_end"]) for source in sources) == expected
+                )
             if (sources[0]["bar_start"] != row["bar_start"] or sources[-1]["bar_end"] != row["bar_end"]
-                or any(a["bar_end"] != b["bar_start"] for a, b in zip(sources, sources[1:]))
+                or not contiguous
                 or any(s["adjustment_basis"] != row["adjustment_basis"] for s in sources)):
                 raise ValueError("Derived screening source window/basis drift")
             expected = [sources[0]["open"], max(s["high"] for s in sources),
@@ -239,7 +272,11 @@ def produce_realtime_screening(inputs: RealtimeScreeningInput) -> RealtimeScreen
             raise ValueError(f"Screening reference is not available: {ticker}")
         own = [dict(bar) for bar in bars_by_ticker.get(ticker, ())]
         _validate_bars(own, member, inputs)
-        adjusted = sorted((b for b in own if b["interval"] == "1d" and b["adjustment_basis"] == "ADJUSTED"), key=lambda b: b["session_date"])
+        adjusted = sorted((
+            b for b in own
+            if b["interval"] == "1d" and b["adjustment_basis"] == "ADJUSTED"
+            and b["session_date"] in ordinals
+        ), key=lambda b: b["session_date"])
         raw = sorted((b for b in own if b["interval"] == "1d" and b["adjustment_basis"] == "RAW_UNADJUSTED"), key=lambda b: b["session_date"])
         if [b["session_date"] for b in adjusted] != sessions:
             observed = [b["session_date"] for b in adjusted]
@@ -338,6 +375,7 @@ def produce_realtime_screening(inputs: RealtimeScreeningInput) -> RealtimeScreen
         projection_code_sha256=digest(Path(__file__).read_text(encoding="utf-8")),
         input_sha256=inputs_sha256(inputs), lineage_contract=dict(version=SCREENING_LINEAGE_VERSION),
     )
+    manifest.update(source_manifest_continuity_fields(inputs))
     payload = finalize(rows, manifest, lineage)
     payload.update(
         gap_contract=REALTIME_GAP_CATALOG,

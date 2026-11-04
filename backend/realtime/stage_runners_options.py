@@ -39,7 +39,7 @@ import hashlib
 import logging
 import threading
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta
 from typing import Any
 from uuid import UUID, uuid5
@@ -913,6 +913,17 @@ def _start_session(environment: RunnerEnvironment, settings: OptionsFlowSettings
                                 clock=environment.options_flow_clock, in_transaction=hook)
 
     def gap_sink(entries: Sequence[GapEntry]) -> None:
+        registered_session_id = getattr(source, "registered_session_id", None)
+        if registered_session_id is not None:
+            entries = [
+                replace(
+                    entry,
+                    stream_session_id=registered_session_id(
+                        entry.stream_session_id
+                    ),
+                )
+                for entry in entries
+            ]
         try:
             with connection.context.transaction() as unit:
                 persist_gap_entries(unit.cursor, entries)

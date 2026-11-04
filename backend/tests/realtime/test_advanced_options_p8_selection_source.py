@@ -14,7 +14,10 @@ from realtime.advanced_options_p8_selection_source import (
     MassiveAdvancedOptionsSelectionSource,
     SEALED_CAPTURE_EXACT_FOUR_PROFILE,
     SEALED_CAPTURE_GENERALIZED_C6_PROFILE,
+    P8SelectionNoUsableContracts,
+    P8SelectionProviderAttempt,
     _candidate_from_snapshot,
+    _snapshot_rejection_reason,
     p8_activity_selection_capture_from_sealed,
 )
 from realtime.advanced_options_p8_production import (
@@ -939,3 +942,157 @@ def test_p8_cycle_cutoff_is_prospective_and_window_bounded():
         REVIEWED,
         REVIEWED + timedelta(minutes=10),
     ) == REVIEWED + timedelta(minutes=9)
+
+
+def _rejectable_row():
+    return _contract(
+        "QQQ",
+        "O:QQQ261021C00600000",
+        "call",
+        600,
+        600,
+    )
+
+
+@pytest.mark.parametrize(
+    ("mutate", "reason"),
+    (
+        (lambda row: row.pop("last_quote"), "MISSING_LAST_QUOTE"),
+        (lambda row: row.pop("day"), "MISSING_DAY"),
+        (lambda row: row.pop("details"), "MISSING_DETAILS"),
+        (lambda row: row.pop("underlying_asset"), "MISSING_UNDERLYING"),
+        (lambda row: row["last_quote"].clear(), "INCOMPLETE_QUOTE"),
+        (lambda row: row["last_quote"].pop("ask"), "INCOMPLETE_QUOTE"),
+        (
+            lambda row: row["last_quote"].pop("last_updated"),
+            "INCOMPLETE_QUOTE",
+        ),
+        (
+            lambda row: row["last_quote"].update(bid=0, ask=0),
+            "NON_POSITIVE_ASK",
+        ),
+        (
+            lambda row: row["last_quote"].update(bid=2, ask=1),
+            "CROSSED_QUOTE",
+        ),
+        (
+            lambda row: row["details"].pop("strike_price"),
+            "INCOMPLETE_DETAILS",
+        ),
+        (
+            lambda row: row["underlying_asset"].pop("price"),
+            "MISSING_UNDERLYING_PRICE",
+        ),
+    ),
+)
+def test_absent_optional_snapshot_field_rejects_only_its_row(mutate, reason):
+    row = _rejectable_row()
+    mutate(row)
+
+    assert _snapshot_rejection_reason(row) == reason
+    assert _candidate_from_snapshot(row, session_date=SESSION) is None
+
+
+def test_null_day_volume_is_zero_activity_not_a_failed_capture():
+    row = _rejectable_row()
+    row["day"]["volume"] = None
+
+    candidate = _candidate_from_snapshot(row, session_date=SESSION)
+
+    assert candidate is not None
+    assert candidate.day_volume == 0
+
+
+def test_rejected_chain_reports_reasons_and_every_real_request():
+    zero_quote = _rejectable_row()
+    zero_quote["last_quote"].update(bid=0, ask=0)
+    no_quote = _rejectable_row()
+    no_quote.pop("last_quote")
+    first = _payload(
+        "QQQ",
+        [zero_quote, zero_quote],
+        next_url=(
+            "https://api.massive.com/v3/snapshot/options/QQQ?cursor=2"
+        ),
+    )
+    second = _payload("QQQ", [no_quote])
+    source = MassiveAdvancedOptionsSelectionSource(
+        _Transport([first, second]),
+        _Spots(),
+        clock=lambda: REVIEWED,
+        maximum_provider_requests=4,
+    )
+
+    with pytest.raises(P8SelectionNoUsableContracts) as raised:
+        source.capture(reviewed_at=REVIEWED, session_date=SESSION)
+
+    assert raised.value.rejections == {
+        "NON_POSITIVE_ASK": 2,
+        "MISSING_LAST_QUOTE": 1,
+    }
+    assert raised.value.reason_code == (
+        "NO_USABLE_CONTRACTS:QQQ:rows=3:"
+        "NON_POSITIVE_ASK=2,MISSING_LAST_QUOTE=1"
+    )
+    assert "no usable contracts for QQQ" in str(raised.value)
+    assert source.provider_attempts == (
+        P8SelectionProviderAttempt(
+            200,
+            len(json.dumps(first).encode("utf-8")),
+            2,
+        ),
+        P8SelectionProviderAttempt(
+            200,
+            len(json.dumps(second).encode("utf-8")),
+            1,
+        ),
+    )
+
+
+def test_empty_chain_is_distinguishable_from_rejected_rows():
+    source = MassiveAdvancedOptionsSelectionSource(
+        _Transport([_payload("QQQ", [])]),
+        _Spots(),
+        clock=lambda: REVIEWED,
+    )
+
+    with pytest.raises(P8SelectionNoUsableContracts) as raised:
+        source.capture(reviewed_at=REVIEWED, session_date=SESSION)
+
+    assert raised.value.reason_code == "NO_USABLE_CONTRACTS:QQQ:rows=0"
+    assert source.provider_attempts[0].row_count == 0
+
+
+def test_failed_transport_and_http_error_are_still_accounted():
+    class _Partial:
+        http_status = 200
+        response_bytes = 1_234
+
+        def get(self, _url, _params):
+            raise TimeoutError("body read timed out")
+
+    class _ServerError:
+        def get(self, _url, _params):
+            return PolygonHttpResponse(502, b"bad gateway")
+
+    partial = MassiveAdvancedOptionsSelectionSource(
+        _Partial(),
+        _Spots(),
+        clock=lambda: REVIEWED,
+    )
+    with pytest.raises(TimeoutError):
+        partial.capture(reviewed_at=REVIEWED, session_date=SESSION)
+    assert partial.provider_attempts == (
+        P8SelectionProviderAttempt(200, 1_234),
+    )
+
+    rejected = MassiveAdvancedOptionsSelectionSource(
+        _ServerError(),
+        _Spots(),
+        clock=lambda: REVIEWED,
+    )
+    with pytest.raises(RuntimeError, match="HTTP 502"):
+        rejected.capture(reviewed_at=REVIEWED, session_date=SESSION)
+    assert rejected.provider_attempts == (
+        P8SelectionProviderAttempt(502, len(b"bad gateway")),
+    )

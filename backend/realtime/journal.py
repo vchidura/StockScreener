@@ -911,6 +911,24 @@ class RawJournalReader:
             return 0, 0
         return int(row["raw_offset"]), int(row["event_offset"])
 
+    def latest_event_at(self, *, after_event_offset: int = 0) -> datetime | None:
+        """The newest event time past one offset, so a caller can keep a running maximum."""
+        with closing(
+            _connect(
+                self.path,
+                timeout_seconds=self.timeout_seconds,
+                read_only=True,
+            )
+        ) as connection:
+            row = connection.execute(
+                "SELECT max(event_at) AS event_at FROM normalized_events "
+                "WHERE event_offset > ?",
+                (after_event_offset,),
+            ).fetchone()
+        if row is None or row["event_at"] is None:
+            return None
+        return _parse_stamp(row["event_at"])
+
     def read_quarantines(
         self, *, raw_offset: int | None = None
     ) -> tuple[QuarantineJournalRecord, ...]:

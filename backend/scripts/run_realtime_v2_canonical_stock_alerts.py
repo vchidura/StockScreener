@@ -8,6 +8,7 @@ import os
 import signal
 import sys
 import threading
+import time
 from datetime import date, datetime, timezone
 from pathlib import Path
 from uuid import UUID
@@ -15,10 +16,14 @@ from uuid import UUID
 from psycopg2.pool import ThreadedConnectionPool
 
 
+_PUBLICATION_RETRY_SECONDS = 60
 BACKEND_DIR = Path(__file__).resolve().parent.parent
 if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
+from realtime.canonical_stock_alert_publication import (  # noqa: E402
+    publish_due_canonical_stock_alerts,
+)
 from realtime.canonical_stock_alert_repository import (  # noqa: E402
     build_canonical_stock_alert_batch_cursor,
     canonical_stock_alert_health_cursor,
@@ -28,6 +33,13 @@ from realtime.canonical_stock_alert_repository import (  # noqa: E402
 from realtime.advanced_realtime_session_operations import (  # noqa: E402
     AdvancedSessionOperation,
     diagnostic_authorization_from_payload,
+)
+from realtime.database_access import (  # noqa: E402
+    RealtimeDatabasePrincipal,
+    RealtimeDatabaseRole,
+    RealtimePoolBudget,
+    RealtimeProcessDatabasePlan,
+    RoleScopedConnectionProvider,
 )
 from realtime.database_access_v2 import (  # noqa: E402
     APP_ROLE,
@@ -42,6 +54,7 @@ from realtime.migrations import (  # noqa: E402
     EXPECTED_V2_DATABASE_NAME,
     validate_target_database_v2,
 )
+from realtime.worker_database import RealtimeProcessDatabase  # noqa: E402
 from realtime.advanced_realtime_v3_runtime import (  # noqa: E402
     load_current_advanced_realtime_session_scope_cursor,
 )
@@ -220,6 +233,32 @@ def _provider(args):
     return provider, pool
 
 
+def _publication_databases(pool):
+    """Serving publication role plans, under the same scoped app login."""
+    app_role = f"{EXPECTED_V2_DATABASE_NAME}_app"
+    roles = RoleScopedConnectionProvider(
+        {RealtimeDatabasePrincipal.RUNTIME: pool},
+        {
+            RealtimeDatabaseRole.COMPUTE: app_role,
+            RealtimeDatabaseRole.PUBLICATION: app_role,
+        },
+    )
+    return tuple(
+        RealtimeProcessDatabase(
+            RealtimeProcessDatabasePlan(
+                f"worker:canonical_stock_alerts:{role.value.lower()}",
+                role,
+                RealtimePoolBudget(0, 1),
+            ),
+            roles,
+        )
+        for role in (
+            RealtimeDatabaseRole.COMPUTE,
+            RealtimeDatabaseRole.PUBLICATION,
+        )
+    )
+
+
 def _runtime_scope(provider, args):
     if not args.dynamic_scope:
         return args.cohort_id, args.session_date
@@ -294,6 +333,9 @@ def main(argv=None) -> int:
         stop = threading.Event()
         signal.signal(signal.SIGINT, lambda *_: stop.set())
         signal.signal(signal.SIGTERM, lambda *_: stop.set())
+        serving = args.operation is AdvancedSessionOperation.PRIMARY_SERVING
+        databases = _publication_databases(pool) if serving else None
+        next_publication_at = 0.0
         while not stop.is_set():
             cohort_id, session_date = _runtime_scope(provider, args)
             if cohort_id is None:
@@ -342,6 +384,34 @@ def main(argv=None) -> int:
                     "delivery_performed": False,
                     "execution_performed": False,
                 }, default=str, sort_keys=True), flush=True)
+            if serving and time.monotonic() >= next_publication_at:
+                # Publication must never stop batch production; an unpublished
+                # batch stays due and is retried after a bounded pause.
+                try:
+                    published = publish_due_canonical_stock_alerts(
+                        provider,
+                        compute=databases[0],
+                        publication=databases[1],
+                        cohort_id=cohort_id,
+                        session_date=session_date,
+                    )
+                except Exception as error:
+                    next_publication_at = (
+                        time.monotonic() + _PUBLICATION_RETRY_SECONDS
+                    )
+                    print(json.dumps({
+                        "status": "PUBLICATION_FAILED",
+                        "reason": f"{type(error).__name__}:{error}"[:300],
+                        "retry_seconds": _PUBLICATION_RETRY_SECONDS,
+                        "provider_fetch_performed": False,
+                    }, sort_keys=True), flush=True)
+                else:
+                    if published:
+                        print(json.dumps({
+                            "status": "STOCK_ALERTS_PUBLICATION",
+                            "publications": published,
+                            "provider_fetch_performed": False,
+                        }, default=str, sort_keys=True), flush=True)
             stop.wait(args.poll_seconds)
         return 0
     finally:

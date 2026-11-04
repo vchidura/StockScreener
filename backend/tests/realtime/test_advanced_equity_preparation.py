@@ -1,5 +1,6 @@
 from contextlib import contextmanager
-from datetime import date, datetime, timezone
+from dataclasses import replace
+from datetime import date, datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 from urllib.parse import urlparse
@@ -7,10 +8,13 @@ from uuid import UUID
 
 import pytest
 
+from equity.domain import BarAvailabilityMode, BarSourceKind
+from equity.polygon import normalize_native_bars
 from realtime.advanced_equity_preparation import (
     AdvancedEquityPreparationResident,
     BoundedPolygonEquityPreparationClient,
     EquityPreparationChunk,
+    EquityPreparationBlockedError,
     EquityPreparationClaim,
     EquityPreparationFetchRequest,
     EquityPreparationLimits,
@@ -20,6 +24,7 @@ from realtime.advanced_equity_preparation import (
     MassiveEquityPreparationSource,
     advanced_equity_live_priority_cursor,
     preparation_retry_delay_seconds,
+    _advanced_rest_facts,
 )
 from realtime.advanced_realtime_desired_state import DesiredMemberKind
 from realtime.advanced_realtime_desired_state_repository import (
@@ -170,9 +175,9 @@ def test_preparation_target_reuses_complete_portal_history_contract():
         (
             "1wk",
             date(2025, 8, 22),
-            datetime(2025, 8, 24, 4, 0, tzinfo=UTC),
-            date(2025, 8, 24),
-            date(2025, 8, 24),
+            datetime(2025, 8, 17, 4, 0, tzinfo=UTC),
+            date(2025, 8, 17),
+            date(2025, 8, 22),
         ),
         (
             "1mo",
@@ -251,6 +256,127 @@ def test_adjusted_extension_chunks_use_provider_bucket_boundaries(
     assert len(chunk.bars) == 1
 
 
+def test_bootstrap_weekly_revalidation_replaces_full_interval_without_resetting_progress():
+    sessions = (date(2026, 10, 9), date(2026, 10, 16), date(2026, 10, 23), date(2026, 10, 30))
+
+    class FakeClient:
+        def fetch_native_bars(self, ticker, interval, start, end, *, adjusted):
+            assert (ticker, interval, start, end, adjusted) == (
+                "XLK", "1wk", date(2026, 10, 4), date(2026, 10, 30), True,
+            )
+            return tuple({
+                "t": int(datetime(2026, 10, day, 4, tzinfo=UTC).timestamp() * 1000),
+                "o": 100, "h": 102, "l": 99, "c": 101, "v": 5000,
+            } for day in (4, 11, 18, 25))
+
+    claim = _claim(
+        stage=EquityPreparationStage.ADJUSTED_DAILY, stage_order=20,
+        target={"interval_sessions": {"1wk": [value.isoformat() for value in sessions]}},
+        watermark={"interval_index": 0, "session_index": 2},
+        coverage={"available_intervals": {"1wk:ADJUSTED": 2}},
+    )
+    request = EquityPreparationFetchRequest(
+        claim, datetime(2026, 11, 2, 13, tzinfo=UTC), EquityPreparationLimits(),
+        history_sessions=sessions[2:], revalidate_weekly_history=True,
+    )
+
+    chunk = MassiveEquityPreparationSource(FakeClient()).fetch(request)
+
+    assert chunk.complete
+    assert len(chunk.bars) == 4
+    assert tuple(fact.revision.session_date for fact in chunk.bars) == sessions
+    assert chunk.watermark_after == {"interval_index": 1, "session_index": 0}
+    assert chunk.coverage_after == {"available_intervals": {"1wk:ADJUSTED": 4}}
+    assert chunk.source_lineage["coordinate_contract"] == "MASSIVE_WEEK_SUNDAY_START_V2"
+    assert chunk.source_lineage["whole_interval_revalidated"] is True
+
+
+def test_preparation_rest_ids_are_stable_and_scoped_to_cohort_and_basis():
+    rows = ({"t": 1793332800000, "o": 100, "h": 102, "l": 99, "c": 101, "v": 5000},)
+    observed = datetime(2026, 11, 2, 13, tzinfo=UTC)
+    adjusted = normalize_native_bars(
+        UUID(int=2), "XLK", "1d", rows, observed_at=observed, adjusted=True,
+        availability_mode=BarAvailabilityMode.HISTORICAL_RECONSTRUCTED,
+        ingestion_segment_id=UUID(int=55),
+    )
+    raw = normalize_native_bars(
+        UUID(int=2), "XLK", "1d", rows, observed_at=observed, adjusted=False,
+        availability_mode=BarAvailabilityMode.HISTORICAL_RECONSTRUCTED,
+        ingestion_segment_id=UUID(int=55),
+    )
+    claim = _claim()
+    original_id = adjusted[0].bar_revision_id
+    (first,) = _advanced_rest_facts(adjusted, claim=claim)
+    (replayed,) = _advanced_rest_facts(adjusted, claim=claim)
+    (other_cohort,) = _advanced_rest_facts(adjusted, claim=_claim(source_cohort_id=UUID(int=99)))
+    (other_basis,) = _advanced_rest_facts(raw, claim=claim)
+
+    assert first.revision.bar_revision_id == replayed.revision.bar_revision_id
+    assert len({first.revision.bar_revision_id, other_cohort.revision.bar_revision_id,
+                other_basis.revision.bar_revision_id, original_id}) == 4
+    assert adjusted[0].bar_revision_id == original_id
+    assert first.revision.system_observed_at == observed
+    assert first.revision.payload_sha256 == adjusted[0].payload_sha256
+
+
+def test_bootstrap_derivation_uses_real_identity_clock_and_checks_exact_source_identity(monkeypatch):
+    checked = datetime(2026, 11, 2, 13, tzinfo=UTC)
+    opened = datetime(2026, 10, 30, 13, 30, tzinfo=UTC)
+    claim = _claim(
+        stage=EquityPreparationStage.DERIVED_INTERVALS,
+        target={"target_intervals": ["15m"], "source_sessions": ["2026-10-30"]},
+    )
+    revisions = normalize_native_bars(
+        claim.security_id, claim.ticker, "5m", tuple({
+            "t": int((opened + timedelta(minutes=5 * offset)).timestamp() * 1000),
+            "o": 100, "h": 102, "l": 99, "c": 101, "v": 5000,
+        } for offset in range(3)),
+        observed_at=checked, adjusted=False,
+        availability_mode=BarAvailabilityMode.HISTORICAL_RECONSTRUCTED,
+        ingestion_segment_id=UUID(int=55),
+    )
+    sources = _advanced_rest_facts(revisions, claim=claim)
+    output = replace(sources[0], revision=replace(
+        sources[0].revision, interval="15m", bar_end=opened + timedelta(minutes=15),
+        source_kind=BarSourceKind.DERIVED,
+        source_bar_revision_ids=tuple(fact.revision.bar_revision_id for fact in sources),
+    ))
+    security = SimpleNamespace(
+        active=True, security_id=claim.security_id, ticker=claim.ticker,
+        security_revision_id=UUID(int=88),
+    )
+    load_identity = MagicMock(return_value=security)
+    monkeypatch.setattr(
+        "realtime.advanced_equity_preparation.load_current_five_minute_facts_cursor",
+        lambda *_args, **_kwargs: sources,
+    )
+    monkeypatch.setattr("realtime.advanced_equity_preparation.load_derivation_security_cursor", load_identity)
+    monkeypatch.setattr(
+        "realtime.advanced_equity_preparation.derive_realtime_interval_facts",
+        lambda *_args, **_kwargs: (output,),
+    )
+
+    @contextmanager
+    def transaction(*_args, **_kwargs):
+        yield SimpleNamespace(cursor=MagicMock())
+
+    resident = AdvancedEquityPreparationResident(
+        SimpleNamespace(transaction=transaction), SimpleNamespace(), owner_id=UUID(int=5),
+        bootstrap_history=lambda *_args: (None, ()), bootstrap_revision_id=claim.revision_id,
+    )
+    request = EquityPreparationFetchRequest(claim, checked, EquityPreparationLimits())
+    chunk = resident._derive(request)
+
+    assert load_identity.call_args.kwargs["window_end"] == checked
+    assert load_identity.call_args.kwargs["as_of"] == checked
+    assert chunk.bars[0].revision.bar_end == opened + timedelta(minutes=15)
+    assert chunk.source_lineage["security_revision_id"] == str(security.security_revision_id)
+    assert chunk.source_lineage["security_reference_clock"] == checked.isoformat()
+    security.security_id = UUID(int=99)
+    with pytest.raises(EquityPreparationBlockedError, match="REFERENCE_IDENTITY_DIVERGED"):
+        resident._derive(request)
+
+
 class _JsonResponse:
     status_code = 200
 
@@ -304,6 +430,29 @@ def _reference_chunk(overview):
         )
     )
     return chunk, session.calls
+
+
+def test_provider_fence_runs_before_each_network_request_and_can_stop_a_chunk():
+    session = _WholeMarketPaginatingSession({"ticker": "SPY"})
+    client = BoundedPolygonEquityPreparationClient("test-key", session=session)
+    calls = []
+
+    def fence(timeout_seconds):
+        calls.append(timeout_seconds)
+        if len(calls) == 2:
+            raise EquityPreparationBlockedError("LEASE_HEADROOM_EXHAUSTED")
+
+    client.begin_chunk(maximum_requests=3, maximum_response_bytes=8192, before_request=fence)
+    client._request("https://api.massive.com/v3/reference/tickers/SPY", {})
+    with pytest.raises(EquityPreparationBlockedError, match="LEASE_HEADROOM_EXHAUSTED"):
+        client._request("https://api.massive.com/v3/reference/tickers/SPY", {})
+    assert len(session.calls) == 1
+    assert calls == [client.timeout_seconds, client.timeout_seconds]
+    assert client.chunk_metrics()[0] == 1
+    client.begin_chunk(maximum_requests=1, maximum_response_bytes=8192)
+    client._request("https://api.massive.com/v3/reference/tickers/SPY", {})
+    assert len(session.calls) == 2
+    assert len(calls) == 2
 
 
 ETF_OVERVIEW = {"ticker": "SPY", "type": "ETF", "active": True}

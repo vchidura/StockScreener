@@ -81,7 +81,7 @@ def test_continuous_controller_derives_daily_scope_and_finite_budgets():
     assert args.catch_up_mode == "AUTO"
     assert args.external_ingress is True
     derived = script._continuous_session_budgets(args, 9)
-    assert derived.rest_repair_requests == 18
+    assert derived.rest_repair_requests == 72
     assert derived.rest_repair_decoded_bytes > 0
 
 
@@ -190,9 +190,9 @@ def test_controller_auto_catch_up_derives_target_budget():
     ])
 
     assert args.catch_up_mode == "AUTO"
-    assert args.budgets.rest_repair_requests == 18
+    assert args.budgets.rest_repair_requests == 72
     assert args.budgets.rest_repair_decoded_bytes == (
-        18 * (1024 * 1024 + 1)
+        72 * (1024 * 1024 + 1)
     )
     assert args.rest_repair_response_byte_limit == 1024 * 1024
     assert args.rest_repair_expected_cost == (
@@ -428,7 +428,7 @@ def test_websocket_child_starts_before_hybrid_repair_tick():
     assert [item[0] for item in order] == ["websocket", "repair-tick"]
 
 
-def test_hybrid_repair_command_reuses_fixed_cutoff_incremental_runner(tmp_path):
+def test_hybrid_repair_command_targets_the_exact_stored_hole(tmp_path):
     args = script.parse_args([
         *_base()[:-1],
         "--rest-repair-requests",
@@ -467,32 +467,21 @@ def test_hybrid_repair_command_reuses_fixed_cutoff_incremental_runner(tmp_path):
         2,
     )
 
-    command = script._incremental_repair_command(
+    command = script._gap_repair_command(
         args,
         runtime,
         identity,
         tmp_path / "repair.json",
-        SimpleNamespace(
-            rest_provider_delay_seconds=0,
-            rest_aggregate_endpoint_class=(
-                "MASSIVE_STOCKS_AGGREGATES_1M"
-            ),
-            rest_eligibility_policy_version=(
-                "advanced-real-time-closed-bar-v1"
-            ),
-        ),
-        2,
     )
 
-    assert "run_realtime_v2_incremental_equity.py" in " ".join(command)
-    assert command[command.index("--cutoff") + 1].endswith("13:40:00+00:00")
-    assert "--advanced-ingress-plan-id" in command
-    assert command[command.index("--provider-delay-seconds") + 1] == "0"
-    assert command[command.index("--repair-attempt") + 1] == "2"
-    assert command.count("--once") == 1
+    assert "run_realtime_v2_advanced_gap_repair.py" in " ".join(command)
+    assert command[command.index("--plan-id") + 1] == str(runtime.plan_id)
+    assert command[command.index("--gap-start") + 1].endswith("13:30:00+00:00")
+    assert command[command.index("--gap-end") + 1].endswith("13:40:00+00:00")
+    assert command.count("--execute") == 1
 
 
-def test_zero_repair_budget_blocks_hybrid_gap_without_byte_limit(
+def test_zero_repair_budget_blocks_repair_without_ending_the_session(
     monkeypatch,
     tmp_path,
 ):
@@ -502,6 +491,7 @@ def test_zero_repair_budget_blocks_hybrid_gap_without_byte_limit(
         cohort_id=script.UUID(int=2),
         plan_id=script.UUID(int=3),
         budgets=args.budgets,
+        authorized_end_at=now + timedelta(hours=6),
     )
 
     class Transaction:
@@ -517,9 +507,10 @@ def test_zero_repair_budget_blocks_hybrid_gap_without_byte_limit(
     monkeypatch.setattr(
         script,
         "_load_hybrid_progress_cursor",
-        lambda *_args: (
-            now - timedelta(minutes=1),
-            None,
+        lambda *_args, **_kwargs: (
+            now - timedelta(minutes=40),
+            now - timedelta(minutes=10),
+            now - timedelta(minutes=5),
             (1,),
         ),
     )
@@ -566,8 +557,56 @@ def test_zero_repair_budget_blocks_hybrid_gap_without_byte_limit(
 
     coordinator._plan_next(now)
 
-    assert coordinator.terminal_outcome == "AUTHORIZATION_EXHAUSTED"
+    assert coordinator.repair_blocked == "AUTHORIZATION_EXHAUSTED"
     assert coordinator.window is None
+    assert coordinator.next_plan_at > now
+
+
+def test_reconnect_hole_is_found_from_stored_bars_not_the_first_stream():
+    # 2026-11-02: the stream began at the open, and the 16:22 hole came later.
+    session_open = datetime(2026, 11, 2, 14, 30, tzinfo=timezone.utc)
+    hole_start = datetime(2026, 11, 2, 16, 22, tzinfo=timezone.utc)
+    hole_end = datetime(2026, 11, 2, 16, 36, tzinfo=timezone.utc)
+    through = datetime(2026, 11, 2, 16, 40, tzinfo=timezone.utc)
+    first_stream = session_open + timedelta(seconds=20)
+    minutes = int((through - session_open).total_seconds() // 60)
+    stored = [
+        (1, session_open + timedelta(minutes=index))
+        for index in range(minutes)
+        if not hole_start
+        <= session_open + timedelta(minutes=index)
+        < hole_end
+    ]
+    cursor = MagicMock()
+    cursor.fetchone.return_value = (first_stream,)
+    cursor.fetchall.side_effect = [[(1,)], stored]
+
+    assert script._load_hybrid_progress_cursor(
+        cursor,
+        script.UUID(int=3),
+        script.UUID(int=2),
+        session_open=session_open,
+        through=through,
+    ) == (first_stream, hole_start, hole_end, (1,))
+
+
+def test_complete_stored_coverage_has_no_hole():
+    session_open = datetime(2026, 11, 2, 14, 30, tzinfo=timezone.utc)
+    through = session_open + timedelta(minutes=2)
+    cursor = MagicMock()
+    cursor.fetchone.return_value = (session_open,)
+    cursor.fetchall.side_effect = [
+        [(1,)],
+        [(1, session_open), (1, session_open + timedelta(minutes=1))],
+    ]
+
+    assert script._load_hybrid_progress_cursor(
+        cursor,
+        script.UUID(int=3),
+        script.UUID(int=2),
+        session_open=session_open,
+        through=through,
+    ) == (session_open, None, None, (1,))
 
 
 def test_hybrid_attempt_paths_and_claims_are_durable_and_bounded(tmp_path):
@@ -664,7 +703,7 @@ def test_coverage_pending_gets_one_durable_retry_then_blocks(tmp_path):
 
     assert coordinator.window.state == "PENDING"
     assert coordinator.window.owner_epoch == 1
-    assert coordinator.terminal_outcome is None
+    assert coordinator.repair_blocked is None
     assert now + identity.retry_grace == now + timedelta(seconds=10)
 
     second_report = script._hybrid_report_path(
@@ -690,7 +729,8 @@ def test_coverage_pending_gets_one_durable_retry_then_blocks(tmp_path):
         stderr="",
     )
 
-    assert coordinator.terminal_outcome == "BLOCKED_GAP"
+    assert coordinator.repair_blocked == "BLOCKED_GAP"
+    assert coordinator.window is None
     assert any(
         "state=%s" in call.args[0]
         and call.args[1][0] == "RETAINED_GAP"
@@ -760,7 +800,7 @@ def test_reportless_child_exit_accepts_complete_durable_closure(
     )
 
     verify.assert_called_once_with(now)
-    assert coordinator.terminal_outcome is None
+    assert coordinator.repair_blocked is None
     assert not coordinator.window.report_path.exists()
 
 

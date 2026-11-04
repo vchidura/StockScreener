@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime, timezone
 from uuid import NAMESPACE_URL, UUID, uuid5
 
@@ -37,6 +37,51 @@ def _sha256(value: str, name: str) -> str:
     ):
         raise ValueError(f"{name} must be a SHA-256 digest")
     return value
+
+
+class _StoredIdentity:
+    """A rebuilt universe or manifest carrying the hash its materialized cohort stored."""
+
+    def __init__(self, value, sha256: str) -> None:
+        self._value = value
+        self.sha256 = sha256
+
+    def __getattr__(self, name: str):
+        return getattr(self._value, name)
+
+    def __eq__(self, other: object) -> bool:
+        return (
+            isinstance(other, _StoredIdentity)
+            and self.sha256 == other.sha256
+            and self._value == other._value
+        )
+
+    def __hash__(self) -> int:
+        return hash(self.sha256)
+
+
+def materialized_cohort_identity_payload(plan) -> dict[str, str] | None:
+    """What a binding must carry to rebuild a cohort materialized from the desired state."""
+    if not isinstance(plan.manifest, _StoredIdentity):
+        return None
+    return {
+        "cohort_id": str(plan.cohort_id),
+        "cohort_sha256": plan.cohort_sha256,
+        "manifest_id": str(plan.manifest_id),
+        "manifest_sha256": plan.manifest.sha256,
+        "universe_sha256": plan.universe.sha256,
+    }
+
+
+def with_materialized_cohort_identity(plan, value: Mapping[str, str]):
+    return replace(
+        plan,
+        cohort_id=UUID(value["cohort_id"]),
+        cohort_sha256=value["cohort_sha256"],
+        manifest_id=UUID(value["manifest_id"]),
+        manifest=_StoredIdentity(plan.manifest, value["manifest_sha256"]),
+        universe=_StoredIdentity(plan.universe, value["universe_sha256"]),
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -378,8 +423,35 @@ def load_advanced_equity_control_plane_plan_cursor(
         str(row["profile_sha256"]),
     )
     if plan.cohort_id != cohort_id or actual != expected:
-        raise ValueError(
-            "Advanced Equity source control plane identity changed"
+        # A session cohort materialized from the desired state has its own
+        # manifest and effective time, which this rebuild cannot reproduce. Its
+        # snapshot row is the durable proof of that identity; everything the
+        # profile determines must still match.
+        cursor.execute(
+            "SELECT 1 FROM rt.realtime_desired_session_snapshots "
+            "WHERE cohort_id=%s AND manifest_id=%s AND session_date=%s",
+            (str(cohort_id), str(row["manifest_id"]), row["session_date"]),
+        )
+        if (
+            cursor.fetchone() is None
+            or plan.configuration_sha256 != str(row["configuration_sha256"])
+            or plan.model_bundle_sha256 != str(row["model_bundle_sha256"])
+            or plan.valuation_sha256 != str(row["valuation_sha256"])
+            or plan.session_date != row["session_date"]
+            or plan.profile_id != UUID(str(row["profile_id"]))
+            or plan.capabilities_sha256 != str(row["capabilities_sha256"])
+            or plan.profile_sha256 != str(row["profile_sha256"])
+        ):
+            raise ValueError(
+                "Advanced Equity source control plane identity changed"
+            )
+        return replace(
+            plan,
+            cohort_id=cohort_id,
+            cohort_sha256=str(row["cohort_sha256"]),
+            manifest_id=UUID(str(row["manifest_id"])),
+            manifest=_StoredIdentity(plan.manifest, str(row["manifest_sha256"])),
+            universe=_StoredIdentity(plan.universe, str(row["universe_sha256"])),
         )
     return plan
 

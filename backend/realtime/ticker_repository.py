@@ -17,6 +17,7 @@ from equity.ticker_contracts import PATTERN_WATCH_INTERVALS, PATTERN_WATCH_POLIC
 from .contracts import canonical_sha256
 from .database_access import RealtimeDatabaseRole
 from .equity_bar_repository import load_current_bar_groups_cursor
+from .equity_history import EquityHistoryScope
 from .equity_evidence_repository import (
     EvidenceRef,
     RealtimeEquityMaterializationWrite,
@@ -28,8 +29,9 @@ from .equity_evidence_repository import (
 )
 from .lineage_head import inputs_sha256, mapping_identity, reference_set, require_member_set, workspace_set
 from .portal_compatibility_repository import (
-    SNAPSHOT_IDENTITY_RELATION, SNAPSHOT_RELATION, BoundedCache, _RealtimeCompatibilityRepository,
-    _active_cohort, _utc, _TICKER_PATTERN,
+    DEVELOPER_DELAY_MINUTES, SNAPSHOT_IDENTITY_RELATION, SNAPSHOT_RELATION,
+    BoundedCache, _RealtimeCompatibilityRepository, _active_cohort, _utc,
+    _TICKER_PATTERN, action_evidence_until,
 )
 from .portal_projection_repository import (
     RELEASE_CLASS_SESSION_CLOSE, RETENTION_HOT_AND_KEPT, persist_portal_snapshot_cursor,
@@ -232,6 +234,7 @@ def _chart_source(manifest, *, cohort_id, snapshot_id):
             "history_source_provider_tier"
         ),
         history_before=manifest.get("history_before"),
+        history_scope_chain=manifest.get("history_scope_chain", ()),
     )
 
 
@@ -511,8 +514,18 @@ def _stamp(value):
     return _utc(value if isinstance(value, datetime) else datetime.fromisoformat(value), "stored ticker clock")
 
 
-def _availability(market_time, cutoff, interval):
-    expected = latest_expected_market_time(cutoff - timedelta(minutes=15), interval)
+def _availability(market_time, cutoff, interval, provider_tier):
+    if provider_tier not in {"MASSIVE_ADVANCED", "MASSIVE_DEVELOPER"}:
+        raise ValueError("Ticker availability requires a supported provider tier")
+    delay = (
+        DEVELOPER_DELAY_MINUTES
+        if provider_tier == "MASSIVE_DEVELOPER"
+        else 0
+    )
+    expected = latest_expected_market_time(
+        cutoff - timedelta(minutes=delay),
+        interval,
+    )
     actual = _stamp(market_time)
     if actual > expected:
         raise TickerPublicationUnavailable(
@@ -555,11 +568,33 @@ def _with_retained_state(payload, read_state):
     return result
 
 
-def _read_availability(market_time, cutoff, interval, read_state):
-    state = _availability(market_time, cutoff, interval)
+def _read_availability(
+    market_time,
+    cutoff,
+    interval,
+    read_state,
+    provider_tier,
+):
+    state = _availability(
+        market_time,
+        cutoff,
+        interval,
+        provider_tier,
+    )
     if read_state is not None and not read_state["current_data_available"]:
         state["status"] = "UNAVAILABLE"
     return state
+
+
+def _latest_closing_session(sessions):
+    available = list(sessions["sessions"])
+    if not sessions.get("current_is_session_close"):
+        available = [
+            session
+            for session in available
+            if session != sessions.get("current_session")
+        ]
+    return available[-1] if available else None
 
 
 class RealtimeTickerWorkspaceRepository(_RealtimeCompatibilityRepository):
@@ -610,6 +645,13 @@ class RealtimeTickerWorkspaceRepository(_RealtimeCompatibilityRepository):
                     if source.get("history_before")
                     else None
                 ),
+                history_source_scopes=tuple(
+                    (scope.cohort_id, scope.provider_tier.value, scope.history_before)
+                    for scope in (
+                        EquityHistoryScope.from_payload(value)
+                        for value in source.get("history_scope_chain", ())
+                    )
+                ),
             )
         try:
             return compose_charts(manifest, refs, chart_market_times, rows)[interval]
@@ -646,31 +688,66 @@ class RealtimeTickerWorkspaceRepository(_RealtimeCompatibilityRepository):
             for session in calendar.sessions_in_range(first, last)]
         with self._cursor() as cursor:
             self._begin(cursor)
-            release = self._release(cursor, cohort_id)
-            current = release.entry(TICKER_WORKSPACE_VERSION, symbol) if release is not None else None
+            entries = self._latest_release_entries(
+                cursor,
+                cohort_id,
+                (TICKER_WORKSPACE_VERSION,),
+                symbol,
+                cutoff,
+            )
+            current = entries[0] if entries else None
             if current is None or datetime.fromisoformat(current["generated_at"]) > cutoff:
                 raise TickerPublicationUnavailable("Ticker has no stored publication for this cohort")
             cursor.execute(
-                "SELECT DISTINCT ON (snapshot.session_date) snapshot.session_date,snapshot.snapshot_id,"
+                "SELECT DISTINCT ON ((snapshot.payload->'quote'->>'trade_date')::date) "
+                "(snapshot.payload->'quote'->>'trade_date')::date AS session_date,snapshot.snapshot_id,"
                 "snapshot.payload->'quote'->>'as_of' AS market_time "
                 "FROM " + SNAPSHOT_RELATION + " WHERE snapshot.cohort_id=%s "
                 "AND snapshot.snapshot_type=%s AND snapshot.snapshot_key=%s "
-                "AND snapshot.session_date BETWEEN %s AND %s AND snapshot.generated_at<=%s "
+                "AND (snapshot.payload->'quote'->>'trade_date')::date BETWEEN %s AND %s "
+                "AND snapshot.generated_at<=%s "
                 "AND (snapshot.payload->'quote'->>'as_of')::timestamptz=ANY(%s::timestamptz[]) "
-                "ORDER BY snapshot.session_date,(snapshot.snapshot_id=%s::uuid) DESC,"
+                "ORDER BY (snapshot.payload->'quote'->>'trade_date')::date,"
+                "(snapshot.snapshot_id=%s::uuid) DESC,"
                 "snapshot.generated_at DESC,snapshot.source_generation DESC,snapshot.snapshot_id LIMIT 21",
                 (str(cohort_id), TICKER_WORKSPACE_VERSION, symbol, first, last.date(), cutoff, closes, current["snapshot_id"]),
             )
             rows = tuple(cursor.fetchall())
+        selected = self._snapshot(
+            symbol,
+            cutoff,
+            cohort_id,
+            snapshot_id=current["snapshot_id"],
+            read_mode="retained",
+            strict_snapshot=True,
+        )
         for row in rows:
             if (not calendar.is_session(str(row["session_date"]))
                     or _stamp(row["market_time"]) != calendar.session_close(str(row["session_date"])).to_pydatetime()
                     or _stamp(row["market_time"]) > cutoff):
                 raise TickerPublicationUnavailable("Stored ticker closing clock does not match its exchange session")
-        return dict(ticker=symbol, interval="1d", sessions=[str(row["session_date"]) for row in rows],
-            snapshots={str(row["session_date"]): str(row["snapshot_id"]) for row in rows},
-            data_as_of=rows[-1]["market_time"] if rows else None, data_interval="1d" if rows else None,
-            provider_fetch_performed=False)
+        sessions = {
+            str(row["session_date"]): str(row["snapshot_id"])
+            for row in rows
+        }
+        current_session = str(selected["quote"]["trade_date"])
+        current_is_session_close = (
+            _stamp(selected["quote"]["as_of"])
+            == calendar.session_close(current_session).to_pydatetime()
+        )
+        sessions[current_session] = str(current["snapshot_id"])
+        return dict(
+            ticker=symbol,
+            interval="1d",
+            sessions=sorted(sessions),
+            snapshots={session: sessions[session] for session in sorted(sessions)},
+            current_session=current_session,
+            current_snapshot=str(current["snapshot_id"]),
+            current_is_session_close=current_is_session_close,
+            data_as_of=selected["quote"]["as_of"],
+            data_interval="1d",
+            provider_fetch_performed=False,
+        )
 
     def pattern_closing_sessions(self, *, available_by, cohort_id=None):
         return self._summary_closing_sessions(PATTERN_WATCH_PUBLICATION_VERSION,
@@ -691,8 +768,18 @@ class RealtimeTickerWorkspaceRepository(_RealtimeCompatibilityRepository):
         first = calendar.session_offset(last, -20).date()
         with self._cursor() as cursor:
             self._begin(cursor)
-            release = self._release(cursor, cohort_id)
-            current = release.entry(snapshot_type, "PLATFORM") if release is not None else None
+            entries = self._latest_release_entries(
+                cursor,
+                cohort_id,
+                (snapshot_type,),
+                "PLATFORM",
+                cutoff,
+            )
+            current = entries[0] if entries else None
+            if current is None:
+                raise TickerPublicationUnavailable(
+                    "Saved sessions have no retained publication for this cohort"
+                )
             cursor.execute(
                 "SELECT DISTINCT ON (snapshot.session_date) snapshot.session_date,snapshot.snapshot_id,"
                 "snapshot.generated_at FROM " + SNAPSHOT_RELATION + " WHERE snapshot.cohort_id=%s "
@@ -707,14 +794,46 @@ class RealtimeTickerWorkspaceRepository(_RealtimeCompatibilityRepository):
                  current["snapshot_id"] if current is not None else None),
             )
             rows = tuple(cursor.fetchall())
+            selected = self._summary_snapshot(
+                cursor,
+                cutoff=cutoff,
+                cohort_id=cohort_id,
+                snapshot_id=current["snapshot_id"],
+                snapshot_type=snapshot_type,
+                read_mode="retained",
+            )
         for row in rows:
             close = calendar.session_close(str(row["session_date"])).to_pydatetime()
             if not close <= row["generated_at"] <= cutoff:
                 raise TickerPublicationUnavailable("Saved publication does not match a completed session close")
-        return dict(cohort_id=str(cohort_id), interval="1d", sessions=[str(row["session_date"]) for row in rows],
-            snapshots={str(row["session_date"]): str(row["snapshot_id"]) for row in rows},
-            data_as_of=calendar.session_close(str(rows[-1]["session_date"])).isoformat() if rows else None,
-            data_interval="1d" if rows else None, provider_fetch_performed=False)
+        sessions = {
+            str(row["session_date"]): str(row["snapshot_id"])
+            for row in rows
+        }
+        # A Pattern Watch payload has neither field; its row and daily view do.
+        payload = selected["payload"]
+        current_session = str(payload.get("session") or selected["session_date"])
+        # A closed session keeps its frozen release: closing reads accept only that.
+        current_is_session_close = (
+            selected.get("snapshot_class") == "SESSION_CLOSE"
+            or current_session in sessions
+        )
+        sessions.setdefault(current_session, str(selected["snapshot_id"]))
+        return dict(
+            cohort_id=str(cohort_id),
+            interval="1d",
+            sessions=sorted(sessions),
+            snapshots={session: sessions[session] for session in sorted(sessions)},
+            current_session=current_session,
+            current_snapshot=str(selected["snapshot_id"]),
+            current_is_session_close=current_is_session_close,
+            data_as_of=(
+                payload["market_time"] if "market_time" in payload
+                else payload["views"]["1d"]["market_time"]
+            ),
+            data_interval="1d",
+            provider_fetch_performed=False,
+        )
 
     def trading_sessions(self, *, interval, limit, available_by, cohort_id=None):
         cutoff = _utc(available_by, "available_by")
@@ -757,6 +876,7 @@ class RealtimeTickerWorkspaceRepository(_RealtimeCompatibilityRepository):
             if entries:
                 cursor.execute(
                     "SELECT snapshot.snapshot_key, snapshot.generated_at, "
+                    "snapshot.provider_tier, "
                     "snapshot.payload->'chart_market_times' AS chart_market_times "
                     "FROM " + SNAPSHOT_RELATION + " "
                     "JOIN rt.cohorts AS cohort ON cohort.cohort_id=snapshot.cohort_id "
@@ -776,6 +896,10 @@ class RealtimeTickerWorkspaceRepository(_RealtimeCompatibilityRepository):
             raise TickerPublicationUnavailable("Ticker Workspace has no stored publication for this cohort")
         if len(tickers) != len(set(tickers)) or any(not _TICKER_PATTERN.fullmatch(ticker) for ticker in tickers):
             raise ValueError("Ticker freshness stored identity drift")
+        provider_tiers = {row["provider_tier"] for row in rows}
+        if len(provider_tiers) != 1:
+            raise ValueError("Ticker freshness provider tier drift")
+        provider_tier = provider_tiers.pop()
         intervals = set(rows[0]["chart_market_times"])
         for row in rows[1:]:
             intervals.intersection_update(row["chart_market_times"])
@@ -784,7 +908,12 @@ class RealtimeTickerWorkspaceRepository(_RealtimeCompatibilityRepository):
         interval_states = {}
         for interval in sorted(intervals):
             actual = min(_stamp(row["chart_market_times"][interval]) for row in rows)
-            state = _availability(actual, cutoff, interval)
+            state = _availability(
+                actual,
+                cutoff,
+                interval,
+                provider_tier,
+            )
             interval_states[interval] = dict(
                 market_time=actual.isoformat(),
                 published_at=min(_stamp(row["generated_at"]) for row in rows).isoformat(),
@@ -819,6 +948,9 @@ class RealtimeTickerWorkspaceRepository(_RealtimeCompatibilityRepository):
             source=TICKER_WORKSPACE_VERSION,
             ticker_count=len(tickers),
             serving_latest_available=True,
+            retained_setup_generated_at=min(
+                _stamp(row["generated_at"]) for row in rows
+            ).isoformat(),
         )
 
     def _summary_snapshot(self, cursor, *, cutoff, cohort_id, snapshot_id, snapshot_type, read_mode="current"):
@@ -829,8 +961,18 @@ class RealtimeTickerWorkspaceRepository(_RealtimeCompatibilityRepository):
         selected = str(snapshot_id) if snapshot_id is not None else None
         current_release = None
         if selected is None:
-            current_release = self._release(cursor, cohort_id)
-            entry = current_release.entry(snapshot_type, "PLATFORM") if current_release is not None else None
+            if read_mode == "retained":
+                entries = self._latest_release_entries(
+                    cursor,
+                    cohort_id,
+                    (snapshot_type,),
+                    "PLATFORM",
+                    cutoff,
+                )
+                entry = entries[0] if entries else None
+            else:
+                current_release = self._release(cursor, cohort_id)
+                entry = current_release.entry(snapshot_type, "PLATFORM") if current_release is not None else None
             if entry is None:
                 raise TickerPublicationUnavailable("Ticker Workspace summary has no stored publication for this cohort")
             selected = str(entry["snapshot_id"])
@@ -942,12 +1084,13 @@ class RealtimeTickerWorkspaceRepository(_RealtimeCompatibilityRepository):
                 (ids, cutoff, cutoff, cutoff),
             )
             reference_current = _reference_set_matches(expected_references, cursor.fetchall())
+        until = action_evidence_until(source_cutoff, cutoff, read_mode)
         cursor.execute(
             "SELECT EXISTS (SELECT 1 FROM ref.corporate_action_revisions "
             "WHERE security_id=ANY(%s::uuid[]) AND received_at>%s AND received_at<=%s) "
             "OR EXISTS (SELECT 1 FROM ref.corporate_action_coverage "
             "WHERE security_id=ANY(%s::uuid[]) AND received_at>%s AND received_at<=%s) AS action_drift",
-            (ids, source_cutoff, cutoff, ids, source_cutoff, cutoff),
+            (ids, source_cutoff, until, ids, source_cutoff, until),
         )
         action_drift = cursor.fetchone()["action_drift"]
         if action_drift and read_mode != "retained" and not self_contained:
@@ -966,7 +1109,7 @@ class RealtimeTickerWorkspaceRepository(_RealtimeCompatibilityRepository):
                     raise ValueError("All Tickers closing date must be an ISO XNYS trading session")
             if snapshot_id is None:
                 sessions = self.workspace_closing_sessions(available_by=cutoff, cohort_id=cohort_id)
-                target = session_date or (sessions["sessions"][-1] if sessions["sessions"] else None)
+                target = session_date or _latest_closing_session(sessions)
                 snapshot_id = sessions["snapshots"].get(target)
                 if snapshot_id is None:
                     raise TickerPublicationUnavailable("No saved All Tickers closing publication for the requested session")
@@ -1017,6 +1160,7 @@ class RealtimeTickerWorkspaceRepository(_RealtimeCompatibilityRepository):
             cutoff,
             availability_interval,
             read_state,
+            row["provider_tier"],
         )
         publication = dict(
             cohort_id=str(cohort_id),
@@ -1056,7 +1200,7 @@ class RealtimeTickerWorkspaceRepository(_RealtimeCompatibilityRepository):
                     raise ValueError("Pattern Watch closing date must be an ISO XNYS trading session")
             if snapshot_id is None:
                 sessions = self.pattern_closing_sessions(available_by=cutoff, cohort_id=cohort_id)
-                target = session_date or (sessions["sessions"][-1] if sessions["sessions"] else None)
+                target = session_date or _latest_closing_session(sessions)
                 snapshot_id = sessions["snapshots"].get(target)
                 if snapshot_id is None:
                     raise TickerPublicationUnavailable("No saved Pattern Watch closing publication for the requested session")
@@ -1076,7 +1220,13 @@ class RealtimeTickerWorkspaceRepository(_RealtimeCompatibilityRepository):
                 if not _stamp(view["market_time"]) <= close <= row["generated_at"] <= cutoff:
                     raise TickerPublicationUnavailable("Pattern Watch clocks extend beyond the selected session close")
             read_state = row.get("_retained_read_state")
-            state = _read_availability(view["market_time"], cutoff, interval, read_state)
+            state = _read_availability(
+                view["market_time"],
+                cutoff,
+                interval,
+                read_state,
+                row["provider_tier"],
+            )
             for reference in row["payload"]["references"]:
                 if view["evidence_storage"] == "RELEASE_ONLY" or row.get("snapshot_class") == "SESSION_CLOSE":
                     continue
@@ -1130,8 +1280,18 @@ class RealtimeTickerWorkspaceRepository(_RealtimeCompatibilityRepository):
                                   requested_snapshot_id=selected)
                     selected = None
             if selected is None:
-                release = self._release(cursor, cohort_id)
-                entry = release.entry(TICKER_WORKSPACE_VERSION, symbol) if release is not None else None
+                if read_mode == "retained":
+                    entries = self._latest_release_entries(
+                        cursor,
+                        cohort_id,
+                        (TICKER_WORKSPACE_VERSION,),
+                        symbol,
+                        cutoff,
+                    )
+                    entry = entries[0] if entries else None
+                else:
+                    release = self._release(cursor, cohort_id)
+                    entry = release.entry(TICKER_WORKSPACE_VERSION, symbol) if release is not None else None
                 if entry is None:
                     raise TickerPublicationUnavailable("Ticker Workspace has no stored publication for this cohort")
                 selected = str(entry["snapshot_id"])
@@ -1151,7 +1311,9 @@ class RealtimeTickerWorkspaceRepository(_RealtimeCompatibilityRepository):
                 "(snapshot.source_manifest->>'source_generation')::integer AS manifest_source_generation, "
                 "snapshot.source_manifest->>'identity_continuity_sha256' "
                 "AS manifest_identity_continuity_sha256, "
-                "snapshot.source_manifest->>'known_by' AS manifest_known_by "
+                "snapshot.source_manifest->>'known_by' AS manifest_known_by, "
+                "snapshot.source_manifest->'history_scope_chain' "
+                "AS manifest_history_scope_chain "
                 ", snapshot.source_manifest->'reconstruction' AS reconstruction, snapshot.session_date, "
                 "snapshot.payload->'quote'->>'as_of' AS market_time "
                 "FROM " + SNAPSHOT_RELATION + " "
@@ -1180,10 +1342,14 @@ class RealtimeTickerWorkspaceRepository(_RealtimeCompatibilityRepository):
             source_cutoff = publication_source_cutoff(row["generated_at"], row.get("reconstruction"),
                 session_date=row.get("session_date"), market_time=row.get("market_time"))
             continuity_manifest = {
+                "cohort_id": str(cohort_id),
                 "identity_continuity_sha256": row.get(
                     "manifest_identity_continuity_sha256"
                 ),
                 "known_by": row.get("manifest_known_by"),
+                "history_scope_chain": row.get(
+                    "manifest_history_scope_chain"
+                ) or (),
             }
             expected_source_manifest_sha256, continuity_rows = (
                 source_manifest_identity_cursor(
@@ -1238,13 +1404,14 @@ class RealtimeTickerWorkspaceRepository(_RealtimeCompatibilityRepository):
                     (str(reference["security_id"]), symbol, cutoff, cutoff, cutoff),
                 )
                 reference_current = _reference_matches(reference, cursor.fetchall())
+            until = action_evidence_until(source_cutoff, cutoff, read_mode)
             cursor.execute(
                 "SELECT EXISTS (SELECT 1 FROM ref.corporate_action_revisions "
                 "WHERE security_id=%s AND received_at>%s AND received_at<=%s) "
                 "OR EXISTS (SELECT 1 FROM ref.corporate_action_coverage "
                 "WHERE security_id=%s AND received_at>%s AND received_at<=%s) AS action_drift",
-                (str(reference["security_id"]), source_cutoff, cutoff,
-                 str(reference["security_id"]), source_cutoff, cutoff),
+                (str(reference["security_id"]), source_cutoff, until,
+                 str(reference["security_id"]), source_cutoff, until),
             )
             action_drift = cursor.fetchone()["action_drift"]
             if action_drift and read_mode != "retained":
@@ -1353,13 +1520,14 @@ class RealtimeTickerWorkspaceRepository(_RealtimeCompatibilityRepository):
                 )
             if not _reference_matches(reference, references):
                 raise TickerPublicationUnavailable("Ticker reference identity changed; republish required")
+            until = action_evidence_until(source_cutoff, cutoff, read_mode)
             cursor.execute(
                 "SELECT EXISTS (SELECT 1 FROM ref.corporate_action_revisions "
                 "WHERE security_id=%s AND received_at>%s AND received_at<=%s) "
                 "OR EXISTS (SELECT 1 FROM ref.corporate_action_coverage "
                 "WHERE security_id=%s AND received_at>%s AND received_at<=%s) AS action_drift",
-                (str(reference["security_id"]), source_cutoff, cutoff,
-                 str(reference["security_id"]), source_cutoff, cutoff),
+                (str(reference["security_id"]), source_cutoff, until,
+                 str(reference["security_id"]), source_cutoff, until),
             )
             if cursor.fetchone()["action_drift"] and read_mode != "retained":
                 raise TickerPublicationUnavailable("Ticker action evidence changed; republish required")
@@ -1368,8 +1536,11 @@ class RealtimeTickerWorkspaceRepository(_RealtimeCompatibilityRepository):
             if "chart_refs" in payload:
                 _verified_evidence_bodies(cursor, manifest, payload, cohort_id=cohort_id, cutoff=cutoff)
         result = deepcopy(payload)
-        if "chart_refs" in payload:
-            result["_chart_source"] = _chart_source(manifest, cohort_id=cohort_id, snapshot_id=snapshot_id)
+        result["_chart_source"] = _chart_source(
+            manifest,
+            cohort_id=cohort_id,
+            snapshot_id=snapshot_id,
+        )
         result["evidence_refs"] = evidence_refs
         result["context"]["cohort"].update(
             snapshot_id=str(row["snapshot_id"]), payload_sha256=row["payload_sha256"],
@@ -1400,9 +1571,10 @@ class RealtimeTickerWorkspaceRepository(_RealtimeCompatibilityRepository):
         closing_view = read_mode == "session_close"
         if closing_view and contract == "publication" and snapshot_id is None:
             sessions = self.closing_sessions(ticker, available_by=cutoff, cohort_id=cohort_id)
-            if not sessions["sessions"]:
+            target = _latest_closing_session(sessions)
+            if target is None:
                 raise TickerPublicationUnavailable("No retained ticker closing view is available")
-            snapshot_id = sessions["snapshots"][sessions["sessions"][-1]]
+            snapshot_id = sessions["snapshots"][target]
         if closing_view and (snapshot_id is None or cohort_id is None):
             raise ValueError("Ticker closing reads require an explicit cohort and snapshot")
         if snapshot_id is not None and cohort_id is None:
@@ -1417,6 +1589,7 @@ class RealtimeTickerWorkspaceRepository(_RealtimeCompatibilityRepository):
                     or session_date is not None and quote["trade_date"] != session_date):
                 raise TickerPublicationUnavailable("Ticker publication does not match the selected session close")
         read_state = payload.get("_retained_read_state")
+        provider_tier = payload["_chart_source"]["provider_tier"]
         if contract == "publication":
             context = payload["context"]["cohort"]
             quote = payload["quote"]
@@ -1426,11 +1599,17 @@ class RealtimeTickerWorkspaceRepository(_RealtimeCompatibilityRepository):
                 cutoff,
                 quote_interval,
                 read_state,
+                provider_tier,
             )
             serving = deepcopy(read_state) if read_state is not None else {}
             if serving:
                 serving["current_data_available"] = serving["current_data_available"] and state["status"] == "READY"
-                if _availability(quote["as_of"], cutoff, quote_interval)["status"] != "READY":
+                if _availability(
+                    quote["as_of"],
+                    cutoff,
+                    quote_interval,
+                    provider_tier,
+                )["status"] != "READY":
                     serving["section_warnings"]["market"] = "Market data is not current; displaying the retained publication."
             publication = dict(
                 cohort_id=str(cohort_id or context.get("cohort_id")), snapshot_id=context["snapshot_id"],
@@ -1465,7 +1644,13 @@ class RealtimeTickerWorkspaceRepository(_RealtimeCompatibilityRepository):
                 {"chart": "charts", "patterns": "patterns", "channel": "channels"}[contract]]
             if interval not in values:
                 raise TickerPublicationUnavailable(payload["missing_producers"].get(f"chart:{interval}", "RETAINED_INTERVAL_UNAVAILABLE"))
-            _read_availability(payload["chart_market_times"][interval], cutoff, interval, read_state)
+            _read_availability(
+                payload["chart_market_times"][interval],
+                cutoff,
+                interval,
+                read_state,
+                provider_tier,
+            )
             result = self._chart(payload, interval) if by_reference else values[interval]
             if contract != "chart":
                 return result
@@ -1476,20 +1661,38 @@ class RealtimeTickerWorkspaceRepository(_RealtimeCompatibilityRepository):
             return [point for point in result if point["time"] >= boundary.timestamp()]
         if contract == "quote":
             quote = payload["quote"]
-            _read_availability(quote["as_of"], cutoff, "5m" if quote["source"] == "5m" else "1d", read_state)
+            _read_availability(
+                quote["as_of"],
+                cutoff,
+                "5m" if quote["source"] == "5m" else "1d",
+                read_state,
+                provider_tier,
+            )
             return quote
         if contract == "multi":
             result = deepcopy(payload["multi"])
             for frame in tuple(result["setups"]):
                 metrics = result["setup_read_metrics"][frame]
-                metrics.update(_read_availability(metrics["market_time"], cutoff, frame, read_state))
+                metrics.update(_read_availability(
+                    metrics["market_time"],
+                    cutoff,
+                    frame,
+                    read_state,
+                    provider_tier,
+                ))
             if set(result["setups"]) != set(payload["multi"]["setup_sources"]):
                 raise ValueError("Ticker setup source identity drift")
             return result
         if contract == "cross_patterns":
             for frame in payload["patterns"]:
                 if frame in PATTERN_WATCH_INTERVALS:
-                    _read_availability(payload["chart_market_times"][frame], cutoff, frame, read_state)
+                    _read_availability(
+                        payload["chart_market_times"][frame],
+                        cutoff,
+                        frame,
+                        read_state,
+                        provider_tier,
+                    )
             result = deepcopy(payload["cross_patterns"])
             result["results"] = [row for row in result["results"] if row["interval"] in PATTERN_WATCH_INTERVALS]
             result["matched_tickers"] = 1 if result["results"] else 0
@@ -1499,14 +1702,26 @@ class RealtimeTickerWorkspaceRepository(_RealtimeCompatibilityRepository):
             return result
         if contract == "context":
             result = deepcopy(payload["context"])
-            state = _read_availability(result["cohort"]["market_time"], cutoff, "1d", read_state)
+            state = _read_availability(
+                result["cohort"]["market_time"],
+                cutoff,
+                "1d",
+                read_state,
+                provider_tier,
+            )
             result["cohort"]["status"] = result["status"] = state["status"]
             if result["rows"][0]["daily"]["status"] == "READY":
                 result["rows"][0]["daily"]["status"] = state["status"]
             for frame, value in result["rows"][0]["frames"].items():
                 if value["status"] == "READY":
                     try:
-                        value["status"] = _read_availability(value["market_time"], cutoff, frame, read_state)["status"]
+                        value["status"] = _read_availability(
+                            value["market_time"],
+                            cutoff,
+                            frame,
+                            read_state,
+                            provider_tier,
+                        )["status"]
                     except TickerPublicationUnavailable as error:
                         value.update(status="UNAVAILABLE", reason=str(error), trend=None, momentum=None, close=None)
             return result

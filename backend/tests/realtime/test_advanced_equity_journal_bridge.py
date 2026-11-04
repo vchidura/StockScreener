@@ -1,4 +1,5 @@
 from contextlib import nullcontext
+from dataclasses import replace
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from types import SimpleNamespace
@@ -239,6 +240,47 @@ def test_process_advances_check_time_to_concurrent_decoder_proof(
     )
 
     assert status.checked_at == own_progress.updated_at
+
+
+def test_gap_check_compares_raw_offsets_when_one_frame_holds_several_events(
+    monkeypatch,
+):
+    # 2026-11-02: gap at raw 2374, while the last events reached offset 2377.
+    records = (
+        replace(record(2376), raw_offset=2374),
+        replace(record(2377), raw_offset=2374),
+    )
+    source = reader(records, progress(2377))
+    monkeypatch.setattr(
+        bridge,
+        "_load_checkpoint_offsets_cursor",
+        MagicMock(return_value={0: 2375, 1: 2375}),
+    )
+    monkeypatch.setattr(bridge, "_verify_stream_session_cursor", MagicMock())
+    no_gaps = MagicMock()
+    monkeypatch.setattr(bridge, "_require_no_unresolved_am_gaps_cursor", no_gaps)
+    monkeypatch.setattr(
+        bridge,
+        "_load_security_ids_cursor",
+        MagicMock(return_value={1: SECURITY}),
+    )
+    monkeypatch.setattr(
+        bridge,
+        "_persist_consumer_checkpoints_cursor",
+        MagicMock(return_value=2),
+    )
+    monkeypatch.setattr(bridge, "persist_realtime_equity_bars_cursor", MagicMock())
+    monkeypatch.setattr(
+        bridge,
+        "adapt_advanced_minute_aggregate",
+        MagicMock(return_value=object()),
+    )
+
+    bridge.process_advanced_equity_journal_once(
+        Database(), source, config(), checked_at=NOW + timedelta(days=3)
+    )
+
+    assert no_gaps.call_args.kwargs == {"scanned_through_raw_offset": 2374}
 
 
 def test_unresolved_relevant_gap_prevents_bar_and_checkpoint_advancement(monkeypatch):

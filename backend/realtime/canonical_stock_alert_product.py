@@ -349,26 +349,27 @@ def _return(rows: tuple[Mapping[str, object], ...]) -> Decimal | None:
 
 
 def _bar_available_at(row: Mapping[str, object]) -> datetime:
-    return max(
+    # Stream bars carry no publication clocks, so the optional clocks may be
+    # empty; max() of a single bare datetime would try to iterate it.
+    return max((
         row["bar_end"],
         *(
             row[name]
             for name in ("provider_published_at", "replay_available_at")
             if row.get(name) is not None
         ),
-    )
+    ))
 
 
 def _bar_received_at(row: Mapping[str, object]) -> datetime:
-    available_at = _bar_available_at(row)
-    return max(
-        available_at,
+    return max((
+        _bar_available_at(row),
         *(
             row[name]
             for name in ("observed_at", "created_at")
             if row.get(name) is not None
         ),
-    )
+    ))
 
 
 def canonical_stock_alert_contexts(

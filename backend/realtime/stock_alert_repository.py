@@ -2,6 +2,7 @@
 from copy import deepcopy
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
+from collections.abc import Mapping
 from uuid import UUID
 
 from research.stock_alert_review import build_stock_eod_review
@@ -11,7 +12,8 @@ from .contracts import canonical_sha256
 from .database_access import RealtimeDatabaseRole
 from .lineage_head import reference_set, require_member_set
 from .portal_compatibility_repository import (
-    SNAPSHOT_RELATION, _RealtimeCompatibilityRepository, _active_cohort, _utc, load_current_release,
+    SNAPSHOT_RELATION, _RealtimeCompatibilityRepository, _active_cohort, _utc, action_evidence_until,
+    load_current_release,
 )
 from .portal_projection_repository import (
     PortalReleaseReceipt,
@@ -24,7 +26,11 @@ from .portal_publisher import (
     resume_portal_publication_once,
     run_portal_publication_once,
 )
-from .screening_repository import load_realtime_stock_alert_input
+from .screening_repository import (
+    load_realtime_canonical_stock_alert_input,
+    load_realtime_stock_alert_input,
+)
+from .reference_continuity import source_manifest_identity_cursor
 from .stock_alert_projection import STOCK_ALERTS_VERSION, produce_realtime_stock_alerts
 from .worker_database import RealtimeProcessDatabase
 
@@ -73,7 +79,17 @@ def compute_realtime_stock_alerts(
         ):
             raise RetainedForwardState(
                 "Forward checkpoint loader is unavailable; refusing to replace retained publications")
-        inputs = load_realtime_stock_alert_input(cursor, **scope)
+        # A canonical projection is bound to the exact input its batch was built from.
+        canonical = (
+            isinstance(retained_projection, Mapping)
+            and retained_projection.get("contract")
+            == "canonical-stock-alert-retained-projection-v1"
+        )
+        inputs = (
+            load_realtime_canonical_stock_alert_input
+            if canonical
+            else load_realtime_stock_alert_input
+        )(cursor, **scope)
         return produce_realtime_stock_alerts(
             inputs,
             retained_projection=retained_projection,
@@ -186,10 +202,14 @@ class RealtimeStockAlertViewRepository(_RealtimeCompatibilityRepository):
             if entry is None:
                 raise StockAlertPublicationUnavailable("Realtime Stock Alerts has no retained projection")
             cursor.execute(
-                "SELECT snapshot.*, manifest.manifest_sha256 AS cohort_manifest_sha256 "
+                "SELECT snapshot.*, manifest.manifest_id AS cohort_manifest_id, "
+                "manifest.manifest_sha256 AS cohort_manifest_sha256, "
+                "history_binding.binding_sha256 AS history_binding_sha256 "
                 "FROM " + SNAPSHOT_RELATION + " "
                 "JOIN rt.cohorts AS cohort ON cohort.cohort_id=snapshot.cohort_id "
                 "JOIN rt.subscription_manifests AS manifest ON manifest.manifest_id=cohort.manifest_id "
+                "LEFT JOIN rt.cohort_history_bindings AS history_binding "
+                "ON history_binding.target_cohort_id=cohort.cohort_id "
                 "JOIN rt.screening_current AS screening_current ON screening_current.cohort_id=cohort.cohort_id "
                 "JOIN rt.screening_generations AS screening ON screening.generation_id=screening_current.generation_id "
                 "AND screening.cohort_id=screening_current.cohort_id AND screening.status='COMPLETE' "
@@ -204,11 +224,19 @@ class RealtimeStockAlertViewRepository(_RealtimeCompatibilityRepository):
             if row is None or row["payload"] is None:
                 raise StockAlertPublicationUnavailable("Realtime Stock Alerts has no retained projection")
             manifest, payload = row["source_manifest"], row["payload"]
+            expected_source_manifest_sha256, _ = source_manifest_identity_cursor(
+                cursor,
+                manifest,
+                manifest_id=row["cohort_manifest_id"],
+                cohort_manifest_sha256=row["cohort_manifest_sha256"],
+                history_binding_sha256=row["history_binding_sha256"],
+                cutoff=row["generated_at"],
+            )
             if (canonical_sha256(manifest) != row["source_manifest_sha256"]
                 or canonical_sha256(payload) != row["payload_sha256"]
                 or manifest["version"] != STOCK_ALERTS_VERSION or payload["version"] != STOCK_ALERTS_VERSION
                 or str(manifest["cohort_id"]) != str(cohort_id)
-                or manifest["source_manifest_sha256"] != row["cohort_manifest_sha256"]
+                or manifest["source_manifest_sha256"] != expected_source_manifest_sha256
                 or manifest["source_generation"] != row["source_generation"]
                 or manifest["provider_tier"] != row["provider_tier"]
                 or any(payload[key] is not False for key in (
@@ -253,12 +281,13 @@ class RealtimeStockAlertViewRepository(_RealtimeCompatibilityRepository):
                 ):
                     raise StockAlertPublicationUnavailable("Realtime alert reference changed; republish required")
             ids = reference_ids
+            until = action_evidence_until(row["generated_at"], cutoff)
             cursor.execute(
                 "SELECT EXISTS (SELECT 1 FROM ref.corporate_action_revisions "
                 "WHERE security_id=ANY(%s::uuid[]) AND received_at>%s AND received_at<=%s) "
                 "OR EXISTS (SELECT 1 FROM ref.corporate_action_coverage "
                 "WHERE security_id=ANY(%s::uuid[]) AND received_at>%s AND received_at<=%s) AS action_drift",
-                (ids, row["generated_at"], cutoff, ids, row["generated_at"], cutoff),
+                (ids, row["generated_at"], until, ids, row["generated_at"], until),
             )
             if cursor.fetchone()["action_drift"]:
                 raise StockAlertPublicationUnavailable("Realtime alert action evidence changed; republish required")

@@ -6,6 +6,9 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from uuid import UUID
 
+from .advanced_equity_capability_refresh import (
+    MASSIVE_STOCKS_CONNECTION_RESOURCE,
+)
 from .advanced_equity_journal_bridge import (
     AdvancedEquityJournalBridgeConfig,
     AdvancedEquityJournalBridgeStatus,
@@ -220,10 +223,16 @@ def _postgres_reconciliation_cursor(
     *,
     checked_at: datetime,
 ) -> tuple[int, int, bool]:
+    # The heartbeat only moves when frames arrive, about once a minute on the AM
+    # channel, so it can briefly look stale on a healthy stream. A session whose
+    # owner still holds the provider connection lease is live, not abandoned.
     cursor.execute(
         "SELECT session.ended_at IS NOT NULL,session.heartbeat_at,"
         "(profile.profile_document->'settings'->>"
-        "'stale_after_seconds')::integer "
+        "'stale_after_seconds')::integer,"
+        "EXISTS (SELECT 1 FROM rt.worker_leases AS lease "
+        "WHERE lease.resource_key=%s AND lease.owner_id=session.owner_id "
+        "AND lease.lease_until>%s) "
         "FROM rt.stream_sessions AS session "
         "JOIN rt.advanced_ingress_plans AS plan ON plan.plan_id=%s "
         "JOIN rt.advanced_ingress_runtime_profiles AS profile "
@@ -231,6 +240,8 @@ def _postgres_reconciliation_cursor(
         "WHERE session.session_id=%s "
         "AND session.owner_epoch=%s AND session.journal_generation=%s",
         (
+            MASSIVE_STOCKS_CONNECTION_RESOURCE,
+            checked_at,
             str(registration.plan_id),
             str(registration.stream_session_id),
             registration.owner_epoch,
@@ -287,7 +298,8 @@ def _postgres_reconciliation_cursor(
             "canonical bars are ahead of their checkpoint",
         )
     stale = (
-        session[1] is not None
+        not session[3]
+        and session[1] is not None
         and session[1]
         <= checked_at - timedelta(seconds=int(session[2]))
     )

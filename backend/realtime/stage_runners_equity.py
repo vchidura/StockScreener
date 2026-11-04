@@ -56,6 +56,7 @@ from .portal_projection_repository import (
 )
 from .preflight import ProviderTier
 from .runner_environment import RunnerEnvironment
+from .screening_repository import _BAR_VISIBLE_AT, BarClocks
 from .reference_continuity import (
     load_reference_continuity_rows_cursor,
 )
@@ -85,6 +86,7 @@ STAGE_CANCELLED = "STAGE_CANCELLED"
 FINALIZER_INPUT_PENDING = "FINALIZER_INPUT_PENDING"
 FINALIZER_BARRIER_FAILED = "FINALIZER_BARRIER_FAILED"
 DERIVATION_FAILED = "DERIVATION_FAILED"
+CLOSING_DAILY_INPUTS_PENDING = "CLOSING_DAILY_INPUTS_PENDING"
 
 
 def reference_generation(database: V2StageDatabase, cutoff) -> int:
@@ -483,32 +485,79 @@ def finalize_five_minute_inputs(
     return "FAILED", (FINALIZER_BARRIER_FAILED, *dict.fromkeys(reasons))
 
 
+def _cohort_equity_instrument_ids(cursor, cohort_id) -> tuple[int, ...]:
+    """Requires a dictionary cursor."""
+    cursor.execute(
+        "SELECT instrument.instrument_id "
+        "FROM rt.cohorts AS cohort "
+        "JOIN rt.subscription_members AS member USING(manifest_id) "
+        "JOIN rt.instruments AS instrument USING(instrument_id) "
+        "WHERE cohort.cohort_id=%s "
+        "AND instrument.asset_class='EQUITY' "
+        "AND member.channel='AM' ORDER BY instrument.instrument_id",
+        (str(cohort_id),),
+    )
+    return tuple(
+        int(row["instrument_id"])
+        for row in cursor.fetchall()
+    )
+
+
+def closing_daily_inputs_visible(
+    database: V2StageDatabase,
+    context: StageContext,
+    *,
+    known_by,
+) -> bool:
+    """Whether every member's own-session daily bars are recorded by known_by.
+
+    Screening reads them at the close, and a retry reuses the known_by of the
+    first INPUT_READY. Issuing it earlier would leave the window unable to ever
+    see them, since neither bar can exist when the close is first processed.
+    """
+    plan = context.plan
+    with database.transaction(read_only=True, dict_cursor=True) as cursor:
+        instrument_ids = _cohort_equity_instrument_ids(cursor, plan.cohort_id)
+        cursor.execute(
+            "SELECT count(DISTINCT (instrument_id,adjustment_basis)) AS visible "
+            "FROM rt.bar_revisions "
+            "WHERE cohort_id=%s AND provider_tier='MASSIVE_ADVANCED' "
+            "AND instrument_id=ANY(%s::bigint[]) AND interval='1d' "
+            "AND session_scope='RTH' AND session_date=%s AND is_final "
+            "AND adjustment_basis IN ('ADJUSTED','RAW_UNADJUSTED') AND "
+            + _BAR_VISIBLE_AT,
+            (
+                str(plan.cohort_id),
+                list(instrument_ids),
+                plan.session_date,
+                *BarClocks(context.window.cutoff, known_by).params(),
+            ),
+        )
+        return int(cursor.fetchone()["visible"]) == 2 * len(instrument_ids)
+
+
 def finalize_higher_interval_inputs(
     database: V2StageDatabase,
     context: StageContext,
 ) -> tuple[str, tuple[str, ...]]:
     plan, window = context.plan, context.window
     with database.transaction(dict_cursor=True) as cursor:
-        cursor.execute(
-            "SELECT instrument.instrument_id "
-            "FROM rt.cohorts AS cohort "
-            "JOIN rt.subscription_members AS member USING(manifest_id) "
-            "JOIN rt.instruments AS instrument USING(instrument_id) "
-            "WHERE cohort.cohort_id=%s "
-            "AND instrument.asset_class='EQUITY' "
-            "AND member.channel='AM' ORDER BY instrument.instrument_id",
-            (str(plan.cohort_id),),
-        )
-        instrument_ids = tuple(
-            int(row["instrument_id"])
-            for row in cursor.fetchall()
+        instrument_ids = _cohort_equity_instrument_ids(cursor, plan.cohort_id)
+        # This stage just recorded the 5m bars, after it started. Reading them
+        # at its start would leave the session's last bars underived for good,
+        # because no window follows the close.
+        cursor.execute("SELECT clock_timestamp() AS checked_at")
+        checked_at = max(
+            context.started_at,
+            window.cutoff,
+            cursor.fetchone()["checked_at"],
         )
         enqueue_interval_derivation_jobs_cursor(
             cursor,
             cohort_id=plan.cohort_id,
             instrument_ids=instrument_ids,
             session_date=plan.session_date,
-            checked_at=max(context.started_at, window.cutoff),
+            checked_at=checked_at,
         )
     config = EquityWorkerConfig(
         cohort_id=plan.cohort_id,
@@ -525,7 +574,7 @@ def finalize_higher_interval_inputs(
         status = run_interval_derivation_worker_once(
             database,
             config,
-            checked_at=max(context.started_at, window.cutoff),
+            checked_at=checked_at,
         )
         reasons.extend(status.reason_codes)
         if status.failed or status.blocked:
@@ -581,6 +630,15 @@ def equity_materialize_runner(environment: RunnerEnvironment) -> StageRunner:
                 )
                 if derivation_state == "FAILED":
                     return StageOutcome.failed(*derivation_reasons)
+                if (
+                    _is_session_close(context)
+                    and not closing_daily_inputs_visible(
+                        compute,
+                        context,
+                        known_by=environment.known_by(window),
+                    )
+                ):
+                    return StageOutcome.blocked(CLOSING_DAILY_INPUTS_PENDING)
             gate_digest = (
                 None
                 if getattr(

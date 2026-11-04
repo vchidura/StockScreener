@@ -16,6 +16,13 @@ const words = (value: string) => value.toLowerCase().replace(/_/g, ' ').replace(
 const percent = (value: number | null | undefined, unit = '%') => value == null || !Number.isFinite(value) ? 'Unavailable' : `${value > 0 ? '+' : ''}${(value * 100).toFixed(2)}${unit}`
 const price = (value: number | undefined) => value == null ? 'Unavailable' : value.toLocaleString('en-US', { style: 'currency', currency: 'USD' })
 const tone = (value: number | null | undefined) => value == null || value === 0 ? '' : value > 0 ? 'mc-positive' : 'mc-negative'
+export const movingAverage50 = (values?: RotationPrices | null) => values?.moving_average_basis === 'SMA50'
+  ? { label: 'SMA50', value: values.sma50, change10: values.sma50_change10 }
+  : { label: 'EMA50', value: values?.ema50, change10: values?.ema50_change10 }
+export const movingAverageDistance50 = (values?: RotationPrices | null) => {
+  const average = movingAverage50(values).value
+  return values && average != null && average > 0 ? values.close / average - 1 : null
+}
 const compactNumber = new Intl.NumberFormat('en-US', { notation: 'compact', maximumFractionDigits: 1 })
 const tabs = [['rotation', 'Sector Rotation'], ['stocks', 'Stock Divergence'], ['indicators', 'Indicators'], ['activity', 'ETF Activity']] as const
 type ConditionsTab = typeof tabs[number][0]
@@ -159,7 +166,7 @@ export default function MarketConditionsPage() {
         return <div className="mc-market-metric" key={ticker}>
           <Link to={`/ticker/${ticker}`}>{ticker}</Link><strong>{price(values?.close)}</strong>
           <span className={tone(values?.return1)}>{percent(values?.return1)} <small>1 session</small></span>
-          <span className="mc-muted">{values?.direction ?? 'Unavailable'} | EMA50 trend</span>
+          <span className="mc-muted">{values?.direction ?? 'Unavailable'} | {movingAverage50(values).label} trend</span>
         </div>
       })}
       <div className="mc-market-metric"><span>Sector coverage</span><strong>{data.coverage?.ready_sectors} / {data.coverage?.expected_sectors}</strong><span>Price comparisons ready</span><span className="mc-muted">12 fixed proxy buckets</span></div>
@@ -267,8 +274,8 @@ export default function MarketConditionsPage() {
           <p className="mc-muted">Higher values combine stronger relative momentum, broader participation, and lower implied-volatility/credit stress. Not a vendor Fear &amp; Greed index or trading signal. Missing components are not reweighted.</p>
         </section>
         <h2>Price Momentum</h2>
-        <div className="mc-table-scroll" tabIndex={0} aria-label="Market indicators"><table className="mc-table"><thead><tr><th>Benchmark</th><th>1 session</th><th>5 sessions</th><th>20 sessions</th><th>Distance to EMA50</th><th>EMA50 change (10)</th></tr></thead><tbody>
-          {['SPY', 'QQQ'].map(ticker => { const values = data.benchmarks[ticker]?.value; return <tr key={ticker}><th scope="row">{ticker}</th><td>{percent(values?.return1)}</td><td>{percent(values?.return5)}</td><td>{percent(values?.return20)}</td><td>{percent(values ? values.close / values.ema50 - 1 : null)}</td><td>{percent(values?.ema50_change10)}</td></tr> })}
+        <div className="mc-table-scroll" tabIndex={0} aria-label="Market indicators"><table className="mc-table"><thead><tr><th>Benchmark</th><th>1 session</th><th>5 sessions</th><th>20 sessions</th><th>Distance to 50-day MA</th><th>50-day MA change (10)</th></tr></thead><tbody>
+          {['SPY', 'QQQ'].map(ticker => { const values = data.benchmarks[ticker]?.value; return <tr key={ticker}><th scope="row">{ticker} ({movingAverage50(values).label})</th><td>{percent(values?.return1)}</td><td>{percent(values?.return5)}</td><td>{percent(values?.return20)}</td><td>{percent(movingAverageDistance50(values))}</td><td>{percent(movingAverage50(values).change10)}</td></tr> })}
         </tbody></table></div>
         <h2>Additional Context</h2>
         <dl className="mc-capabilities">{Object.entries(contextLabels).filter(([key]) => !['sentiment', 'weights'].includes(key)).map(([key, label]) => {

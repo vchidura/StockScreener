@@ -46,12 +46,18 @@ class BoundedAsyncProgressReporter:
         self._stopping = False
         self._thread: threading.Thread | None = None
         self._failure_count = 0
+        self._consecutive_failures = 0
         self._last_failure_name: str | None = None
 
     @property
     def failure_count(self) -> int:
         with self._condition:
             return self._failure_count
+
+    @property
+    def consecutive_failures(self) -> int:
+        with self._condition:
+            return self._consecutive_failures
 
     @property
     def last_failure_name(self) -> str | None:
@@ -101,7 +107,11 @@ class BoundedAsyncProgressReporter:
             except Exception as error:
                 with self._condition:
                     self._failure_count += 1
+                    self._consecutive_failures += 1
                     self._last_failure_name = type(error).__name__
+            else:
+                with self._condition:
+                    self._consecutive_failures = 0
 
 
 class AdvancedJournalPump:

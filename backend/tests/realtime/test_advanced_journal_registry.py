@@ -1,7 +1,8 @@
 from dataclasses import replace
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 from uuid import UUID
 
 import pytest
@@ -9,10 +10,14 @@ import pytest
 from realtime.advanced_journal_registry import (
     AdvancedJournalRecoveryEvent,
     build_advanced_journal_registration,
+    discover_incomplete_advanced_journals_cursor,
     journal_relative_path,
     measure_journal_capacity,
     record_advanced_journal_recovery_event_cursor,
+    register_advanced_journal_cursor,
     resolve_registered_journal_path,
+    seal_advanced_journal_cursor,
+    update_advanced_journal_offsets_cursor,
 )
 from realtime.advanced_journal_replay import (
     JournalReplayPending,
@@ -115,6 +120,117 @@ def test_registry_identity_and_empty_journal_recovery_are_deterministic(
     assert state.integrity_check == "ok"
     assert state.raw_committed_offset == 0
     assert len(journal_files_sha256(path)) == 64
+
+
+def test_registry_accepts_either_plan_authority_and_rejects_unknown(
+    tmp_path,
+):
+    registration = _registration(
+        tmp_path,
+        tmp_path / "journal.sqlite",
+    )
+    stored = (
+        registration.journal_generation,
+        registration.plan_id,
+        registration.stream_session_id,
+        registration.cohort_id,
+        registration.manifest_id,
+        registration.session_date,
+        registration.owner_epoch,
+        registration.relative_path,
+        registration.path_sha256,
+        registration.metadata_sha256,
+        registration.journal_codec,
+        registration.journal_schema_version,
+        registration.normalizer_version,
+        registration.shard_ids,
+        registration.shard_map_sha256,
+        registration.status,
+        registration.raw_committed_offset,
+        registration.normalized_committed_offset,
+        registration.bridge_committed_offset,
+        registration.sealed_files_sha256,
+    )
+    for authority in ((True, False), (False, True)):
+        cursor = MagicMock()
+        cursor.fetchone.side_effect = [authority, stored]
+
+        assert (
+            register_advanced_journal_cursor(cursor, registration)
+            == registration
+        )
+        assert "rt.advanced_ingress_plans" in (
+            cursor.execute.call_args_list[0].args[0]
+        )
+        assert "rt.service_plans" in (
+            cursor.execute.call_args_list[0].args[0]
+        )
+
+    cursor = MagicMock()
+    cursor.fetchone.return_value = (False, False)
+    with pytest.raises(ValueError, match="plan authority"):
+        register_advanced_journal_cursor(cursor, registration)
+    assert cursor.execute.call_count == 1
+
+
+def test_terminal_registry_updates_are_idempotent_only_when_exact():
+    checked_at = datetime(2026, 11, 3, 18, tzinfo=timezone.utc)
+    cursor = MagicMock()
+    cursor.fetchone.side_effect = [
+        None,
+        ("DRAINED", 100, 90, "a" * 64),
+    ]
+
+    update_advanced_journal_offsets_cursor(
+        cursor,
+        GENERATION,
+        raw_committed_offset=100,
+        normalized_committed_offset=90,
+        bridge_committed_offset=None,
+        checked_at=checked_at,
+    )
+
+    cursor = MagicMock()
+    cursor.fetchone.side_effect = [
+        None,
+        ("DRAINED", 100, 90, "a" * 64),
+    ]
+    seal_advanced_journal_cursor(
+        cursor,
+        GENERATION,
+        raw_committed_offset=100,
+        normalized_committed_offset=90,
+        sealed_files_sha256="a" * 64,
+        checked_at=checked_at,
+    )
+
+    cursor = MagicMock()
+    cursor.fetchone.side_effect = [
+        None,
+        ("DRAINED", 101, 90, "a" * 64),
+    ]
+    with pytest.raises(ValueError, match="offset update was rejected"):
+        update_advanced_journal_offsets_cursor(
+            cursor,
+            GENERATION,
+            raw_committed_offset=100,
+            normalized_committed_offset=90,
+            bridge_committed_offset=None,
+            checked_at=checked_at,
+        )
+
+
+def test_equity_bridge_discovers_only_stocks_journals():
+    cursor = MagicMock()
+    cursor.fetchall.return_value = []
+
+    assert discover_incomplete_advanced_journals_cursor(cursor) == ()
+
+    statement = cursor.execute.call_args.args[0]
+    assert "EXISTS (SELECT 1 FROM rt.stream_sessions AS session" in (
+        statement
+    )
+    assert "session.feed='STOCKS'" in statement
 
 
 def test_journal_checkpoint_truncates_wal_before_seal(tmp_path):
@@ -332,3 +448,62 @@ def test_missing_journal_recovery_is_append_only_overlay(
     assert "registry.status='QUARANTINED'" in insert
     assert "registry.quarantine_reason=%s" in insert
     assert "UPDATE rt.advanced_journal_registry" not in insert
+
+
+class _ReconciliationCursor:
+    """Answers the three reconciliation reads; the lease flag is what is under test."""
+
+    def __init__(self, *, heartbeat_at, lease_held, ended=False):
+        self._heartbeat_at = heartbeat_at
+        self._lease_held = lease_held
+        self._ended = ended
+        self._statement = ""
+        self.parameters = []
+
+    def execute(self, sql, parameters=()):
+        self._statement = sql
+        self.parameters.append(parameters)
+
+    def fetchone(self):
+        if "rt.stream_sessions" in self._statement:
+            return (self._ended, self._heartbeat_at, 60, self._lease_held)
+        return (0,)
+
+    def fetchall(self):
+        return ()
+
+
+@pytest.mark.parametrize(
+    ("age_seconds", "lease_held", "ended", "expected"),
+    (
+        # The 16:23:02 live seal on 2026-11-02: AM frames arrive about once a
+        # minute, so a healthy stream can read 61 seconds stale.
+        (61, True, False, False),
+        (61, False, False, True),
+        (10, False, False, False),
+        (10, True, True, True),
+    ),
+)
+def test_session_is_ended_only_without_a_held_connection_lease(
+    tmp_path,
+    age_seconds,
+    lease_held,
+    ended,
+    expected,
+):
+    checked_at = datetime(2026, 11, 2, 16, 23, 2, tzinfo=timezone.utc)
+    cursor = _ReconciliationCursor(
+        heartbeat_at=checked_at - timedelta(seconds=age_seconds),
+        lease_held=lease_held,
+        ended=ended,
+    )
+
+    assert replay._postgres_reconciliation_cursor(
+        cursor,
+        _registration(tmp_path, tmp_path / "journal.sqlite"),
+        checked_at=checked_at,
+    ) == (0, 0, expected)
+    assert cursor.parameters[0][:2] == (
+        replay.MASSIVE_STOCKS_CONNECTION_RESOURCE,
+        checked_at,
+    )

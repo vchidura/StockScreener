@@ -150,6 +150,116 @@ def test_v2_materialize_runner_emits_input_ready_without_loading_or_projecting(m
     ) == (runners.INPUT_READY, 3, "b" * 64, "c" * 64)
 
 
+ADVANCED_CLOSE = datetime(2026, 10, 12, 20, 0, tzinfo=timezone.utc)
+
+
+def _advanced_context(cutoff):
+    plan = SimpleNamespace(cohort_id=uuid4(), session_date=SESSION)
+    window = SimpleNamespace(
+        window_id=uuid4(),
+        cutoff=cutoff,
+        release_at=cutoff + timedelta(seconds=5),
+        deadline=cutoff + timedelta(minutes=5),
+        provider_tier="MASSIVE_ADVANCED",
+    )
+    return StageContext(
+        plan, window, STAGES_V2["EQUITY_MATERIALIZE"], uuid4(), 1, NOW, None, None, fenced=True,
+    )
+
+
+def _advanced_materialize(monkeypatch, context, *, visible):
+    monkeypatch.setattr(runners, "finalize_five_minute_inputs", lambda *args, **kwargs: ("COMPLETE", ()))
+    monkeypatch.setattr(runners, "finalize_higher_interval_inputs", lambda *args, **kwargs: ("COMPLETE", ()))
+    monkeypatch.setattr(runners, "reference_generation", lambda database, cutoff: 3)
+    monkeypatch.setattr(runners, "input_ready_identity", lambda database, **scope: ("b" * 64, "c" * 64))
+    gate = MagicMock(return_value=visible)
+    monkeypatch.setattr(runners, "closing_daily_inputs_visible", gate)
+    return runners.equity_materialize_runner(RunnerEnvironment(None))(context), gate
+
+
+def test_close_issues_no_input_ready_before_its_daily_bars_are_recorded(monkeypatch):
+    # A receipt here would pin every retry to a known_by before the bars can exist.
+    context = _advanced_context(ADVANCED_CLOSE)
+
+    outcome, gate = _advanced_materialize(monkeypatch, context, visible=False)
+
+    assert outcome.state == "BLOCKED_POLICY"
+    assert outcome.reason_codes == (runners.CLOSING_DAILY_INPUTS_PENDING,)
+    assert outcome.receipt is None
+    assert gate.call_args.kwargs["known_by"] == context.window.release_at
+
+
+def test_close_issues_input_ready_once_its_daily_bars_are_recorded(monkeypatch):
+    outcome, _ = _advanced_materialize(monkeypatch, _advanced_context(ADVANCED_CLOSE), visible=True)
+
+    assert outcome.state == "COMPLETE"
+    assert outcome.receipt.receipt_kind == runners.INPUT_READY
+
+
+def test_intraday_window_never_waits_for_daily_bars(monkeypatch):
+    outcome, gate = _advanced_materialize(
+        monkeypatch, _advanced_context(ADVANCED_CLOSE - timedelta(minutes=5)), visible=False,
+    )
+
+    assert outcome.state == "COMPLETE"
+    gate.assert_not_called()
+
+
+class _DictDatabase:
+    """Yields a cursor directly, as V2StageDatabase does."""
+
+    def __init__(self, cursor):
+        self.cursor, self.options = cursor, []
+
+    def transaction(self, **options):
+        self.options.append(options)
+        return nullcontext(self.cursor)
+
+
+@pytest.mark.parametrize(
+    ("visible_rows", "expected"),
+    (
+        # Nine members need both bases; adjusted alone is not enough.
+        (18, True),
+        (17, False),
+        (9, False),
+    ),
+)
+def test_closing_daily_inputs_need_both_bases_for_every_member(visible_rows, expected):
+    cursor = _Cursor([
+        [{"instrument_id": value} for value in range(1, 10)],
+        {"visible": visible_rows},
+    ])
+    context = _advanced_context(ADVANCED_CLOSE)
+    known_by = ADVANCED_CLOSE + timedelta(hours=8)
+
+    assert runners.closing_daily_inputs_visible(_DictDatabase(cursor), context, known_by=known_by) is expected
+
+    statement, parameters = cursor.statements[-1]
+    assert "'ADJUSTED','RAW_UNADJUSTED'" in statement and "observed_at<=%s" in statement
+    assert parameters[:3] == (str(context.plan.cohort_id), list(range(1, 10)), SESSION)
+    assert parameters[3:] == (known_by, known_by, known_by, known_by, ADVANCED_CLOSE)
+
+
+def test_higher_intervals_read_bars_recorded_after_the_stage_started(monkeypatch):
+    # The closing 5m bar is recorded mid-stage and no later window would pick it up.
+    context = _advanced_context(ADVANCED_CLOSE)
+    context = replace(context, started_at=ADVANCED_CLOSE + timedelta(seconds=6))
+    recorded = ADVANCED_CLOSE + timedelta(seconds=9)
+    cursor = _Cursor([[{"instrument_id": 7}], {"checked_at": recorded}])
+    enqueue, worker = MagicMock(), MagicMock(
+        return_value=SimpleNamespace(reason_codes=(), failed=0, blocked=0, claimed=0),
+    )
+    monkeypatch.setattr(runners, "enqueue_interval_derivation_jobs_cursor", enqueue)
+    monkeypatch.setattr(runners, "run_interval_derivation_worker_once", worker)
+
+    state, _ = runners.finalize_higher_interval_inputs(_DictDatabase(cursor), context)
+
+    assert state == "COMPLETE"
+    assert enqueue.call_args.kwargs["checked_at"] == recorded
+    assert worker.call_args.kwargs["checked_at"] == recorded
+
+
 def _input_identity_database(*, second_watermark=True, batch_sha="9" * 64):
     scope = (
         "1" * 64, "2" * 64, "3" * 64, "4" * 64,

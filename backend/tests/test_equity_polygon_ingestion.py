@@ -421,7 +421,7 @@ def test_native_monthly_bar_waits_for_final_exchange_session_close():
     assert complete[0].session_date == date(2026, 8, 31)
 
 
-def test_native_weekly_bar_maps_massive_sunday_bucket_to_prior_trading_week():
+def test_native_weekly_bar_maps_massive_sunday_start_to_following_trading_week():
     row = {
         "t": int(datetime(2025, 8, 24, 4, 0, tzinfo=UTC).timestamp() * 1000),
         "o": 100, "h": 110, "l": 95, "c": 108, "v": 500000, "n": 10000,
@@ -437,9 +437,9 @@ def test_native_weekly_bar_maps_massive_sunday_bucket_to_prior_trading_week():
         availability_mode=BarAvailabilityMode.HISTORICAL_RECONSTRUCTED,
     )
 
-    assert weekly.bar_start == datetime(2025, 8, 18, 13, 30, tzinfo=UTC)
-    assert weekly.bar_end == datetime(2025, 8, 22, 20, 0, tzinfo=UTC)
-    assert weekly.session_date == date(2025, 8, 22)
+    assert weekly.bar_start == datetime(2025, 8, 25, 13, 30, tzinfo=UTC)
+    assert weekly.bar_end == datetime(2025, 8, 29, 20, 0, tzinfo=UTC)
+    assert weekly.session_date == date(2025, 8, 29)
 
 
 def test_client_requests_polygon_month_timespan():

@@ -6,11 +6,15 @@ from datetime import datetime
 from enum import Enum
 from uuid import UUID
 
+from options.calendar import OptionExchangeCalendar
+from psycopg2.extras import RealDictCursor
+
 from .advanced_equity_control_plane import AdvancedEquityControlPlanePlan
 from .advanced_options_control_plane import (
     AdvancedOptionsEquityInputBinding,
 )
 from .contracts import canonical_sha256
+from .equity_history import equity_history_coordinates, load_equity_history_cursor
 from .preflight import DetectorFamily
 
 
@@ -269,6 +273,7 @@ def load_advanced_options_equity_context_cursor(
         raise ValueError("Options Equity dependency identities are incomplete")
 
     contexts = []
+    calendar = OptionExchangeCalendar("XNYS")
     requirements_by_lane: dict[
         DetectorFamily,
         list[AdvancedOptionsEquityContextRequirement],
@@ -286,8 +291,58 @@ def load_advanced_options_equity_context_cursor(
         lane_requirements = tuple(requirements_by_lane.get(lane, ()))
         members = []
         reasons = []
+        required_sources = (
+            {AdvancedOptionsEquityContextSource.LIVE_EQUITY, AdvancedOptionsEquityContextSource.HISTORY}
+            if lane in {DetectorFamily.OS1, DetectorFamily.OS2}
+            else {AdvancedOptionsEquityContextSource.LIVE_EQUITY}
+            if lane is DetectorFamily.O3 else set()
+        )
+        if not required_sources.issubset({row.source for row in lane_requirements}):
+            reasons.append(f"{lane.value}_E_CONTEXT_REQUIREMENTS_INCOMPLETE")
         for requirement in lane_requirements:
             for ticker in underlyings:
+                if requirement.source is AdvancedOptionsEquityContextSource.HISTORY:
+                    sessions = calendar.trailing_sessions_before(
+                        equity_cutoff.date(), requirement.session_count,
+                    )
+                    with cursor.connection.cursor(cursor_factory=RealDictCursor) as history_cursor:
+                        history = load_equity_history_cursor(
+                            history_cursor,
+                            cohort_id=history_source_cohort_id,
+                            security_id=security_ids[ticker],
+                            ticker=ticker,
+                            interval=requirement.interval,
+                            adjusted=False,
+                            sessions=sessions,
+                            checked_at=equity_cutoff,
+                        )
+                    rows = history.rows
+                    incomplete = (
+                        tuple(row["session_date"] for row in rows) != sessions
+                        or any(
+                            row["availability_mode"] not in requirement.availability_modes
+                            or (row["bar_start"], row["bar_end"])
+                            != equity_history_coordinates(
+                                calendar, requirement.interval, row["session_date"],
+                            )[0]
+                            for row in rows
+                        )
+                    )
+                    if incomplete:
+                        reasons.append(f"{lane.value}_{ticker}_E_CONTEXT_INCOMPLETE")
+                        continue
+                    members.extend(
+                        AdvancedOptionsEquityContextMember(
+                            ticker=ticker,
+                            source_cohort_id=UUID(str(row["cohort_id"])),
+                            bar_revision_id=UUID(str(row["bar_revision_id"])),
+                            bar_end=row["bar_end"],
+                            observed_at=row["observed_at"],
+                            payload_sha256=str(row["payload_sha256"]),
+                        )
+                        for row in rows
+                    )
+                    continue
                 cursor.execute(
                     "SELECT revision.bar_revision_id::text,"
                     "revision.bar_end,revision.observed_at,"

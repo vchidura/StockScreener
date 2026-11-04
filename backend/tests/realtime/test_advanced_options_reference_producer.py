@@ -347,7 +347,7 @@ def test_reference_plan_binds_broad_data_and_narrow_flow_membership():
         )
 
 
-def test_identical_terminal_oi_observations_coalesce_to_latest_clock():
+def test_terminal_oi_observations_coalesce_to_latest_clock():
     base = {
         "baseline_id": "11111111-1111-1111-1111-111111111111",
         "contract_id": 7,
@@ -375,9 +375,20 @@ def test_identical_terminal_oi_observations_coalesce_to_latest_clock():
     )
 
     assert selected["baseline_id"] == repeated["baseline_id"]
-    divergent = {**repeated, "open_interest": 124}
+    changed_value = {**repeated, "open_interest": 124}
+    (selected,) = _coalesce_terminal_open_interest(
+        (base, changed_value),
+        date(2026, 10, 27),
+    )
+    assert selected["baseline_id"] == changed_value["baseline_id"]
+
+    same_clock_conflict = {
+        **changed_value,
+        "baseline_id": "33333333-3333-3333-3333-333333333333",
+        "open_interest": 125,
+    }
     assert len(_coalesce_terminal_open_interest(
-        (base, divergent),
+        (changed_value, same_clock_conflict),
         date(2026, 10, 27),
     )) == 2
 

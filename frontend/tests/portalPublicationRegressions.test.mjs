@@ -25,6 +25,151 @@ function compile(file, overrides = {}) {
   return module.exports
 }
 
+test('portal identity recovery refetches active queries without a cohort change', async () => {
+  const originalWindow = globalThis.window
+  let effect, poll, refreshes = 0, invalidations = 0
+  globalThis.window = {
+    setInterval: callback => { poll = callback; return 1 },
+    clearInterval: () => {},
+  }
+  try {
+    const { PortalIdentityGate } = compile('layout/PortalIdentityGate.tsx', {
+      react: {
+        ...React,
+        useEffect: callback => { effect = callback },
+        useRef: value => ({ current: value }),
+        useState: value => [value, () => {}],
+      },
+      '@tanstack/react-query': {
+        useQueryClient: () => ({
+          invalidateQueries: async options => {
+            invalidations++
+            assert.deepEqual(options, { type: 'active' })
+          },
+        }),
+      },
+      '../services/portalIdentity': {
+        refreshPortalIdentity: async () => {
+          refreshes++
+          if (refreshes === 1) throw new Error('API unavailable')
+          return false
+        },
+      },
+    })
+    PortalIdentityGate({ children: null })
+    const cleanup = effect()
+    await new Promise(setImmediate)
+    assert.equal(invalidations, 0)
+    poll()
+    await new Promise(setImmediate)
+    assert.equal(refreshes, 2)
+    assert.equal(invalidations, 1)
+    cleanup()
+  } finally {
+    globalThis.window = originalWindow
+  }
+})
+
+test('healthy portal identity polling retries only active failed queries', async () => {
+  const originalWindow = globalThis.window
+  let effect, invalidation
+  globalThis.window = {
+    setInterval: () => 1,
+    clearInterval: () => {},
+  }
+  try {
+    const { PortalIdentityGate } = compile('layout/PortalIdentityGate.tsx', {
+      react: {
+        ...React,
+        useEffect: callback => { effect = callback },
+        useRef: value => ({ current: value }),
+        useState: value => [value, () => {}],
+      },
+      '@tanstack/react-query': {
+        useQueryClient: () => ({
+          invalidateQueries: async options => { invalidation = options },
+        }),
+      },
+      '../services/portalIdentity': {
+        refreshPortalIdentity: async () => false,
+      },
+    })
+    PortalIdentityGate({ children: null })
+    const cleanup = effect()
+    await new Promise(setImmediate)
+    assert.equal(invalidation.type, 'active')
+    assert.equal(invalidation.predicate({ state: { status: 'error' } }), true)
+    assert.equal(invalidation.predicate({ state: { status: 'success' } }), false)
+    cleanup()
+  } finally {
+    globalThis.window = originalWindow
+  }
+})
+
+test('legacy Options requests do not require a runtime publication identity', async () => {
+  const calls = []
+  globalThis.__regressionEnvironment = { VITE_REALTIME_ONLY: 'false' }
+  try {
+    const api = compile('services/api.ts', {
+      axios: { default: { create: () => ({ get: async (...args) => {
+        calls.push(args)
+        return { data: { available: false, reason: 'NO_DATA', data: {} } }
+      } }) } },
+      './portalIdentity': {
+        realtimeCohortId: () => undefined,
+        realtimeOptionsCohortId: () => { throw new Error('Legacy must not discover Options identity') },
+        realtimeOptionsReadsEnabled: () => false,
+      },
+    })
+    await api.getOptionDetectorDatasets()
+    await api.getOptionAlertSchedule()
+    assert.deepEqual(calls, [
+      ['/options/alerts/datasets', { params: undefined }],
+      ['/options/alerts/schedule', { params: undefined }],
+    ])
+  } finally { delete globalThis.__regressionEnvironment }
+})
+
+test('realtime Options still requires its own identity without borrowing the Equity cohort', async () => {
+  let requests = 0
+  let cohort
+  globalThis.__regressionEnvironment = { VITE_REALTIME_ONLY: 'true' }
+  try {
+    const api = compile('services/api.ts', {
+      axios: { default: { create: () => ({ get: async (_path, options) => {
+        requests++
+        assert.equal(options.params.cohort_id, 'options-cohort')
+        return { data: { available: false, reason: 'NO_DATA', data: {} } }
+      } }) } },
+      './portalIdentity': {
+        realtimeCohortId: () => 'equity-cohort',
+        realtimeOptionsCohortId: () => cohort,
+        realtimeOptionsReadsEnabled: () => true,
+      },
+    })
+    await assert.rejects(api.getOptionDetectorDatasets(), /No Options publication/)
+    assert.equal(requests, 0)
+    cohort = 'options-cohort'
+    await api.getOptionDetectorDatasets()
+    assert.equal(requests, 1)
+  } finally { delete globalThis.__regressionEnvironment }
+})
+
+test('market moving-average presentation distinguishes retained SMA50 from legacy EMA50', () => {
+  const page = compile('pages/MarketConditionsPage.tsx', {
+    '../services/api': {}, '../layout/pageContext': {}, './stockDivergence': {},
+    './MarketConditionsPage.css': {},
+  })
+  const retained = { close: 110, moving_average_basis: 'SMA50', sma50: 100, ema50: null }
+  const legacy = { close: 110, ema50: 100, ema50_change10: 0.02 }
+  assert.equal(page.movingAverage50(retained).label, 'SMA50')
+  assert.equal(page.movingAverage50(legacy).label, 'EMA50')
+  assert.ok(Math.abs(page.movingAverageDistance50(retained) - 0.1) < 1e-10)
+  assert.ok(Math.abs(page.movingAverageDistance50(legacy) - 0.1) < 1e-10)
+  assert.equal(page.movingAverageDistance50({ ...retained, sma50: null }), null)
+  assert.equal(page.movingAverage50({ ...retained, sma50: null }).label, 'SMA50')
+})
+
 test('market-hours banner skips freshness validation on weekends, holidays and outside session hours', async context => {
   let now = Date.parse('2026-10-09T15:00:00Z')
   context.mock.method(Date, 'now', () => now)
@@ -76,7 +221,9 @@ test('market-hours banner skips freshness validation on weekends, holidays and o
       assert.equal(freshnessReads, scenario.enabled ? 1 : 0)
       const element = StalenessBanner()
       if (scenario.enabled) {
-        assert.match(renderToStaticMarkup(element), /Delayed market data/)
+        assert.match(renderToStaticMarkup(element), /STALE DATA/)
+        assert.match(renderToStaticMarkup(element), /1 session behind/)
+        assert.match(renderToStaticMarkup(element), /Affected timeframes: 1d, 30m/)
         const boundary = boundaries.get(2)
         assert.equal(boundary.delay, Date.parse(market.session_close) - now)
         now = Date.parse(market.session_close)
@@ -136,7 +283,7 @@ test('market-hours banner suppresses unknown calendars and late responses, but r
   }
 })
 
-test('date-only ticker and Pattern Watch closing views never poll the live publication', () => {
+test('explicit historical ticker and cross-ticker views do not report intentional age as live lag', () => {
   const previous = globalThis.__regressionEnvironment
   globalThis.__regressionEnvironment = { VITE_REALTIME_ONLY: 'true' }
   try {
@@ -145,7 +292,7 @@ test('date-only ticker and Pattern Watch closing views never poll the live publi
       const { StalenessBanner } = compile('layout/StalenessBanner.tsx', {
         react: { ...React, useState: () => [null, () => {}], useEffect: callback => { effect = callback } },
         'react-router-dom': { useLocation: () => ({ pathname }),
-          useSearchParams: () => [new URLSearchParams()] },
+          useSearchParams: () => [new URLSearchParams('session_date=2026-10-08')] },
         './navigation': { activeTickerSymbol: () => pathname.startsWith('/ticker/') ? 'SPY' : null },
         '../pages/publicationNavigation': { isDailyStrategyPath: () => false },
         '../services/api': { fetchMarketNotificationWindow: () => { reads++ },
@@ -155,6 +302,139 @@ test('date-only ticker and Pattern Watch closing views never poll the live publi
       assert.equal(effect(), undefined)
       assert.equal(reads, 0)
     }
+  } finally {
+    globalThis.__regressionEnvironment = previous
+  }
+})
+
+test('latest ticker and cross-ticker views show retained content with the stale-data banner', async () => {
+  const previous = globalThis.__regressionEnvironment
+  const originalWindow = globalThis.window
+  globalThis.__regressionEnvironment = { VITE_REALTIME_ONLY: 'true' }
+  globalThis.window = { setInterval: () => 1, clearInterval: () => {}, setTimeout: () => 2, clearTimeout: () => {} }
+  try {
+    for (const pathname of ['/ticker/SPY', '/pattern-watch', '/overview']) {
+      let state, effect, reads = 0
+      const { StalenessBanner } = compile('layout/StalenessBanner.tsx', {
+        react: { ...React, useState: () => [state ?? null, value => { state = value }],
+          useEffect: callback => { effect ??= callback } },
+        'react-router-dom': { useLocation: () => ({ pathname }),
+          useSearchParams: () => [new URLSearchParams()] },
+        './navigation': { activeTickerSymbol: () => pathname.startsWith('/ticker/') ? 'SPY' : null },
+        '../pages/publicationNavigation': { isDailyStrategyPath: () => false },
+        '../services/api': {
+          fetchMarketNotificationWindow: async () => ({
+            calendar: 'XNYS', session: '2026-10-09', checked_at: '2026-10-09T15:00:00Z',
+            is_trading_session: true, notifications_enabled: true,
+            session_open: '2026-10-09T13:30:00Z', session_close: '2026-10-09T20:00:00Z',
+          }),
+          fetchMaterializationStatus: async () => {
+            reads++
+            return {
+              status: 'STALE', last_market_time: '2026-10-08T20:00:00Z',
+              oldest_stale_market_time: '2026-10-08T19:30:00Z',
+              retained_setup_generated_at: '2026-10-08T20:05:00Z',
+              stale_intervals: ['1d'], staleness_sessions: 1,
+            }
+          },
+        },
+      })
+      assert.equal(StalenessBanner(), null)
+      const cleanup = effect()
+      await new Promise(setImmediate)
+      assert.equal(reads, 1)
+      const html = renderToStaticMarkup(StalenessBanner())
+      assert.match(html, /STALE DATA/)
+      assert.match(html, /Oldest published timestamp/)
+      assert.match(html, /Retained setup age/)
+      cleanup()
+    }
+  } finally {
+    globalThis.window = originalWindow
+    globalThis.__regressionEnvironment = previous
+  }
+})
+
+test('enabled Options uses retained release age for the stale-data banner', async () => {
+  const previous = globalThis.__regressionEnvironment
+  const originalWindow = globalThis.window
+  globalThis.__regressionEnvironment = { VITE_REALTIME_ONLY: 'true' }
+  globalThis.window = { setInterval: () => 1, clearInterval: () => {}, setTimeout: () => 2, clearTimeout: () => {} }
+  let state, effect, reads = 0
+  try {
+    const { StalenessBanner } = compile('layout/StalenessBanner.tsx', {
+      react: { ...React, useState: () => [state ?? null, value => { state = value }],
+        useEffect: callback => { effect ??= callback } },
+      'react-router-dom': { useLocation: () => ({ pathname: '/options/flow' }),
+        useSearchParams: () => [new URLSearchParams()] },
+      './navigation': { activeTickerSymbol: () => null },
+      '../pages/publicationNavigation': { isDailyStrategyPath: () => false },
+      '../services/portalIdentity': { realtimeOptionsReadsEnabled: () => true },
+      '../services/api': {
+        fetchMarketNotificationWindow: async () => ({
+          calendar: 'XNYS', session: '2026-10-09', checked_at: '2026-10-09T15:00:00Z',
+          is_trading_session: true, notifications_enabled: true,
+          session_open: '2026-10-09T13:30:00Z', session_close: '2026-10-09T20:00:00Z',
+        }),
+        fetchOptionsMaterializationStatus: async (session, checkedAt) => {
+          reads++
+          assert.deepEqual([session, checkedAt], ['2026-10-09', '2026-10-09T15:00:00Z'])
+          return {
+            status: 'STALE', last_market_time: '2026-10-09T14:45:00Z',
+            oldest_stale_market_time: '2026-10-09T14:45:00Z',
+            retained_setup_generated_at: '2026-10-09T14:46:00Z',
+            stale_intervals: ['options'], staleness_sessions: 0,
+          }
+        },
+      },
+    })
+    assert.equal(StalenessBanner(), null)
+    const cleanup = effect()
+    await new Promise(setImmediate)
+    assert.equal(reads, 1)
+    assert.match(renderToStaticMarkup(StalenessBanner()), /Affected timeframes: options/)
+    cleanup()
+  } finally {
+    globalThis.window = originalWindow
+    globalThis.__regressionEnvironment = previous
+  }
+})
+
+test('enabled Options freshness preserves the retained release and reports its age', async () => {
+  const previous = globalThis.__regressionEnvironment
+  globalThis.__regressionEnvironment = { VITE_REALTIME_ONLY: 'true' }
+  const calls = []
+  try {
+    const api = compile('services/api.ts', {
+      axios: { default: {
+        isAxiosError: () => false,
+        create: () => ({
+          get: async (url, config = {}) => {
+            calls.push([url, config.params])
+            return { data: {
+              available: true, reason: null, data_tier: 'REAL-TIME ADVANCED RESEARCH DATA',
+              generated_at: '2026-10-09T14:46:00Z', as_of: '2026-10-09T14:45:00Z',
+              observed_at: '2026-10-09T14:46:00Z', policy_sha256: 'a'.repeat(64),
+              model_version: 'v1', data: { underlyers: [], selected: 'SPY' },
+            } }
+          },
+        }),
+      } },
+      './portalIdentity': {
+        realtimeCohortId: () => 'equity-cohort',
+        realtimeOptionsCohortId: () => 'options-cohort',
+        realtimeOptionsReadsEnabled: () => true,
+      },
+    })
+    const status = await api.fetchOptionsMaterializationStatus(
+      '2026-10-09',
+      '2026-10-09T15:00:00Z',
+    )
+    assert.equal(status.status, 'STALE')
+    assert.equal(status.serving_latest_available, true)
+    assert.equal(status.oldest_stale_market_time, '2026-10-09T14:45:00Z')
+    assert.equal(status.retained_setup_generated_at, '2026-10-09T14:46:00Z')
+    assert.deepEqual(calls, [['/options/flow', { underlyer: undefined, session_date: undefined, cohort_id: 'options-cohort' }]])
   } finally {
     globalThis.__regressionEnvironment = previous
   }

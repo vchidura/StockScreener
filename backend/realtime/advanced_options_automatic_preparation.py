@@ -12,7 +12,7 @@ from dataclasses import replace
 
 from options.calendar import OptionExchangeCalendar
 from options.config import load_valuation_policy
-from options.data.polygon_http import RequestsPolygonHttpTransport
+from options.data.polygon_http import SingleAttemptPolygonHttpTransport
 
 from scripts.apply_advanced_options_p8_catalog_hydration import (
     _current_rows,
@@ -62,9 +62,11 @@ from .advanced_options_activity_momentum_c6 import (
 from .advanced_options_lifecycle import (
     AdvancedOptionsPreparationClaim,
     AdvancedOptionsPreparationExecutor,
+    AdvancedOptionsPreparationProviderFailed,
     AdvancedOptionsPreparationRefreshRequired,
     AdvancedOptionsPreparationRetryable,
     AdvancedOptionsPreparationTerminal,
+    AdvancedOptionsProviderRequestAttempt,
     AdvancedOptionsProviderRequestPlan,
     AdvancedOptionsProviderRequestResult,
     AdvancedOptionsStageProviderBudget,
@@ -73,12 +75,18 @@ from .advanced_options_lifecycle import (
 from .advanced_options_p7_selection import P7TransportSelectionPolicy
 from .advanced_options_p8_selection_source import (
     MassiveAdvancedOptionsSelectionSource,
+    P8SelectionNoUsableContracts,
     SEALED_CAPTURE_EXACT_FOUR_PROFILE,
     SEALED_CAPTURE_GENERALIZED_C6_PROFILE,
     p8_activity_selection_capture_from_sealed,
 )
 from .advanced_options_reference_producer import (
     load_opening_reference_inputs_cursor,
+)
+from .equity_history import (
+    EquityHistoryIdentityError,
+    equity_history_coordinates,
+    load_equity_history_cursor,
 )
 from .advanced_options_reference_repository import (
     decode_advanced_options_reference_state,
@@ -158,6 +166,14 @@ def _utc(value: datetime, name: str) -> datetime:
     return value.astimezone(UTC)
 
 
+def _catalog_failure_reason(error: Exception) -> str:
+    if isinstance(error, P8SelectionNoUsableContracts):
+        return error.reason_code
+    if isinstance(error, (ValueError, RuntimeError)):
+        return f"{type(error).__name__}:{error}"
+    return type(error).__name__
+
+
 class PostgresAutomaticOptionsPreparationExecutor(
     AdvancedOptionsPreparationExecutor
 ):
@@ -179,6 +195,7 @@ class PostgresAutomaticOptionsPreparationExecutor(
         effective_provider_project_ceiling: int | None = None,
         enabled_strategies: tuple[str, ...] = (),
         exact_four_compatibility: bool = False,
+        capture_after_open_seconds: int | None = None,
         connection_attempt_ceiling: int = 12,
         decoded_message_ceiling: int = 1_000_000,
         decoded_byte_ceiling: int = 1_073_741_824,
@@ -219,6 +236,7 @@ class PostgresAutomaticOptionsPreparationExecutor(
         self._backend_image_id = backend_image_id.strip()
         self._request_limit = maximum_provider_requests_per_underlying
         self._byte_limit = maximum_decoded_bytes_per_underlying
+        self._capture_after_open_seconds = capture_after_open_seconds
         self._maximum_contracts_per_logical_shard = (
             maximum_contracts_per_logical_shard
         )
@@ -241,6 +259,33 @@ class PostgresAutomaticOptionsPreparationExecutor(
         self._clock = clock
         self._selection_source_factory = selection_source_factory
         self._combined_capture_factory = combined_capture_factory
+        self._catalog_capture = None
+
+    def provider_attempts(
+        self,
+        claim: AdvancedOptionsPreparationClaim,
+    ) -> tuple[AdvancedOptionsProviderRequestAttempt, ...] | None:
+        """Exact requests of this claim's capture; None when unknowable."""
+        if (
+            self._catalog_capture is None
+            or self._catalog_capture[0] is not claim
+        ):
+            return None
+        attempts = getattr(
+            self._catalog_capture[1],
+            "provider_attempts",
+            None,
+        )
+        if attempts is None:
+            return None
+        return tuple(
+            AdvancedOptionsProviderRequestAttempt(
+                row.http_status,
+                row.response_bytes,
+                row.row_count,
+            )
+            for row in attempts
+        )
 
     def provider_budget(
         self,
@@ -248,9 +293,7 @@ class PostgresAutomaticOptionsPreparationExecutor(
     ) -> AdvancedOptionsStageProviderBudget | None:
         if claim.stage != "CATALOG_QUOTE":
             return None
-        if _utc(self._clock(), "preparation clock").date() != (
-            claim.session_date
-        ):
+        if not self._capture_is_open(claim):
             return None
         request_count = self._request_limit
         scope = ProviderBudgetScope(
@@ -303,6 +346,7 @@ class PostgresAutomaticOptionsPreparationExecutor(
                 )
                 for index in range(1, request_count + 1)
             ),
+            underlying_request_ceiling=self._request_limit * 3,
         )
 
     def _source(self, claim):
@@ -329,10 +373,20 @@ class PostgresAutomaticOptionsPreparationExecutor(
             if profile.selection_criteria
             else Decimal("0.05")
         )
-        transport = RequestsPolygonHttpTransport(
+        hard_stop = (
+            OptionExchangeCalendar("XNYS").session_close(
+                claim.session_date
+            )
+            + timedelta(minutes=5)
+        )
+        # One HTTP attempt per reserved slot: a transparent retry would be a
+        # request the ledger and the provider budget never see.
+        transport = SingleAttemptPolygonHttpTransport(
             self._api_key,
+            deadline=hard_stop,
             timeout_seconds=30,
             maximum_response_bytes=self._byte_limit,
+            clock=self._clock,
         )
         return MassiveAdvancedOptionsSelectionSource(
             transport,
@@ -362,12 +416,7 @@ class PostgresAutomaticOptionsPreparationExecutor(
             ),
             query_maximum_dte=discovery_maximum_dte,
             query_maximum_moneyness_fraction=discovery_moneyness,
-            deadline=(
-                OptionExchangeCalendar("XNYS").session_close(
-                    claim.session_date
-                )
-                + timedelta(minutes=5)
-            ),
+            deadline=hard_stop,
         )
 
     def _capture_document(self, claim, capture):
@@ -406,18 +455,67 @@ class PostgresAutomaticOptionsPreparationExecutor(
         document["semantic_sha256"] = canonical_sha256(document)
         return document
 
-    def _catalog_quote(self, claim, provider_request_ids):
-        if _utc(self._clock(), "preparation clock").date() != (
+    def _capture_opens_at(self, claim) -> datetime | None:
+        if self._capture_after_open_seconds is None:
+            return None
+        return OptionExchangeCalendar("XNYS").session_open(
             claim.session_date
-        ):
-            raise AdvancedOptionsPreparationRetryable(
-                "target-session provider window is not open"
-            )
+        ) + timedelta(seconds=self._capture_after_open_seconds)
+
+    def _capture_is_open(self, claim) -> bool:
+        checked = _utc(self._clock(), "preparation clock")
+        opens_at = self._capture_opens_at(claim)
+        return checked.date() == claim.session_date and (
+            opens_at is None or checked >= opens_at
+        )
+
+    def _capture_wait(self, claim):
+        """Anything captured before the open would go stale, so spend no budget
+        yet, but still report now whether the history the session needs exists."""
+        try:
+            self._history(claim)
+        except AdvancedOptionsPreparationRetryable as error:
+            detail = str(error)
+        else:
+            detail = "history ready"
+        opens_at = self._capture_opens_at(claim)
+        checked = _utc(self._clock(), "preparation clock")
+        return AdvancedOptionsPreparationRetryable(
+            f"target-session provider window is not open; {detail}",
+            retry_at=(
+                None
+                if opens_at is None
+                else min(opens_at, checked + timedelta(seconds=300))
+            ),
+        )
+
+    def _catalog_quote(self, claim, provider_request_ids):
+        if not self._capture_is_open(claim):
+            raise self._capture_wait(claim)
         if not provider_request_ids:
             raise AdvancedOptionsPreparationTerminal(
                 "catalog stage has no provider reservations"
             )
-        capture = self._source(claim).capture(
+        source = self._source(claim)
+        self._catalog_capture = (claim, source)
+        try:
+            return self._capture_catalog(
+                claim,
+                source,
+                provider_request_ids,
+            )
+        except (
+            AdvancedOptionsPreparationRetryable,
+            AdvancedOptionsPreparationTerminal,
+        ):
+            raise
+        except Exception as error:
+            raise AdvancedOptionsPreparationProviderFailed(
+                _catalog_failure_reason(error)
+            ) from error
+
+    def _capture_catalog(self, claim, source, provider_request_ids):
+        capture = source.capture(
             reviewed_at=_utc(self._clock(), "selection clock"),
             session_date=claim.session_date,
         )
@@ -643,41 +741,53 @@ class PostgresAutomaticOptionsPreparationExecutor(
         with self._provider.transaction(
             APP_ROLE,
             read_only=True,
+            dict_cursor=True,
         ) as unit:
             unit.cursor.execute(
-                "SELECT source_cohort_id::text "
-                "FROM rt.cohort_history_bindings "
-                "WHERE target_cohort_id=%s",
-                (str(claim.source_equity_cohort_id),),
+                "SELECT DISTINCT binding.security_id "
+                "FROM rt.realtime_desired_member_intents AS intent "
+                "JOIN rt.realtime_desired_member_bindings AS binding USING(intent_id) "
+                "WHERE intent.revision_id=%s AND intent.ticker=%s "
+                "AND intent.member_kind IN ('EQUITY','SECTOR_ETF')",
+                (str(claim.revision_id), claim.ticker),
             )
-            source_row = unit.cursor.fetchone()
-            history_cohort_id = (
-                claim.source_equity_cohort_id
-                if source_row is None
-                else UUID(str(source_row[0]))
+            identities = tuple(unit.cursor.fetchall())
+            if len(identities) != 1:
+                raise AdvancedOptionsPreparationRetryable(
+                    f"required Equity identity is unavailable for {claim.ticker}"
+                )
+            checked_at = _utc(self._clock(), "history clock")
+            try:
+                history = {
+                    basis: load_equity_history_cursor(
+                        unit.cursor,
+                        cohort_id=claim.source_equity_cohort_id,
+                        security_id=UUID(str(identities[0]["security_id"])),
+                        ticker=claim.ticker,
+                        interval="1d",
+                        adjusted=basis == "ADJUSTED",
+                        sessions=selected,
+                        checked_at=checked_at,
+                    )
+                    for basis, selected in (
+                        ("ADJUSTED", sessions),
+                        ("RAW_UNADJUSTED", sessions[-1:]),
+                    )
+                }
+            except EquityHistoryIdentityError as error:
+                raise AdvancedOptionsPreparationTerminal(str(error)) from error
+        adjusted = history["ADJUSTED"].rows
+        raw = history["RAW_UNADJUSTED"].rows
+        if (
+            tuple(row["session_date"] for row in adjusted) != sessions
+            or tuple(row["session_date"] for row in raw) != sessions[-1:]
+            or any(row["stale_adjustment_lineage"] for row in adjusted)
+            or any(
+                (row["bar_start"], row["bar_end"])
+                != equity_history_coordinates(calendar, "1d", row["session_date"])[0]
+                for row in (*adjusted, *raw)
             )
-            unit.cursor.execute(
-                "SELECT revision.session_date,"
-                "current.adjustment_basis "
-                "FROM rt.bar_current AS current "
-                "JOIN rt.bar_revisions AS revision "
-                "ON revision.bar_revision_id=current.bar_revision_id "
-                "AND revision.observed_at=current.observed_at "
-                "WHERE current.cohort_id=%s "
-                "AND revision.ticker=%s AND revision.is_final "
-                "AND revision.session_date=ANY(%s) "
-                "AND current.adjustment_basis "
-                "IN ('ADJUSTED','RAW_UNADJUSTED')",
-                (
-                    str(history_cohort_id),
-                    claim.ticker,
-                    list(sessions),
-                ),
-            )
-            rows = tuple(unit.cursor.fetchall())
-        adjusted = {row[0] for row in rows if row[1] == "ADJUSTED"}
-        raw = {row[0] for row in rows if row[1] == "RAW_UNADJUSTED"}
-        if adjusted != set(sessions) or sessions[-1] not in raw:
+        ):
             raise AdvancedOptionsPreparationRetryable(
                 f"required Options history is incomplete for {claim.ticker}"
             )
@@ -689,7 +799,10 @@ class PostgresAutomaticOptionsPreparationExecutor(
             },
             evidence={
                 "status": "READY",
-                "source_cohort_id": str(history_cohort_id),
+                "source_cohort_id": str(claim.source_equity_cohort_id),
+                "resolved_history": {
+                    basis: value.lineage for basis, value in history.items()
+                },
                 "sessions": [
                     session.isoformat() for session in sessions
                 ],

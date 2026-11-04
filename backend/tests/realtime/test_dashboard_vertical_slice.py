@@ -63,6 +63,7 @@ class DashboardStore(TickerStore):
             if row and (row["cohort_id"], row["snapshot_type"], row["snapshot_key"]) == key and row["generated_at"] <= params[3]:
                 self.result = [dict(
                     row,
+                    cohort_manifest_id=None,
                     cohort_manifest_sha256="a" * 64,
                     stock_count=9,
                     history_binding_sha256=getattr(

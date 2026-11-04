@@ -1,4 +1,5 @@
 import axios from 'axios'
+import { realtimeCohortId, realtimeOptionsCohortId, realtimeOptionsReadsEnabled } from './portalIdentity'
 
 // Development: uses Vite proxy (/api → localhost:8001)
 // Production: set VITE_API_BASE_URL to your backend URL
@@ -9,27 +10,47 @@ const api = axios.create({
   timeout: 120000,
 })
 
-const storedReadError = (error: unknown): Error => {
+type StoredReadError = Error & { status?: number }
+
+const storedReadError = (error: unknown): StoredReadError => {
   if (axios.isAxiosError?.(error) && typeof error.response?.data?.detail === 'string') {
-    return new Error(error.response.data.detail)
+    return Object.assign(new Error(error.response.data.detail), {
+      status: error.response.status,
+    })
   }
   return error instanceof Error ? error : new Error('Stored realtime publication is unavailable')
 }
+
+const storedReadStatus = (error: unknown) =>
+  axios.isAxiosError?.(error) ? error.response?.status : (error as StoredReadError)?.status
 
 type ApiQueryValue = string | number | boolean | readonly (string | number | boolean)[] | undefined
 
 export const tickerParams = (params?: Record<string, ApiQueryValue>, snapshotId?: string) => {
   if (import.meta.env.VITE_REALTIME_ONLY !== 'true') return params
-  const cohort_id = import.meta.env.VITE_REALTIME_COHORT_ID?.trim()
-  if (!cohort_id) throw new Error('Realtime ticker requires VITE_REALTIME_COHORT_ID')
-  return { ...params, cohort_id, ...(snapshotId !== undefined ? { snapshot_id: snapshotId } : {}) }
+  // A session read is served from the cohort holding that session, which the API resolves.
+  const cohort_id = params?.session_date === undefined ? realtimeCohortId() : undefined
+  return { ...params, ...(cohort_id ? { cohort_id } : {}), ...(snapshotId !== undefined ? { snapshot_id: snapshotId } : {}) }
+}
+
+// Options has its own per-session cohort, so an Equity identity must never reach these reads.
+const optionParams = (params?: Record<string, ApiQueryValue>) => {
+  if (import.meta.env.VITE_REALTIME_ONLY !== 'true') return params
+  const cohort_id = realtimeOptionsCohortId()
+  if (!cohort_id) throw new Error('No Options publication is available yet')
+  return { ...params, cohort_id }
+}
+
+const foreignCohort = (cohortId: string | undefined, sessionDate?: string) => {
+  const current = realtimeCohortId()
+  return sessionDate === undefined && current !== undefined && cohortId !== current
 }
 
 const requireRealtimeOptionsReads = () => {
   if (
     import.meta.env.VITE_REALTIME_ONLY === 'true'
-    && import.meta.env.VITE_REALTIME_OPTIONS_V2 !== 'true'
-  ) throw new Error('Advanced Options stored reads require VITE_REALTIME_OPTIONS_V2=true')
+    && !realtimeOptionsReadsEnabled()
+  ) throw new Error('Advanced Options stored reads are disabled')
 }
 
 export const retainedTickerParams = (params?: Record<string, ApiQueryValue>, snapshotId?: string, closingView = false) =>
@@ -79,7 +100,7 @@ export const getTickerWorkspacePublication = async (ticker: string, snapshotId?:
     })
     const publication = response.data as TickerWorkspacePublication
     if (!publication.snapshot_id || publication.ticker !== ticker.trim().toUpperCase()
-      || publication.cohort_id !== import.meta.env.VITE_REALTIME_COHORT_ID?.trim()
+      || foreignCohort(publication.cohort_id, sessionDate)
       || (snapshotId !== undefined && publication.snapshot_id !== snapshotId)
       || sessionDate !== undefined && (publication.session !== sessionDate || publication.read_mode !== 'SESSION_CLOSE')
       || closingView && publication.read_mode !== 'SESSION_CLOSE') {
@@ -119,8 +140,11 @@ export interface RotationFact<Value> {
 export interface RotationPrices {
   close: number
   direction: string
-  ema50: number
-  ema50_change10: number
+  ema50: number | null
+  ema50_change10: number | null
+  moving_average_basis?: 'EMA50' | 'SMA50'
+  sma50?: number | null
+  sma50_change10?: number | null
   return1: number
   return5: number
   return20: number
@@ -256,19 +280,95 @@ export interface MaterializationStatus {
   source?: string
   ticker_count?: number
   serving_latest_available?: boolean
+  retained_setup_generated_at?: string | null
+}
+
+export const fetchScreeningMaterializationStatus = async (): Promise<MaterializationStatus> => {
+  const response = await api.get('/stocks/screening/status', {
+    params: tickerParams({ read_mode: 'retained' }),
+  })
+  return response.data
+}
+
+export const fetchOptionsMaterializationStatus = async (
+  expectedSession: string,
+  checkedAt: string,
+): Promise<MaterializationStatus> => {
+  requireRealtimeOptionsReads()
+  const envelope = await getOptionFlow()
+  const checked = Date.parse(checkedAt)
+  const marketTime = envelope.as_of
+  const generatedAt = typeof envelope.generated_at === 'string'
+    ? envelope.generated_at
+    : new Date(envelope.generated_at).toISOString()
+  if (!envelope.available || !marketTime || !Number.isFinite(Date.parse(marketTime))) {
+    return {
+      status: 'UNAVAILABLE',
+      checked_at: checkedAt,
+      max_serveable_stale_sessions: 5,
+      staleness_sessions: 0,
+      last_market_time: marketTime,
+      oldest_stale_market_time: marketTime,
+      stale_intervals: ['options'],
+      pipeline_active: false,
+      active_intervals: [],
+      source: 'OPTIONS_RETAINED_RELEASE',
+      serving_latest_available: true,
+      retained_setup_generated_at: generatedAt,
+    }
+  }
+  const sessionParts = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'America/New_York',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).formatToParts(new Date(marketTime))
+  const sessionPart = (type: Intl.DateTimeFormatPartTypes) =>
+    sessionParts.find(part => part.type === type)?.value ?? ''
+  const sourceSession = `${sessionPart('year')}-${sessionPart('month')}-${sessionPart('day')}`
+  const age = checked - Date.parse(marketTime)
+  const sessionsBehind = sourceSession < expectedSession ? 1 : 0
+  const status: MaterializationStatus['status'] = sessionsBehind
+    ? 'EXPIRED'
+    : age > 5 * 60 * 1000
+      ? 'STALE'
+      : 'READY'
+  return {
+    status,
+    checked_at: checkedAt,
+    max_serveable_stale_sessions: 5,
+    staleness_sessions: sessionsBehind,
+    last_market_time: marketTime,
+    oldest_stale_market_time: status === 'READY' ? null : marketTime,
+    stale_intervals: status === 'READY' ? [] : ['options'],
+    pipeline_active: false,
+    active_intervals: [],
+    source: 'OPTIONS_RETAINED_RELEASE',
+    serving_latest_available: true,
+    retained_setup_generated_at: generatedAt,
+  }
 }
 
 export const fetchMaterializationStatus = async (snapshotId?: string, ticker?: string, dailyStrategies = false, interval: StrategyInterval = '1d'): Promise<MaterializationStatus> => {
   if (import.meta.env.VITE_REALTIME_ONLY === 'true' && dailyStrategies) {
-    const publication = await resolveDailyStrategyPublication(snapshotId, interval)
-    if (publication.staleness_sessions === undefined || publication.max_serveable_stale_sessions === undefined) {
-      throw new Error('Independent strategy freshness metadata is unavailable')
+    try {
+      const publication = await resolveDailyStrategyPublication(snapshotId, interval)
+      if (publication.staleness_sessions === undefined || publication.max_serveable_stale_sessions === undefined) {
+        throw new Error('Independent strategy freshness metadata is unavailable')
+      }
+      return { status: publication.status, checked_at: publication.read_at, source: publication.release_type,
+        max_serveable_stale_sessions: publication.max_serveable_stale_sessions,
+        staleness_sessions: publication.staleness_sessions, last_market_time: publication.market_time,
+        oldest_stale_market_time: publication.status === 'READY' ? null : publication.market_time,
+        stale_intervals: publication.status === 'READY' ? [] : [interval], pipeline_active: false, active_intervals: [],
+        retained_setup_generated_at: publication.generated_at }
+    } catch (error) {
+      if (storedReadStatus(error) !== 503 || interval !== '1d' || snapshotId !== undefined) throw error
+      const response = await api.get('/equity/materialization-status', {
+        params: tickerParams(),
+      })
+      return response.data
     }
-    return { status: publication.status, checked_at: publication.read_at, source: publication.release_type,
-      max_serveable_stale_sessions: publication.max_serveable_stale_sessions,
-      staleness_sessions: publication.staleness_sessions, last_market_time: publication.market_time,
-      oldest_stale_market_time: publication.status === 'READY' ? null : publication.market_time,
-      stale_intervals: publication.status === 'READY' ? [] : [interval], pipeline_active: false, active_intervals: [] }
   }
   if (import.meta.env.VITE_REALTIME_ONLY === 'true' && ticker) {
     const { publication } = await getTickerWorkspacePublication(ticker, snapshotId)
@@ -295,6 +395,7 @@ export const fetchMaterializationStatus = async (snapshotId?: string, ticker?: s
       staleness_sessions: Math.max(...metrics.map(([, metric]) => metric.staleness_sessions ?? 0)),
       last_market_time: publication.market_time, oldest_stale_market_time: oldest ?? null,
       stale_intervals: Array.from(new Set([...stale.map(([interval]) => interval), ...unavailableIntervals])),
+      retained_setup_generated_at: publication.generated_at,
     }
   }
   const params = import.meta.env.VITE_REALTIME_ONLY === 'true' && snapshotId ? { snapshot_id: snapshotId } : undefined
@@ -687,7 +788,7 @@ export interface MarketRegime {
   caution_buy: boolean
   caution_sell: boolean
   divergence: string | null
-  spy: IndexTechnicals
+  spy: IndexTechnicals | null
   qqq: IndexTechnicals | null
 }
 
@@ -1209,7 +1310,7 @@ const checkedDailyStrategyPublication = (publication: DashboardPublication | und
   const versions = interval === '1d' ? ['DAILY_STRATEGIES_V1', 'DAILY_STRATEGY_HISTORY_V1', 'DAILY_STRATEGY_ROLLING_V1']
     : ['HOURLY_STRATEGIES_V1', 'HOURLY_STRATEGY_HISTORY_V1', 'HOURLY_STRATEGY_ROLLING_V1']
   if (!publication || !versions.includes(publication.release_type ?? '') || (publication.interval ?? '1d') !== interval
-    || publication.cohort_id !== import.meta.env.VITE_REALTIME_COHORT_ID?.trim()
+    || foreignCohort(publication.cohort_id, sessionDate)
     || !publication.snapshot_id || (snapshotId !== undefined && publication.snapshot_id !== snapshotId)
     || sessionDate !== undefined && publication.session !== sessionDate) {
     throw new Error('Stored independent strategy publication does not match the requested identity')
@@ -1278,7 +1379,7 @@ export const getAllTickersPublication = async (snapshotId?: string, sessionDate?
     const publication = result.publication
     const members = result.overview?.map(row => row.ticker)
     const setups = result.setup?.results
-    if (!publication?.snapshot_id || publication.cohort_id !== import.meta.env.VITE_REALTIME_COHORT_ID?.trim()
+    if (!publication?.snapshot_id || foreignCohort(publication.cohort_id, sessionDate)
       || publication.read_mode !== 'SESSION_CLOSE'
       || snapshotId !== undefined && publication.snapshot_id !== snapshotId
       || sessionDate !== undefined && publication.session !== sessionDate
@@ -1320,6 +1421,39 @@ export interface DailyScannerPages {
 }
 
 export async function getDailyScannerPublication<K extends keyof DailyScannerPages>(kind: K, snapshotId?: string, interval: StrategyInterval = '1d', sessionDate?: string): Promise<DailyScannerPages[K]> {
+  const readDashboard = async (): Promise<DailyScannerPages[K]> => {
+    if (interval !== '1d' || sessionDate !== undefined) {
+      throw new Error('No retained independent strategy release is available for this selection')
+    }
+    const publication = await resolveDashboardPublication(snapshotId)
+    const pin = publication.snapshot_id
+    const checked = <T extends { publication?: DashboardPublication; scanner_basis?: ScannerBasis }>(data: T) => {
+      requireMatchingPublication(data.publication, publication)
+      if (!data.scanner_basis || data.scanner_basis.raw_volume_parity !== 'UNVERIFIED') {
+        throw new Error('Stored scanner research basis is unavailable')
+      }
+      return { data, publication: data.publication }
+    }
+    const reads: { [P in keyof DailyScannerPages]: () => Promise<DailyScannerPages[P]> } = {
+      gaps: async () => {
+        const [data, fvgData] = await Promise.all([
+          scanGaps(undefined, undefined, '1d', false, pin),
+          scanFVG(undefined, undefined, '1d', 50, false, pin),
+        ])
+        const fvg = checked(fvgData)
+        const result = checked(data)
+        if (JSON.stringify(data.scanner_basis) !== JSON.stringify(fvgData.scanner_basis)) {
+          throw new Error('Opening gaps and FVG research basis does not match')
+        }
+        return { ...result, fvgData, publication: fvg.publication.read_at > result.publication.read_at ? fvg.publication : result.publication }
+      },
+      'ma-crossover': async () => checked(await scanMACrossover(undefined, 9, 21, undefined, '1d', false, pin)),
+      'momentum-pullback': async () => checked(await scanMomentumPullback(undefined, undefined, '1d', false, pin)),
+      'bearish-bounce': async () => checked(await scanBearishBounce(undefined, undefined, '1d', false, pin)),
+      fibonacci: async () => checked(await scanFibonacci(undefined, undefined, 5, '1d', false, pin)),
+    }
+    return reads[kind]()
+  }
   if (import.meta.env.VITE_REALTIME_ONLY === 'true') {
     try {
       const response = await api.get('/strategies/daily', { params: tickerParams({ strategy: kind, read_mode: 'retained',
@@ -1343,37 +1477,15 @@ export async function getDailyScannerPublication<K extends keyof DailyScannerPag
       if (kind === 'gaps' && !('fvgData' in result)) throw new Error('Stored FVG contract is unavailable')
       return result
     } catch (error) {
-      throw storedReadError(error)
-    }
-  }
-  const publication = await resolveDashboardPublication(snapshotId)
-  const pin = publication.snapshot_id
-  const checked = <T extends { publication?: DashboardPublication; scanner_basis?: ScannerBasis }>(data: T) => {
-    requireMatchingPublication(data.publication, publication)
-    if (!data.scanner_basis || data.scanner_basis.raw_volume_parity !== 'UNVERIFIED') {
-      throw new Error('Stored scanner research basis is unavailable')
-    }
-    return { data, publication: data.publication }
-  }
-  const reads: { [P in keyof DailyScannerPages]: () => Promise<DailyScannerPages[P]> } = {
-    gaps: async () => {
-      const [data, fvgData] = await Promise.all([
-        scanGaps(undefined, undefined, '1d', false, pin),
-        scanFVG(undefined, undefined, '1d', 50, false, pin),
-      ])
-      const fvg = checked(fvgData)
-      const result = checked(data)
-      if (JSON.stringify(data.scanner_basis) !== JSON.stringify(fvgData.scanner_basis)) {
-        throw new Error('Opening gaps and FVG research basis does not match')
+      if (storedReadStatus(error) !== 503) throw storedReadError(error)
+      try {
+        return await readDashboard()
+      } catch {
+        throw storedReadError(error)
       }
-      return { ...result, fvgData, publication: fvg.publication.read_at > result.publication.read_at ? fvg.publication : result.publication }
-    },
-    'ma-crossover': async () => checked(await scanMACrossover(undefined, 9, 21, undefined, '1d', false, pin)),
-    'momentum-pullback': async () => checked(await scanMomentumPullback(undefined, undefined, '1d', false, pin)),
-    'bearish-bounce': async () => checked(await scanBearishBounce(undefined, undefined, '1d', false, pin)),
-    fibonacci: async () => checked(await scanFibonacci(undefined, undefined, 5, '1d', false, pin)),
+    }
   }
-  return reads[kind]()
+  return readDashboard()
 }
 
 export type StrategyInterval = '1d' | '1h'
@@ -1572,7 +1684,7 @@ export async function getDailyStrategyTickerPublication(symbol: string, snapshot
   const ticker = symbol.toUpperCase()
   if (!/^[A-Z][A-Z0-9.-]{0,31}$/.test(ticker)) throw new Error('Invalid daily research ticker')
   const publication = await resolveDailyStrategyPublication(snapshotId, interval)
-  if (publication.cohort_id !== import.meta.env.VITE_REALTIME_COHORT_ID?.trim()) {
+  if (foreignCohort(publication.cohort_id)) {
     throw new Error('Daily research publication does not match the requested cohort')
   }
   if (publication.strategy_ticker_available !== true) {
@@ -1622,16 +1734,29 @@ export const getTradingSessions = async (interval = '1d', limit = 260): Promise<
 }
 
 export const getStrategyTradingSessions = async (interval = '1d', snapshotId?: string): Promise<TradingSessionsResponse> => {
-  const response = await api.get('/strategies/daily', { params: tickerParams({
-    view: 'sessions', interval, read_mode: 'retained',
-  }, snapshotId) })
-  const result = response.data as TradingSessionsResponse
-  if (result.interval !== interval || !result.sessions?.length || new Set(result.sessions).size !== result.sessions.length
-    || result.sessions.some((session, index) => !/^\d{4}-\d{2}-\d{2}$/.test(session)
-      || index > 0 && session <= result.sessions[index - 1])) {
-    throw new Error('Stored strategy trading sessions do not match the selected interval')
+  try {
+    const response = await api.get('/strategies/daily', { params: tickerParams({
+      view: 'sessions', interval, read_mode: 'retained',
+    }, snapshotId) })
+    const result = response.data as TradingSessionsResponse
+    if (result.interval !== interval || !result.sessions?.length || new Set(result.sessions).size !== result.sessions.length
+      || result.sessions.some((session, index) => !/^\d{4}-\d{2}-\d{2}$/.test(session)
+        || index > 0 && session <= result.sessions[index - 1])) {
+      throw new Error('Stored strategy trading sessions do not match the selected interval')
+    }
+    return result
+  } catch (error) {
+    if (storedReadStatus(error) !== 503 || interval !== '1d' || snapshotId !== undefined) {
+      throw storedReadError(error)
+    }
+    const publication = await resolveDashboardPublication()
+    return {
+      interval,
+      sessions: [publication.session],
+      data_as_of: publication.market_time,
+      data_interval: interval,
+    }
   }
-  return result
 }
 
 export const getTickerClosingSessions = async (ticker: string): Promise<TradingSessionsResponse> => {
@@ -1649,7 +1774,7 @@ export const getTickerClosingSessions = async (ticker: string): Promise<TradingS
 const getClosingSummarySessions = async (path: string): Promise<TradingSessionsResponse> => {
   const response = await api.get(path, { params: tickerParams() })
   const result = response.data as TradingSessionsResponse & { cohort_id: string }
-  if (result.cohort_id !== import.meta.env.VITE_REALTIME_COHORT_ID?.trim() || result.interval !== '1d'
+  if (foreignCohort(result.cohort_id) || result.interval !== '1d'
     || !Array.isArray(result.sessions) || new Set(result.sessions).size !== result.sessions.length
     || result.sessions.some((session, index) => !/^\d{4}-\d{2}-\d{2}$/.test(session)
       || index > 0 && session <= result.sessions[index - 1])) {
@@ -2403,7 +2528,7 @@ export interface AdvancedOptionsV2Status {
 }
 
 export const getAdvancedOptionsV2Status = async (): Promise<AdvancedOptionsV2Status> => {
-  if (import.meta.env.VITE_REALTIME_OPTIONS_V2 === 'true') {
+  if (realtimeOptionsReadsEnabled()) {
     return (await api.get<AdvancedOptionsV2Status>('/realtime/options-v2/status', { params: tickerParams() })).data
   }
   const envelope = (await api.get<OptionsEnvelope<AdvancedOptionsV2Status>>('/options/advanced-v2/status')).data
@@ -2459,12 +2584,12 @@ export interface AdvancedOptionsV2AlertsProjection {
 export const getAdvancedOptionsV2Projection = async (
   snapshotType: AdvancedOptionsV2ProjectionType,
 ): Promise<AdvancedOptionsV2AlertsProjection> => {
-  if (import.meta.env.VITE_REALTIME_OPTIONS_V2 !== 'true') {
+  if (!realtimeOptionsReadsEnabled()) {
     throw new Error('Advanced Options V2 stored reads are disabled')
   }
   return (await api.get<AdvancedOptionsV2AlertsProjection>(
     `/realtime/options-v2/projections/${snapshotType}`,
-    { params: tickerParams() },
+    { params: optionParams() },
   )).data
 }
 
@@ -2483,7 +2608,7 @@ export interface OptionDetectorDatasets {
 
 export const getOptionDetectorDatasets = async (): Promise<OptionsEnvelope<OptionDetectorDatasets>> => {
   requireRealtimeOptionsReads()
-  return (await api.get('/options/alerts/datasets', { params: tickerParams() })).data
+  return (await api.get('/options/alerts/datasets', { params: optionParams() })).data
 }
 
 export interface OptionAlertSchedule {
@@ -2506,7 +2631,7 @@ export interface OptionAlertSchedule {
 
 export const getOptionAlertSchedule = async (): Promise<OptionsEnvelope<OptionAlertSchedule>> => {
   requireRealtimeOptionsReads()
-  return (await api.get('/options/alerts/schedule', { params: tickerParams() })).data
+  return (await api.get('/options/alerts/schedule', { params: optionParams() })).data
 }
 
 export interface OptionAlertOriginalPackage {
@@ -2664,7 +2789,7 @@ export const getOptionDetectorEvaluations = async (params: {
   selection_status?: 'SELECTED' | 'NOT_SELECTED' | 'REPEAT' | 'OBSERVATION'; limit?: number; offset?: number;
 }): Promise<OptionsEnvelope<OptionDetectorEvaluationReview>> => {
   requireRealtimeOptionsReads()
-  return (await api.get('/options/alerts/evaluations', { params: tickerParams(params) })).data
+  return (await api.get('/options/alerts/evaluations', { params: optionParams(params) })).data
 }
 
 export interface OptionCurrentMark {
@@ -2735,7 +2860,7 @@ export const getOptionDetectorAlerts = async (params: {
   detector?: OptionDetectorId; limit?: number; offset?: number;
 }): Promise<OptionsEnvelope<OptionDetectorAlertReview>> => {
   requireRealtimeOptionsReads()
-  return (await api.get('/options/alerts/detector-runs', { params: tickerParams(params) })).data
+  return (await api.get('/options/alerts/detector-runs', { params: optionParams(params) })).data
 }
 
 export interface OptionDiscoveryCatalog {
@@ -3074,7 +3199,7 @@ export const getOptionFlow = async (
   sessionDate?: string,
 ): Promise<OptionsEnvelope<OptionFlowData>> => {
   requireRealtimeOptionsReads()
-  const response = await api.get('/options/flow', { params: tickerParams({ underlyer, session_date: sessionDate }) })
+  const response = await api.get('/options/flow', { params: optionParams({ underlyer, session_date: sessionDate }) })
   return response.data
 }
 
@@ -3101,13 +3226,13 @@ export const getOptionCandidates = async (params?: {
 
 export const getOptionDiscoveryCatalog = async (): Promise<OptionDiscoveryCatalog> => {
   requireRealtimeOptionsReads()
-  const response = await api.get('/options/discovery-catalog', { params: tickerParams() })
+  const response = await api.get('/options/discovery-catalog', { params: optionParams() })
   return response.data
 }
 
 export const queryEligibleChain = async (request: EligibleChainRequest): Promise<OptionsEnvelope<EligibleChainData>> => {
   requireRealtimeOptionsReads()
-  const response = await api.post('/options/eligible-chain/query', request, { params: tickerParams() })
+  const response = await api.post('/options/eligible-chain/query', request, { params: optionParams() })
   return response.data
 }
 
@@ -3115,7 +3240,7 @@ export const getOptionCandidate = async (
   candidateId: string,
 ): Promise<OptionsEnvelope<OptionCandidateDetailData>> => {
   requireRealtimeOptionsReads()
-  const response = await api.get(`/options/candidates/${candidateId}`, { params: tickerParams() })
+  const response = await api.get(`/options/candidates/${candidateId}`, { params: optionParams() })
   return response.data
 }
 
@@ -3172,7 +3297,7 @@ export interface OptionAlertPreviewData {
 
 export const previewOptionAlert = async (candidateId: string, request: OptionAlertPreviewRequest = {}): Promise<OptionsEnvelope<OptionAlertPreviewData>> => {
   requireRealtimeOptionsReads()
-  const response = await api.post(`/options/alerts/preview/${candidateId}`, request, { params: tickerParams() })
+  const response = await api.post(`/options/alerts/preview/${candidateId}`, request, { params: optionParams() })
   return response.data
 }
 

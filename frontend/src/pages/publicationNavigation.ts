@@ -2,15 +2,15 @@ import { useEffect, useRef, useState } from 'react'
 import { useSearchParams } from 'react-router-dom'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import type { DashboardPublication } from '../services/api'
+import { realtimeCohortId, usePortalIdentity } from '../services/portalIdentity'
 
 const isTickerPath = (path: string) => /^\/ticker\/[^/]+(?:\/|$)/.test(path)
 export const isTickerWorkspaceQuery = (name: string) => name.startsWith('ticker-workspace:')
 
 export function publicationPath(path: string, snapshotId?: string, cohortId?: string, interval?: '1d' | '1h', sessionDate?: string) {
   if (import.meta.env.VITE_REALTIME_ONLY !== 'true' || (snapshotId === undefined && cohortId === undefined && sessionDate === undefined)) return path
-  const cohort = cohortId ?? import.meta.env.VITE_REALTIME_COHORT_ID?.trim()
-  if (!cohort) throw new Error('Realtime publication requires VITE_REALTIME_COHORT_ID')
-  const params = new URLSearchParams({ cohort_id: cohort })
+  const cohort = cohortId ?? realtimeCohortId()
+  const params = new URLSearchParams(cohort ? { cohort_id: cohort } : undefined)
   // Ticker pages resolve their own snapshot; a foreign release pin never travels to them.
   if (snapshotId !== undefined && !isTickerPath(path)) params.set('snapshot_id', snapshotId)
   if (interval === '1h') params.set('interval', interval)
@@ -61,19 +61,22 @@ export function usePublicationQuery<T extends { publication: Pick<DashboardPubli
   requireIdentity = false,
 ) {
   const realtimeOnly = import.meta.env.VITE_REALTIME_ONLY === 'true'
-  const cohort = import.meta.env.VITE_REALTIME_COHORT_ID?.trim()
+  const cohort = usePortalIdentity()?.equity?.cohort_id
   const [params, setParams] = useSearchParams()
   // Closing workspaces resolve their own date-bound identity, not an inherited hot pin.
   const internalWorkspace = isTickerWorkspaceQuery(name) || name === 'all-tickers'
-  const pin = internalWorkspace ? undefined : params.get('snapshot_id') ?? undefined
+  const inheritedCohort = params.get('cohort_id')
+  // A link from an earlier session re-resolves to the current publication, because
+  // its snapshot belongs to another cohort. Research identities are never replaced.
+  const earlierSession = !!inheritedCohort && !!cohort && inheritedCohort !== cohort
+  const pin = internalWorkspace || (earlierSession && !requireIdentity) ? undefined : params.get('snapshot_id') ?? undefined
   const internalSelection = !requireIdentity && pin === undefined
     && (internalWorkspace || name.startsWith('daily-'))
   const interval = name.startsWith('daily-') ? params.get('interval') ?? '1d' : '1d'
   const sessionDate = name.startsWith('daily-') || internalWorkspace ? params.get('session_date') ?? undefined : undefined
-  const inheritedCohort = params.get('cohort_id')
   const scopeError = name.startsWith('daily-') && !['1d', '1h'].includes(interval)
-    ? 'Unsupported strategy interval; no substitution was made.' : inheritedCohort && inheritedCohort !== cohort
-    ? 'Requested cohort does not match this realtime deployment; no substitution was made.'
+    ? 'Unsupported strategy interval; no substitution was made.' : requireIdentity && earlierSession
+    ? 'This research link belongs to another session; no substitution was made.'
     : requireIdentity && (!inheritedCohort || !pin)
       ? 'Daily strategy research requires explicit cohort and snapshot identities.' : null
   const queryClient = useQueryClient()
@@ -101,7 +104,7 @@ export function usePublicationQuery<T extends { publication: Pick<DashboardPubli
     queryKey: key,
     queryFn: () => {
       if (scopeError) throw new Error(scopeError)
-      if (!internalWorkspace && params.has('snapshot_id') && !pin) throw new Error('Requested snapshot identity is empty')
+      if (!internalWorkspace && !earlierSession && params.has('snapshot_id') && !pin) throw new Error('Requested snapshot identity is empty')
       return read(pin)
     },
     enabled: realtimeOnly,
@@ -119,7 +122,7 @@ export function usePublicationQuery<T extends { publication: Pick<DashboardPubli
     }
     setParams(previous => {
       const next = new URLSearchParams(previous)
-      next.set('cohort_id', cohort ?? '')
+      next.set('cohort_id', result.publication.cohort_id ?? '')
       next.set('snapshot_id', snapshot)
       return next
     }, { replace: true })

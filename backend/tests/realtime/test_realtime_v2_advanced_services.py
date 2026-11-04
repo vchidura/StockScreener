@@ -5,6 +5,7 @@ import re
 import shutil
 import subprocess
 from datetime import date, datetime, timedelta, timezone
+from unittest.mock import MagicMock
 from pathlib import Path
 from types import SimpleNamespace
 from uuid import UUID
@@ -250,11 +251,11 @@ def test_options_lifecycle_stream_ceilings_are_configurable():
 @pytest.mark.parametrize(
     ("environment", "expected"),
     (
-        ({}, 32),
+        ({}, 12),
         ({"REALTIME_V3_OPTIONS_EXACT_FOUR_COMPATIBILITY": "enabled"}, 4),
         (
             {"REALTIME_V3_OPTIONS_MAXIMUM_PROVIDER_REQUESTS_PER_UNDERLYING": ""},
-            32,
+            12,
         ),
         (
             {"REALTIME_V3_OPTIONS_MAXIMUM_PROVIDER_REQUESTS_PER_UNDERLYING": "20"},
@@ -296,14 +297,106 @@ def test_options_discovery_budget_scales_with_the_configured_request_limit():
         )
     )
 
-    assert budget.scope.request_ceiling == 32 * 2 * 3
-    assert len(budget.requests) == 32
+    assert budget.scope.request_ceiling == 12 * 2 * 3
+    assert len(budget.requests) == 12
     with pytest.raises(ValueError, match="configuration is invalid"):
         options_preparation.PostgresAutomaticOptionsPreparationExecutor(
             V2ConnectionProvider.__new__(V2ConnectionProvider),
             api_key="configured",
             backend_image_id="sha256:" + "0" * 64,
             maximum_provider_requests_per_underlying=33,
+        )
+
+
+def _capture_executor(checked_at, capture_after_open_seconds):
+    return options_preparation.PostgresAutomaticOptionsPreparationExecutor(
+        V2ConnectionProvider.__new__(V2ConnectionProvider),
+        api_key="configured",
+        backend_image_id="sha256:" + "0" * 64,
+        capture_after_open_seconds=capture_after_open_seconds,
+        clock=lambda: checked_at,
+    )
+
+
+@pytest.mark.parametrize(
+    ("checked_at", "floor", "reserves"),
+    (
+        # The evening before: the UTC date already matches the session.
+        (datetime(2026, 11, 3, 2, 47, tzinfo=timezone.utc), 90, False),
+        # Before the open, then inside the 90-second floor, then after it.
+        (datetime(2026, 11, 3, 14, 26, tzinfo=timezone.utc), 90, False),
+        (datetime(2026, 11, 3, 14, 31, tzinfo=timezone.utc), 90, False),
+        (datetime(2026, 11, 3, 14, 31, 30, tzinfo=timezone.utc), 90, True),
+        # A system started late in the day captures when it starts.
+        (datetime(2026, 11, 3, 19, 0, tzinfo=timezone.utc), 90, True),
+        # The old policy may capture any time on the session's UTC date.
+        (datetime(2026, 11, 3, 2, 47, tzinfo=timezone.utc), None, True),
+        (datetime(2026, 11, 2, 23, 0, tzinfo=timezone.utc), None, False),
+    ),
+)
+def test_options_capture_spends_budget_only_when_its_window_is_open(
+    checked_at,
+    floor,
+    reserves,
+):
+    budget = _capture_executor(checked_at, floor).provider_budget(
+        SimpleNamespace(
+            stage="CATALOG_QUOTE",
+            session_date=date(2026, 11, 3),
+            revision_id=UUID(int=1),
+            ticker="SPY",
+            option_underlyings=("QQQ", "SPY"),
+        )
+    )
+
+    assert (budget is not None) is reserves
+
+
+def test_options_capture_wait_reports_history_and_wakes_for_the_open(
+    monkeypatch,
+):
+    checked_at = datetime(2026, 11, 3, 14, 28, tzinfo=timezone.utc)
+    executor = _capture_executor(checked_at, 90)
+    monkeypatch.setattr(
+        executor,
+        "_history",
+        MagicMock(side_effect=options_preparation.AdvancedOptionsPreparationRetryable(
+            "required Options history is incomplete for QQQ"
+        )),
+    )
+
+    with pytest.raises(
+        options_preparation.AdvancedOptionsPreparationRetryable,
+        match="history is incomplete",
+    ) as error:
+        executor._catalog_quote(
+            SimpleNamespace(session_date=date(2026, 11, 3)),
+            (),
+        )
+
+    assert error.value.retry_at == datetime(
+        2026, 11, 3, 14, 31, 30, tzinfo=timezone.utc,
+    )
+
+
+@pytest.mark.parametrize(
+    ("environment", "expected"),
+    (
+        ({}, 90),
+        ({"REALTIME_V3_OPTIONS_CAPTURE_POLICY": ""}, 90),
+        ({"REALTIME_V3_OPTIONS_CAPTURE_POLICY": "at_open"}, 90),
+        ({"REALTIME_V3_OPTIONS_CAPTURE_POLICY": "EARLIEST"}, None),
+        ({"REALTIME_V3_OPTIONS_EXACT_FOUR_COMPATIBILITY": "enabled"}, None),
+    ),
+)
+def test_options_capture_policy_defaults_to_the_open(environment, expected):
+    assert options_lifecycle._capture_after_open_seconds(environment) == expected
+
+
+def test_options_capture_policy_rejects_unknown_values():
+    with pytest.raises(ValueError, match="capture policy"):
+        options_lifecycle._capture_after_open_seconds(
+            {"REALTIME_V3_OPTIONS_CAPTURE_POLICY": "OVERNIGHT"}
         )
 
 
@@ -387,6 +480,8 @@ def test_compose_lifecycle_inherits_all_options_ceiling_configuration():
     script_source = inspect.getsource(options_lifecycle)
 
     assert "<<: *advanced-environment" in lifecycle_service
+    assert "REALTIME_V2_EQUITY_PIPELINE: MASSIVE_ADVANCED" in lifecycle_service
+    assert "REALTIME_V2_EQUITY_PIPELINE: DISABLED" not in lifecycle_service.split("    secrets:", 1)[0]
     for name in ceiling_names:
         assert name in shared_environment
         assert name in script_source
@@ -423,7 +518,7 @@ def test_advanced_supervisor_has_no_developer_rest_process(
     scheduler = commands["scheduler"]
     assert scheduler[
         scheduler.index("--publication-mode") + 1
-    ] == "projection-only"
+    ] == "continuous-publication"
     controller = commands["controller"]
     assert "--authorization-id" in controller
     assert "--universe-target" in controller
@@ -576,6 +671,21 @@ def _compose_service_blocks():
         )[0]
         for name in names
     }
+
+
+def test_v3_options_resident_services_mount_shared_journal():
+    blocks = _compose_service_blocks()
+    journal_mount = (
+        "realtime_v2_advanced_journals:/var/lib/realtime-v2-advanced"
+    )
+
+    for service in (
+        "realtime-v3-options-p8-ingress",
+        "realtime-v3-options-p8-market-state",
+        "realtime-v3-options-p8-flow",
+        "realtime-v3-options-p8-window",
+    ):
+        assert journal_mount in blocks[service]
 
 
 def test_v3_profile_services_do_not_leak_through_compose_extends():

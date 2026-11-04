@@ -46,6 +46,9 @@ def produce_daily_setup_summary(inputs, *, materializations=None, excluded_ticke
             analysis_run_id=analysis_run_id,
             security=_security(member), bars=tuple(_fact(row, inputs) for row in daily),
             confirmation_bars=tuple(_fact(row, inputs) for row in hourly), observed_at=inputs.cutoff,
+            target_cohort_id=inputs.cohort_id,
+            target_provider_tier=inputs.provider_tier,
+            target_instrument_id=member["instrument_id"],
         )
         if materializations is not None:
             materializations.append(result)
@@ -92,7 +95,8 @@ def produce_hourly_setup_summary(inputs, *, market_time, materializations=None, 
             missing[ticker] = "EXACT_COMPLETED_DAILY_CONFIRMATION_UNAVAILABLE"
         result = materialize_realtime_equity_evidence(analysis_run_id=analysis_run_id, security=_security(member),
             bars=tuple(_fact(row, inputs) for row in primary), confirmation_bars=tuple(_fact(row, inputs) for row in confirmation),
-            observed_at=inputs.cutoff)
+            observed_at=inputs.cutoff, target_cohort_id=inputs.cohort_id,
+            target_provider_tier=inputs.provider_tier, target_instrument_id=member["instrument_id"])
         if materializations is not None:
             materializations.append(result)
         setup = next(row for row in result.materialization.evidence if row.evidence_type is EvidenceType.TRADE_SETUP)

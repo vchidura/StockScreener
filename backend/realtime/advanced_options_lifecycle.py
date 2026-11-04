@@ -54,6 +54,7 @@ OPTIONS_PREPARATION_STAGES = (
 OPTIONS_REFRESH_INITIAL_BACKOFF_SECONDS = 30
 OPTIONS_REFRESH_MAXIMUM_BACKOFF_SECONDS = 300
 OPTIONS_REFRESH_OPEN_FLOOR_SECONDS = 90
+_PROVIDER_FAILURE_CODE_LENGTH = 64
 
 
 @dataclass(frozen=True, slots=True)
@@ -115,6 +116,7 @@ class AdvancedOptionsProviderRequestPlan:
 class AdvancedOptionsStageProviderBudget:
     scope: ProviderBudgetScope
     requests: tuple[AdvancedOptionsProviderRequestPlan, ...]
+    underlying_request_ceiling: int | None = None
 
     def __post_init__(self) -> None:
         if (
@@ -125,6 +127,13 @@ class AdvancedOptionsStageProviderBudget:
                 row.reserved_response_bytes for row in self.requests
             )
             > self.scope.decoded_byte_ceiling
+            or self.underlying_request_ceiling is not None
+            and (
+                type(self.underlying_request_ceiling) is not int
+                or not len(self.requests)
+                <= self.underlying_request_ceiling
+                <= self.scope.request_ceiling
+            )
         ):
             raise ValueError("Options stage provider budget is invalid")
 
@@ -150,6 +159,36 @@ class AdvancedOptionsProviderRequestResult:
             )
         ):
             raise ValueError("Options provider request result is invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class AdvancedOptionsProviderRequestAttempt:
+    """One real provider request made by an attempt that did not complete."""
+
+    http_status: int | None
+    response_bytes: int
+    row_count: int = 0
+
+    def __post_init__(self) -> None:
+        if (
+            self.http_status is not None
+            and type(self.http_status) is not int
+            or any(
+                type(value) is not int or value < 0
+                for value in (self.response_bytes, self.row_count)
+            )
+        ):
+            raise ValueError("Options provider request attempt is invalid")
+
+    @property
+    def outcome(self) -> ProviderRequestOutcome:
+        if self.http_status is None:
+            return ProviderRequestOutcome.TIMEOUT
+        if self.http_status == 429:
+            return ProviderRequestOutcome.HTTP_429
+        if self.http_status != 200:
+            return ProviderRequestOutcome.HTTP_ERROR
+        return ProviderRequestOutcome.INVALID
 
 
 @dataclass(frozen=True, slots=True)
@@ -193,7 +232,23 @@ class AdvancedOptionsPreparationExecutor(Protocol):
 
 
 class AdvancedOptionsPreparationRetryable(RuntimeError):
-    pass
+    def __init__(
+        self,
+        *args: object,
+        retry_at: datetime | None = None,
+    ) -> None:
+        super().__init__(*args)
+        self.retry_at = retry_at
+
+
+class AdvancedOptionsPreparationProviderFailed(RuntimeError):
+    """Reserved provider work failed; retried on the refresh schedule."""
+
+    def __init__(self, reason: str) -> None:
+        self.reason = reason.strip()
+        if not self.reason:
+            raise ValueError("Options provider failure reason is blank")
+        super().__init__(self.reason)
 
 
 class AdvancedOptionsPreparationRefreshRequired(RuntimeError):
@@ -533,16 +588,37 @@ def _complete_provider_requests_cursor(
     results: tuple[AdvancedOptionsProviderRequestResult, ...],
     checked_at: datetime,
     failure_code: str | None = None,
+    attempts: tuple[AdvancedOptionsProviderRequestAttempt, ...] | None = None,
 ) -> None:
     by_id = {row.request_id: row for row in results}
     if (
         len(by_id) != len(results)
         or not set(by_id).issubset(reserved_request_ids)
+        or attempts is not None
+        and len(attempts) > len(reserved_request_ids)
     ):
         raise ValueError("Options provider results exceed reservations")
+    attempt_by_id = dict(zip(reserved_request_ids, attempts or ()))
     for request_id in reserved_request_ids:
         result = by_id.get(request_id)
-        if result is None:
+        attempt = attempt_by_id.get(request_id)
+        if attempt is not None:
+            completion = ProviderRequestCompletion(
+                ProviderRequestState.FAILED,
+                completed_at=checked_at,
+                started_at=checked_at,
+                outcome=attempt.outcome,
+                http_status=attempt.http_status,
+                response_bytes=attempt.response_bytes,
+                row_count=attempt.row_count,
+                pages_fetched=1,
+                price_basis=PriceBasis.NOT_APPLICABLE,
+                completeness=RequestCompleteness.INCOMPLETE,
+                failure_code=failure_code or "PROVIDER_ATTEMPT_FAILED",
+            )
+        elif result is None:
+            # Without exact attempt accounting a reservation may have been
+            # spent, so it keeps the failure instead of claiming it was unused.
             completion = ProviderRequestCompletion(
                 ProviderRequestState.FAILED,
                 completed_at=checked_at,
@@ -553,7 +629,11 @@ def _complete_provider_requests_cursor(
                 pages_fetched=0,
                 price_basis=PriceBasis.NOT_APPLICABLE,
                 completeness=RequestCompleteness.INCOMPLETE,
-                failure_code=failure_code or "RESERVATION_NOT_USED",
+                failure_code=(
+                    "RESERVATION_NOT_USED"
+                    if attempts is not None
+                    else failure_code or "RESERVATION_NOT_USED"
+                ),
             )
         else:
             completion = ProviderRequestCompletion(
@@ -720,6 +800,10 @@ def fail_advanced_options_preparation_cursor(
     reason: str,
     retryable: bool,
     provider_request_ids: tuple[UUID, ...] = (),
+    provider_attempts: (
+        tuple[AdvancedOptionsProviderRequestAttempt, ...] | None
+    ) = None,
+    retry_at: datetime | None = None,
 ) -> None:
     failed = _utc(failed_at, "Options preparation failed_at")
     normalized = reason.strip()[:160]
@@ -730,7 +814,8 @@ def fail_advanced_options_preparation_cursor(
         reserved_request_ids=provider_request_ids,
         results=(),
         checked_at=failed,
-        failure_code=normalized,
+        failure_code=normalized[:_PROVIDER_FAILURE_CODE_LENGTH],
+        attempts=provider_attempts,
     )
     delay = min(300, 2 ** min(claim.attempt, 8))
     status = "RETRY" if retryable else "FAILED"
@@ -739,14 +824,22 @@ def fail_advanced_options_preparation_cursor(
         "status=%s,failure_streak=failure_streak+1,"
         "next_retry_at=%s,lease_owner=NULL,lease_until=NULL,"
         "terminal_reason=%s,blocked_reason=NULL,retry_reason=%s,"
+        "provider_request_count=provider_request_count+%s,"
+        "response_bytes=response_bytes+%s,"
         "completed_at=%s,updated_at=clock_timestamp() "
         "WHERE revision_id=%s AND intent_id=%s AND stage=%s "
         "AND status='RUNNING' AND lease_owner=%s AND lease_epoch=%s",
         (
             status,
-            failed + timedelta(seconds=delay),
+            (
+                failed + timedelta(seconds=delay)
+                if retry_at is None
+                else _utc(retry_at, "Options preparation retry_at")
+            ),
             None if retryable else normalized,
             normalized if retryable else None,
+            len(provider_attempts or ()),
+            sum(row.response_bytes for row in provider_attempts or ()),
             None if retryable else failed,
             str(claim.revision_id),
             str(claim.intent_id),
@@ -1090,6 +1183,24 @@ def _reserve_stage_provider_budget(
 ) -> tuple[UUID, ...]:
     if budget is None:
         return ()
+    if budget.underlying_request_ceiling is not None:
+        # Slot digests repeat across attempts, so this counts the share this
+        # underlying already holds; no attempt counter is involved.
+        cursor.execute(
+            "SELECT count(*) FROM rt.provider_request_ledger "
+            "WHERE budget_scope_sha256=%s AND request_sha256=ANY(%s)",
+            (
+                budget.scope.sha256,
+                [request.request_sha256 for request in budget.requests],
+            ),
+        )
+        if (
+            int(cursor.fetchone()[0]) + len(budget.requests)
+            > budget.underlying_request_ceiling
+        ):
+            raise ProviderBudgetExceeded(
+                "provider underlying request share is exhausted"
+            )
     request_ids = []
     for index, request in enumerate(budget.requests, start=1):
         request_id = uuid5(
@@ -1118,6 +1229,14 @@ def _reserve_stage_provider_budget(
         )
         request_ids.append(request_id)
     return tuple(request_ids)
+
+
+def _observed_provider_attempts(
+    executor: AdvancedOptionsPreparationExecutor,
+    claim: AdvancedOptionsPreparationClaim,
+) -> tuple[AdvancedOptionsProviderRequestAttempt, ...] | None:
+    observed = getattr(executor, "provider_attempts", None)
+    return None if observed is None else observed(claim)
 
 
 def run_advanced_options_preparation_cycle(
@@ -1223,6 +1342,49 @@ def run_advanced_options_preparation_cycle(
             "retry_at_utc": retry_at.isoformat(),
             "provider_requests": 0,
         }
+    except AdvancedOptionsPreparationProviderFailed as error:
+        heartbeat.close()
+        if heartbeat.lost:
+            raise RuntimeError(
+                "Options preparation fence was lost"
+            ) from error
+        attempts = _observed_provider_attempts(executor, claim)
+        retry_at, _backoff_seconds = (
+            advanced_options_preparation_retry_schedule(
+                session_date=claim.session_date,
+                requested_at=_utc(
+                    clock(),
+                    "Options preparation failure clock",
+                ),
+                attempt=claim.attempt,
+            )
+        )
+        with provider.transaction(APP_ROLE) as unit:
+            fail_advanced_options_preparation_cursor(
+                unit.cursor,
+                claim,
+                failed_at=checked,
+                reason=error.reason,
+                retryable=True,
+                provider_request_ids=provider_request_ids,
+                provider_attempts=attempts,
+                retry_at=retry_at,
+            )
+        return {
+            "status": "RETRY",
+            "stage": claim.stage,
+            "ticker": claim.ticker,
+            "reason": error.reason,
+            "retry_at_utc": retry_at.isoformat(),
+            "provider_requests": (
+                len(provider_request_ids)
+                if attempts is None
+                else len(attempts)
+            ),
+            "response_bytes": sum(
+                row.response_bytes for row in attempts or ()
+            ),
+        }
     except AdvancedOptionsPreparationTerminal as error:
         heartbeat.close()
         if heartbeat.lost:
@@ -1237,6 +1399,10 @@ def run_advanced_options_preparation_cycle(
                 reason=str(error),
                 retryable=False,
                 provider_request_ids=provider_request_ids,
+                provider_attempts=_observed_provider_attempts(
+                    executor,
+                    claim,
+                ),
             )
         return {
             "status": "FAILED",
@@ -1259,6 +1425,11 @@ def run_advanced_options_preparation_cycle(
                 reason=str(error),
                 retryable=True,
                 provider_request_ids=provider_request_ids,
+                provider_attempts=_observed_provider_attempts(
+                    executor,
+                    claim,
+                ),
+                retry_at=error.retry_at,
             )
         return {
             "status": "RETRY",
@@ -1333,6 +1504,10 @@ def run_advanced_options_preparation_cycle(
                 reason=type(error).__name__,
                 retryable=True,
                 provider_request_ids=provider_request_ids,
+                provider_attempts=_observed_provider_attempts(
+                    executor,
+                    claim,
+                ),
             )
         raise
     heartbeat.close()
@@ -1604,6 +1779,15 @@ def reconcile_advanced_options_lifecycle_cursor(
         ),
         None,
     )
+    retry_wait = next(
+        (
+            (str(row[0]), str(row[2]), row[3])
+            for row in work
+            if str(row[1]) == "RETRY"
+            and row[2] is not None
+        ),
+        None,
+    )
     scheduled_retry_at = min(
         (
             row[3]
@@ -1661,6 +1845,9 @@ def reconcile_advanced_options_lifecycle_cursor(
                 f"{budget_wait[1]}:{budget_wait[0]}:"
                 f"{budget_wait[2].isoformat()}"
                 if budget_wait is not None
+                else f"{retry_wait[1]}:{retry_wait[0]}:"
+                f"{retry_wait[2].isoformat()}"
+                if retry_wait is not None
                 else None
             )
         ),

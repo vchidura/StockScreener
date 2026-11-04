@@ -9,6 +9,7 @@ from psycopg2 import errors
 from psycopg2.extras import Json
 
 from option_flow_support import advanced_policy
+from options.calendar import OptionExchangeCalendar
 from realtime.advanced_options_control_plane import (
     persist_advanced_options_enrollment_cursor,
 )
@@ -79,6 +80,12 @@ from tests.realtime.v2_database import (
     disposable_v2_database,
     requires_v2_database,
 )
+from tests.realtime.test_advanced_equity_bootstrap_v2_db import _insert_as_of_fact
+from tests.realtime.test_advanced_equity_preparation import _claim
+from tests.realtime.test_advanced_equity_preparation_v2_db import _fact
+from realtime.advanced_equity_preparation import EquityPreparationFetchRequest, EquityPreparationLimits
+from realtime.equity_interval_derivation import derive_realtime_interval_facts
+from tests.realtime.test_equity_validation_history import _security
 
 
 pytestmark = requires_v2_database
@@ -418,6 +425,7 @@ def test_owp4d_native_loader_and_disposable_readiness_audit(monkeypatch):
             cutoff = control.receipts.options_input_ready.spec.cutoff
             equity_cutoff = cutoff - timedelta(minutes=2)
             history_cohort_id = uuid4()
+            retained_history_cohort_id = uuid4()
             with _role_cursor(
                 database_pool,
                 roles.name("admin"),
@@ -436,6 +444,74 @@ def test_owp4d_native_loader_and_disposable_readiness_audit(monkeypatch):
                         str(enrollment.equity_plan.cohort_id),
                     ),
                 )
+                database_cursor.execute(
+                    "INSERT INTO rt.cohorts (cohort_id,cohort_sha256,manifest_id,"
+                    "configuration_sha256,model_bundle_sha256,valuation_sha256,effective_at,mode) "
+                    "SELECT %s,%s,manifest_id,configuration_sha256,model_bundle_sha256,"
+                    "valuation_sha256,effective_at,mode FROM rt.cohorts WHERE cohort_id=%s",
+                    (
+                        str(retained_history_cohort_id), _digest("retained-history-cohort"),
+                        str(history_cohort_id),
+                    ),
+                )
+                calendar = OptionExchangeCalendar("XNYS")
+                sessions = calendar.trailing_sessions_before(equity_cutoff.date(), 15)
+                database_cursor.execute(
+                    "INSERT INTO rt.cohort_history_bindings (target_cohort_id,source_cohort_id,"
+                    "source_provider_tier,history_before,source_manifest_sha256,"
+                    "authorization_reference,binding_sha256,created_at) "
+                    "SELECT %s,%s,'MASSIVE_ADVANCED',%s,manifest.manifest_sha256,"
+                    "'NATIVE-MIXED-HISTORY-TEST',%s,%s FROM rt.cohorts AS cohort "
+                    "JOIN rt.subscription_manifests AS manifest USING(manifest_id) "
+                    "WHERE cohort.cohort_id=%s",
+                    (
+                        str(history_cohort_id), str(retained_history_cohort_id),
+                        calendar.session_open(sessions[-5]), _digest("mixed-history-binding"),
+                        equity_cutoff, str(retained_history_cohort_id),
+                    ),
+                )
+                security_id = dict(enrollment.equity_plan.security_ids)["SPY"]
+                database_cursor.execute(
+                    "SELECT instrument_id FROM rt.instruments WHERE security_id=%s",
+                    (str(security_id),),
+                )
+                instrument_id = database_cursor.fetchone()[0]
+                for index, session in enumerate(sessions):
+                    source_cohort = (
+                        retained_history_cohort_id if index < 10 else history_cohort_id
+                    )
+                    database_cursor.execute(
+                        "SELECT rt.ensure_partitions('rt.bar_revisions',%s)", (session,),
+                    )
+                    request = EquityPreparationFetchRequest(
+                        _claim(
+                            ticker="SPY", security_id=security_id, instrument_id=instrument_id,
+                            source_cohort_id=source_cohort,
+                        ),
+                        equity_cutoff, EquityPreparationLimits(),
+                    )
+                    opened, closed = calendar.session_open(session), calendar.session_close(session)
+                    sources = []
+                    start = opened
+                    while start < closed:
+                        fact = _fact(
+                            request, interval="5m", start=start,
+                            end=min(start + timedelta(minutes=5), closed),
+                            adjusted=False, index=len(sources),
+                        )
+                        fact = replace(fact, revision=replace(fact.revision, session_date=session))
+                        sources.append(fact)
+                        _insert_as_of_fact(database_cursor, fact, equity_cutoff)
+                        start += timedelta(minutes=5)
+                    daily = derive_realtime_interval_facts(
+                        replace(_security("SPY"), security_id=security_id),
+                        tuple(sources), target_interval="1d", observed_at=equity_cutoff,
+                        ingestion_segment_id=uuid4(),
+                    )
+                    assert len(daily) == 1
+                    _insert_as_of_fact(
+                        database_cursor, daily[0], equity_cutoff,
+                    )
                 (
                     equity_receipt_id,
                     equity_window_id,
@@ -486,7 +562,15 @@ def test_owp4d_native_loader_and_disposable_readiness_audit(monkeypatch):
             assert set(preflight.bundle.executors()) == {
                 DetectorFamily.O1,
                 DetectorFamily.O3,
+                DetectorFamily.OS1,
+                DetectorFamily.OS2,
             }
+            assert all(
+                row.available
+                for row in preflight.evidence
+                if row.member_kind == "EQUITY_CONTEXT"
+                and row.member_key in {"OS1", "OS2"}
+            )
             missing_context_plan = build_advanced_options_native_input_plan(
                 enrollment=enrollment,
                 producer_plan=producer_plan,
@@ -501,18 +585,36 @@ def test_owp4d_native_loader_and_disposable_readiness_audit(monkeypatch):
                 history_source_cohort_id=history_cohort_id,
                 maximum_equity_input_age_seconds=300,
                 equity_context_requirements=(
-                    replace(
-                        initial_advanced_options_equity_context_requirements()[
-                            0
-                        ],
-                        session_count=4,
-                    ),
+                    initial_advanced_options_equity_context_requirements()[0],
                 ),
             )
-            missing_context = PostgresAdvancedOptionsNativeInputLoader(
-                provider,
-                missing_context_plan,
-            ).preflight()
+            current_columns = (
+                "cohort_id,provider_tier,instrument_id,interval,bar_start,session_scope,"
+                "adjustment_basis,source_kind,bar_revision_id,bar_end,observed_at,updated_at"
+            )
+            with _role_cursor(database_pool, roles.name("admin")) as database_cursor:
+                database_cursor.execute(
+                    "SELECT " + current_columns + " FROM rt.bar_current "
+                    "WHERE cohort_id=%s AND interval='5m' AND bar_end=%s",
+                    (str(enrollment.equity_plan.cohort_id), equity_cutoff),
+                )
+                missing_head = database_cursor.fetchone()
+                assert missing_head is not None
+                database_cursor.execute(
+                    "DELETE FROM rt.bar_current WHERE cohort_id=%s AND bar_revision_id=%s",
+                    (str(enrollment.equity_plan.cohort_id), str(missing_head[8])),
+                )
+            try:
+                missing_context = PostgresAdvancedOptionsNativeInputLoader(
+                    provider, missing_context_plan,
+                ).preflight()
+            finally:
+                with _role_cursor(database_pool, roles.name("admin")) as database_cursor:
+                    database_cursor.execute(
+                        "INSERT INTO rt.bar_current (" + current_columns + ") VALUES ("
+                        "%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                        missing_head,
+                    )
             assert missing_context.status is NativeInputPlanStatus.READY
             assert not missing_context.bundle.o1.blocked_reason_codes
             assert (

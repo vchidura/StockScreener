@@ -2,13 +2,13 @@ import { useQuery } from '@tanstack/react-query'
 import { AlertTriangle, Check, CircleX, Database, RefreshCw, ShieldCheck } from 'lucide-react'
 import { usePublishPageContext } from '../../layout/pageContext'
 import {
-  REALTIME_COHORT_ID,
   getRealtimeEquityValidationStatus,
   getRealtimeHealth,
   getRealtimeOptionAlerts,
   type RealtimeValidationStatus,
   type RealtimeHealth,
 } from '../../services/realtime'
+import { usePortalIdentity } from '../../services/portalIdentity'
 import '../StockDiscoveryPage.css'
 import '../StockAlertsPage.css'
 import '../StockScreeningPage.css'
@@ -28,9 +28,10 @@ function useRealtimeBoundary() {
     retry: false,
     staleTime: 15_000,
   })
+  const equityCohort = usePortalIdentity()?.equity?.cohort_id
   const status = useQuery({
-    queryKey: ['realtime-equity-status', REALTIME_COHORT_ID],
-    queryFn: ({ signal }) => getRealtimeEquityValidationStatus(REALTIME_COHORT_ID, signal),
+    queryKey: ['realtime-equity-status', equityCohort],
+    queryFn: ({ signal }) => getRealtimeEquityValidationStatus(equityCohort, signal),
     retry: false,
     staleTime: 15_000,
   })
@@ -76,9 +77,10 @@ function Boundary({ boundary, children }: {
 
 export function RealtimeOptionsAlertsPage() {
   const boundary = useRealtimeBoundary()
+  const optionsCohort = usePortalIdentity()?.options?.cohort_id
   const query = useQuery({
-    queryKey: ['realtime-option-alerts', REALTIME_COHORT_ID],
-    queryFn: ({ signal }) => getRealtimeOptionAlerts(REALTIME_COHORT_ID, signal),
+    queryKey: ['realtime-option-alerts', optionsCohort],
+    queryFn: ({ signal }) => getRealtimeOptionAlerts(optionsCohort, signal),
     retry: false,
   })
   usePublishPageContext({

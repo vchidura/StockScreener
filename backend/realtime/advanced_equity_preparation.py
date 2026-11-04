@@ -53,6 +53,11 @@ from .equity_interval_derivation_worker import (
     load_current_five_minute_facts_cursor,
     load_derivation_security_cursor,
 )
+from .equity_history import (
+    EquityHistoryIdentityError,
+    equity_history_coordinates,
+    load_equity_history_cursor,
+)
 from .preflight import ProviderTier
 from .provider_budget import (
     MASSIVE_ADVANCED_ACCOUNT_DECODED_BYTE_CEILING,
@@ -228,6 +233,9 @@ class EquityPreparationFetchRequest:
     provider_reservations: tuple[
         ProviderRequestReservation, ...
     ] = ()
+    history_sessions: tuple[date, ...] = ()
+    revalidate_weekly_history: bool = False
+    before_provider_request: Callable[[float], None] | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -318,6 +326,9 @@ class EquityPreparationRunResult:
     next_retry_at: datetime | None = None
     reason: str | None = None
     reconciliation_state: str | None = None
+    provider_requests: int = 0
+    response_bytes: int = 0
+    stored_history_adopted: bool = False
 
 
 class EquityPreparationSource(Protocol):
@@ -360,6 +371,7 @@ def claim_equity_preparation_work_cursor(
     owner_id: UUID,
     checked_at: datetime,
     limits: EquityPreparationLimits,
+    revision_id: UUID | None = None,
 ) -> EquityPreparationClaim | None:
     checked = _utc(checked_at, "preparation claim checked_at")
     cursor.execute(
@@ -397,10 +409,15 @@ def claim_equity_preparation_work_cursor(
         "AND prior.stage_order<work.stage_order "
         "AND prior.status<>'COMPLETE'"
         ") "
+        + ("AND work.revision_id=%s " if revision_id is not None else "")
+        +
         "ORDER BY work.stage_order,work.next_retry_at,"
         "work.ticker,work.intent_id "
         "FOR UPDATE OF work SKIP LOCKED LIMIT 1",
-        (DESIRED_STATE_SCOPE, checked, checked),
+        (
+            DESIRED_STATE_SCOPE, checked, checked,
+            *((str(revision_id),) if revision_id is not None else ()),
+        ),
     )
     row = cursor.fetchone()
     if row is None:
@@ -1141,6 +1158,13 @@ def _advanced_rest_facts(
             instrument_id=claim.instrument_id,
             revision=replace(
                 revision,
+                bar_revision_id=uuid5(
+                    NAMESPACE_URL,
+                    "advanced-equity-preparation-bar-v2:"
+                    f"{claim.source_cohort_id}:MASSIVE_ADVANCED:"
+                    f"{revision.bar_revision_id}:"
+                    f"{'ADJUSTED' if revision.adjusted else 'RAW_UNADJUSTED'}",
+                ),
                 quality_codes=tuple(dict.fromkeys((
                     *revision.quality_codes,
                     "EXPLICIT_ADVANCED_REST_REPAIR_V1",
@@ -1186,6 +1210,10 @@ class MassiveEquityPreparationSource:
                     reservation.request_id
                     for reservation in request.provider_reservations
                 ),
+                **(
+                    {"before_request": request.before_provider_request}
+                    if request.before_provider_request is not None else {}
+                ),
             )
         try:
             if stage is EquityPreparationStage.REFERENCE:
@@ -1217,8 +1245,16 @@ class MassiveEquityPreparationSource:
                 provider_requests=requests,
                 response_bytes=response_bytes,
             ) from error
-        except EquityPreparationSourceError:
-            raise
+        except EquityPreparationSourceError as error:
+            chunk_metrics = getattr(self.client, "chunk_metrics", None)
+            if chunk_metrics is None:
+                raise
+            requests, response_bytes = chunk_metrics()
+            raise type(error)(
+                str(error),
+                provider_requests=requests,
+                response_bytes=response_bytes,
+            ) from error
         except Exception as error:
             requests = response_bytes = 0
             chunk_metrics = getattr(self.client, "chunk_metrics", None)
@@ -1363,29 +1399,34 @@ class MassiveEquityPreparationSource:
             date.fromisoformat(str(value))
             for value in interval_sessions[interval]
         )
-        selected = sessions[
+        selected = request.history_sessions or sessions[
             session_index:
             session_index + self.adjusted_daily_sessions_per_chunk
         ]
+        if selected != sessions[session_index:session_index + len(selected)]:
+            raise EquityPreparationBlockedError("ADJUSTED_HISTORY_SELECTION_DIVERGED")
         if not selected:
             raise EquityPreparationBlockedError(
                 "ADJUSTED_HISTORY_WATERMARK_EXHAUSTED"
             )
+        progressed_sessions = len(selected)
+        if request.revalidate_weekly_history:
+            if (
+                interval != "1wk"
+                or selected != sessions[session_index:]
+                or len(sessions) > request.limits.maximum_facts_per_chunk
+            ):
+                raise EquityPreparationBlockedError("WEEKLY_REVALIDATION_SCOPE_INVALID")
+            selected = sessions
         request_start = selected[0]
         request_end = selected[-1]
         if interval == "1wk":
             first_iso = selected[0].isocalendar()
-            last_iso = selected[-1].isocalendar()
             request_start = date.fromisocalendar(
                 first_iso.year,
                 first_iso.week,
-                7,
-            )
-            request_end = date.fromisocalendar(
-                last_iso.year,
-                last_iso.week,
-                7,
-            )
+                1,
+            ) - timedelta(days=1)
         elif interval == "1mo":
             request_start = selected[0].replace(day=1)
         rows = self.client.fetch_native_bars(
@@ -1414,11 +1455,25 @@ class MassiveEquityPreparationSource:
             ingestion_segment_id=segment,
         )
         actual = {revision.session_date for revision in revisions}
-        if actual != set(selected):
+        expected_coordinates = {
+            coordinate
+            for session in selected
+            for coordinate in equity_history_coordinates(
+                OptionExchangeCalendar("XNYS"), interval, session,
+            )
+        }
+        coordinates = [
+            (revision.bar_start, revision.bar_end) for revision in revisions
+        ]
+        if (
+            actual != set(selected)
+            or len(coordinates) != len(expected_coordinates)
+            or set(coordinates) != expected_coordinates
+        ):
             raise EquityPreparationUnavailableError(
                 "ADJUSTED_HISTORY_COVERAGE_INCOMPLETE"
             )
-        next_session_index = session_index + len(selected)
+        next_session_index = session_index + progressed_sessions
         next_interval_index = interval_index
         if next_session_index == len(sessions):
             next_interval_index += 1
@@ -1433,7 +1488,7 @@ class MassiveEquityPreparationSource:
             coverage_after=_coverage_with_count(
                 claim.coverage,
                 f"{interval}:ADJUSTED",
-                len(revisions),
+                progressed_sessions,
             ),
             source_lineage={
                 "provider": "MASSIVE",
@@ -1448,6 +1503,10 @@ class MassiveEquityPreparationSource:
                     "adjusted": True,
                 }),
                 "response_sha256": response_sha,
+                **({
+                    "coordinate_contract": "MASSIVE_WEEK_SUNDAY_START_V2",
+                    "whole_interval_revalidated": request.revalidate_weekly_history,
+                } if interval == "1wk" else {}),
             },
             complete=next_interval_index == len(intervals),
             provider_requests=1,
@@ -1503,9 +1562,17 @@ class MassiveEquityPreparationSource:
             ),
             ingestion_segment_id=segment,
         )
-        if not revisions or {
-            revision.session_date for revision in revisions
-        } != {session}:
+        expected_coordinates = equity_history_coordinates(
+            OptionExchangeCalendar("XNYS"), interval, session,
+        )
+        coordinates = tuple(
+            (revision.bar_start, revision.bar_end) for revision in revisions
+        )
+        if (
+            {revision.session_date for revision in revisions} != {session}
+            or len(coordinates) != len(expected_coordinates)
+            or set(coordinates) != set(expected_coordinates)
+        ):
             raise EquityPreparationUnavailableError(
                 "NATIVE_INTRADAY_COVERAGE_INCOMPLETE"
             )
@@ -1556,6 +1623,7 @@ class BoundedPolygonEquityPreparationClient(PolygonEquityClient):
         self._chunk_provider_requests = 0
         self._chunk_response_bytes = 0
         self._chunk_reservation_ids: tuple[UUID, ...] = ()
+        self._chunk_before_request: Callable[[float], None] | None = None
 
     def begin_chunk(
         self,
@@ -1563,6 +1631,7 @@ class BoundedPolygonEquityPreparationClient(PolygonEquityClient):
         maximum_requests: int,
         maximum_response_bytes: int,
         reservation_ids: tuple[UUID, ...] = (),
+        before_request: Callable[[float], None] | None = None,
     ) -> None:
         if maximum_requests <= 0 or maximum_response_bytes <= 0:
             raise ValueError("provider chunk bounds must be positive")
@@ -1571,6 +1640,7 @@ class BoundedPolygonEquityPreparationClient(PolygonEquityClient):
         self._chunk_provider_requests = 0
         self._chunk_response_bytes = 0
         self._chunk_reservation_ids = tuple(reservation_ids)
+        self._chunk_before_request = before_request
         if (
             self._chunk_reservation_ids
             and len(self._chunk_reservation_ids) < maximum_requests
@@ -1580,6 +1650,8 @@ class BoundedPolygonEquityPreparationClient(PolygonEquityClient):
             )
 
     def _request(self, url, params):
+        if self._chunk_before_request is not None:
+            self._chunk_before_request(self.timeout_seconds)
         if (
             self._chunk_provider_requests
             >= self._chunk_maximum_requests
@@ -1654,6 +1726,11 @@ class AdvancedEquityPreparationResident:
         limits: EquityPreparationLimits = EquityPreparationLimits(),
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
         calendar: OptionExchangeCalendar | None = None,
+        bootstrap_history: Callable[
+            [EquityPreparationClaim, datetime],
+            tuple[EquityPreparationChunk | None, tuple[date, ...]],
+        ] | None = None,
+        bootstrap_revision_id: UUID | None = None,
     ) -> None:
         self.provider = provider
         self.source = source
@@ -1661,6 +1738,10 @@ class AdvancedEquityPreparationResident:
         self.limits = limits
         self.clock = clock
         self.calendar = calendar or OptionExchangeCalendar("XNYS")
+        self.bootstrap_history = bootstrap_history
+        self.bootstrap_revision_id = bootstrap_revision_id
+        if (bootstrap_history is None) != (bootstrap_revision_id is None):
+            raise ValueError("one-time bootstrap requires an exact desired revision")
         self.planner = AdvancedEquityLifecyclePlanner(
             calendar=self.calendar,
             clock=clock,
@@ -1695,6 +1776,7 @@ class AdvancedEquityPreparationResident:
                     owner_id=self.owner_id,
                     checked_at=checked,
                     limits=self.limits,
+                    revision_id=self.bootstrap_revision_id,
                 )
                 live_priority = False
         if live_priority:
@@ -1710,6 +1792,10 @@ class AdvancedEquityPreparationResident:
                 reason="NO_DUE_PREPARATION_WORK",
             )
         try:
+            adopted, history_sessions = (
+                self.bootstrap_history(claim, checked)
+                if self.bootstrap_history is not None else (None, ())
+            )
             with self.provider.transaction(APP_ROLE) as unit:
                 provider_reservations = (
                     reserve_equity_preparation_provider_requests_cursor(
@@ -1718,10 +1804,13 @@ class AdvancedEquityPreparationResident:
                         checked_at=checked,
                         limits=self.limits,
                     )
+                    if adopted is None else ()
                 )
-        except ProviderBudgetExceeded as error:
+        except (ProviderBudgetExceeded, EquityHistoryIdentityError) as error:
             budget_reason = (
-                "MEMBER_PROVIDER_BUDGET_EXHAUSTED"
+                f"HISTORY_IDENTITY_DIVERGED:{error}"
+                if isinstance(error, EquityHistoryIdentityError)
+                else "MEMBER_PROVIDER_BUDGET_EXHAUSTED"
                 if "member" in str(error).lower()
                 else "ACCOUNT_PROVIDER_BUDGET_EXHAUSTED"
             )
@@ -1746,9 +1835,19 @@ class AdvancedEquityPreparationResident:
             checked,
             self.limits,
             provider_reservations,
+            history_sessions,
+            revalidate_weekly_history=(
+                self.bootstrap_history is not None
+                and claim.stage is EquityPreparationStage.ADJUSTED_DAILY
+                and tuple(claim.target["interval_sessions"])[
+                    int(claim.watermark.get("interval_index", 0))
+                ] == "1wk"
+            ),
         )
         try:
-            if claim.stage is EquityPreparationStage.DERIVED_INTERVALS:
+            if adopted is not None:
+                chunk = adopted
+            elif claim.stage is EquityPreparationStage.DERIVED_INTERVALS:
                 chunk = self._derive(request)
             elif claim.stage is EquityPreparationStage.TECHNICAL_WARMUP:
                 chunk = self._warmup(request)
@@ -1767,6 +1866,11 @@ class AdvancedEquityPreparationResident:
                 stage=claim.stage.value,
                 attempts=claim.attempts,
                 reconciliation_state=reconciliation,
+                provider_requests=chunk.provider_requests,
+                response_bytes=chunk.response_bytes,
+                stored_history_adopted=(
+                    chunk.source_lineage.get("mode") == "ONE_TIME_BOOTSTRAP"
+                ),
             )
         except EquityPreparationSourceError as error:
             with self.provider.transaction(APP_ROLE) as unit:
@@ -1794,6 +1898,8 @@ class AdvancedEquityPreparationResident:
                     attempts=claim.attempts,
                     reason="MEMBER_PROVIDER_BUDGET_EXHAUSTED",
                     reconciliation_state=reconciliation,
+                    provider_requests=error.provider_requests,
+                    response_bytes=error.response_bytes,
                 )
             return EquityPreparationRunResult(
                 "RETRY",
@@ -1803,6 +1909,8 @@ class AdvancedEquityPreparationResident:
                 attempts=claim.attempts,
                 next_retry_at=next_retry,
                 reason=str(error),
+                provider_requests=error.provider_requests,
+                response_bytes=error.response_bytes,
             )
         except EquityPreparationBlockedError as error:
             with self.provider.transaction(APP_ROLE) as unit:
@@ -1825,6 +1933,8 @@ class AdvancedEquityPreparationResident:
                 attempts=claim.attempts,
                 reason=str(error),
                 reconciliation_state=reconciliation,
+                provider_requests=error.provider_requests,
+                response_bytes=error.response_bytes,
             )
 
     def _derive(
@@ -1861,18 +1971,54 @@ class AdvancedEquityPreparationResident:
                 session_date=session,
                 checked_at=request.checked_at,
             )
+            if not sources or "expected_counts" in claim.target:
+                history = load_equity_history_cursor(
+                    unit.cursor,
+                    cohort_id=claim.source_cohort_id,
+                    security_id=claim.security_id,
+                    ticker=claim.ticker,
+                    interval="5m",
+                    adjusted=False,
+                    sessions=(session,),
+                    checked_at=request.checked_at,
+                    source_kind="NATIVE_REST",
+                )
+                sources = history.facts
+            if "expected_counts" in claim.target and (
+                len(sources) != len(equity_history_coordinates(self.calendar, "5m", session))
+                or {(fact.revision.bar_start, fact.revision.bar_end) for fact in sources}
+                != set(equity_history_coordinates(self.calendar, "5m", session))
+            ):
+                raise EquityPreparationUnavailableError("DERIVATION_SOURCE_COVERAGE_INCOMPLETE")
             if not sources:
                 raise EquityPreparationUnavailableError(
                     "DERIVATION_SOURCE_UNAVAILABLE"
                 )
+            if any(
+                fact.instrument_id != claim.instrument_id
+                or fact.revision.security_id != claim.security_id
+                or fact.revision.ticker != claim.ticker
+                for fact in sources
+            ):
+                raise EquityPreparationBlockedError("DERIVATION_SOURCE_IDENTITY_DIVERGED")
+            # Bootstrap reconstructs history now; it does not simulate historical reference knowledge.
+            identity_clock = (
+                request.checked_at
+                if self.bootstrap_history is not None
+                else max(fact.revision.bar_end for fact in sources)
+            )
             security = load_derivation_security_cursor(
                 unit.cursor,
                 instrument_id=claim.instrument_id,
-                window_end=max(
-                    fact.revision.bar_end for fact in sources
-                ),
+                window_end=identity_clock,
                 as_of=request.checked_at,
             )
+            if (
+                not security.active
+                or security.security_id != claim.security_id
+                or security.ticker != claim.ticker
+            ):
+                raise EquityPreparationBlockedError("DERIVATION_REFERENCE_IDENTITY_DIVERGED")
         source_sha256 = canonical_sha256(tuple(
             fact.revision.bar_revision_id for fact in sources
         ))
@@ -1887,6 +2033,14 @@ class AdvancedEquityPreparationResident:
                 f"{claim.revision_id}:{claim.ticker}:{target}:"
                 f"{session}:{source_sha256}",
             ),
+        )
+        facts = tuple(
+            replace(
+                fact,
+                cohort_id=claim.source_cohort_id,
+                provider_tier=ProviderTier.MASSIVE_ADVANCED,
+            )
+            for fact in facts
         )
         if not facts:
             raise EquityPreparationUnavailableError(
@@ -1920,6 +2074,12 @@ class AdvancedEquityPreparationResident:
                 "response_sha256": canonical_sha256(tuple(
                     fact.revision.bar_revision_id for fact in facts
                 )),
+                "source_scopes": sorted({
+                    (str(fact.cohort_id), fact.provider_tier.value)
+                    for fact in sources
+                }),
+                "security_revision_id": str(security.security_revision_id),
+                "security_reference_clock": identity_clock.isoformat(),
             },
             complete=complete,
             bars=facts,

@@ -10,6 +10,11 @@ from uuid import UUID
 
 import pytest
 
+from realtime.advanced_ingress_controller import (
+    IngressFailureDisposition,
+    classify_advanced_ingress_failure,
+)
+
 
 script = importlib.import_module(
     "scripts.run_realtime_v2_advanced_equity_ingress"
@@ -82,6 +87,55 @@ def test_monotonic_deadline_stops_provider_when_wall_clock_stalls():
     ))
     assert result is None
     assert stopped == [True]
+
+
+def test_rejected_status_updates_end_the_session_for_a_new_journal():
+    started = datetime(2026, 11, 2, 16, 23, tzinfo=timezone.utc)
+    stopped = []
+
+    async def run():
+        try:
+            await asyncio.Event().wait()
+        finally:
+            stopped.append(True)
+
+    reporter = SimpleNamespace(consecutive_failures=0, last_failure_name=None)
+
+    def status_check():
+        script._raise_if_status_rejected(reporter)
+        reporter.consecutive_failures = script.STATUS_REJECTION_LIMIT
+        reporter.last_failure_name = "ValueError"
+
+    with pytest.raises(script.AdvancedStreamStatusRejected):
+        asyncio.run(script._run_continuous(
+            SimpleNamespace(run_session=run), threading.Event(), 0.01,
+            started + timedelta(minutes=1), utc_clock=lambda: started,
+            status_check=status_check,
+        ))
+    assert stopped == [True]
+    failure = classify_advanced_ingress_failure(
+        "STREAM_STATUS_REJECTED",
+        detail="Advanced stream status updates were rejected",
+    )
+    assert failure.disposition is IngressFailureDisposition.TRANSIENT
+
+
+@pytest.mark.parametrize(
+    ("failures", "name"),
+    (
+        (script.STATUS_REJECTION_LIMIT - 1, "ValueError"),
+        # A database outage is not a rejection; reconnecting would not help.
+        (script.STATUS_REJECTION_LIMIT, "OperationalError"),
+        (0, None),
+    ),
+)
+def test_status_failures_below_the_rejection_rule_keep_the_session(
+    failures,
+    name,
+):
+    script._raise_if_status_rejected(
+        SimpleNamespace(consecutive_failures=failures, last_failure_name=name)
+    )
 
 
 def test_journal_progress_commits_before_diagnostic_session_failure(

@@ -237,7 +237,7 @@ RELATIONS: dict[str, Relation] = {
     ),
     "rt.readiness_current": _r("control", "BOUNDED", mutable=True, api=True),
     "rt.readiness_transitions": _r("control", "BOUNDED", append=True, api=True),
-    "rt.advanced_stream_authorizations": _r("control", "BOUNDED"),
+    "rt.advanced_stream_authorizations": _r("control", "BOUNDED", mutable=True),
     "rt.advanced_stream_authorization_status": _r(
         "control", "BOUNDED", api=True
     ),

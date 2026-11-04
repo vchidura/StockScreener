@@ -2160,10 +2160,7 @@ def reconcile_desired_state_revision_cursor(
             options_enabled=options_enabled,
         ),
     )
-    newly_ready = tuple(
-        row for row in ready_base if row.security_id not in source_base
-    )
-    if newly_ready and cohort_id != revision.source_cohort_id:
+    if cohort_id != revision.source_cohort_id:
         history_before = exchange.session_open(
             revision.effective_session_date
         )

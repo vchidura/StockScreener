@@ -282,8 +282,10 @@ def _require_no_unresolved_am_gaps_cursor(
     cursor,
     config: AdvancedEquityJournalBridgeConfig,
     *,
-    scanned_through_offset: int,
+    scanned_through_raw_offset: int,
 ) -> None:
+    # Gaps store raw offsets, and one raw frame can hold several events, so
+    # event offsets here would flag records that precede the gap.
     cursor.execute(
         "SELECT gap_id FROM rt.stream_gaps WHERE session_id=%s "
         "AND journal_generation=%s AND shard_id=ANY(%s::smallint[]) "
@@ -294,7 +296,7 @@ def _require_no_unresolved_am_gaps_cursor(
             str(config.stream_session_id),
             str(config.journal_generation),
             list(config.shard_ids),
-            scanned_through_offset,
+            scanned_through_raw_offset,
         ),
     )
     if cursor.fetchone() is not None:
@@ -491,7 +493,9 @@ def process_advanced_equity_journal_once(
         _require_no_unresolved_am_gaps_cursor(
             cursor,
             config,
-            scanned_through_offset=batch.scanned_through_offset,
+            scanned_through_raw_offset=max(
+                row.raw_offset for row in batch.scanned_records
+            ),
         )
         security_ids = _load_security_ids_cursor(
             cursor,

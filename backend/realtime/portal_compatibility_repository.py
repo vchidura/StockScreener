@@ -10,6 +10,8 @@ from threading import Lock
 from typing import Callable
 from uuid import UUID
 
+import exchange_calendars
+
 from .contracts import CANARY_UNIVERSE
 from .contracts import canonical_sha256
 from .advanced_options_read_pin import (
@@ -19,7 +21,7 @@ from .equity_bar_repository import load_current_bar_heads_cursor
 from .screening_projection import REALTIME_FIELDS, REALTIME_GAP_CATALOG, SCREENING_BASIS
 from . import screening_references
 from .ticker_references import BarLineageChanged
-from equity.calendar import latest_expected_market_time
+from equity.calendar import latest_expected_market_time, staleness_state
 from research.screening import (
     DEFERRED, GAP_VERSION, HOURLY_CATALOG, PATTERNS, VERSION, GapPredicate, digest,
     evaluate_gaps, query_generation, supported_hourly_contract,
@@ -57,6 +59,27 @@ def _utc(value: datetime, name: str) -> datetime:
     if value.tzinfo is None or value.utcoffset() is None:
         raise ValueError(f"{name} must be timezone-aware")
     return value.astimezone(timezone.utc)
+
+
+def action_evidence_until(
+    generated_at: datetime,
+    read_at: datetime,
+    read_mode: str = "current",
+) -> datetime:
+    """The end of the period whose corporate actions can make a publication stale.
+
+    A publication reports its session, and only the next session's publications
+    can absorb actions recorded after that session closed. Without this bound,
+    the nightly reference refresh would take every current read down until the
+    next open. Retained reads still see every later action, to warn about them.
+    """
+    if read_mode == "retained":
+        return read_at
+    calendar = exchange_calendars.get_calendar("XNYS")
+    session = _utc(generated_at, "generated_at").date().isoformat()
+    if not calendar.is_session(session):
+        return read_at
+    return min(read_at, calendar.session_close(session).to_pydatetime())
 
 
 def _row(value) -> dict[str, object] | None:
@@ -222,7 +245,26 @@ def _active_cohort(
             "AND generation.status='COMPLETE' AND generation.generated_at<=%s",
             (str(cohort_id), available_by),
         )
+        active = _row(cursor.fetchone())
+        if active is not None:
+            return active
+        # An Options cohort publishes releases without a screening generation.
+        cursor.execute(
+            "SELECT cohort_id, provider_tier, updated_at AS effective_at "
+            "FROM rt.portal_release_current "
+            "WHERE cohort_id=%s AND cutoff<=%s "
+            "ORDER BY cutoff DESC LIMIT 1",
+            (str(cohort_id), available_by),
+        )
     return _row(cursor.fetchone())
+
+
+def _unavailable_options_data_tier(active: dict[str, object] | None) -> str:
+    return (
+        "REAL-TIME ADVANCED RESEARCH DATA"
+        if active is not None and active["provider_tier"] == "MASSIVE_ADVANCED"
+        else "15-MINUTE DELAYED RESEARCH DATA"
+    )
 
 
 class _RealtimeCompatibilityRepository:
@@ -270,6 +312,48 @@ class _RealtimeCompatibilityRepository:
                 cache=self._release_cache,
             )
         return load_current_release(cursor, cohort_id, self._release_cache)
+
+    def _latest_release_entries(
+        self,
+        cursor,
+        cohort_id,
+        snapshot_types,
+        snapshot_key,
+        cutoff,
+    ):
+        current = self._release(cursor, cohort_id)
+        types = tuple(snapshot_types)
+        entries = tuple(
+            entry
+            for snapshot_type in types
+            if (entry := current.entry(snapshot_type, snapshot_key) if current is not None else None)
+            is not None
+        )
+        if entries:
+            return entries
+        cursor.execute(
+            "SELECT release_id, cutoff FROM rt.portal_releases "
+            "WHERE cohort_id=%s AND cutoff<=%s "
+            "ORDER BY session_date DESC, cutoff DESC, release_id LIMIT 32",
+            (str(cohort_id), cutoff),
+        )
+        for row in cursor.fetchall():
+            if current is not None and str(row["release_id"]) == str(current.release_id):
+                continue
+            release = load_release(
+                cursor,
+                row["release_id"],
+                row["cutoff"],
+                cache=self._release_cache,
+            )
+            entries = tuple(
+                entry
+                for snapshot_type in types
+                if (entry := release.entry(snapshot_type, snapshot_key)) is not None
+            )
+            if entries:
+                return entries
+        return ()
 
     def release_etag(
         self,
@@ -374,7 +458,7 @@ class RealtimeOptionFlowRepository(_RealtimeCompatibilityRepository):
         return {
             "available": False,
             "reason": reason,
-            "data_tier": "15-MINUTE DELAYED RESEARCH DATA",
+            "data_tier": _unavailable_options_data_tier(active),
             "generated_at": cutoff,
             "as_of": None,
             "observed_at": None,
@@ -452,7 +536,7 @@ class RealtimeOptionScreenerRepository(_RealtimeCompatibilityRepository):
         return {
             "available": False,
             "reason": reason,
-            "data_tier": "15-MINUTE DELAYED RESEARCH DATA",
+            "data_tier": _unavailable_options_data_tier(active),
             "generated_at": cutoff,
             "as_of": None,
             "observed_at": None,
@@ -884,12 +968,20 @@ class RealtimeScreeningRepository(_RealtimeCompatibilityRepository):
             self._verify_bars(cursor, record, payload)
         return payload
 
-    def query(self, request, *, available_by, cohort_id=None):
+    def query(self, request, *, available_by, cohort_id=None, read_mode="current"):
+        if read_mode not in {"current", "retained"}:
+            raise ScreeningQueryRejected("Unsupported screening read mode")
         cutoff = _utc(available_by, "available_by")
         with self._cursor() as cursor:
             self._begin(cursor)
             cohort = self._cohort(cursor, cutoff, cohort_id)
-            generation = self._load(cursor, cohort, cutoff, generation=request.generation)
+            generation = self._load(
+                cursor,
+                cohort,
+                cutoff,
+                generation=request.generation,
+                verify_bars=read_mode == "current",
+            )
             try:
                 previous = self._load(
                     cursor, cohort, cutoff, session=generation["previous_expected_session"], verify_bars=False,
@@ -900,7 +992,18 @@ class RealtimeScreeningRepository(_RealtimeCompatibilityRepository):
             result = query_generation(generation, request, previous)
         except ValueError as error:
             raise ScreeningQueryRejected(str(error)) from error
-        result["stale"] = datetime.fromisoformat(generation["market_time"]) < latest_expected_market_time(cutoff, "1d")
+        expected = latest_expected_market_time(cutoff, "1d")
+        actual = datetime.fromisoformat(generation["market_time"])
+        state = staleness_state(actual, expected, is_fresh=actual == expected)
+        result.update(
+            stale=state["status"] != "READY",
+            status=state["status"],
+            expected_market_time=expected.isoformat(),
+            staleness_sessions=state["staleness_sessions"],
+            max_serveable_stale_sessions=state["max_serveable_stale_sessions"],
+            read_mode=read_mode.upper(),
+            provider_fetch_performed=False,
+        )
         delay = 15 if generation["provider_tier"] == "MASSIVE_DEVELOPER" else 0
         expected_hourly = latest_expected_market_time(cutoff - timedelta(minutes=delay), "1h")
         hourly = generation["hourly_source"]
@@ -909,19 +1012,60 @@ class RealtimeScreeningRepository(_RealtimeCompatibilityRepository):
         result["hourly_provider_delay_minutes"] = delay
         return result
 
-    def _snapshot_row(self, request, available_by, cohort_id):
+    def status(self, *, available_by, cohort_id=None, read_mode="retained"):
+        if read_mode not in {"current", "retained"}:
+            raise ScreeningQueryRejected("Unsupported screening read mode")
         cutoff = _utc(available_by, "available_by")
         with self._cursor() as cursor:
             self._begin(cursor)
             cohort = self._cohort(cursor, cutoff, cohort_id)
-            generation = self._load(cursor, cohort, cutoff, generation=request.generation)
+            generation = self._load(
+                cursor,
+                cohort,
+                cutoff,
+                verify_bars=read_mode == "current",
+            )
+        actual = datetime.fromisoformat(generation["market_time"])
+        expected = latest_expected_market_time(cutoff, "1d")
+        state = staleness_state(actual, expected, is_fresh=actual == expected)
+        stale = state["status"] != "READY"
+        return {
+            "status": state["status"],
+            "checked_at": cutoff.isoformat(),
+            "max_serveable_stale_sessions": state["max_serveable_stale_sessions"],
+            "staleness_sessions": state["staleness_sessions"],
+            "last_market_time": generation["market_time"],
+            "oldest_stale_market_time": generation["market_time"] if stale else None,
+            "stale_intervals": ["1d"] if stale else [],
+            "pipeline_active": False,
+            "active_intervals": [],
+            "source": VERSION,
+            "serving_latest_available": True,
+            "retained_setup_generated_at": generation["observed_at"],
+            "read_mode": read_mode.upper(),
+        }
+
+    def _snapshot_row(self, request, available_by, cohort_id, read_mode):
+        cutoff = _utc(available_by, "available_by")
+        with self._cursor() as cursor:
+            self._begin(cursor)
+            cohort = self._cohort(cursor, cutoff, cohort_id)
+            generation = self._load(
+                cursor,
+                cohort,
+                cutoff,
+                generation=request.generation,
+                verify_bars=read_mode == "current",
+            )
         row = next((r for r in generation["rows"] if r["security_id"] == request.security_id), None)
         if row is None:
             raise ScreeningPublicationUnavailable("Requested security is not in this publication")
         return generation, row
 
-    def gap_details(self, request, *, available_by, cohort_id=None):
-        generation, row = self._snapshot_row(request, available_by, cohort_id)
+    def gap_details(self, request, *, available_by, cohort_id=None, read_mode="current"):
+        if read_mode not in {"current", "retained"}:
+            raise ScreeningQueryRejected("Unsupported screening read mode")
+        generation, row = self._snapshot_row(request, available_by, cohort_id, read_mode)
         if generation.get("gap_contract") != REALTIME_GAP_CATALOG:
             raise ValueError("Stored daily gap contract is incompatible")
         context = row["gaps"]
@@ -931,8 +1075,10 @@ class RealtimeScreeningRepository(_RealtimeCompatibilityRepository):
                     reason=reason, episode_count=len(context["episodes"]), matching_episodes=episodes,
                     contract=generation["gap_contract"])
 
-    def hourly_details(self, request, *, available_by, cohort_id=None):
-        generation, row = self._snapshot_row(request, available_by, cohort_id)
+    def hourly_details(self, request, *, available_by, cohort_id=None, read_mode="current"):
+        if read_mode not in {"current", "retained"}:
+            raise ScreeningQueryRejected("Unsupported screening read mode")
+        generation, row = self._snapshot_row(request, available_by, cohort_id, read_mode)
         if not supported_hourly_contract(generation.get("hourly_contract")):
             raise ValueError("Stored hourly contract is incompatible")
         lineage = generation["hourly_lineage"][request.security_id]

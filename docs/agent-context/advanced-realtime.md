@@ -1,776 +1,358 @@
 # Advanced Realtime V3 - Current Runtime Checkpoint
 
-Updated: 2026-11-02 UTC
+Updated: 2026-11-03 20:28 UTC - Equity portal recovery deployed and verified; Options processing roles remain stopped; nothing committed.
 
-## Objective And Mode
+## Nov 3 Equity portal recovery - Options resume is now eligible
 
-Replace the one-session artifact/qualification-driven V3 launcher with a simple
-self-reconciling continuous worker for local and Docker development.
+Migration `047_advanced_journal_plan_authority` is applied live with no pending migrations. It removes the
+single-table journal-plan FK; registry writes now require the plan to exist in either `advanced_ingress_plans`
+or `service_plans`. The bridge image is `e4ab5e9dcf93` (base `d3198c1b`) and changes only
+`advanced_journal_registry.py`: Equity replay discovers `STOCKS` streams only. It is healthy with zero restarts.
 
-Canonical design and assessment:
-[REALTIME_V3_PIPELINE.md](../REALTIME_V3_PIPELINE.md).
+The falsely quarantined Options journal `d629048a-2187-5bab-abfd-a12787b2df1a` was repaired under exact
+plan/stream/cohort/manifest/reason/detail/offset predicates from `QUARANTINED` to `DRAINING`; the quarantine
+reason, detail and timestamp remain stored. The stream is now truthfully `STOPPED`, ended at the original
+`2026-11-03T15:53:01.329202Z`, with watermark `15:51:50.577Z`; raw/event offsets are `107257/170196`.
+MARKET_STATE is checkpointed at `170196`; all nine FLOW shards are checkpointed at `107257`.
 
-Mode: C0/C1 committed at `eafe5f7`; C2 committed at `3754337`; reviewed C3
-committed at `d8fd82d`; reviewed C4 committed at `d78dcf2`; reviewed C5
-committed at `56cd1a9`; reviewed C6 committed at `b2ff055`; C7 at `2c39ace`; C8 at
-`7d399cd`. Post-C8 corrections and migration 045 remain uncommitted. Current
-blockers: [Post-C8 Market-Readiness Corrections](#post-c8-market-readiness-corrections).
+The live Options release count and pointer remain zero. Failed 17:35 and expired 17:50 windows were not cleared,
+backdated or published. The five Options processing roles are stopped: ingress `b9c2e021b126`, market-state/flow
+`f6ea58c8916b`, window `cfd20e717a34`, scheduler `d354ed2dbba1`. Acquisition `25336afa` remains unhealthy but
+its durable status is COMPLETE; lifecycle `b61d80cc` remains healthy.
 
-## Settled Runtime Decisions
+The portal fix was scoped onto the running images: scheduler `7921bc32` from `35808528` plus only
+`ticker_projection.py`, API `a1f37347` from `41f819b8` plus only `ticker_repository.py`, and frontend `8e9b58a`
+from `060adb55` plus only `PortalIdentityGate.tsx` and its test. API and frontend are healthy with zero restarts.
+The scheduler was recreated only after a 20:22:31 UTC read proved zero RUNNING windows/stages. Its old durable
+lease caused eight fenced startup attempts before epoch 26 acquired normally; it is stable on the new image, while
+the known health probe still reports unhealthy because it contends for the scheduler lease.
 
-- Derive the current/next XNYS session and due intervals automatically.
-- Do not require software qualification, source/image approval, daily freeze files,
-  packages, bundles or manually supplied dates for normal startup.
-- Keep PostgreSQL durable state, journal offsets, watermarks and leases as restart
-  authority.
-- Add Equity, sector ETF and Options members only during market-close maintenance.
-- Backfill and warm new members independently before the next market run.
-- On a market-hours restart, start live capture first, catch recoverable bars up to
-  the current finalized interval and continue latest-interval ingestion.
-- Record unrecoverable raw T/Q gaps without blocking unrelated future work.
-- Keep provider rate limits, bounded buffers, leadership and visible durability
-  errors as ordinary runtime correctness.
-- Keep qualification/replay tools as optional diagnostics only.
-- Dispatch, broker and trading remain disabled and separate.
+The first post-rollout 20:25 Equity window is COMPLETE: INPUT_GATE, MATERIALIZE, PROJECTION and PORTAL_PUBLISH
+all completed with fresh receipts. SPY 1m/5m/15m/30m/1h/1d/1wk/1mo reads all return 200. The publication truthfully
+reports STALE and serves retained market data; 1m ends 20:24 and the retained 5m prefix ends 20:15. No non-target
+container changed. Options ingress/market-state/flow/window/scheduler remain stopped; acquisition/lifecycle remain
+unchanged. The Equity prerequisite is now satisfied. To resume Options, keep WINDOW stopped, start
+ingress/market-state/flow and scheduler, require all three resident completions for a new cutoff, then start WINDOW
+and verify release plus current pointer. Do not retry either expired Options window.
 
-## Verified Reuse Points
+## Live state after the Nov 2 recovery - approved by the user 2026-11-03
 
-- Advanced Equity scheduler already discovers durable due windows, continues siblings
-  after failure and rolls to the next XNYS session.
-- Advanced ingress already has live-first hybrid REST/stream repair primitives.
-- Equity and Options journals, bridge/checkpoints, finalization and restart rehydration
-  exist.
-- Options heartbeat/reconnect/gap accounting and P8 resident roles exist.
-- Canonical Stock Alert persistence, portal publication, stored readers, retention
-  and archive components exist.
+Live recovery ran 10:00-10:29 UTC: journals +117/+514 bars, gap repair 9 requests, 15 windows, rollover 36
+requests, close attempt 5 COMPLETE. Windows 78/78; all 9 members exact on 1m/5m/15m/30m/1h/raw 1d/adjusted 1d;
+real HISTORY stage READY for QQQ and SPY; Treasury Nov 2 VERIFIED (fetched automatically at 21:00:01).
+Deployed by `scoped_rollout.py`, other 16 containers unchanged, rollback images in `scoped-rollout-plan.json`:
+bridge `d3198c1b` (was `226c8e1c`), scheduler hotfix `ef5fdfb9` (was `61b942e6`), API `41f819b8` (source
+`36145771`, was `65d36a00`), frontend `060adb55` (source `49af6ddc`, was `1f319b3f`).
 
-## Main Integration Gaps
+API source fixes in that image: empty `known_by` crash on ticker reads; Pattern Watch session fields; frozen
+closing release no longer overwritten by the hot one (All Tickers/Pattern Watch `session_close` reads); positional
+cursor for `/realtime/equity-preparation`; `action_evidence_until` ends the action-drift period at the session's
+close for current reads, so a nightly refresh no longer takes the portal down. This is a deliberate behaviour change.
+Routes through the frontend: 131/153. Remaining: 13 absent paths, 8 needing parameters, `/strategies/daily` with
+no release. Browser acceptance is the user's check. `runner/ui_calls.py` holds the calls real pages make;
+`preopen_smoke.py` checks stored live state; `api_smoke.py` alone misses `read_mode=session_close`.
 
-- Wire durable desired-state reconciliation into the continuous lifecycle owner.
-- Remove fixed initial date/cutoff/authorization arguments from normal resident startup.
-- Generalize exact target-9 and exact-four QQQ/SPY assertions across bindings,
-  scheduler counts, Stock Alerts and tests.
-- Replace package/bundle/binding file mounts as runtime coordination with durable
-  database state.
-- Integrate mid-session catch-up through publication without pointer regression or
-  stale alert delivery.
-- Add Options subscription sharding and per-underlying readiness.
-- Consolidate the existing continuous Equity path and one-session V3 path under one
-  native/Docker lifecycle owner.
-- Measure retention, journal rotation, disk growth and backup/restore without making
-  them startup gates.
+Still not deployed, for after the Nov 3 close: controller, ingress, preparation (rollover), lifecycle, full scheduler,
+sleep gate. Without preparation's rollover, Nov 4 Options blocks again. Every image except the bridge and API still caps the
+history binding chain at 4 scopes (source: 64). The chain gains one per session, so Nov 3 has 3, Nov 4 has 4, and Nov 5
+would exceed the cap, which makes this rollout due before the Nov 5 open at the latest. The Options roles also lack the
+15-session native context in `advanced_options_equity_input.py`, so OS1/OS2 context may be incomplete today; not verified.
 
-## C0/C1 Completion Evidence
+Prior-session stream-derived 5m: the deployed scheduler `ef5fdfb9` fails every Nov 3 window, from the first one, with
+`Ticker 5m history source drift`, because Nov 2's 5m are all DERIVED and the check allowed DERIVED for the current
+session only. Reproduced read-only by `runner/repro_nov3_window.py`, which runs the projection on real history with
+in-memory Nov 3 bars and the binding activation will write. The source fix accepts Advanced DERIVED 5m from any retained
+session and verifies each against its 1m parents, using the source closure for sessions older than the 1m chart window.
+Image `35808528` (source `1c73c27d`) is built and passes the simulation for 9 tickers at 14:35 and 21:00, including summary,
+Pattern Watch and dashboard. Not deployed until the user approves: `scheduler_hotfix_switch.py plan|start|verify --to drift`;
+`--to previous` is the rollback. Publishing and real Nov 3 bars stay unproven until the first window.
+`test_ticker_projection_state.py` has 2 failures with or without the fix: hard-coded materialization counts of 24 and 22
+against 20 and 18.
 
-- Provider-free pre-change baseline: 66 focused tests passed.
-- `SessionRuntimeStatePort` and `LegacyArtifactSessionStateAdapter` now isolate
-  package, bundle, acquisition, pre-open and downstream binding reads plus
-  downstream append.
-- The adapter delegates to the existing JSON loaders, bundle validator, typed parsers
-  and downstream chain store; payload/hash/error, append sequence, replay and atomic
-  publication semantics are unchanged.
-- The bounded scheduler, acquisition/production CLIs and P8 service, health and
-  resident paths use the compatibility seam. The scheduler no longer constructs or
-  reads/writes the downstream file store directly.
-- Consumer-injection regressions run the bounded scheduler and P8 service with
-  in-memory session state while package, bundle, acquisition and downstream artifact
-  paths are absent.
-- Corrected bounded seam suites: 107 tests passed with 5 existing warnings. Adjacent
-  continuous Equity,
-  session-operations, production and deployment suites: 50 tests passed.
-- Equity ingress remains the STOCKS socket owner; the split Options acquisition
-  runtime remains the OPTIONS socket/journal owner. The Equity bridge owns its
-  consumer checkpoints and the canonical publisher remains the sole release-pointer
-  writer.
-- Exact target-9 and exact-four QQQ/SPY validation remains active. No provider,
-  schema, Docker, publication or database effects ran.
-- C2 leaves the compatibility seam unchanged. Old-path retirement is not started.
+Options has never activated on live: 2 underlyings (QQQ, SPY), `option_flow_policies` 0 rows until first activation.
 
-## C2 Completion Evidence
+Options pre-open validation, 2026-11-03, approved by the user. One websocket handshake at 11:43 UTC: auth accepted, T and
+Q subscriptions accepted for one contract, no market events, no retry. `REALTIME_V2_ADVANCED_OPTIONS_READS=ENABLED` since
+11:45 UTC on the same API image, recreated by `options_reads_switch.py` (`plan`/`start`/`verify --value`; `--value DISABLED`
+is the rollback). `scoped_rollout.py` does not carry the flag, so an API rollout through it turns reads off. Pages read a
+published release, never stored T/Q, and show nothing until the first Options window publishes.
+`runner/options_selection_dryrun.py` runs the deployed selection on the stored real chain with no writes or provider calls;
+`runner/options_open_check.py` tracks capture through release, for 14:32-14:45 UTC. QQQ has one capture round left (64/96
+slots), and activation is revision-wide, so a failed QQQ capture leaves Options unactivated for the session. Host
+`node.exe` crashes on any script (`0xC0000096`), and 4 of 8 tests in `optionsFlowRealtime`, `optionsScreenerRealtime` and
+`optionsAlertsRealtime` cannot load `api.ts` since it imports `./portalIdentity`, so page requests are unverified.
 
-- Migration `039_realtime_desired_state` adds append-only desired revisions and role
-  members, one scoped mutable current-revision pointer, mutable per-member
-  `WARMING`/`READY`/`FAILED` preparation, and an append-only link to canonical
-  immutable session objects. It adds no coordinator, provider authority or
-  publication pointer.
-- The provider-free maintenance command records only identities already present in
-  `ref.security_revisions`, `rt.instruments` and a stored manifest/slot-set
-  lineage. Invalid or ambiguous identities fail explicitly.
-- Current selection is deterministic by effective session, revision timestamp and
-  revision ID. Same-session corrections keep prior evidence and replay cannot move
-  the pointer backwards.
-- Before-open changes target the upcoming XNYS session. Market-hours and after-close
-  changes target the next XNYS session; the source/active session is never updated.
-- Reconciliation waits while any enabled member is `WARMING`, blocks when an enabled
-  source Equity or Options-underlying member is `FAILED`, and may omit only failed
-  new or explicitly disabled members. It idempotently creates the existing immutable
-  subscription manifest/members, SHADOW cohort, tier binding and PRE_SESSION slot set.
-- C2 preparation uses one set-based identity read, two batched desired-state writes
-  and one set-based instrument read for up to 400 names. Maintenance timestamps
-  default to aware current UTC and retain explicit test/operator overrides.
-- The default remains exact target-9 plus exact-four QQQ/SPY T/Q. C2 does not add
-  runtime count generalization, sharding, provider work, live sockets, publication,
-  Docker changes or old-path retirement.
-- Focused offline/schema tests: 39 passed. Final adjacent offline/seam selection:
-  109 passed, 1 pre-existing malformed fake negative test deselected and 5 warnings.
-  C2 plus adjacent disposable PostgreSQL control-plane and slot-set tests: 21 passed
-  with 4 existing warnings.
+Selection works but favours expensive in-the-money contracts: shortlist and group ranks sort by relative spread first and
+use delta only as a late tie-break. On the stored Nov 2 chain, SPY's 8 picks traded 4,755 contracts against 533,230 for its
+busiest 8, and 3 of the 16 picks were 3 DTE, which the Flow policy excludes. Expect sparse Flow and Activity. Fix after the
+close; volume-first ranking at the open needs prior-session volume, because the chain then holds about 90 seconds of it.
 
-## C3 Completion Evidence
+Product gaps the portal correctly reports, not portal bugs. Stock Alerts cannot fire: all 558 Nov 2 evaluations are
+UNAVAILABLE, because `canonical_stock_alert_product.py` hard-codes event context to None and has no sector context, and
+the detector computes nothing when context is missing. The earlier "0 matches, truthful no-signal" note was wrong;
+no signal was evaluated. Batches also stop at 20:00, since recovered windows do not run alerts. Strategies has no
+continuous producer: the scheduler never passes `--include-strategies`, which needs a BOUND history report (283
+adjusted, 90 raw sessions); the newest release is Oct 27 in an older cohort. So Strategies Overview and Stocks
+Persistence stay 503. Both need a user decision and are not planned before the Nov 3 open.
 
-- The existing Advanced controller is the sole lifecycle leader. It fences one owner
-  in `rt.worker_leases`; the existing STOCKS stream owner epoch, journal generation
-  and cumulative plan-usage ledgers remain authoritative.
-- The provider-free injected-clock planner derives XNYS before-open, market-hours,
-  drain and idle phases; current/next sessions; dynamic half-day/DST windows; first
-  due cutoff; and catch-up-needed state.
-- The controller selects the C2 current/effective immutable snapshot and carries
-  unchanged intent into a new immutable revision/snapshot only at a derived session
-  boundary. Its internal rollover may explicitly target the planner's active XNYS
-  session after offline downtime; operator changes still use C2 market-hours
-  deferral. A current revision with no snapshot is reconciled automatically after
-  readiness changes; readiness and materialization share one revision advisory lock,
-  and concurrent reconcilers reuse first-writer `materialized_at` evidence.
-- Target-session desired intent/current selection commits before capability-dependent
-  snapshot reconciliation. A REFRESH_REQUIRED rollback therefore retains one durable
-  target revision for the refresh resident; success later creates one snapshot/plan.
-- Continuous mode derives the session cohort, authorization, date and cutoff.
-  Session-scoped finite stream/connection/byte/repair budgets create a deterministic
-  internal authorization ladder and daily plan without resetting durable counters.
-  A restart pins the existing same-session plan, budgets and usage even if runtime
-  configuration changed; the change applies only when preparing the next session.
-- Acquisition stops at exchange close. Provider drain, exact final-window deadline
-  (`close + finality delay + completion budget`, including half days) and
-  next-session preparation are separate: scheduler/finalizer retain today's scope
-  through that deadline while the controller may prepare tomorrow.
-- Continuous controller mode requires the independent external ingress resident;
-  direct provider-child execution remains `legacy-diagnostic` only.
-- An independent capability-refresh resident now owns
-  `CAPABILITY_REFRESH_REQUIRED:REFERENCE` in native and Compose lineups. On startup,
-  desired/profile change, approaching expiry and bounded cadence it checks the exact
-  Equity AM scope with one AdvancedGateway subscription-only WebSocket session, then
-  reuses the existing Advanced control-plane builder/persistence to append honest
-  profile/check evidence. Historical REST success is not capability evidence.
-- The probe persists exact accepted/rejected `AM.*` membership plus bounded
-  connection/control/request/byte evidence. Partial or rejected membership is never
-  PASS. A 400-member scope remains one subscription request/connection.
-- Subscription acknowledgement accumulates across bounded frames. Generic success
-  confirms only request/control success; PASS requires every requested member
-  explicitly accepted with zero rejected or unconfirmed members.
-- Probe runtime is bounded by a configurable event-loop timeout and cumulative
-  control-byte ceiling, both smaller than the resident lease by validation. Silent
-  auth, silent subscription acknowledgement and byte overflow close the socket,
-  raise typed probe failures and return to persisted DEGRADED/backoff.
-- TTL planning derives the earliest `probe_not_before` whose evidence can cover the
-  target XNYS close. Earlier weekend/holiday checks expose `WAITING`/next check and
-  make zero provider calls; unchanged fresh scope also makes zero calls.
-- Temporary provider failure persists `DEGRADED`, heartbeat, last success and bounded
-  next retry in existing readiness/lease state. It does not exit or stop controller,
-  ingress, scheduler, bridge or finalizer; successful fake-source refresh unblocks the
-  next lifecycle reconciliation without a manual command.
-- Ingress and capability probe share one atomic database-visible
-  `provider-connection:massive:STOCKS` owner fence. Live ingress blocks probes;
-  release/expiry permits one probe, and concurrent claims cannot open two sockets.
-- One bounded `window_runs` query uses the existing cohort/window-key index to load
-  latest discovered and contiguous-complete progress. Controller/scheduler planning
-  starts after that durable prefix; complete sessions have no due cutoff and midday
-  catch-up does not rescan earlier completed windows.
-- Initial lifecycle claim refuses every unexpired lease, including the same owner
-  UUID. Renewal is the only same-process continuation; expired takeover advances the
-  durable owner epoch.
-- `legacy-diagnostic` retains explicit authorization/cohort/session/cutoff arguments.
-  Native and Compose continuous launchers now share capability refresh, controller,
-  ingress, bridge, finalizer and scheduler residents; ingress detects a surviving
-  live stream before spawning another child.
-- Desired state is read on startup, pointer change, session transition and bounded
-  supervisor cadence only. The live ingress/message path has no lifecycle,
-  calendar, desired-state or leadership query.
-- Controller lease renewal runs at one-third of its lease instead of every supervisor
-  loop. Capability membership/readiness reloads use retry/expiry or bounded status
-  cadence, scheduler caches immutable session scope/windows, and runtime health scopes
-  current processing without aggregating historical failures.
-- Continuous health reports current acquisition, unfinished processing and future
-  preparation separately; active stale streams are `STALE`, failures are `DEGRADED`,
-  completed acquisition is `TERMINAL` and future-only preparation is `IDLE`. It also
-  exposes capability-refresh owner epoch, heartbeat, last success, TTL waiting and
-  next retry.
-- Final provider-free offline compatibility selection: 282 passed, 7 skipped
-  (including six opt-in PostgreSQL tests), 1 pre-existing malformed delayed-pong
-  fake deselected and 5 existing warnings.
-- Final owned disposable PostgreSQL selection: 30 passed with 5 existing warnings.
-  Evidence includes refresh failure visibility, fake-source capability/check
-  persistence, next-reconcile success, readiness/reconcile races, first-writer
-  snapshot identity, Friday-to-Monday rollover, post-close plan reuse, budget
-  pinning, scheduler scope, ingress-plan compatibility and lease fencing.
-- Remaining C4+: remove fixed count ladders and split intended membership from
-  per-member/lane readiness in C4; revalidate daily Options/reference evidence and
-  account-wide connection capacity in C5/C6; isolate resident/API/frontend failures
-  and long-lived recovery in C8. C3 intentionally retains the global WARMING gate.
-  No migration or new coordination table was added.
+## Nov 2 recovery and Nov 3 readiness - history of the approval
 
-## C4 Completion Evidence
+Everything below predates the live run. Evidence and scripts: `backend/.realtime-canary/v3-supervised-20261102/recovery-20261103/`
+(`runner/`, `scoped_rollout.py`, `rehearsal/`). Run recovery in containers only: host Python crashed twice
+(`0xc0000005`). Backup: `backend/backups/stocks_db_backup_v3-pre-nov2-recovery-20261103_2026-11-02.dump`,
+SHA256 `FCAD888E0AAB8C38EB4B36A0809602086640FDFBDB04EDC71CB6AE1C4E0ED3B6`.
 
-- Any exact Equity/sector-ETF target from 1 through 400 now gets an immutable
-  exact-target runtime profile. The next reviewed capacity point supplies unchanged
-  finite technical settings; known 1/9/25/50/100/200/400 identities stay unchanged.
-- Migration `040_realtime_equity_preparation` adds mutable per-member/per-stage work
-  plus immutable member intents, resolved identity bindings and chunk lineage.
-  Watermarks, coverage, total attempts, independent failure streak, retry time,
-  leases, terminal/blocked reasons, provider requests/bytes and exact source hashes
-  survive restart; completed chunks are not reset or replayed.
-- One desired-state edit set-creates work only for changed warming Equity members.
-  A syntactically valid absent ticker is accepted provider-free; its REFERENCE stage
-  persists canonical reference/instrument identity through existing owners, refuses
-  ambiguity/conflict and binds the immutable intent before history stages continue.
-  The resident runs reference, adjusted daily, native intraday, existing interval
-  derivation and declared technical warmup stages in bounded chunks. It is
-  provider-aware/injectable, uses exact request/decoded-byte/member ceilings and does
-  no work during market-hours or drain phases.
-- Before any REFERENCE/adjusted/native provider I/O, C4 reserves deterministic
-  per-call slots in the existing account-wide `provider_request_ledger`, bound to
-  revision, intent, stage, lease epoch, attempt and request slot. Successful and
-  handled-failure paths reconcile actual calls/bytes transactionally with work;
-  process loss leaves the maximum reservation durable and the next claim marks prior
-  unresolved effects ambiguous. Completed, failed, reserved and ambiguous rows all
-  consume member/account ceilings; DERIVED/WARMUP reserve zero provider scope.
-- Intended membership stays immutable while readiness changes. Post-close drain
-  commits future intent/capability/work but never pins the future plan. One activation
-  boundary (`open - controller warmup`) selects the session snapshot/plan; readiness
-  before it joins that snapshot, while readiness after it rolls to the next XNYS
-  session. Current active snapshots, plans, budgets and usage are never mutated.
-- Retryable coverage/reference/derivation availability uses durable backoff from a
-  separate failure streak, which resets after progress. Permanent identity/policy and
-  exhausted member-budget failures remain blocked; progress resumes from its watermark.
-- Exact changed membership still requires exact capability evidence. The controller
-  derives/registers a non-ladder profile automatically and uses an exact promotion
-  ladder; current-session plans, budgets and usage remain pinned.
-- Stored portal status exposes every desired Equity member, per-stage state, available
-  intervals, bounded first/last/count/latest OHLC identities, reference/source lineage,
-  durable watermark, attempts, failure streak, reasons and retry timing. Ready
-  non-target9 members remain explicitly preparation-only with a required C7 handoff;
-  the prior canonical release remains readable and no provider call occurs.
-- C3-R13 preserves the cached progress-derived next incomplete cutoff and refreshes
-  only at session/scope change, cutoff availability, retry due time or bounded
-  reconciliation expiry. C3-R14 routes typed connection-lease loss through pump drain,
-  final offsets, WAL checkpoint/journal seal, ownership gap, conservative usage,
-  terminal stream status and a durable failure report.
-- Focused provider-free C4/desired/lifecycle/repair/scheduler/portal/schema selection:
-  250 passed, 1 skipped and the one documented malformed delayed-pong fake deselected,
-  with 11 existing warnings. Owned disposable PostgreSQL
-  desired/lifecycle/plan/preparation selection: 40 passed with 5 existing warnings.
-  Evidence covers absent-ticker onboarding, non-ladder profiles, activation timing,
-  one plan/usage ledger per session, established-member continuity, bounded chunks,
-  retry/backoff/reset, restart resume, reservation idempotency, crashes before calls
-  and after responses, handled HTTP failure, successful reconciliation, concurrent
-  account work, no duplicate bars/derivations, stored availability/C7 handoff, live
-  priority and lease-loss closure. No provider, production, Docker or publication
-  effects ran.
-- Supplemental live-024/schema/security/C4 relation compatibility selection:
-  72 passed with 4 existing warnings. All committed C2 desired-state and C4
-  preparation relations are excluded from the historical through-024 registry;
-  its accepted migrations and pinned registry SHA remain unchanged.
-- C5 remains Options PostgreSQL session state and daily catalog/OI/reference
-  revalidation. C6 remains Options membership/count generalization, account-capacity
-  planning and deterministic sharding. C7 remains canonical release merge,
-  pointer/retry/outbox, delivery and broker/trading boundaries; C4 adds no publisher.
+Nov 3 Options: `CATALOG_QUOTE` and `REFERENCE_OI` are COMPLETE; `HISTORY` retries with no provider calls
+until Nov 2 adjusted and raw daily bars exist. Dividends also need the rollover. QQQ has 64/96 budget slots
+used (one capture round left), SPY 32/96. Do not reset them.
 
-## C5 Completion Evidence
+New defect, found by rehearsal: a closing window could never complete. Derivation read 5m bars at the stage's
+start clock, so the last 15m/30m/1h and raw 1d bars were never derived, and a retry reuses the first
+INPUT_READY `known_by`, which predates the daily bars. Fixed in `stage_runners_equity.py`
+(`CLOSING_DAILY_INPUTS_PENDING`). Deployed code still has it, so without the hotfix today's close would fail too.
 
-- Migration `041_advanced_options_continuous_session_state` adds only an immutable
-  current-session envelope, immutable downstream binding rows and one mutable
-  transactional head. The envelope references the effective desired snapshot plus
-  existing service plan, session authority and reference-state owners; downstream
-  rows retain canonical window, Equity receipt and E/O authority identities.
-- `PostgresContinuousSessionStateRepository` implements the existing
-  `SessionRuntimeStatePort`. Immutable package/acquisition/pre-open/bundle state is
-  parsed once and cached; resident polls read only the indexed head on a bounded
-  cadence. An unchanged head refreshes cadence without fetching/parsing the immutable
-  document; changed identity hydrates by exact session/sequence/hash. Append locks one
-  head row, validates existing normalized E/O facts, inserts one immutable sequence
-  row and advances the head in the same transaction.
-- Same-binding retries are idempotent, concurrent retries serialize, divergent
-  replay fails, rollback leaves no row/head advance and an exact committed
-  unpointed tail is recoverable. An identical older committed-prefix replay succeeds
-  without revalidation or head regression. Restart rehydrates the same typed
-  acquisition, session binding, sequence and hash chain without recreating stages.
-  Full-chain reads capture head plus rows through that sequence in one database
-  snapshot, so concurrent append cannot create false divergence or incoherent export.
-- Session activation hashes immutable `prepared_at`, not the caller attempt clock,
-  and runs under explicit SERIALIZABLE isolation plus the per-session advisory lock.
-  SQLSTATE 40001 receives at most three whole-transaction retries, preserving
-  concurrent idempotency. Activation revalidates the effective
-  exact target-9 plus QQQ/SPY desired snapshot, exact-four current catalog/slot
-  identity, sealed quote usability, current-session prior OI/reference validity,
-  prior-session history coverage and session clocks before persisting state.
-  Prior-session or divergent catalog/OI/reference facts fail explicitly.
-- Normal acquisition, scheduler, P8 role and health commands select `postgres`.
-  Normal Compose services mount no package, bundle, acquisition or downstream
-  artifacts. The original `realtime-v2-options-p8` profile remains explicit
-  `legacy-diagnostic`; source selection refuses mixed file/database authority.
-  One optional export command writes the existing payloads/hashes and binding-chain
-  layout from committed PostgreSQL state without becoming a mutable replica.
-- Acquisition journals, offsets, resident barriers, sole publisher/read pins,
-  lane isolation and effect denials are unchanged. State is not queried per market
-  message; database interruption is surfaced and restart resumes from existing
-  journal/checkpoint ownership.
-- C5 intentionally stores and serves one explicitly activated validated session. It
-  does not provide unattended next-session materialization/activation or resident
-  rebinding across XNYS rollover.
-- Focused provider-free C5/Options/scheduler/schema/live-024 selection: 214 passed
-  with 5 existing warnings. Owned disposable PostgreSQL C5/authority/catalog/desired
-  selection: 16 passed with 6 existing warnings. Evidence includes typed file/DB
-  parity, strict selection, deterministic retry identity, observed SERIALIZABLE
-  activation/retry, document/readiness reconstruction, stale-session rejection,
-  bounded binding discovery, cheap unchanged-head polling, captured-head export under
-  concurrent append, older-prefix replay parity without head regression, same-owner
-  restart, interruption visibility, concurrent append, rollback retry and unpointed-
-  tail recovery. No provider, production, Docker, publication, delivery, broker or
-  trading effects ran.
-- C6 remains generalized per-underlying catalog/OI/history readiness, exact-count
-  generalization, shard state/construction and account-wide connection capacity.
-  C7 remains product/release merge, publisher pointer/retry/outbox, delivery and
-  broker/trading effects. C8 owns the long-lived Options lifecycle, automatic next
-  effective-session activation, waiting without restart exhaustion and XNYS resident
-  rebinding. C9 removes manual `activate-session`/daily supervisor paths only after
-  C8 parity. C5 keeps exact-four QQQ/SPY and adds none of those behaviors.
+Images, pinned; do not rebuild, because a rebuild changes the ids: recovery `sha256:d3198c1b...` (source `ad1b8476`)
+for journals, gap, rollover and bridge. Hotfix `sha256:ef5fdfb9...` (source `74a4a884`) is deployed scheduler
+`61b942e6` plus `stage_runners_equity.py` and `ticker_projection.py`, for all windows and the scheduler.
 
-## C6 Completion Evidence
+Final rehearsal, finished 09:56 UTC on the disposable copy with these images (fake provider, no live effect):
+- PASS: closing window attempt 4 BLOCKED, attempt 5 COMPLETE in 77s; pointer at 21:00. Real HISTORY stage READY for
+  QQQ and SPY on lifecycle image `d9dea05d`; dividends valid; all 9 members have both daily bases.
+- Windows 76/78: 20:10 and 20:25 timed out in publish and every retry hit `CYCLE_REHYDRATION_MISMATCH`, so they stay
+  incomplete. Later windows, the close and Options were unaffected. Cause of the mismatch is not diagnosed; it has
+  followed a publish failure each time it has been seen. A timeout in projection recovers on retry.
+- Timeouts come from CPU speed swings, not the hotfix: identical work took 57-228 CPU-seconds on the deployed image
+  and 34-153 on the hotfix, and a fixed loop took 3-20s. Windows reports a 76% performance limit on the Balanced
+  plan, with no thermal throttling. Live windows share the 300s limit, so this also threatens today's session.
+- Deployed API: 22/153 routes 200 (baseline 21). 10 routes newly 200 (`/stock/*/sessions`, `/trading-sessions`).
+  9 routes stay 503 `action evidence changed; republish required`, and a completed close does not clear them: hot
+  releases set `generated_at` to the market cutoff, so any coverage row received later trips the reader until a
+  newer release publishes. Expect them back at the first Nov 3 publish, about 14:35-14:40 UTC; not proven. After
+  the rollover deploys, this would repeat every night unless the reader changes.
+- The working-tree API still returns 503 on 112 routes (`AttributeError` on 100); do not deploy it.
 
-The
-[C6 early-selection addendum](../REALTIME_V3_PIPELINE.md#c6-addendum-early-selection-and-bounded-detector-work)
-is implemented by the separately versioned `c6_activity_momentum_v2` profile. It
-supersedes the earlier initial 900-slot and proposed 300/600/900 rollout targets for
-new configurable preparation while preserving frozen v1/exact-four sessions.
+Second rehearsal, finished 06:14 UTC on the disposable copy (fake provider, no live effect):
+- PASS: journals, gap repair, all 15 windows, rollover. All 9 members have both daily bases. SPY raw bars are
+  15m 26, 30m 13, 1h 7, 5m 78, 1m 390, 1d 1. The real HISTORY stage from lifecycle image `d9dea05d` returned READY
+  for QQQ and SPY at a simulated 14:32 UTC, and dividends read `KNOWN_NO_ANNOUNCED_DIVIDEND`. So Options is unblocked.
+- FAIL: the 21:00 window is still not COMPLETE (77/78). Attempt 4 BLOCKED as designed and derived the bars, but
+  attempt 5 failed in projection with `Ticker 5m history source drift`. `ticker_projection.py:898-909` allows DERIVED
+  own-session 5m bars only while `partial_session`, so at the close it demands native bars nothing writes.
+- REGRESSION: on the deployed API, 200 routes fell from 21 to 13 of 153 and 9 baseline-200 routes went 503 with
+  `action evidence changed; republish required` (`/tickers/overview`, `/scan/all`, `/stocks/alert-view` and others;
+  `/trading-sessions` became 200). Readers reject a release once corporate-action rows arrive after it was generated,
+  and the rollover's dividend refresh does that until a newer release publishes. A completed closing window after
+  the rollover should clear it, and otherwise the first Nov 3 window should. Neither is proven.
+- Do not deploy the working-tree API yet: on this copy the recovery image returned 503 `AttributeError` on 100 routes
+  (ticker pages) and `KeyError` on 2. Not diagnosed.
+- The one unresolved gap is the stream-end marker at 21:00, which the input gate passes. It is not missing data.
 
-The [weekly-expiry and criterion refinement](../ADVANCED_OPTIONS_FLOW_POLICY.md#weekly-expiry-coverage-and-criterion-tuning-2026-11-01-recommendation)
-is implemented by separately versioned, explicit-opt-in `c6_activity_momentum_v3`;
-preparation still defaults to v2. Scheduled preparation alone resolves listed
-near-target/EOW expiries and dated last-trading evidence, persists the frozen
-allocation, and restart reloads it without recomputation. Short/core remain disjoint
-at 0-5/6-21 DTE. V3 uses the documented short 0.50 delta/ATM/7.5% moneyness/20% spread
-and core 0.60 delta/ATM/10% moneyness/20% spread offline seeds. Ingestion and detector
-hot paths perform no chain/calendar work or v2-v3 profile comparison.
+The source now validates legitimate DERIVED session 5m at the close; see the source-only checkpoint below.
+The hotfix image contains it, `scoped_rollout.py` is pinned to these images, and the final rehearsal above used them.
+No live step, deployment or changed live order is authorized by any of this; live still needs explicit approval.
 
-- V2 derives default `B` from 8 times eligible ready names plus configured/measured/
-  provider ceilings, producing 80/200/400 for 10/25/50 names. Explicit persisted
-  expansion to 12 per name permits 120/300/600; deterministic redistribution never
-  exceeds 12 per name or B and never pads missing quality coverage.
-- Typed selection criteria own discovery DTEs, role expiry/delta/moneyness targets,
-  quote/liquidity checks, coverage targets, candidate/shortlist/group bounds and
-  tie-breakers. Provider queries default to 0-21 DTE and extend to 60 only for enabled
-  strategy/required groups. Candidate DTE is never its own expiry target. Required and
-  enabled complete groups resolve from the bounded pool before coverage shortlisting;
-  accepted groups protect all legs, and bound overflow is explicit rather than partial.
-- The immutable allocation records profile identity, effective/configured capacity,
-  expansion, ranking clocks, discovery/filter/pool/shortlist/group/admission counts,
-  bounded rejection totals, complete groups, coverage and per-consumer eligibility.
-  Activation loads by frozen identity; residents never expand an existing session.
-- Market-state residents build one bounded in-memory contract/group route map from the
-  persisted allocation, share quote/factual-volume state, scan checkpoints contiguously
-  and persist restart state once per batch. Disabled 50 ms/silent-accumulation
-  consumers have empty routes. Output caps suppress returned detector outputs only,
-  never journaling, volume accounting, invocation accounting or checkpoint progress.
-  Equal-offset routing replay is idempotent only when equivalent; divergent/stale
-  replay fails. Traffic clocks cover all admitted events, including unrouted boundaries.
-- Addendum evidence: the affected provider-free admission/routing/C6/C5/downstream/
-  schema/security/live-024 selection is 283 passed with 5 existing warnings. The clean
-  owned-disposable C6/C5/reference/rolling/integration slice is 25 passed with 6
-  existing warnings and proves preparation allocation -> activation -> plan/routing
-  reload. Fixture evidence records event/detail-byte counts, invocation/skip counts,
-  bounded cache sizes and checkpoint lag. It does not claim safe full-session capacity.
+Live order after approval: copy journals afresh and verify hashes; replay both journals (no provider calls);
+gap repair 16:35 (9 requests); 15 windows on the hotfix; rollover (36 requests); closing window on the hotfix
+(attempt 4 BLOCKED and derives raw daily, which Options needs; attempt 5 COMPLETE); scoped rollout of bridge and
+scheduler (re-run `scoped_rollout.py prepare` first; it refuses at or after 14:15 UTC); verify with the `check`
+step on lifecycle image `d9dea05d` and compare the API with `baseline/`
+(21/153 routes 200 before recovery). If not clean by about 13:00 UTC, deploy only the bridge and scheduler fixes;
+Options then stays blocked for Nov 3. Drop `test_realtime_v2_rehearsal_20261103` when finished.
 
-- The generic C6 policy and frozen flow-v1 identity remain unchanged. The separately
-  versioned `c6_activity_momentum_v1` profile implements 900 active/100 reserve quote
-  slots, 50/100-name fair shares, deterministic unused-slot rounds, resolver-owned
-  complete groups, 0-5 then 6-21 then strategy-required 22-60 DTE priority, explicit
-  missing OI and capture-only flow unavailability for 3-4 DTE/new flow underlyings.
-- Migration `042_advanced_options_selection_shards` now persists immutable selection,
-  member, normalized coverage, one physical subscription and logical shard generations;
-  mutable reconnect/gap state belongs to the physical owner while logical processing
-  state and consumer offsets remain independent. C5 SERIALIZABLE activation owns the
-  write and immutable state is cached outside message processing.
-- Capacity is `(account, provider cluster)`: Stocks does not consume Options allowance,
-  reconnect needs no simultaneous spare connection, T/Q share one quote slot per exact
-  contract, and logical shards create no sockets. Baseline defaults are one Options
-  connection and 1,000 quote slots; deployment values are persisted/configurable and a
-  second Options producer or over-budget selection fails without truncation.
-- Chain discovery follows bounded `next_url` pagination under total request/byte/deadline
-  limits. Authority, acquisition, P7/P8 replay, scheduler, capture application and
-  session activation accept configured asymmetric membership. QQQ/SPY exact four
-  remains the compatibility fixture.
-- Preparation uses per-response receipt clocks and a separate completion/deadline; a
-  valid quote arriving after preparation start is not mislabeled future data. Missing
-  OI remains unavailable context instead of becoming zero or aborting discovery.
-- Flow residents consume only flow-v1-eligible contracts and persist/report explicit
-  `UNAVAILABLE` states for 3-4 DTE or unknown flow underlyings. Reference and rolling
-  producers bind the broad enrolled data membership separately from its exact frozen
-  flow-v1 subset. New reference documents are v2; immutable v1 documents decode with
-  their original identity and remain valid for exact broad-equals-flow membership.
-  Unknown/divergent flow members still fail closed.
-- A wholly ineligible universe advances raw and normalized barriers independently,
-  discovers newly registered quiet-period targets on a bounded cadence, and persists
-  one transactional `UNAVAILABLE` window plus exact stage evidence. Equivalent replay
-  is idempotent, divergent replay fails, and both serial-window callers bypass flow
-  products without publication effects.
-- Persisted logical shards drive acquisition normalization, journal registration,
-  materializer fanout, aligned lease ownership, batched shard/consumer health and
-  checkpoint restore. Rolling production validates separate market-state and flow
-  shard-id sets/map hashes and separate normalized-market/raw-flow checkpoint offsets;
-  neither side assumes shard zero or one shared offset. Physical message/byte/reconnect
-  counters and actual transport gaps update when durable status changes.
-- The strategy resolver emits atomic debit/credit wings, long-premium/income singles,
-  explicit required-leg groups and smile expiry neighborhoods only for explicitly
-  enabled strategies. A synthetic consumer reads the real durable journal, commits its
-  own PostgreSQL checkpoint and resumes after restart without acquisition changes.
-- Generic journal records preserve raw timestamp value/unit, source schema, sequences,
-  trade IDs, conditions, corrections, exchange metadata and receive time. Future
-  consumers retain independent offsets, event-time watermarks, history bounds and
-  explicit missing-feed states. Silent accumulation remains 120-730 DTE foundation
-  only with zero live slots/history/detector work; registration alone adds no work.
-- Provider-free C6/C5/policy/runtime/schema/security/live-024 selection: 379 passed,
-  4 expected PostgreSQL skips and 5 existing warnings. Owned disposable PostgreSQL
-  corrected C6 plus exact-four C5 session/authority/catalog/desired selection:
-  33 passed with 6 existing warnings. This includes the weekly-expiry successor,
-  corrected routing/restart boundaries and exact C5 session regressions.
-  No provider/network, production Docker, publication, delivery, broker or trading
-  effect ran.
-- Account-specific provider extras and full-session message/byte/memory/journal/drain
-  measurements remain operational validation, not a startup software qualification
-  gate or a claim made by C6.
-- C7 completes product/release/pointer/outbox/publication/delivery boundaries. C8 owns
-  unattended lifecycle, automatic next-session activation and resident rollover.
-  C9 owns retirement of manual activation, daily supervisors and duplicate paths.
+Do not redeploy lifecycle before the Nov 3 close: K=12 changes the budget scope hash and would act like a budget
+bypass. Deploy controller, ingress, preparation, lifecycle, the full scheduler and the sleep gate after that close.
+Follow-ups: history binding depth 64 needs compaction within about 3 months; `test_equity_interval_derivation_worker.py`
+has a pre-existing collection error; the wider regression has not run.
 
-## C7 Completion Evidence
+## H1 source-only fixes and remaining automatic readiness
 
-- Migration `043_realtime_product_publication` adds immutable Stock Alert
-  desired-snapshot/membership lineage, durable claimed publication work and immutable
-  attempt receipts. It registers only post-024 relations; the pinned live-024 vector
-  and SHA remain unchanged.
-- Canonical Stock Alerts evaluate the effective immutable 1-400 member snapshot.
-  Intended WARMING/FAILED members stay visible as partial status without blocking
-  effective members. Missing sector/event context remains explicit `UNAVAILABLE` and
-  non-actionable. The target-9/eight-ticker and Options exact-four fixtures remain
-  compatibility examples.
-- Snapshot/work enqueue is durable before publication. One claimed attempt atomically
-  creates the release, compares session/cutoff/generation, swaps the pointer and
-  completes the work. Failure preserves the prior pointer and records retry state;
-  restart loads the stored snapshot bodies. Expired claims are reclaimable with an
-  incremented durable fencing epoch; live claims and superseded owners remain fenced.
-  Equivalent replay is idempotent, divergent replay fails, rank-backward catch-up is
-  non-deliverable `HISTORICAL_STALE`, and forward/equal non-deliverable evidence is
-  pointer-ineligible `HISTORICAL_NONCURRENT`. A first historical public-API result is
-  explicitly degraded with `pointer=None`; resume/replay returns the same completed
-  release, and a later deliverable publication can create the first pointer.
-- Explicit complete ticker membership is part of the durable work identity. Restart
-  applies the same replacement scope, pruning removed per-ticker entries while keeping
-  unrelated independent-lane snapshots; publishers without a replacement scope keep
-  legacy merge behavior.
-- Stored readers follow the durable pointer and expose membership, unavailable context,
-  current/non-current disposition and publication retry/failure. Reference validation
-  is one bounded set read. Options H/E/O publication uses the same sole publisher and
-  does not add an Equity-completion dependency.
-- Provider-free affected C7/C6/C5/schema/security/live-024 selection: 321 passed with
-  23 existing warnings. Owned-disposable PostgreSQL C7 pointer/retry plus C6/C5
-  exact-Options selection: 24 passed with 5 existing warnings. Targeted Python compile
-  also passed. No provider/network, live database, Docker, dispatch, delivery, broker
-  or trading effect ran.
-- C8 now owns long-lived lifecycle/Compose/status consolidation. C9 still owns
-  retirement of manual activation, daily supervisors and duplicate paths.
+The completed 45-stage/nine-member bootstrap is preserved; do not repeat it or restore the archive wholesale.
+The user selected existing PostgreSQL leases/request-ledger ownership rather than a new C4 migration.
 
-## Post-C7 Integration Corrections
+- [Native Options context](../../backend/realtime/advanced_options_equity_input.py) now resolves exact
+  15-session XNYS raw daily history through bounded bindings, retaining each actual source cohort/bar/hash.
+  Incomplete stock-first requirement declarations block their lanes instead of entering ATR with empty inputs.
+- [Recurring rollover](../../backend/realtime/advanced_equity_rollover.py) uses a durable revision lease,
+  owner/epoch and current-desired-scope fences before I/O and at completion. Every real HTTP request checks
+  lease/open-time headroom and live priority. Facts and ledger outcomes commit atomically; ledger completion
+  clocks drive restart-safe backoff. Expired reservations are recovered only with matching prior-owner hashes.
+  Unknown/legacy unfenced reservations stay BLOCKED for controlled reconciliation; never reset them.
+  Quiesce old unfenced rollover callers before deploying this protocol. Lease duration is 10-3600 seconds.
+  Manual reports expose BUSY/backoff and only return success with an empty verified remaining work plan.
+- [Closing projection](../../backend/realtime/ticker_projection.py) accepts current Advanced derived 5m
+  bars at close only after checking exact native minute parents and aggregates. Missing unrelated older
+  minute-chart history does not invalidate those current 5m bars.
+- Disposable DB checks passed for overlap, completed-work restart, persistent backoff, expired-owner recovery,
+  unproven reservations, stale completion, complete mixed-source native assembly/frozen replay, bootstrap/HV
+  identity preservation, reference production and Equity input binding. In distinct focused runs, 125 offline
+  and 12 disposable DB tests passed, including existing hardened app-role rollover permissions and
+  normal/SESSION_CLOSE publication with the real closing projection.
+  The full recovery rehearsal remains unrepeated. No live/provider effects, new schema/grants or budget resets.
 
-- Equity-only desired membership changes no longer invalidate unchanged Options
-  activation. Options package Equity context may be a subset of the effective READY
-  Equity universe, must include every configured Options underlying and must not name
-  members outside that universe.
-- Adding an Options-underlying role requires that ticker's Equity role to be READY.
-  It schedules no duplicate Equity reference/history/technical preparation; the
-  target-session Options catalog/quote, prior OI/reference/history, bounded selection
-  and capacity checks still run.
-- C6 market-state logical shards now own independent leases and checkpoints over the
-  one shared physical Options journal. A logical shard failure is persisted and
-  retried locally while healthy shards continue; physical reconnect remains one
-  account/feed action and never creates a socket per logical shard.
-- Focused provider-blocked C5/C6/P8 tests: 169 passed with 5 existing warnings.
-  Complete owned-disposable C5/C6 files: 12 passed with 6 existing warnings. The
-  owned-disposable exact V3 restart/publication integration also passed with 6
-  existing warnings. No provider/network, live database, Docker, live publication,
-  delivery, broker or trading effect ran.
+Broader H1 is still deferred, not completed by these fixes:
 
-## C8 Completion Evidence
+1. Extract ordinary verified adoption from the bootstrap-only adapter. Normal C4 residents still disable it;
+   never enable its unconditional whole-weekly revalidation for routine onboarding. Preserve native/derived,
+   adjustment, causal source and closure checks, and commit reuse through ordinary C4 chunks.
+2. Derive a per-product history inventory from enabled detector lookbacks plus portal/Options requirements;
+   the current initial targets use a portal plan with fixed 210-daily/200-hourly warmup minima.
+3. Rollover now plans absent, split-stale and invalid-coordinate adjusted history over the existing portal
+   targets, using the last completed session as the adjustment horizon even for weekly/monthly bars.
+   General policy-driven lookbacks beyond these existing targets remain future work.
+4. Qualify retained stream-derived 5m across the next session's bindings and minute-parent retention. The close
+   fix accepts current-session derived 5m only; prior-session 5m still has the native-source contract. Define
+   supported retained derivation evidence explicitly, without relabeling bars or refetching merely for a label.
+5. Replace coverage-only technical assurance with durable product/checkpoint evidence bound to exact bar IDs,
+   parameter/code versions and through-clocks. Recompute only dependent tails from the earliest changed input
+   through existing materialization/evidence owners, then validate real screening/HV/OS/chart/publication reads.
+6. Qualify interrupted adoption/repair and rollover with zero repeat spend, unchanged earlier checkpoints,
+   bounded requests/bytes/DB work, live-priority deferral and source/adjustment divergence tests. Compact bounded
+   history chains before the existing depth-64 limit. These are implementation acceptance, not a daily manual gate.
 
-- One 19-role inventory drives the normal native command and the
-  `advanced-realtime-v3` Compose profile. Neither normal path accepts a session
-  date or package/bundle/binding/release/pointer artifact.
-- Migration 044 durably records per-underlying Options catalog/quote,
-  reference/OI, history, capacity/shard and activation progress. Only an
-  already-READY Equity role can schedule Options work; the work table contains
-  only `OPTION_UNDERLYING` intents. Stage claims are lease/epoch fenced,
-  provider-aware work reserves account-wide request/byte scope before I/O,
-  immutable evidence/watermarks survive crashes and the final stage activates
-  the PostgreSQL session without manual artifacts.
-- Equity detectors and canonical Stock Alerts derive the current durable
-  processing scope. C7 retry resumes due publication work. Options acquisition
-  and residents wait for and rebind to PostgreSQL session envelopes across
-  rollover. The physical socket remains acquisition-owned; logical shards keep
-  independent leases/checkpoints.
-- Native and Compose share PostgreSQL runtime, role and physical Options-socket
-  fences; host locks are defense in depth. Initial and restart launch failures
-  use the same per-role state machine: transient failures back off independently
-  while explicit configuration failures terminalize without draining healthy
-  provider/processing roles.
-- One stored-only status reports current/future sessions, members, logical
-  shards, physical feeds, publication, retention and non-null per-service
-  native/Compose health. C7 retry directly covers pending, retry, expired,
-  terminal and restart-idempotent work.
-- The market-readiness correction retains the profile-filtered candidate pool
-  but runs the canonical C6 allocator exactly once in the durable
-  `CAPACITY_SHARDS` authority row. C5 activation reloads that frozen capture and
-  allocation; no post-open allocator or detector-allocation migration exists,
-  and window H/E/O processing depends only on the resident barrier. Missing OI
-  is stored as explicit unavailable reference context, never zero, while
-  capture and unrelated products continue.
-- Equity preparation treats the default local `.env` as optional so the
-  Compose secret/environment path starts without `/app/.env`. Options
-  connection-attempt, decoded-message and decoded-byte session ceilings are
-  environment-configurable, frozen into the session/acquisition binding and
-  cumulative across restart. Defaults remain engineering starting values;
-  full-session measurement plus headroom is operational evidence, not a daily
-  qualification gate.
-- Isolated restore verification now covers V3 desired/session lifecycle,
-  journal/checkpoint bounds, selection/physical/shard membership, publication
-  pointers/work, read pins and service state in addition to canonical Equity
-  storage. Database verification still requires the separately retained
-  journal/report/retention volume snapshots before any provider owner starts.
-- Provider-blocked C8 selections: 147 passed with 5 existing warnings,
-  including native `main()` fence setup/initial scheduling with an isolated
-  launch failure. Affected provider-blocked C6 allocator/routing/session:
-  100 passed with 5 existing warnings. Owned-disposable C6 plus complete C5/C8
-  lifecycle/fencing: 25 passed with 6 existing warnings. Generalized automatic
-  activation uses `c6_activity_momentum_v2`, B<=8*N/default ceilings, 8/12
-  configured/effective per-underlying limits, whole groups, consumer evidence,
-  one physical subscription and identical restart generation; explicit
-  exact-four retains `c6_exact_four_regression_v1`. Targeted compile passed.
-  No provider/network, live database, Docker/service restart, publication,
-  delivery, broker or trading effect ran.
-- Market-readiness correction provider-blocked C5-C8, schema, security,
-  live-024, startup and restore selection: 255 passed with 5 existing warnings.
-  It covers B<N, 12-per-name redistribution, one frozen allocation, schema-valid
-  activation, missing-OI activation, product-gate removal, environment-only
-  startup, configurable cumulative acquisition ceilings and V3 restore checks.
-  Final owned-disposable C5/C6/C8 and desired-state selection: 29 passed with
-  6 existing warnings, including generalized missing-OI activation and exact
-  allocation generation reload after restart.
-  No provider/network, live database or Docker/service effect ran.
+Refresh only due catalog/OI/dividend/action context; missing OI and deferred sector dependencies stay UNAVAILABLE.
+Stored Nov 2 Treasury was separately VERIFIED for Nov 3 (14 tenors, zero fetches); reuse it, not Oct 30 evidence.
 
-## Post-C8 Market-Readiness Corrections
+## Residual-finding fixes - source only, Nov 3
 
-Status: **Focused corrections tested; deployment pending; NOT READY_FOR_SUPERVISED_RUN**
-until the section 8 migration/image/secrets/startup steps are separately approved
-and verified. No full-session or unattended-operation claim.
+- Screening's shared depth-64/identity checks were left unchanged.
+- Rollover repairs only the first contiguous invalid range, bounded by the configured fact ceiling. It
+  supplies that exact range to the existing preparation adapter, including ranges larger than its ordinary
+  20-period default. References run before historical work. Lease fencing, request/byte limits and the
+  existing per-action attempt/budget scope remain unchanged; exhaustion is still BLOCKED, never reset.
+- The user selected a resident overnight Equity scheduler. It is excluded from session-bound sleep roles;
+  the open-minus-25-minute recovery stop and other workers' wake windows were not relaxed.
+- Legacy Options calls no longer require runtime publication identity. Realtime Options still requires its
+  own cohort and never borrows the Equity cohort.
+- Retained context reports SMA50 explicitly; EMA50 remains unavailable. Market Conditions labels and
+  distances follow the declared basis, while legacy EMA calculations stay unchanged.
+- Focused validation: 41 offline backend tests, 3 frontend regressions and 4 disposable DB checks passed.
+  The DB repair uses the real preparation source, fixes stale history beyond 20 sessions, preserves valid
+  bar IDs and proves both requests retain one budget scope. TypeScript completed cleanly in cached
+  `node:20-alpine` with no network/read-only source; host Node again exited -1073741674.
+- Recovery-runner editing/rehearsal belongs to the other session by explicit user choice after concurrent
+  runner changes were detected. Its fake-provider fence hook was preserved; this session left no runner edits.
+  Do not claim runner approval gates or a full recovery rehearsal passed based on these source checks.
 
-### First-Run Readiness Review (2026-11-02)
+Candidate backend/frontend images must include these latest edits before rehearsal; older pins may predate
+them. No live repair, provider fetch, deployment, grant/migration, budget reset or bootstrap rerun occurred here.
 
-Evidence matrix, decisions and first-run plan:
-[ADVANCED_REALTIME_V3_FIRST_RUN_READINESS_2026-11-02.md](../ADVANCED_REALTIME_V3_FIRST_RUN_READINESS_2026-11-02.md).
-Section 11 holds the implementation brief and its status.
+## Authority and safety
 
-Items 1-9 remain recorded in readiness section 11. Additional corrections:
+Target `stocks_realtime_v2` only. Supervised approval V3-FIRST-SUPERVISED-20261102
+through Nov3 21:15 UTC. Current live pass remains READ-ONLY; the source remediation is not a rollout.
+No unscoped Compose up, live-role recreation, deliberate outage, active restore,
+legacy runtime, trading/delivery, budget reset or manual READY/watermark edits.
+Preserve dirty source, immutable facts/bindings, original clocks and quarantines.
+Do not rerun completed bootstrap or infer authority for a bridge fix.
+Evidence: [readiness section12, Independent live monitoring](../ADVANCED_REALTIME_V3_FIRST_RUN_READINESS_2026-11-02.md).
 
-- The user authorized one October 30 Treasury refresh: 14 tenors verified,
-  source update 2026-11-02 01:02:04Z, real receipt 09:43:10.994274Z. This is the
-  only new live effect. Scheduled end-of-day/catch-up ownership is implemented in
-  `options-lifecycle`, with bounded durable retries; deployment is pending.
-- Reference `known_at` uses the real activation clock, not the compatibility
-  pre-open timestamp. A curve arriving after open and frozen capture now unblocks
-  activation without backdating or reallocating.
-- The user approved `options-scheduler` as the twentieth native/Compose role.
-  `backend/scripts/run_advanced_options_v3_scheduler.py` derives session/E scope,
-  snapshots only frozen contracts and appends durable per-E authority/bindings.
-  WINDOW reloads each exact binding; continuous control/history identities are
-  preserved without routine qualification-artifact gates.
-- Scheduler replay now uses persisted `requested_to` (original selection time),
-  never ledger completion time. Dedicated no-retry HTTP transport accounts for
-  failed/partial bytes and checks the E/O deadline. Frozen batches are <=250
-  contracts, <=1,000 total; request budgets are `3*B`/interval and `234*B`/session,
-  reserving 2,000,001 bytes/request including the oversize probe. Follow-up:
-  107 offline passed plus advancing-clock/failed-byte PostgreSQL regression.
-  This does not certify full expanded-universe products or live operation.
-- Focused runtime/topology/input tests: 224 provider-blocked passed; Treasury,
-  lifecycle and rates: 117 passed. Disposable DB: 27 passed, including full-size
-  activation, append recovery, two E bindings and frozen cohort/service-plan
-  fences. Native-plan blockers remain blocking; accepted lane-local unavailable
-  evidence no longer produces a contradictory READY preflight.
-- Additional combined canary passed backend stored publication/rollback/API
-  assertions but failed in its bundled Node process (`0xC0000096`, also reproduced
-  by direct Node execution). No complete frontend/canary PASS claim.
-- Section 8 is the sole current operator sequence: safe-start target 13:00 UTC,
-  member boundary 14:15 UTC. Warmup remains 4,401 chunks, estimated 25-45 min;
-  replace the estimate with observed throughput. Render 20, not 19, services.
-- B1 migrations, immutable build/configuration and retention startup remain
-  deployment work; D5 finite stream-ceiling approval is still required.
-  Compose-only/native retention, one-session frontend cohort
-  handling, throughput and reboot/history repair remain supervised-run limits.
-  Stored publication validation is included; browser/Options UI and rollover
-  validation are deferred. Established-member dividend refresh remains unresolved.
+## Current observed deployment
 
-Blockers as found by the review, in execution order:
+- Another session deployed API, scheduler, canonical-stock-alerts and Options
+  WINDOW on `alpha-research-realtime-v3@sha256:9ce840961a554612e055cda9d737d2b8a0bbabf508b1c2804454ff4657cd62e9`.
+  Frontend `sha256:1f319b3fa2b7cf9f2dae495895806f85c54f6fbfc9ab4143c774cb67c452d04d`.
+  Scoped recreation17:36-17:37; deployment evidence:
+  `backend/.realtime-canary/v3-supervised-20261102/portal-publication-deploy/`.
+- Other15 containers were unchanged by that rollout. Bridge/ingress still226c8e1c;
+  Options lifecycle stilld9dea05d. No monitored container restarts17:55-17:59.
+- Publication uses continuous-publication and C7 batch publication. No migration
+  or new grants; Options reads remain DISABLED. Current identity resolves cohort
+  `52b9fef3-beeb-5181-8fe8-e28fb6f2de48`; no build-time cohort required.
+- 45/45 C4 prep COMPLETE14:04:13, nine Equity READY before14:15. Schema/security
+  verified; 045/046 only, original backups preserved. No new bootstrap/adoption.
+  October30 Treasury cachedVERIFIED14tenors, zero monitoring provider fetches.
+- Member160requests/2GiB, account64k/512GiB, Options40M/8GiB/12attempts unchanged.
 
-- B1: the live ledger records `045_advanced_options_detector_allocation`, whose file
-  no longer exists; the tree's 045 differs. Planner, status and audit all fail.
-- B2: Equity `REFERENCE` fetches whole-market splits/dividends under a 3-request
-  chunk, so it can never complete (81 failed ledger rows; reproduced offline).
-- B3: `TECHNICAL_WARMUP` requires a sector, and SPY/QQQ/IWM have none, so the only
-  Options underlyings can never become READY.
-- B4: the 4-page discovery ceiling fails on QQQ/SPY (about 16-18 pages estimated).
-- B5: `extends` merges profiles, so the V3 Compose profile renders 23 services, not
-  19, and the documented render exits 1. Fix validated on a scratch copy.
-- B6: retention exits 2 on both paths (native lacks DSN files; Compose needs two
-  undocumented variables). Daily partitions end at `p20261105`.
-- B7: the frontend pins one build-time cohort, but cohorts change per session.
-- B8: no commit or image contains the current code.
+## Five-sample live observations, 17:55-17:59 UTC
 
-Decisions D1-D7 are open and are the user's to make. Results: focused 43 passed;
-broad provider-blocked 551 passed, 4 failed, 1 skipped; owned-disposable 67 passed,
-4 failed; C7 and drain additions 103 and 5 passed. Failures are classified in the
-readiness document: stale tests, except one unresolved reconciliation test outside
-the 19 roles. No provider, service, migration, publication or restore effect ran in
-this review.
+1. Real PORTAL_PUBLISH writes completed:17:35retry,17:40,17:45,17:50,17:55.
+   Four normal durations187/235/184/166s; all within their300s release budgets.
+   Minimum observed deadline headroom~59s. Overrun recovery not demonstrated.
+2.42 releases,37 distinct cutoffs; five dashboard/pattern/summary snapshots each,
+   45 individual ticker snapshots,37 Stock Alerts snapshots. Pointer17:55 CURRENT.
+   37 alert batches,0compute errors,0matches (truthful no-signal).
+3.**Serving still FAILS**, including explicit-cohort controls18:01:50:
+   workspace summary422 `identity/checksum drift`; dashboard503
+   `identity/checksum/clock drift`; Stock Alerts503 `identity/checksum drift`.
+   Frontend proxy also422. Correct cohort header proves this is not just routing.
+   Do not treat successful writes/current pointer as successful product reads.
+4. Same LIVE Stocks sessionf3c9060f, epoch36, remained active; bars/journal advanced.
+   Options192-slot/150MB/one-scope ledger unchanged, no new REST reservations;
+   API returns enabled=false/ADVANCED_OPTIONS_V2_DISABLED, read pins0 as expected.
+5.19 ticker-test failures/baseline are being investigated elsewhere; this monitor
+   did not rerun them or assert that they were pre-existing.
 
-Stored state contradicts the "no live database effect" notes below: 043-045 were
-applied at 03:26-04:09 UTC on 2026-11-02, then one desired revision and 81 provider
-requests ran. Do not start provider-owning services until the blockers are fixed.
+## Serving-integrity source remediation
 
-### Earlier Post-C8 Corrections
+Read-only predicate audit of current releasebaf814b8 at18:10 proved stored
+manifest/payload checksums valid. Aggregate source identity589a46c5 exactly matches
+the resolved two-scope history chain, but Dashboard/summary/Stock Alerts manifests
+omit `history_scope_chain`; readers recompute obsolete single-binding153932b4.
+Immutable snapshots/pointers/clocks were not changed. The fix centralizes
+bounded history/reference continuity fields across aggregate producers and makes
+Stock Alert/strategy readers use the shared exact resolver. Final focused offline
+acceptance:10 passed. Scoped rollout changed only API/scheduler/canonical-alerts:
+images65d36a00/61b942e6/a1559bbf. Non-target IDs, LIVE Stocks owner epoch36,
+Options192/150MB/one-scope ledger and immutable rows stayed unchanged. New18:40
+Dashboard/summary/pattern/alert manifests each carry chain length2 and resolve
+exactly. Six implicit/explicit controls now return200.
 
-- Capture/date freshness is evaluated at the immutable capture/review clock.
-  Capture-fresh evidence still allocates after a delayed worker retry. Evidence
-  already quote-stale at capture time records one durable pre-freeze refresh
-  request, resets only affected catalog/reference work plus unfrozen capacity
-  work, preserves append-only attempt evidence and reserves provider budget
-  before refreshed I/O. Its persisted retry waits for target XNYS open and then
-  applies capped 30-300 second backoff. Restart resumes the transition without
-  spending closed-market budget. Completed allocation or activation refuses
-  refresh, so the frozen session membership never rotates.
-- Provider-budget exhaustion is caught after claim but before execution. The
-  reservation transaction rolls back, the work lease is released to durable
-  `RETRY` with `PROVIDER_BUDGET_EXHAUSTED`, and reconciliation preserves a
-  `DEGRADED` session plus exact retry time. No executor/provider I/O occurs and
-  no ceiling is bypassed.
-- Provider accounting now separates each scope allowance from one shared
-  `MASSIVE_ADVANCED` account ceiling. Options keeps `4*N*3` local requests;
-  Equity/Options/repair/scheduler scopes consistently persist and enforce the
-  reviewed 64,000-request/512-GiB account limits under the shared lock. The
-  helper fails closed if any Advanced caller omits account-wide enforcement;
-  an account-exhausted repair performs no insert and does not advance plan usage.
-- Before claim selection, unfinished preparation is persisted as `EXPIRED`
-  after target close plus five minutes or `SUPERSEDED` by a newer session.
-  Obsolete work becomes terminal `BLOCKED` with expiration metadata and cannot
-  starve new work; completed evidence and active session/drain state are kept.
-- Runtime lifecycle timing is centralized at 30 seconds drain, 5 seconds
-  finality and 300 seconds completion. At November 2 16:02 ET, status and the
-  scheduler both retain November 2 as `DRAINING`, while November 3 remains
-  separately visible as future preparation. Status rolls only after the exact
-  final processing deadline.
-- Sealed captures persist `GENERALIZED_C6` or `EXACT_FOUR_QQQ_SPY_V1` plus
-  configured underlyings. Generalized four-contract, sparse/one-sided and
-  missing-OI pools reach canonical C6; ticker names, count, sides and OI shape
-  never infer exact-four mode.
-- The lifecycle Compose service inherits the shared Advanced environment for
-  configured total, per-underlying, measured and provider/project allocation
-  ceilings plus finite cumulative stream ceilings. Native and Compose feed the
-  same executor inputs; no new secret or qualification gate was added.
-- Backup verification requires explicit `Legacy`, `RealtimeV3` or `Both` scope.
-  `RealtimeV3` omits legacy `public.*` counts and the legacy validator. The V3
-  validator covers desired/session/preparation history, journals and explicit
-  raw/normalized checkpoints, C6 selection/shards, C7 publication, retention,
-  migrations, roles and stale service status. Unknown checkpoint coordinates
-  fail; no `GREATEST(raw, normalized)` fallback remains.
-- Provider-blocked command:
-  `.\backend\.venv\Scripts\python.exe -B -m pytest -p backend.tests.realtime.offline_io_guard backend\tests\realtime\test_advanced_options_lifecycle.py backend\tests\realtime\test_advanced_options_p8_selection_source.py backend\tests\realtime\test_advanced_options_activity_momentum_c6.py backend\tests\realtime\test_realtime_v2_advanced_services.py backend\tests\realtime\test_advanced_options_schema_contract.py backend\tests\realtime\test_security_v2_roles.py backend\tests\realtime\test_equity_live024_compatibility.py backend\tests\realtime\test_check_scripts_against_v2_registry.py backend\tests\test_equity_storage_validation_scripts.py -q --tb=short --disable-warnings -p no:cacheprovider`
-  passed 169 tests with 5 existing warnings.
-- Owned-disposable command (with `STOCKS_V2_DB_TESTS=1`):
-  `.\backend\.venv\Scripts\python.exe -B -m pytest backend\tests\realtime\test_advanced_options_session_state_v2_db.py::test_c8_real_executor_provider_free_end_to_end_with_retry backend\tests\realtime\test_advanced_options_session_state_v2_db.py::test_c8_real_executor_uses_v2_allocation_for_generalized_membership backend\tests\realtime\test_advanced_options_session_state_v2_db.py::test_c8_stale_capture_refresh_survives_restart_before_allocation_freeze backend\tests\realtime\test_advanced_options_session_state_v2_db.py::test_c8_budget_exhaustion_persists_wait_and_releases_claim -q --tb=short --disable-warnings -p no:cacheprovider`
-  passed 4 tests with 6 existing warnings.
-- Follow-up P1 provider-blocked command:
-  `.\backend\.venv\Scripts\python.exe -B -m pytest -p backend.tests.realtime.offline_io_guard backend\tests\realtime\test_advanced_options_lifecycle.py backend\tests\realtime\test_advanced_options_schema_contract.py backend\tests\realtime\test_security_v2_roles.py backend\tests\realtime\test_equity_live024_compatibility.py backend\tests\realtime\test_check_scripts_against_v2_registry.py -q --tb=short --disable-warnings -p no:cacheprovider`
-  passed 75 tests with 5 existing warnings.
-- Dual-budget/expiration provider-blocked command:
-  `.\backend\.venv\Scripts\python.exe -B -m pytest -p backend.tests.realtime.offline_io_guard backend\tests\realtime\test_provider_budget.py backend\tests\realtime\test_advanced_options_lifecycle.py backend\tests\realtime\test_realtime_v2_advanced_services.py backend\tests\realtime\test_advanced_options_schema_contract.py backend\tests\realtime\test_security_v2_roles.py backend\tests\realtime\test_equity_live024_compatibility.py backend\tests\realtime\test_check_scripts_against_v2_registry.py backend\tests\realtime\test_realtime_v2_incremental_script.py backend\tests\realtime\test_advanced_intraday_repair.py backend\tests\realtime\test_advanced_gap_repair.py backend\tests\realtime\test_advanced_options_p8_canary_authorization.py backend\tests\realtime\test_advanced_realtime_session_scheduler.py -q --tb=short --disable-warnings -p no:cacheprovider`
-  passed 177 tests with 5 existing warnings. This includes the corrected
-  long-lived Compose restart contract (`unless-stopped`, never bounded
-  `on-failure`).
-- Final owned-disposable dual-budget/lifecycle command (with
-  `STOCKS_V2_DB_TESTS=1`):
-  `.\backend\.venv\Scripts\python.exe -B -m pytest backend\tests\realtime\test_provider_budget_v2_db.py backend\tests\realtime\test_advanced_ingress_plan_v2_db.py::test_incremental_repair_account_exhaustion_preserves_ledger_and_usage backend\tests\realtime\test_advanced_equity_preparation_v2_db.py::test_preparation_reservation_counts_concurrent_account_work backend\tests\realtime\test_advanced_options_session_state_v2_db.py::test_c8_real_executor_provider_free_end_to_end_with_retry backend\tests\realtime\test_advanced_options_session_state_v2_db.py::test_c8_real_executor_uses_v2_allocation_for_generalized_membership backend\tests\realtime\test_advanced_options_session_state_v2_db.py::test_c8_stale_capture_refresh_survives_restart_before_allocation_freeze backend\tests\realtime\test_advanced_options_session_state_v2_db.py::test_c8_budget_exhaustion_persists_wait_and_releases_claim backend\tests\realtime\test_advanced_options_session_state_v2_db.py::test_c8_obsolete_unfinished_session_expires_once_and_is_not_reclaimed -q --tb=short --disable-warnings -p no:cacheprovider`
-  passed 10 tests with 5 existing warnings.
-- Final focused rerun:
-  `.\backend\.venv\Scripts\python.exe -B -m pytest -p backend.tests.realtime.offline_io_guard backend\tests\realtime\test_advanced_options_lifecycle.py backend\tests\realtime\test_advanced_options_p8_selection_source.py backend\tests\realtime\test_realtime_v2_advanced_services.py backend\tests\test_equity_storage_validation_scripts.py -q --tb=short --disable-warnings -p no:cacheprovider`
-  passed 60 tests with 5 existing warnings.
-- Compile command:
-  `.\backend\.venv\Scripts\python.exe -B -m py_compile backend\realtime\provider_budget.py backend\realtime\advanced_ingress_repository.py backend\realtime\advanced_gap_repair.py backend\realtime\advanced_realtime_v3_runtime.py backend\scripts\repair_realtime_v2_advanced_intraday.py backend\scripts\run_advanced_realtime_session_scheduler.py backend\scripts\run_realtime_v2_advanced_equity_scheduler.py backend\scripts\run_advanced_options_v3_lifecycle.py backend\scripts\report_advanced_realtime_v3_status.py`
-  passed. `git --no-pager diff --check` passed.
-- No provider/network, live database, Docker/service, publication, delivery,
-  broker or trading effect ran. C9 was not started.
-- `docs/DEPLOYMENT.md` is now a current-only V2/V3 deployment authority:
-  one native launcher, one `advanced-realtime-v3` Compose profile, V2
-  migration/security/credential lifecycle, desired-state preconditions,
-  status/drain, V3-scoped backup/restore, upgrade and non-legacy rollback.
-  Legacy deployment is explicitly unsupported here; code retirement remains
-  C9 after stability. README production commands and the V3 operations runbook
-  are aligned with that boundary.
-- Four authorized operational evidence items remain: full-session traffic and
-  reconnect measurement; deployment ceiling/headroom selection; isolated
-  database plus journal/report/retention-volume restore; and native/Compose
-  startup/drain smoke. None was performed here.
+## Confirmed historical gap and remaining live risk
 
-## Exact Anchors
+Old journalb0c80d14 DRAINED16:23:02 while its stream481bccd6 ended16:36:17
+with CONNECTIONCLOSEDERROR; replacement began16:36:21. Missing ALL9 ticker bars
+at bar_start16:22-16:35 inclusive (126 coordinates); adjacent minutes have9.
+16:40 all4 attempts correctly blockedADVANCED_INPUT_NOT_READY; not timeouts.
+Deployed bridge226c8e1c AND portal image9ce84096 have identical heartbeat-only
+orphan-drain logic, no connection-owner lease check. The AM/60s race remains live.
+Working-tree changes are not evidence of deployment. No repair/waiver was made.
+Any bridge update/recreation requires a separate controlled scope decision.
 
-- `docs/ADVANCED_REALTIME_V3_FIRST_RUN_READINESS_2026-11-02.md`
-- `backend/realtime/advanced_equity_capability_refresh.py`
-- `backend/realtime/advanced_equity_lifecycle.py`
-- `backend/scripts/run_realtime_v2_advanced_capability_refresh.py`
-- `backend/scripts/run_realtime_v2_advanced_equity_scheduler.py`
-- `backend/scripts/run_realtime_v2_advanced_controller.py`
-- `backend/scripts/run_realtime_v2_advanced_ingress_service.py`
-- `backend/scripts/run_realtime_v2_advanced_services.py`
-- `backend/scripts/run_realtime_v2_equity_interval_finalizer.py`
-- `backend/realtime/advanced_ingress_controller.py`
-- `backend/realtime/advanced_gap_repair.py`
-- `backend/realtime/advanced_realtime_session_scheduler.py`
-- `backend/realtime/advanced_options_acquisition_runtime.py`
-- `backend/realtime/advanced_options_p8_runtime.py`
-- `backend/realtime/advanced_options_session_state.py`
-- `backend/realtime/advanced_options_lifecycle.py`
-- `backend/realtime/advanced_options_automatic_preparation.py`
-- `backend/realtime/advanced_realtime_fencing.py`
-- `backend/realtime/advanced_realtime_v3_runtime.py`
-- `backend/realtime/advanced_realtime_desired_state.py`
-- `backend/realtime/advanced_realtime_desired_state_repository.py`
-- `backend/realtime/advanced_equity_preparation.py`
-- `backend/realtime/advanced_ingress_runtime_profile.py`
-- `backend/realtime/provider_budget.py`
-- `backend/realtime/sql_v2/039_realtime_desired_state.sql`
-- `backend/realtime/sql_v2/040_realtime_equity_preparation.sql`
-- `backend/realtime/sql_v2/041_advanced_options_continuous_session_state.sql`
-- `backend/realtime/sql_v2/044_advanced_realtime_v3_lifecycle.sql`
-- `backend/scripts/run_advanced_options_v3_acquisition.py`
-- `backend/scripts/run_advanced_options_v3_production.py`
-- `backend/scripts/run_advanced_options_v3_lifecycle.py`
-- `backend/scripts/run_realtime_v2_portal_publication_retry.py`
-- `backend/scripts/report_advanced_realtime_v3_status.py`
-- `backend/scripts/check_advanced_realtime_v3_service.py`
-- `backend/scripts/run_advanced_realtime_session_scheduler.py`
-- `backend/scripts/run_realtime_v2_advanced_equity_preparation.py`
-- `backend/scripts/manage_advanced_realtime_desired_state.py`
-- `docker-compose.realtime-v2.yml`
+## Remaining Equity portal source remediation
 
-Focused completion check: PASS. The exact-four provider-free workflow commits one
-current-session typed acquisition/pre-open state in PostgreSQL, starts residents in
-`READY_WAITING_FOR_E`, appends successive E/O bindings transactionally and discovers
-the head after restart. Deterministic export preserves existing typed payloads and
-hashes; normal services require no artifact mounts; stale prior-session
-catalog/OI/reference proof fails explicitly. Journals/checkpoints and existing
-publication/read-pin boundaries remain intact, and validation performed zero
-provider, production, Docker, publication, delivery, broker or trading effects.
+Source-only remediation now keeps lag separate from corruption. Per-ticker identity
+resolution carries the stored `history_scope_chain`; ticker session lists use the
+immutable quote trade date/clock and include the current retained session without
+mislabeling it as a frozen close. Screening has explicit `current` and `retained`
+controls: current still fails on live-head drift, while retained verifies stored
+hashes and serves the saved generation with stale metadata. Market Conditions,
+Sector Intelligence and Market Regime routes derive truthful degraded views from
+the validated retained workspace summary; they do not call providers or legacy
+runtime. Retained strategy reads may select an earlier checksum-valid released
+entry, and the UI falls back to an exact pinned Dashboard only for an explicit503
+missing strategy release, never for identity/shape errors.
+
+The session selector retains prior data across refresh failures. The shared banner
+now covers latest ticker, cross-ticker, screening, strategy and enabled Options
+surfaces and reports `STALE DATA`, sessions behind, oldest published timestamp,
+affected timeframes and retained setup age. Explicit historical selections are not
+misreported as live lag. Options reads remain disabled today; enabled-mode status
+uses the retained Options release and never an Equity cohort.
+
+Focused offline evidence: the four retained-reader files first ran461pass/3fail;
+all three local failures were corrected, then affected screening/ticker selectors
+passed. The final combined remediation/identity selection passed33/33. VS Code
+diagnostics report no Python/TypeScript errors. The host Node test/build processes and Playwright MCP
+both terminate before diagnostics with Windows exit-1073741674, so browser rendering
+could not be certified.
+
+No rollout was authorized or performed. The19:51 read-only deployed matrix therefore
+still reflects the old images: eight direct-entry HTML routes return200, but ticker
+current/retained charts return422 old identity drift, ticker sessions503 clock
+mismatch, screening current/retained404 lineage drift, Market/Sector/status routes
+404, and strategies503 absent release. Cross-ticker current/retained remain200;
+Options disabled status remains200. This is baseline evidence, not a result of the
+source changes. Full serving/browser acceptance remains NO until a separately
+authorized scoped rollout and post-rollout direct-entry/network/banner matrix.
+
+Existing malformed old manifests remain fail-closed; no snapshot, clock, pointer,
+service, container, database, grant, provider data or live worker was changed.
+Current monitoring evidence: observing session files/portal-monitor-20261102T1744/,
+portal-serving-evidence.json,1640-gap-evidence.json,deployed-drain-source-metadata.json.
+No services, code or budgets changed by monitoring. Read-only helpers completed.
+Original backups/quarantines retained; volume restore files identical but historical
+DB recovery INVALID (3 boundary/2 codec rows). Member reference refresh fuseNov9;
+calendars/dividend rollover/daily catch-up and next-session continuity unvalidated.
+Close21:00UTC/13:00Pacific, final21:05:05/13:05:05; next XNYS sessionNov3.
+Options real publication, full browser/UI, close/drain and accepted recovery remain
+UNVALIDATED. No recurring manual bootstrap or new daily admission gate.

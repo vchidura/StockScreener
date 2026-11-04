@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import replace
 from datetime import timedelta
-from uuid import UUID, uuid4
+from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 import pytest
 
@@ -10,8 +11,12 @@ from realtime.advanced_options_control_plane import (
     build_advanced_options_equity_input_binding,
 )
 from realtime.advanced_options_equity_input import (
+    load_advanced_options_equity_context_cursor,
+    initial_advanced_options_equity_context_requirements,
     validate_advanced_options_equity_dependencies_cursor,
 )
+from options.calendar import OptionExchangeCalendar
+from realtime.equity_history import EquityHistoryRead, equity_history_coordinates
 from realtime.contracts import UniverseManifest
 from tests.realtime.test_advanced_options_control_plane import (
     _enrollment_plan,
@@ -23,6 +28,11 @@ class _Cursor:
         self.query = ""
         self.parameters = ()
         self.omit_qqq_context = omit_qqq_context
+        self.connection = self
+
+    @contextmanager
+    def cursor(self, **_kwargs):
+        yield self
 
     def execute(self, query, parameters):
         self.query = query
@@ -55,6 +65,34 @@ class _Cursor:
                 for index in range(count)
             ]
         raise AssertionError(self.query)
+
+
+@pytest.fixture(autouse=True)
+def history_resolver(monkeypatch):
+    def resolve(cursor, **scope):
+        calendar = OptionExchangeCalendar("XNYS")
+        if cursor.omit_qqq_context and scope["ticker"] == "QQQ":
+            return EquityHistoryRead((), None)
+        return EquityHistoryRead(tuple(
+            {
+                "cohort_id": scope["cohort_id"],
+                "bar_revision_id": uuid5(
+                    NAMESPACE_URL, f"{scope['cohort_id']}:{scope['ticker']}:{session}",
+                ),
+                "session_date": session,
+                "bar_start": equity_history_coordinates(calendar, "1d", session)[0][0],
+                "bar_end": equity_history_coordinates(calendar, "1d", session)[0][1],
+                "observed_at": scope["checked_at"],
+                "availability_mode": "HISTORICAL_RECONSTRUCTED",
+                "payload_sha256": f"{index:064x}",
+            }
+            for index, session in enumerate(scope["sessions"])
+        ), None)
+
+    monkeypatch.setattr(
+        "realtime.advanced_options_equity_input.load_equity_history_cursor", resolve,
+    )
+    return resolve
 
 
 def _dependencies():
@@ -150,3 +188,93 @@ def test_missing_qqq_context_blocks_only_declared_lanes_before_provider_work():
     )
     assert result["lane_context"]["OS1"]["status"] == "BLOCKED"
     assert result["lane_context"]["OS2"]["status"] == "BLOCKED"
+
+
+def test_native_context_assembly_preserves_mixed_history_sources(monkeypatch, history_resolver):
+    equity, binding = _dependencies()
+    repaired, retained = uuid4(), uuid4()
+    expected = {}
+
+    def mixed(cursor, **scope):
+        assert scope["cohort_id"] == repaired
+        assert scope["checked_at"] == binding.equity_cutoff
+        history = history_resolver(cursor, **scope)
+        rows = tuple(
+            dict(row, cohort_id=retained if index < 12 else repaired)
+            for index, row in enumerate(history.rows)
+        )
+        expected[scope["ticker"]] = rows
+        return EquityHistoryRead(rows, "a" * 64)
+
+    monkeypatch.setattr(
+        "realtime.advanced_options_equity_input.load_equity_history_cursor", mixed,
+    )
+    contexts = load_advanced_options_equity_context_cursor(
+        _Cursor(), equity_plan=equity, history_source_cohort_id=repaired,
+        equity_cutoff=binding.equity_cutoff,
+        requirements=initial_advanced_options_equity_context_requirements(),
+        underlyings=("QQQ", "SPY"),
+    )
+    for context in contexts:
+        assert context.available
+        if context.lane.value in {"OS1", "OS2"}:
+            historical = tuple(
+                member for member in context.members
+                if member.source_cohort_id != equity.cohort_id
+            )
+            assert {
+                (member.source_cohort_id, member.bar_revision_id, member.payload_sha256)
+                for member in historical
+            } == {
+                (row["cohort_id"], row["bar_revision_id"], row["payload_sha256"])
+                for rows in expected.values() for row in rows
+            }
+    readiness = validate_advanced_options_equity_dependencies_cursor(
+        _Cursor(), equity_plan=equity, equity_input=binding,
+        history_source_cohort_id=repaired, underlyings=("QQQ", "SPY"),
+    )
+    assert all(value["status"] == "AVAILABLE" for value in readiness["lane_context"].values())
+
+
+@pytest.mark.parametrize("invalid", ["missing_session", "availability", "coordinates"])
+def test_native_history_context_rejects_invalid_daily_coverage(
+    monkeypatch, history_resolver, invalid,
+):
+    equity, binding = _dependencies()
+
+    def read(cursor, **scope):
+        history = history_resolver(cursor, **scope)
+        rows = list(history.rows)
+        if invalid == "missing_session":
+            rows.pop()
+        elif invalid == "availability":
+            rows[-1] = dict(rows[-1], availability_mode="UNKNOWN")
+        else:
+            rows[-1] = dict(rows[-1], bar_end=rows[-1]["bar_end"] - timedelta(minutes=1))
+        return EquityHistoryRead(tuple(rows), history.binding_sha256)
+
+    monkeypatch.setattr(
+        "realtime.advanced_options_equity_input.load_equity_history_cursor", read,
+    )
+    result = validate_advanced_options_equity_dependencies_cursor(
+        _Cursor(), equity_plan=equity, equity_input=binding,
+        history_source_cohort_id=uuid4(), underlyings=("SPY",),
+    )
+    assert result["lane_context"]["O3"]["status"] == "AVAILABLE"
+    assert result["lane_context"]["OS1"]["status"] == "BLOCKED"
+    assert result["lane_context"]["OS2"]["status"] == "BLOCKED"
+
+
+def test_undeclared_stock_first_context_is_blocked_without_attempting_atr_assembly():
+    equity, binding = _dependencies()
+    result = validate_advanced_options_equity_dependencies_cursor(
+        _Cursor(), equity_plan=equity, equity_input=binding,
+        history_source_cohort_id=uuid4(), underlyings=("SPY",),
+        requirements=(initial_advanced_options_equity_context_requirements()[0],),
+    )
+    assert result["lane_context"]["O3"]["status"] == "AVAILABLE"
+    for lane in ("OS1", "OS2"):
+        assert result["lane_context"][lane]["status"] == "BLOCKED"
+        assert result["lane_context"][lane]["reason_codes"] == (
+            f"{lane}_E_CONTEXT_REQUIREMENTS_INCOMPLETE",
+        )

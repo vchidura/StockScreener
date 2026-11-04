@@ -123,9 +123,13 @@ from .orchestration_repository import (
     WindowRecord,
 )
 from .runner_environment import RunnerEnvironment
-from .stage_graph import STAGE_CATALOG_VERSION_V5
+from .stage_graph import STAGE_CATALOG_VERSION_V5, STAGES_V4
 from .stage_orchestrator import StageContext
-from .stage_runners_options import OptionsFlowSettings, options_flow_runner
+from .stage_runners_options import (
+    OptionsFlowSettings,
+    _engine_config,
+    options_flow_runner,
+)
 from .advanced_options_service import OPTIONS_LATE_CANARY_V4_STAGE_ORDER
 
 
@@ -297,6 +301,106 @@ def _snapshot_v3_resident_windows(
         )
         recorded += 1
     return recorded
+
+
+def _record_v3_stream_session_cursor(
+    cursor,
+    acquisition,
+    *,
+    manifest_id: UUID,
+    owner_epoch: int,
+    started_at: datetime,
+    subscribed_at: datetime | None,
+    observed_at: datetime,
+    ended_at: datetime | None,
+    connection_attempts: int,
+    decoded_messages: int,
+    decoded_bytes: int,
+    raw_offset: int,
+    event_offset: int,
+    event_time_watermark: datetime | None,
+) -> None:
+    """Acquisition owns the socket and no database state, so ingress records
+    its one session from durable progress; the journal registry, the resident
+    barrier and the rolling producer all read this row."""
+    authority = acquisition.authority
+    cursor.execute(
+        "INSERT INTO rt.stream_sessions ("
+        "session_id,provider,feed,manifest_id,owner_id,owner_epoch,"
+        "started_at,subscribed_at,ended_at,status,journal_generation,"
+        "normalizer_version,authorization_reference,budget_scope_sha256,"
+        "connection_attempt,connection_ceiling,decoded_byte_ceiling,"
+        "received_frame_count,received_byte_count,"
+        "admitted_market_message_count,last_raw_offset,last_event_offset,"
+        "event_time_watermark,heartbeat_at"
+        ") VALUES (%s,'massive','OPTIONS',%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,"
+        "%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) "
+        "ON CONFLICT (session_id) DO UPDATE SET "
+        "subscribed_at=COALESCE(rt.stream_sessions.subscribed_at,"
+        "EXCLUDED.subscribed_at),"
+        "ended_at=EXCLUDED.ended_at,status=EXCLUDED.status,"
+        "connection_attempt=EXCLUDED.connection_attempt,"
+        "received_frame_count=EXCLUDED.received_frame_count,"
+        "received_byte_count=EXCLUDED.received_byte_count,"
+        "admitted_market_message_count="
+        "EXCLUDED.admitted_market_message_count,"
+        "last_raw_offset=EXCLUDED.last_raw_offset,"
+        "last_event_offset=EXCLUDED.last_event_offset,"
+        "event_time_watermark=GREATEST(rt.stream_sessions.event_time_watermark,"
+        "EXCLUDED.event_time_watermark),"
+        "heartbeat_at=EXCLUDED.heartbeat_at",
+        (
+            str(acquisition.stream_session_id),
+            str(manifest_id),
+            str(acquisition.owner_id),
+            owner_epoch,
+            started_at,
+            subscribed_at,
+            ended_at,
+            "STOPPED" if ended_at is not None else "LIVE",
+            str(authority.journal_generation),
+            NORMALIZER_VERSION,
+            authority.authorization_reference,
+            authority.provider_budget_sha256,
+            max(1, connection_attempts),
+            acquisition.connection_attempt_ceiling,
+            acquisition.decoded_byte_ceiling,
+            decoded_messages,
+            decoded_bytes,
+            min(raw_offset, decoded_messages),
+            raw_offset,
+            event_offset,
+            event_time_watermark,
+            observed_at,
+        ),
+    )
+
+
+def _acquisition_terminal_ended_at(status) -> datetime | None:
+    if (
+        status.get("socket_state") not in {"DISCONNECTED", "STOPPED"}
+        or status.get("state") not in {"DRAINING", "COMPLETE"}
+        or not status.get("last_market_event_at_utc")
+    ):
+        return None
+    return datetime.fromisoformat(status["last_market_event_at_utc"])
+
+
+def _terminal_journal_is_exact(
+    registration,
+    *,
+    raw_offset: int,
+    event_offset: int,
+) -> bool:
+    if registration.status not in {"DRAINING", "DRAINED"}:
+        return False
+    if (
+        registration.raw_committed_offset != raw_offset
+        or registration.normalized_committed_offset != event_offset
+        or not registration.sealed_files_sha256
+    ):
+        raise RuntimeError("V3 terminal journal offsets changed")
+    return True
 
 
 def _v3_resident_dependencies(provider, binding, bundle):
@@ -488,6 +592,23 @@ def _wait_v3_binding(provider, binding, bundle, stop_event):
     raise RuntimeError("P8 role stopped before exact E binding")
 
 
+def _v3_role_binding(
+    provider,
+    binding,
+    bundle,
+    stop_event,
+    kind: AdvancedOptionsProcessKind,
+):
+    if kind is AdvancedOptionsProcessKind.INGRESS:
+        return binding
+    return _wait_v3_binding(
+        provider,
+        binding,
+        bundle,
+        stop_event,
+    )
+
+
 def _downstream_binding_evidence(provider, binding, bundle):
     authorities = bundle.get("v3_authorities")
     if not isinstance(authorities, dict):
@@ -610,6 +731,11 @@ def _run_v3_acquisition_observer(
     if not path.is_file():
         raise RuntimeError("V3 acquisition journal is unavailable")
     shard_map = _shard_map(binding, selection_plan)
+    reader = RawJournalReader(path)
+    first_message = reader.read_after(0, limit=1)
+    session_started_at = (
+        first_message[0].received_at if first_message else datetime.now(UTC)
+    )
     registration = _registration(
         provider,
         acquisition.authority.journal_generation,
@@ -630,6 +756,22 @@ def _run_v3_acquisition_observer(
             shard_map_sha256=shard_map.sha256,
         )
         with provider.transaction(APP_ROLE) as unit:
+            _record_v3_stream_session_cursor(
+                unit.cursor,
+                acquisition,
+                manifest_id=control.manifest_id,
+                owner_epoch=owner_epoch,
+                started_at=session_started_at,
+                subscribed_at=None,
+                observed_at=session_started_at,
+                ended_at=None,
+                connection_attempts=1,
+                decoded_messages=0,
+                decoded_bytes=0,
+                raw_offset=0,
+                event_offset=0,
+                event_time_watermark=None,
+            )
             register_advanced_journal_cursor(unit.cursor, registration)
             mark_advanced_journal_writing_cursor(
                 unit.cursor,
@@ -652,6 +794,8 @@ def _run_v3_acquisition_observer(
     last_event_offset = 0
     connection_attempts = 0
     last_physical_signature = None
+    watermark_event_offset = 0
+    event_time_watermark = None
     while not stop_event.is_set():
         try:
             status = json.loads(status_path.read_text(encoding="utf-8"))
@@ -687,15 +831,49 @@ def _run_v3_acquisition_observer(
             "transport_gaps": transport_gaps,
         })
         observed_at = datetime.now(UTC)
-        with provider.transaction(APP_ROLE) as unit:
-            update_advanced_journal_offsets_cursor(
-                unit.cursor,
-                registration.journal_generation,
-                raw_committed_offset=last_raw_offset,
-                normalized_committed_offset=last_event_offset,
-                bridge_committed_offset=None,
-                checked_at=observed_at,
+        if last_event_offset > watermark_event_offset:
+            newest = reader.latest_event_at(
+                after_event_offset=watermark_event_offset,
             )
+            if newest is not None:
+                event_time_watermark = (
+                    newest
+                    if event_time_watermark is None
+                    else max(event_time_watermark, newest)
+                )
+            watermark_event_offset = last_event_offset
+        with provider.transaction(APP_ROLE) as unit:
+            _record_v3_stream_session_cursor(
+                unit.cursor,
+                acquisition,
+                manifest_id=control.manifest_id,
+                owner_epoch=registration.owner_epoch,
+                started_at=session_started_at,
+                subscribed_at=(
+                    session_started_at if last_raw_offset > 0 else None
+                ),
+                observed_at=observed_at,
+                ended_at=_acquisition_terminal_ended_at(status),
+                connection_attempts=connection_attempts,
+                decoded_messages=decoded_messages,
+                decoded_bytes=decoded_bytes,
+                raw_offset=last_raw_offset,
+                event_offset=last_event_offset,
+                event_time_watermark=event_time_watermark,
+            )
+            if not _terminal_journal_is_exact(
+                registration,
+                raw_offset=last_raw_offset,
+                event_offset=last_event_offset,
+            ):
+                update_advanced_journal_offsets_cursor(
+                    unit.cursor,
+                    registration.journal_generation,
+                    raw_committed_offset=last_raw_offset,
+                    normalized_committed_offset=last_event_offset,
+                    bridge_committed_offset=None,
+                    checked_at=observed_at,
+                )
             if (
                 selection_plan is not None
                 and physical_signature != last_physical_signature
@@ -743,15 +921,22 @@ def _run_v3_acquisition_observer(
         stop_event.wait(0.1)
     if last_raw_offset <= 0 or last_event_offset <= 0:
         raise RuntimeError("V3 acquisition journal has no durable data")
-    with provider.transaction(APP_ROLE) as unit:
-        seal_advanced_journal_cursor(
-            unit.cursor,
-            registration.journal_generation,
-            raw_committed_offset=last_raw_offset,
-            normalized_committed_offset=last_event_offset,
-            sealed_files_sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
-            checked_at=datetime.now(UTC),
-        )
+    if not _terminal_journal_is_exact(
+        registration,
+        raw_offset=last_raw_offset,
+        event_offset=last_event_offset,
+    ):
+        with provider.transaction(APP_ROLE) as unit:
+            seal_advanced_journal_cursor(
+                unit.cursor,
+                registration.journal_generation,
+                raw_committed_offset=last_raw_offset,
+                normalized_committed_offset=last_event_offset,
+                sealed_files_sha256=(
+                    hashlib.sha256(path.read_bytes()).hexdigest()
+                ),
+                checked_at=datetime.now(UTC),
+            )
     return {
         "status": "COMPLETE",
         "kind": AdvancedOptionsProcessKind.INGRESS.value,
@@ -1791,13 +1976,43 @@ def _flow_environment(provider, binding, source, owner_epoch):
         minimum_volume_oi_ratio=3.0,
         maximum_candidates=20,
     )
+    settings = OptionsFlowSettings(
+        owner_epoch=owner_epoch,
+        limits=ConsumerLimits(
+            batch_size=500,
+            max_messages=50_000,
+            max_seconds=5.0,
+        ),
+        initial_baseline=BaselineKind.WARMING,
+        advanced_flow_policy_sha256=advanced_policy.sha256,
+        contract_scope_sha256=scope.sha256,
+        exchange_reference_sha256=exchange.sha256,
+    )
+    environment = RunnerEnvironment(
+        provider,
+        build_id="advanced-options-p8-flow-v1",
+        options_flow_source=source,
+        options_flow_semantics=semantics,
+        options_flow_policy=base_policy,
+        options_flow_settings=settings,
+        options_flow_advanced_policy=advanced_policy,
+        options_flow_contract_scope=scope,
+        options_flow_exchange_reference=exchange,
+    )
     source_flow = build_option_source_flow_identity(
         journal_generation=source.generation,
         stream_session_ids=(
             binding.enrollment.control_plane.source_flow.stream_session_ids
         ),
         condition_semantics_sha256=semantics.semantics_sha256,
-        flow_policy_sha256=canonical_sha256(base_policy),
+        # The flow stage compares this with its own unbound engine configuration.
+        flow_policy_sha256=_engine_config(
+            environment,
+            settings,
+            binding.enrollment.control_plane.cohort_id,
+            source.generation,
+            source_flow=None,
+        ).policy_sha256(),
         advanced_flow_policy_sha256=advanced_policy.sha256,
         contract_scope_sha256=scope.sha256,
         provider_contract_sha256=(
@@ -1818,30 +2033,8 @@ def _flow_environment(provider, binding, source, owner_epoch):
             ),
             contract_scope=scope,
         )
-    settings = OptionsFlowSettings(
-        owner_epoch=owner_epoch,
-        limits=ConsumerLimits(
-            batch_size=500,
-            max_messages=50_000,
-            max_seconds=5.0,
-        ),
-        initial_baseline=BaselineKind.WARMING,
-        advanced_flow_policy_sha256=advanced_policy.sha256,
-        contract_scope_sha256=scope.sha256,
-        exchange_reference_sha256=exchange.sha256,
-    )
     return (
-        RunnerEnvironment(
-            provider,
-            build_id="advanced-options-p8-flow-v1",
-            options_flow_source=source,
-            options_flow_semantics=semantics,
-            options_flow_policy=base_policy,
-            options_flow_settings=settings,
-            options_flow_advanced_policy=advanced_policy,
-            options_flow_contract_scope=scope,
-            options_flow_exchange_reference=exchange,
-        ),
+        environment,
         resolution,
         advanced_policy,
     )
@@ -2481,11 +2674,12 @@ def run_p8_role(
                     pool=pool,
                     binding_observer=observe_binding,
                 )
-            bound_binding = _wait_v3_binding(
+            bound_binding = _v3_role_binding(
                 provider,
                 template_binding,
                 bundle,
                 stop_event,
+                kind,
             )
             if state_observer is not None:
                 state_observer(

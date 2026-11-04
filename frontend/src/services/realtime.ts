@@ -32,8 +32,6 @@ export type RealtimeHealth = {
   provider_fetch_performed: boolean
 }
 
-export const REALTIME_COHORT_ID = import.meta.env.VITE_REALTIME_COHORT_ID?.trim() ?? ''
-
 const cohortParams = (cohortId?: string) => cohortId ? { cohort_id: cohortId } : undefined
 
 export async function getRealtimeHealth(signal?: AbortSignal): Promise<RealtimeHealth> {

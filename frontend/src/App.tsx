@@ -3,6 +3,7 @@ import { Routes, Route, Navigate, useLocation } from 'react-router-dom'
 import AppShell from './layout/AppShell'
 import { PortalViewBoundary } from './layout/PortalViewBoundary'
 import { SessionDateProvider } from './layout/sessionDate'
+import { PortalIdentityGate } from './layout/PortalIdentityGate'
 
 const Dashboard = lazy(() => import('./pages/Dashboard'))
 const GapScreener = lazy(() => import('./pages/GapScreener'))
@@ -117,19 +118,16 @@ function PortalRoutes({ realtimeOnly }: { realtimeOnly: boolean }) {
 
 function App() {
   const realtimeDeployment = import.meta.env.VITE_REALTIME_ONLY === 'true'
-  const realtimeCohortId = import.meta.env.VITE_REALTIME_COHORT_ID?.trim()
-  if (realtimeDeployment && !realtimeCohortId) {
-    throw new Error('Realtime-only portal requires VITE_REALTIME_COHORT_ID')
-  }
-
   if (realtimeDeployment) return (
-    <SessionDateProvider>
-      <AppShell realtimeOnly>
-        <PortalViewBoundary>
-          <PortalRoutes realtimeOnly />
-        </PortalViewBoundary>
-      </AppShell>
-    </SessionDateProvider>
+    <PortalIdentityGate>
+      <SessionDateProvider>
+        <AppShell realtimeOnly>
+          <PortalViewBoundary>
+            <PortalRoutes realtimeOnly />
+          </PortalViewBoundary>
+        </AppShell>
+      </SessionDateProvider>
+    </PortalIdentityGate>
   )
 
   return (

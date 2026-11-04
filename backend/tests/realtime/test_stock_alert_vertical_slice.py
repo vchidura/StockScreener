@@ -203,7 +203,12 @@ class AlertStore(TickerStore):
             self.result = []
             if (self.screening_available and row and row["generated_at"] <= params[3]
                     and (row["cohort_id"], row["snapshot_type"], row["snapshot_key"]) == tuple(params[:3])):
-                self.result = [dict(row, cohort_manifest_sha256="a" * 64)]
+                self.result = [dict(
+                    row,
+                    cohort_manifest_id=None,
+                    cohort_manifest_sha256="a" * 64,
+                    history_binding_sha256=None,
+                )]
         else:
             super().execute(sql, params)
 
@@ -260,10 +265,11 @@ def test_original_alert_and_eod_routes_read_retained_outputs_only():
         assert eod.status_code == 200 and eod.json()["storage_ready"] is False
         assert eod.json()["rows"] == []
     assert not any(sql.startswith(("INSERT", "UPDATE", "DELETE")) for sql in store.statements[3:])
-    cohort_queries = [sql for sql in store.statements if "SELECT snapshot.*, manifest.manifest_sha256" in sql]
+    cohort_queries = [sql for sql in store.statements if "SELECT snapshot.*, manifest.manifest_id" in sql]
     assert cohort_queries
     assert all("JOIN rt.screening_current" in sql and "screening.status='COMPLETE'" in sql
         and "screening.generated_at<=%s" in sql and "snapshot.provider_tier=screening.provider_tier" in sql
+        and "LEFT JOIN rt.cohort_history_bindings" in sql
         and "rt.capability_profiles" not in sql and "cohort.profile_id" not in sql for sql in cohort_queries)
 
 

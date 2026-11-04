@@ -18,6 +18,7 @@ from realtime.equity_interval_derivation import (
 from realtime.equity_portal_history import (
     build_realtime_equity_portal_history_plan, build_realtime_equity_portal_history_package,
 )
+from realtime.equity_history import EquityHistoryScope
 from realtime.equity_validation_history import SplitAction, SplitCoverage
 from realtime.portal_api import RealtimePortalRepositories, create_realtime_portal_app
 from realtime.portal_compatibility_repository import BoundedCache
@@ -51,12 +52,12 @@ import exchange_calendars
 from pathlib import Path
 
 
-@lru_cache(maxsize=1)
-def ticker_fixture():
+@lru_cache(maxsize=2)
+def ticker_fixture(tickers=EQUITY_VALIDATION_UNIVERSE.equity_tickers):
     plan = build_realtime_equity_portal_history_plan(date(2026, 10, 2))
     calendar = exchange_calendars.get_calendar("XNYS")
     facts, members, actions, coverage = [], [], [], []
-    for instrument, ticker in enumerate(EQUITY_VALIDATION_UNIVERSE.equity_tickers, 1):
+    for instrument, ticker in enumerate(tickers, 1):
         security = _security(ticker)
         members.append(dict(
             security_id=security.security_id, ticker=ticker, instrument_id=instrument,
@@ -195,6 +196,433 @@ def test_partial_session_intraday_counts_replace_the_oldest_retained_session():
         "30m": 1168,
         "1h": 628,
     }
+
+
+def _minutes_from_five(rows):
+    """Minute parents for a session older than the 1m chart window; only its source closure holds them."""
+    minutes = []
+    for row in rows:
+        for index in range(5):
+            start = row["bar_start"] + timedelta(minutes=index)
+            first = index == 0
+            minutes.append(dict(
+                row, interval="1m", bar_start=start, bar_end=start + timedelta(minutes=1),
+                bar_revision_id=uuid5(NAMESPACE_URL, f"closure-minute:{row['bar_revision_id']}:{index}"),
+                source_revision_ids=(),
+                open=row["open"] if first else row["close"],
+                high=row["high"] if first else row["close"],
+                low=row["low"] if first else row["close"],
+                volume=row["volume"] if first else 0.0,
+                vwap=None,
+            ))
+    return minutes
+
+
+def advanced_closing_fixture():
+    return advanced_stream_fixture()
+
+
+def advanced_next_session_fixture(sessions_back=1):
+    """The session after a stream session: its 5m stay DERIVED, in the bound history cohort."""
+    return advanced_stream_fixture(sessions_back=sessions_back, bound=True)
+
+
+def _bound_stream_history(original, stream_session):
+    calendar = exchange_calendars.get_calendar("XNYS")
+    before = calendar.session_open(str(original.session)).to_pydatetime()
+    cohort = uuid5(NAMESPACE_URL, "prior-stream-cohort")
+    return replace(
+        original,
+        bars=tuple(
+            dict(row, cohort_id=cohort) if row["session_date"] == stream_session else row
+            for row in original.bars
+        ),
+        history_source_cohort_id=cohort,
+        history_source_provider_tier=ProviderTier.MASSIVE_ADVANCED,
+        history_before=before,
+        history_binding_sha256="b" * 64,
+        history_scopes=(EquityHistoryScope(cohort, ProviderTier.MASSIVE_ADVANCED, before, "b" * 64),),
+    )
+
+
+@lru_cache(maxsize=4)
+def advanced_stream_fixture(sessions_back=0, bound=False):
+    original = ticker_fixture(("SPY",))
+    calendar = exchange_calendars.get_calendar("XNYS")
+    session = calendar.session_offset(str(original.session), -sessions_back).date()
+    if bound:
+        original = _bound_stream_history(original, session)
+    close = calendar.session_close(str(original.session)).to_pydatetime()
+    inputs = replace(
+        original, provider_tier=ProviderTier.MASSIVE_ADVANCED,
+        cutoff=close, known_by=original.cutoff,
+        members=tuple(
+            dict(row, observed_at=calendar.session_open(str(original.session)).to_pydatetime())
+            for row in original.members if row["ticker"] == "SPY"
+        ),
+        coverage=tuple(
+            dict(row, received_at=close)
+            for row in original.coverage if row["security_id"] == _security("SPY").security_id
+        ),
+        bars=tuple(
+            dict(
+                row, provider_tier="MASSIVE_ADVANCED",
+                quality_codes=(
+                    ("EXPLICIT_ADVANCED_REST_REPAIR_V1",)
+                    if row["source_kind"] == "NATIVE_REST" else row.get("quality_codes", ())
+                ),
+            )
+            for row in original.bars if row["ticker"] == "SPY"
+        ),
+    )
+    minute_rows = tuple(
+        dict(
+            row, source_kind="REALTIME_STREAM", availability_mode="LIVE_OBSERVED",
+            journal_generation=uuid5(NAMESPACE_URL, "closing-journal"),
+            stream_session_id=uuid5(NAMESPACE_URL, "closing-stream"),
+            source_offset=index, ingestion_segment_id=None,
+        )
+        for index, row in enumerate((
+            tuple(
+                row for row in inputs.bars
+                if row["interval"] == "1m" and row["session_date"] == session
+            )
+            or _minutes_from_five(sorted(
+                (
+                    row for row in inputs.bars
+                    if row["interval"] == "5m" and row["session_date"] == session
+                ),
+                key=lambda row: row["bar_start"],
+            ))
+        ), 1)
+    )
+    security = _security("SPY")
+    minute_facts = tuple(_fact(row, inputs) for row in minute_rows)
+    five = derive_realtime_interval_facts(
+        security, minute_facts, target_interval="5m", observed_at=original.cutoff,
+        ingestion_segment_id=uuid5(NAMESPACE_URL, "closing-stream-five"),
+    )
+    derived = {
+        (fact.revision.interval, fact.revision.bar_start): fact
+        for fact in (
+            *five,
+            *(
+                fact for interval in ("15m", "30m", "1h", "1d")
+                for fact in derive_realtime_interval_facts(
+                    security, five, target_interval=interval, observed_at=original.cutoff,
+                    ingestion_segment_id=uuid5(NAMESPACE_URL, f"closing-stream-{interval}"),
+                )
+            ),
+        )
+    }
+    rows = []
+    for row in inputs.bars:
+        if row["session_date"] == session and row["adjustment_basis"] == "RAW_UNADJUSTED":
+            if row["interval"] == "1m":
+                continue
+            fact = derived.get((row["interval"], row["bar_start"]))
+            if fact is not None:
+                bar = fact.revision
+                row = dict(
+                    row, bar_revision_id=bar.bar_revision_id, source_kind="DERIVED",
+                    availability_mode=bar.availability_mode.value,
+                    source_revision_ids=bar.source_bar_revision_ids,
+                    payload_sha256=bar.payload_sha256, observed_at=bar.system_observed_at,
+                    ingestion_segment_id=bar.ingestion_segment_id,
+                    open=float(bar.open_price), high=float(bar.high_price),
+                    low=float(bar.low_price), close=float(bar.close_price), volume=float(bar.volume),
+                    vwap=None if bar.vwap is None else float(bar.vwap),
+                )
+        rows.append(row)
+    return replace(inputs, bars=tuple((*rows, *minute_rows)))
+
+
+def test_ticker_availability_uses_the_provider_tier_delay():
+    calendar = exchange_calendars.get_calendar("XNYS")
+    session_open = calendar.session_open("2026-10-02").to_pydatetime()
+    market_time = session_open + timedelta(minutes=280)
+    available_by = market_time + timedelta(seconds=30)
+
+    state = ticker_repository._availability(
+        market_time,
+        available_by,
+        "1m",
+        ProviderTier.MASSIVE_ADVANCED.value,
+    )
+
+    assert state["status"] == "READY"
+    assert state["expected_market_time"] == market_time.isoformat()
+    with pytest.raises(
+        ticker_repository.TickerPublicationUnavailable,
+        match="ahead of the provider-qualified watermark",
+    ):
+        ticker_repository._availability(
+            market_time,
+            available_by,
+            "1m",
+            ProviderTier.MASSIVE_DEVELOPER.value,
+        )
+
+
+def test_advanced_projection_retains_a_complete_five_minute_prefix():
+    inputs = advanced_stream_fixture()
+    calendar = exchange_calendars.get_calendar("XNYS")
+    next_session = calendar.next_session(str(inputs.session)).date()
+    prior_open = calendar.session_open(
+        str(inputs.session)
+    ).to_pydatetime()
+    session_open = calendar.session_open(
+        str(next_session)
+    ).to_pydatetime()
+    cutoff = session_open + timedelta(minutes=280)
+    shift = session_open - prior_open
+    source_minutes = tuple(
+        row for row in inputs.bars
+        if row["session_date"] == inputs.session
+        and row["interval"] == "1m"
+        and row["bar_end"] + shift <= cutoff
+    )
+    minute_rows = tuple(
+        dict(
+            row,
+            session_date=next_session,
+            bar_start=row["bar_start"] + shift,
+            bar_end=row["bar_end"] + shift,
+            bar_revision_id=uuid5(
+                NAMESPACE_URL,
+                (
+                    "partial-prefix-minute:"
+                    f"{row['bar_start'] + shift}"
+                ),
+            ),
+            payload_sha256=canonical_sha256(
+                (
+                    "partial-prefix-minute",
+                    row["payload_sha256"],
+                    row["bar_start"] + shift,
+                )
+            ),
+            observed_at=row["bar_end"] + shift,
+            journal_generation=uuid5(
+                NAMESPACE_URL,
+                "partial-prefix-journal",
+            ),
+            stream_session_id=uuid5(
+                NAMESPACE_URL,
+                "partial-prefix-stream",
+            ),
+            source_offset=index,
+        )
+        for index, row in enumerate(source_minutes, 1)
+    )
+    security = _security("SPY")
+    minute_facts = tuple(_fact(row, inputs) for row in minute_rows)
+    five = derive_realtime_interval_facts(
+        security,
+        minute_facts,
+        target_interval="5m",
+        observed_at=cutoff,
+        ingestion_segment_id=uuid5(
+            NAMESPACE_URL,
+            "partial-prefix-five",
+        ),
+    )
+    retained_five = five[:-1]
+    derived = (
+        *retained_five,
+        *(
+            fact
+            for interval in ("15m", "30m", "1h")
+            for fact in derive_realtime_interval_facts(
+                security,
+                retained_five,
+                target_interval=interval,
+                observed_at=cutoff,
+                ingestion_segment_id=uuid5(
+                    NAMESPACE_URL,
+                    f"partial-prefix-{interval}",
+                ),
+            )
+        ),
+    )
+
+    def derived_row(fact):
+        bar = fact.revision
+        template = next(
+            row for row in inputs.bars
+            if row["interval"] == bar.interval
+            and row["adjustment_basis"] == "RAW_UNADJUSTED"
+        )
+        return dict(
+            template,
+            session_date=bar.session_date,
+            bar_start=bar.bar_start,
+            bar_end=bar.bar_end,
+            bar_revision_id=bar.bar_revision_id,
+            source_kind=bar.source_kind.value,
+            availability_mode=bar.availability_mode.value,
+            source_revision_ids=bar.source_bar_revision_ids,
+            payload_sha256=bar.payload_sha256,
+            observed_at=bar.system_observed_at,
+            ingestion_segment_id=bar.ingestion_segment_id,
+            open=float(bar.open_price),
+            high=float(bar.high_price),
+            low=float(bar.low_price),
+            close=float(bar.close_price),
+            volume=float(bar.volume),
+            vwap=None if bar.vwap is None else float(bar.vwap),
+        )
+
+    projection = project_realtime_ticker_workspace(
+        replace(
+            inputs,
+            session=next_session,
+            cutoff=cutoff,
+            known_by=max(inputs.recorded_by, cutoff),
+            bars=(
+                *inputs.bars,
+                *minute_rows,
+                *(derived_row(fact) for fact in derived),
+            ),
+            coverage=tuple(
+                dict(
+                    row,
+                    window_end=next_session,
+                    received_at=cutoff,
+                    payload_sha256=canonical_sha256(
+                        (
+                            "partial-prefix-coverage",
+                            next_session,
+                        )
+                    ),
+                )
+                for row in inputs.coverage
+            ),
+        )
+    )
+    payload = projection.snapshots[0].payload
+
+    retained_five_end = cutoff - timedelta(minutes=5)
+    assert {
+        "1m",
+        "5m",
+        "15m",
+        "30m",
+        "1h",
+    } <= set(payload["chart_refs"])
+    assert payload["chart_market_times"]["1m"] == cutoff.isoformat()
+    assert (
+        payload["chart_market_times"]["5m"]
+        == retained_five_end.isoformat()
+    )
+    assert (
+        payload["missing_producers"]["raw_history"]
+        == "LATEST_5M_FINALIZATION_PENDING"
+    )
+    assert payload["quote"]["source"] == "5m"
+    assert payload["quote"]["as_of"] == retained_five_end.isoformat()
+
+
+def test_advanced_closing_projection_accepts_verified_stream_derived_five_minute_bars():
+    inputs = advanced_closing_fixture()
+    projection = project_realtime_ticker_workspace(inputs)
+    assert projection.snapshots
+    assert all(snapshot.generated_at == inputs.cutoff for snapshot in projection.snapshots)
+
+
+def test_advanced_closing_five_minute_lineage_does_not_require_unrelated_retained_minutes():
+    inputs = advanced_closing_fixture()
+    old_minute = next(
+        row for row in inputs.bars
+        if row["interval"] == "1m" and row["session_date"] != inputs.session
+    )
+    projection = project_realtime_ticker_workspace(replace(
+        inputs, bars=tuple(row for row in inputs.bars if row is not old_minute),
+    ))
+    assert projection.snapshots
+
+
+def _corrupt_stream_five(inputs, session, corruption):
+    rows = [dict(row) for row in inputs.bars]
+    target = next(
+        row for row in rows
+        if row["session_date"] == session and row["interval"] == "5m"
+    )
+    if corruption == "source_ids":
+        target["source_revision_ids"] = tuple(
+            uuid5(NAMESPACE_URL, f"invalid-minute-{index}") for index in range(5)
+        )
+    elif corruption == "aggregate":
+        target["volume"] += 1
+    else:
+        rows.remove(next(
+            row for row in rows
+            if row["session_date"] == session and row["interval"] == "1m"
+        ))
+    return replace(inputs, bars=tuple(rows))
+
+
+@pytest.mark.parametrize("corruption", ["source_ids", "aggregate", "missing_minutes"])
+def test_advanced_closing_projection_rejects_invalid_stream_five_lineage(corruption):
+    inputs = advanced_closing_fixture()
+    with pytest.raises(ValueError, match="(?i)(causal|lineage|aggregate|minute|source)"):
+        project_realtime_ticker_workspace(_corrupt_stream_five(inputs, inputs.session, corruption))
+
+
+def test_advanced_next_session_accepts_verified_prior_session_stream_five_minute_bars():
+    inputs = advanced_next_session_fixture()
+    prior = exchange_calendars.get_calendar("XNYS").previous_session(str(inputs.session)).date()
+    five = [row for row in inputs.bars if row["session_date"] == prior and row["interval"] == "5m"]
+    assert {row["source_kind"] for row in five} == {"DERIVED"}
+    assert {row["cohort_id"] for row in five} == {inputs.history_source_cohort_id}
+    projection = project_realtime_ticker_workspace(inputs)
+    assert projection.snapshots
+    assert "raw_history" not in projection.snapshots[0].payload["missing_producers"]
+
+
+def test_stream_five_older_than_the_minute_chart_window_verifies_through_its_source_closure():
+    inputs = advanced_next_session_fixture(sessions_back=8)
+    plan = build_realtime_equity_portal_history_plan(inputs.session)
+    session = exchange_calendars.get_calendar("XNYS").session_offset(str(inputs.session), -8).date()
+    assert session not in plan.one_minute_sessions
+    assert project_realtime_ticker_workspace(inputs).snapshots
+    with pytest.raises(ValueError, match="(?i)(causal|lineage|aggregate|minute|source)"):
+        project_realtime_ticker_workspace(_corrupt_stream_five(inputs, session, "aggregate"))
+
+
+@pytest.mark.parametrize("corruption", ["source_ids", "aggregate", "missing_minutes"])
+def test_advanced_next_session_rejects_invalid_prior_session_stream_five_lineage(corruption):
+    inputs = advanced_next_session_fixture()
+    prior = exchange_calendars.get_calendar("XNYS").previous_session(str(inputs.session)).date()
+    with pytest.raises(ValueError, match="(?i)(causal|lineage|aggregate|minute|source)"):
+        project_realtime_ticker_workspace(_corrupt_stream_five(inputs, prior, corruption))
+
+
+def test_derived_five_minute_bars_from_another_tier_stay_rejected():
+    inputs = advanced_next_session_fixture()
+    prior = exchange_calendars.get_calendar("XNYS").previous_session(str(inputs.session)).date()
+    tier = ProviderTier.MASSIVE_DEVELOPER
+    developer = replace(
+        inputs,
+        bars=tuple(
+            dict(row, provider_tier=tier.value) if row["session_date"] == prior else row
+            for row in inputs.bars
+        ),
+        history_source_provider_tier=tier,
+        history_scopes=(EquityHistoryScope(inputs.history_source_cohort_id, tier, inputs.history_before, "b" * 64),),
+    )
+    with pytest.raises(ValueError, match="Developer bar must use native REST source kind"):
+        project_realtime_ticker_workspace(developer)
+
+
+def test_prior_session_native_five_minute_bars_remain_accepted_without_minute_parents():
+    inputs = advanced_closing_fixture()
+    prior = exchange_calendars.get_calendar("XNYS").previous_session(str(inputs.session)).date()
+    assert {
+        row["source_kind"] for row in inputs.bars
+        if row["session_date"] == prior and row["interval"] == "5m"
+    } == {"NATIVE_REST"}
+    assert project_realtime_ticker_workspace(inputs).snapshots
 
 
 def test_recovery_history_separates_market_cutoff_and_late_known_by(monkeypatch):
@@ -538,7 +966,7 @@ class TickerStore(PortalV2Statements):
             return
         if self.portal_execute(sql, params):
             return
-        if sql.startswith("SELECT DISTINCT ON (snapshot.session_date)"):
+        if sql.startswith("SELECT DISTINCT ON (") and "snapshot.payload->'quote'" in sql:
             selected = {}
             for row in self.snapshots.values():
                 quote = row["payload"].get("quote", {})
@@ -552,6 +980,31 @@ class TickerStore(PortalV2Statements):
                 rank = (str(row["snapshot_id"]) == params[7], row["generated_at"], row["source_generation"], str(row["snapshot_id"]))
                 if session not in selected or rank > selected[session][0]:
                     selected[session] = (rank, dict(session_date=session, snapshot_id=row["snapshot_id"], market_time=quote["as_of"]))
+            self.result = [selected[session][1] for session in sorted(selected)][:21]
+        elif sql.startswith("SELECT DISTINCT ON (snapshot.session_date)"):
+            selected = {}
+            for row in self.snapshots.values():
+                if ((row["cohort_id"], row["snapshot_type"], row["snapshot_key"]) != (params[0], params[1], "PLATFORM")
+                        or row["snapshot_class"] != "SESSION_CLOSE"
+                        or row["generated_at"] > params[4]
+                        or not params[2] <= row["session_date"] <= params[3]):
+                    continue
+                rank = (
+                    row["source_manifest"].get("workspace_set")
+                    == self.snapshots.get(params[5], {}).get("source_manifest", {}).get("workspace_set"),
+                    row["generated_at"],
+                    row["source_generation"],
+                    str(row["snapshot_id"]),
+                )
+                if row["session_date"] not in selected or rank > selected[row["session_date"]][0]:
+                    selected[row["session_date"]] = (
+                        rank,
+                        dict(
+                            session_date=row["session_date"],
+                            snapshot_id=row["snapshot_id"],
+                            generated_at=row["generated_at"],
+                        ),
+                    )
             self.result = [selected[session][1] for session in sorted(selected)][:21]
         elif sql.startswith("SELECT snapshot.*"):
             key = (params[0], params[1], "PLATFORM") if "snapshot_key='PLATFORM'" in sql else params[:3]
@@ -586,6 +1039,9 @@ class TickerStore(PortalV2Statements):
                         "identity_continuity_sha256"
                     ),
                     manifest_known_by=manifest.get("known_by"),
+                    manifest_history_scope_chain=manifest.get(
+                        "history_scope_chain"
+                    ),
                     reconstruction=manifest.get("reconstruction"),
                     session_date=row["payload"].get("session"),
                     market_time=row["payload"]["quote"]["as_of"],
@@ -597,6 +1053,7 @@ class TickerStore(PortalV2Statements):
                     self.result.append(dict(
                         snapshot_key=row["snapshot_key"],
                         generated_at=row["generated_at"],
+                        provider_tier=row["provider_tier"],
                         chart_market_times=row["payload"]["chart_market_times"],
                     ))
             self.result.sort(key=lambda item: item["snapshot_key"])
@@ -640,7 +1097,7 @@ class TickerStore(PortalV2Statements):
                 for order, dependency in enumerate(stored_evidence()[UUID(evidence_id)]["dependencies"]):
                     self.result.append(dict(evidence_id=UUID(evidence_id), dependency_order=order,
                                             dependency_evidence_id=dependency))
-        elif sql.startswith("SELECT cur.interval AS interval"):
+        elif sql.startswith("SELECT DISTINCT ON (cur.interval,cur.adjustment_basis,cur.bar_start) cur.interval AS interval"):
             self.result = self._bar_rows(params)
         elif sql.startswith("SELECT security_id, ticker, revision_id"):
             if self.reference_expired and params[1] > OBSERVED_AT:
@@ -1045,6 +1502,36 @@ def test_ticker_reader_reuses_validated_snapshot_but_rechecks_reference_drift():
         assert client.get("/api/stock/TSLA/quote", params=params).status_code == 503
 
 
+def test_ticker_identity_resolver_receives_stored_history_scope_chain(monkeypatch):
+    app, store = ticker_app()
+    key = (str(COHORT_ID), TICKER_WORKSPACE_VERSION, "TSLA")
+    row = store.snapshots[store.current[key]]
+    chain = [{
+        "cohort_id": str(COHORT_ID),
+        "provider_tier": "MASSIVE_DEVELOPER",
+        "history_before": OBSERVED_AT.isoformat(),
+        "binding_sha256": "b" * 64,
+    }]
+    row["source_manifest"] = dict(row["source_manifest"], history_scope_chain=chain)
+    row["source_manifest_sha256"] = canonical_sha256(row["source_manifest"])
+    calls = []
+
+    def resolve(_cursor, manifest, **_kwargs):
+        calls.append(manifest)
+        assert manifest["history_scope_chain"] == chain
+        assert manifest["cohort_id"] == str(COHORT_ID)
+        return row["source_manifest"]["source_manifest_sha256"], None
+
+    monkeypatch.setattr(ticker_repository, "source_manifest_identity_cursor", resolve)
+    with TestClient(app) as client:
+        response = client.get(
+            "/api/stock/TSLA/quote",
+            params={"cohort_id": str(COHORT_ID), "read_mode": "retained"},
+        )
+    assert response.status_code == 200, response.text
+    assert len(calls) >= 2
+
+
 @pytest.mark.parametrize("age", [timedelta(days=1), timedelta(days=45)])
 def test_retained_ticker_browse_survives_reference_and_market_expiry(age):
     app, store = ticker_app(clock=lambda: OBSERVED_AT + age)
@@ -1086,6 +1573,27 @@ def test_retained_summary_and_pattern_browse_keep_original_members_after_expiry(
             assert publication["execution_permission"] is False
             assert len(publication.get("workspaces", response.json().get("workspaces", []))) == 9
         assert client.get("/api/chart-patterns/scan", params={"cohort_id": str(COHORT_ID)}).status_code == 503
+
+
+def test_retained_cross_ticker_market_routes_serve_data_while_stale():
+    app, _store = ticker_app(clock=lambda: OBSERVED_AT + timedelta(days=45))
+    params = {"cohort_id": str(COHORT_ID)}
+    with TestClient(app) as client:
+        conditions = client.get("/api/stocks/market-conditions", params=params)
+        sectors = client.get("/api/sector-intelligence", params=params)
+        regime = client.get("/api/market-regime", params=params)
+
+    assert conditions.status_code == sectors.status_code == regime.status_code == 200
+    market = conditions.json()
+    assert market["stale"] is True
+    assert market["benchmarks"]["SPY"]["value"]["close"] > 0
+    assert market["stocks"]
+    assert market["provider_fetch_performed"] is False
+    intelligence = sectors.json()
+    assert intelligence["results"]
+    assert intelligence["status"] in {"STALE", "EXPIRED"}
+    assert intelligence["provider_fetch_performed"] is False
+    assert regime.json()["regime"] == "Unknown"
 
 
 def test_retained_reads_still_reject_invalid_original_reference_and_payload():
@@ -1186,16 +1694,21 @@ def test_ticker_materialization_persists_evidence_before_portal(monkeypatch):
     assert max(evidence_positions) < screening_positions[0] < min(portal_positions)
 
 
-def test_session_close_materialization_keeps_summary_and_pattern_only_and_publishes_both_releases(monkeypatch):
+@pytest.mark.parametrize("advanced", (False, True), ids=("developer", "advanced"))
+def test_session_close_materialization_keeps_summary_and_pattern_only_and_publishes_both_releases(
+    monkeypatch, advanced,
+):
     from realtime.portal_projection_repository import PortalReleaseReceipt, session_close_snapshot
     from realtime.ticker_projection import PATTERN_WATCH_PUBLICATION_VERSION
     compute = object.__new__(RealtimeProcessDatabase)
     compute._process_plan = MagicMock(role=RealtimeDatabaseRole.COMPUTE)
     publication = object.__new__(RealtimeProcessDatabase)
     publication._process_plan = MagicMock(role=RealtimeDatabaseRole.PUBLICATION)
-    projection = ticker_projection()
-    receipt = PortalReleaseReceipt(uuid5(NAMESPACE_URL, "receipt"), COHORT_ID, ProviderTier.MASSIVE_DEVELOPER,
-                                   OBSERVED_AT, "9" * 64)
+    inputs = advanced_closing_fixture() if advanced else ticker_fixture()
+    projection = project_realtime_ticker_workspace(inputs) if advanced else ticker_projection()
+    receipt = PortalReleaseReceipt(
+        uuid5(NAMESPACE_URL, "receipt"), COHORT_ID, inputs.provider_tier, inputs.cutoff, "9" * 64,
+    )
     persisted, releases = [], []
 
     @contextmanager
@@ -1208,7 +1721,7 @@ def test_session_close_materialization_keeps_summary_and_pattern_only_and_publis
             return options.get("kept_snapshot") or session_close_snapshot(snapshot)
 
     monkeypatch.setattr(RealtimeProcessDatabase, "transaction", transaction)
-    monkeypatch.setattr(ticker_repository, "load_realtime_screening_input", lambda cursor, **scope: ticker_fixture())
+    monkeypatch.setattr(ticker_repository, "load_realtime_screening_input", lambda cursor, **scope: inputs)
     monkeypatch.setattr(ticker_repository, "_load_ticker_calendar_inputs", lambda cursor, members, cutoff: ((), ()))
     monkeypatch.setattr(ticker_repository, "_load_ticker_fundamental_inputs", lambda cursor, members, cutoff: ((), ()))
     monkeypatch.setattr(ticker_repository, "project_realtime_ticker_workspace", lambda inputs, **context: projection)
@@ -1222,20 +1735,22 @@ def test_session_close_materialization_keeps_summary_and_pattern_only_and_publis
     materialize_realtime_ticker_workspace(compute, publication, receipt=receipt, session_close=True,
                                           cohort_id=COHORT_ID)
 
-    assert [row for row in persisted if row[1] is None] == [(TICKER_WORKSPACE_VERSION, None)] * 9
+    assert [row for row in persisted if row[1] is None] == [
+        (TICKER_WORKSPACE_VERSION, None)
+    ] * len(inputs.members)
     assert sorted(row for row in persisted if row[1]) == [
         (PATTERN_WATCH_PUBLICATION_VERSION, RETENTION_HOT_AND_KEPT),
         ("TICKER_WORKSPACE_SUMMARY_V1", RETENTION_HOT_AND_KEPT),
     ]
     assert len(releases) == 2
-    assert len(releases[0][0]) == 11 and releases[0][1] == {}
+    assert len(releases[0][0]) == len(inputs.members) + 2 and releases[0][1] == {}
     kept = releases[1][0]
     assert sorted(row.snapshot_type for row in kept) == [PATTERN_WATCH_PUBLICATION_VERSION, "TICKER_WORKSPACE_SUMMARY_V1"]
     assert releases[1][1]["release_class"] == "SESSION_CLOSE"
     summary = next(row for row in kept if row.snapshot_type == "TICKER_WORKSPACE_SUMMARY_V1")
-    assert set(summary.payload["setup_evidence_refs"]) == set(EQUITY_VALIDATION_UNIVERSE.equity_tickers)
-    assert len(summary.payload["workspaces"]) == 9
-    assert summary.source_manifest["setup_evidence_set"]["count"] == 9
+    assert set(summary.payload["setup_evidence_refs"]) == {row["ticker"] for row in inputs.members}
+    assert len(summary.payload["workspaces"]) == len(inputs.members)
+    assert summary.source_manifest["setup_evidence_set"]["count"] == len(inputs.members)
     assert "references" not in summary.source_manifest and "workspaces" not in summary.source_manifest
 
 
@@ -1759,7 +2274,7 @@ def test_a_chart_is_composed_when_it_is_read_and_cached_per_snapshot_and_interva
     start = len(store.statements)
 
     def bar_reads():
-        return [sql for sql in store.statements[start:] if sql.startswith("SELECT cur.interval")]
+        return [sql for sql in store.statements[start:] if sql.startswith("SELECT DISTINCT ON (cur.interval,")]
 
     read = lambda interval: reader.read(  # noqa: E731
         "AAPL", "chart", interval=interval, period="5y", available_by=OBSERVED_AT, cohort_id=COHORT_ID)

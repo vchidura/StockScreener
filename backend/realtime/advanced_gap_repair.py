@@ -513,6 +513,7 @@ def verify_and_close_gap_repair_cursor(
     repair_id: UUID,
     *,
     checked_at: datetime,
+    require_derived: bool = True,
 ) -> str:
     cursor.execute(
         "SELECT gap_id,plan_id,instrument_id,gap_start,"
@@ -529,7 +530,11 @@ def verify_and_close_gap_repair_cursor(
         raise ValueError("advanced repair is not ready for verification")
     seconds = int((repair[4] - repair[3]).total_seconds())
     expected_1m = seconds // 60
-    expected_5m = seconds // 300 if seconds % 300 == 0 else 0
+    expected_5m = (
+        seconds // 300
+        if require_derived and seconds % 300 == 0
+        else 0
+    )
     cursor.execute(
         "SELECT current.interval,COUNT(DISTINCT current.bar_start) "
         "FROM rt.bar_current AS current "

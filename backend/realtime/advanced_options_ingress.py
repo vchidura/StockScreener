@@ -1,7 +1,8 @@
 """Provider-free P3A contracts for Advanced Options ingress and journals."""
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from functools import lru_cache
 from pathlib import Path
 from typing import Callable, Mapping, Sequence
 from uuid import NAMESPACE_URL, UUID, uuid5
@@ -51,6 +52,20 @@ ADVANCED_OPTIONS_JOURNAL_STATUSES = frozenset({
     "DRAINING",
     "DRAINED",
 })
+# Far above any configured ceiling; only ids derived from the bound session match.
+_MAXIMUM_DERIVED_CONNECTION_ATTEMPTS = 256
+
+
+@lru_cache(maxsize=8)
+def _journal_session_ids(
+    stream_session_ids: tuple[UUID, ...],
+) -> frozenset[UUID]:
+    """The bound sessions and the per-attempt ids acquisition derives from them."""
+    return frozenset(stream_session_ids) | frozenset(
+        uuid5(session_id, f"connection-attempt:{attempt}")
+        for session_id in stream_session_ids
+        for attempt in range(1, _MAXIMUM_DERIVED_CONNECTION_ATTEMPTS + 1)
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -281,6 +296,16 @@ class AdvancedOptionsJournalSource:
         self._reader = reader_factory(self.path)
         self.generation = registration.journal_generation
 
+    def registered_session_id(self, stream_session_id: UUID) -> UUID:
+        """rt.stream_sessions holds the one bound session; the journal names each attempt."""
+        if stream_session_id not in _journal_session_ids(
+            self.source_flow.stream_session_ids
+        ):
+            raise ValueError(
+                "Advanced Options journal session is not bound to this source"
+            )
+        return self.registration.stream_session_id
+
     def last_offset(self) -> int:
         return self.registration.raw_committed_offset
 
@@ -295,12 +320,12 @@ class AdvancedOptionsJournalSource:
     ) -> Sequence[RawJournalRecord]:
         records = self._reader.read_after(raw_offset, limit=limit)
         previous = raw_offset
+        session_ids = _journal_session_ids(self.source_flow.stream_session_ids)
         for record in records:
             if (
                 record.raw_offset <= previous
                 or record.generation != self.generation
-                or record.stream_session_id
-                not in self.source_flow.stream_session_ids
+                or record.stream_session_id not in session_ids
                 or record.feed is not MarketFeed.OPTIONS
             ):
                 raise ValueError(
@@ -328,12 +353,12 @@ class AdvancedOptionsJournalSource:
             limit=limit,
         )
         previous = event_offset
+        session_ids = _journal_session_ids(self.source_flow.stream_session_ids)
         for record in records:
             if (
                 record.event_offset <= previous
                 or record.journal_generation != self.generation
-                or record.stream_session_id
-                not in self.source_flow.stream_session_ids
+                or record.stream_session_id not in session_ids
                 or record.normalizer_version
                 != self.registration.normalizer_version
                 or record.asset_class is not AssetClass.OPTION
@@ -352,4 +377,12 @@ class AdvancedOptionsJournalSource:
                     "Advanced Options normalized source exceeds durable offset"
                 )
             previous = record.event_offset
-        return records
+        # Market state stores this id under a foreign key to the registered session.
+        # Raw records keep the per-attempt id, which flow reads as a reconnect.
+        return tuple(
+            replace(
+                record,
+                stream_session_id=self.registration.stream_session_id,
+            )
+            for record in records
+        )

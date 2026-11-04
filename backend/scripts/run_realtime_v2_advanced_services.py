@@ -336,7 +336,7 @@ def build_commands(args):
             "--finality-delay-seconds",
             str(args.finality_delay_seconds),
             "--publication-mode",
-            "projection-only",
+            "continuous-publication",
             "--report-directory",
             str(run / "window-reports"),
             "--continuous",
@@ -839,10 +839,6 @@ def main(argv=None):
         "VITE_API_PROXY_TARGET": f"http://127.0.0.1:{args.api_port}",
         "VITE_REALTIME_ONLY": "true",
     })
-    if args.cohort_id is not None:
-        frontend_environment["VITE_REALTIME_COHORT_ID"] = str(
-            args.cohort_id
-        )
     roles = {
         name: _RuntimeRole(name)
         for name in commands

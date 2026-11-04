@@ -288,6 +288,21 @@ def register_advanced_journal_cursor(
     registration: AdvancedJournalRegistration,
 ) -> AdvancedJournalRegistration:
     cursor.execute(
+        "SELECT "
+        "EXISTS (SELECT 1 FROM rt.advanced_ingress_plans "
+        "WHERE plan_id=%s),"
+        "EXISTS (SELECT 1 FROM rt.service_plans WHERE plan_id=%s)",
+        (
+            str(registration.plan_id),
+            str(registration.plan_id),
+        ),
+    )
+    authority = cursor.fetchone()
+    if authority is None or not any(bool(value) for value in authority):
+        raise ValueError(
+            "Advanced journal registration plan authority is unavailable"
+        )
+    cursor.execute(
         "INSERT INTO rt.advanced_journal_registry ("
         "journal_generation,plan_id,stream_session_id,cohort_id,"
         "manifest_id,session_date,owner_epoch,relative_path,path_sha256,"
@@ -385,7 +400,22 @@ def update_advanced_journal_offsets_cursor(
         ),
     )
     if cursor.fetchone() is None:
-        raise ValueError("Advanced journal offset update was rejected")
+        cursor.execute(
+            "SELECT status,raw_committed_offset,"
+            "normalized_committed_offset,sealed_files_sha256 "
+            "FROM rt.advanced_journal_registry "
+            "WHERE journal_generation=%s FOR UPDATE",
+            (str(journal_generation),),
+        )
+        stored = cursor.fetchone()
+        if (
+            stored is None
+            or str(stored[0]) not in {"DRAINING", "DRAINED"}
+            or int(stored[1]) != raw_committed_offset
+            or int(stored[2]) != normalized_committed_offset
+            or not stored[3]
+        ):
+            raise ValueError("Advanced journal offset update was rejected")
 
 
 def seal_advanced_journal_cursor(
@@ -416,7 +446,22 @@ def seal_advanced_journal_cursor(
         ),
     )
     if cursor.fetchone() is None:
-        raise ValueError("Advanced journal seal was rejected")
+        cursor.execute(
+            "SELECT status,raw_committed_offset,"
+            "normalized_committed_offset,sealed_files_sha256 "
+            "FROM rt.advanced_journal_registry "
+            "WHERE journal_generation=%s FOR UPDATE",
+            (str(journal_generation),),
+        )
+        stored = cursor.fetchone()
+        if (
+            stored is None
+            or str(stored[0]) not in {"DRAINING", "DRAINED"}
+            or int(stored[1]) != raw_committed_offset
+            or int(stored[2]) != normalized_committed_offset
+            or str(stored[3]) != sealed_files_sha256
+        ):
+            raise ValueError("Advanced journal seal was rejected")
 
 
 def mark_advanced_journal_drained_cursor(
@@ -608,6 +653,10 @@ def discover_incomplete_advanced_journals_cursor(
     cursor.execute(
         _REGISTRY_SELECT
         + "WHERE status IN ('REGISTERED','WRITING','DRAINING') "
+        "AND EXISTS (SELECT 1 FROM rt.stream_sessions AS session "
+        "WHERE session.session_id="
+        "rt.advanced_journal_registry.stream_session_id "
+        "AND session.feed='STOCKS') "
         "ORDER BY session_date,created_at,journal_generation"
     )
     return tuple(_registration_from_row(row) for row in cursor.fetchall())

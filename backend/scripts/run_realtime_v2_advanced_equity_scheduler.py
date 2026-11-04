@@ -39,7 +39,11 @@ from realtime.advanced_scheduler import (  # noqa: E402
     set_advanced_window_retry_status_cursor,
 )
 from realtime.advanced_equity_lifecycle import (  # noqa: E402
+    AdvancedEquityLifecyclePhase,
     AdvancedEquityLifecyclePlanner,
+)
+from realtime.advanced_session_recovery import (  # noqa: E402
+    plan_session_windows,
 )
 from realtime.advanced_ingress_plan import (  # noqa: E402
     advanced_ingress_provider_deadline,
@@ -58,6 +62,12 @@ from scripts.run_realtime_v2_advanced_equity_window import (  # noqa: E402
 
 
 PROJECTION_ONLY = "projection-only"
+CONTINUOUS_PUBLICATION = "continuous-publication"
+COMPLETED_SESSION_RECOVERY_POLL_SECONDS = 60
+COMPLETED_SESSION_EXTRA_ATTEMPTS = 2
+# A window can take its whole budget, so stop early enough to be idle by the
+# activation boundary at open minus 15 minutes.
+COMPLETED_SESSION_RECOVERY_LEAD = timedelta(minutes=25)
 
 
 def parse_args(argv=None):
@@ -92,7 +102,7 @@ def parse_args(argv=None):
     parser.add_argument("--authorization-reference")
     parser.add_argument(
         "--publication-mode",
-        choices=(PROJECTION_ONLY,),
+        choices=(PROJECTION_ONLY, CONTINUOUS_PUBLICATION),
         default=PROJECTION_ONLY,
     )
     parser.add_argument(
@@ -120,6 +130,13 @@ def parse_args(argv=None):
         args.first_cutoff,
         args.authorization_reference,
     )
+    if (
+        args.publication_mode == CONTINUOUS_PUBLICATION
+        and args.runtime_mode != "continuous"
+    ):
+        parser.error(
+            "continuous publication requires the continuous runtime mode"
+        )
     if args.runtime_mode == "continuous":
         if any(value is not None for value in explicit):
             parser.error(
@@ -193,6 +210,153 @@ def _authorized_windows(windows, *, first_cutoff, started, ended):
     return selected
 
 
+def _window_arguments(args, scope, *, session_date, cutoff, retry):
+    window_args = [
+        "--database",
+        args.database,
+        "--confirm-database-name",
+        args.confirm_database_name,
+        "--cohort-id",
+        str(scope["cohort_id"]),
+        "--session-date",
+        session_date.isoformat(),
+        "--cutoff",
+        cutoff.isoformat(),
+        "--finality-delay-seconds",
+        str(args.finality_delay_seconds),
+        "--completion-budget-seconds",
+        str(args.completion_budget_seconds),
+        "--authorization-reference",
+        scope.get(
+            "authorization_reference",
+            args.authorization_reference,
+        ),
+        "--report-path",
+        str(
+            args.report_directory
+            / retry.report_relative_path
+        ),
+        "--execute",
+    ]
+    if retry.attempt:
+        window_args.extend((
+            f"--window-key-suffix=-retry{retry.attempt}",
+            "--retry-release-now",
+        ))
+    if retry.reused_input_receipt:
+        window_args.append("--reuse-input-receipt")
+    if retry.reused_portal_receipt:
+        window_args.append("--reuse-portal-receipt")
+    if args.publication_mode == CONTINUOUS_PUBLICATION:
+        window_args.append("--continuous-publication")
+    return window_args
+
+
+def _recover_completed_session_window(
+    provider,
+    args,
+    catalog,
+    calendar,
+    *,
+    lifecycle,
+    now,
+    state,
+    window_runner=None,
+) -> bool:
+    """Run one window of the last closed session once its inputs are stored.
+
+    Retries stop at the drain deadline, but a closing window needs the adjusted
+    daily bar that only arrives after it, and repaired bars can arrive later too.
+    """
+    if lifecycle.phase not in {
+        AdvancedEquityLifecyclePhase.IDLE,
+        AdvancedEquityLifecyclePhase.BEFORE_OPEN,
+    }:
+        return False
+    target = lifecycle.target_session_date
+    if now >= calendar.session_open(target) - COMPLETED_SESSION_RECOVERY_LEAD:
+        return False
+    session = calendar.previous_session_date(target)
+    if state.get("finished") == session or (
+        state.get("next_check_at") is not None
+        and now < state["next_check_at"]
+    ):
+        return False
+    state["next_check_at"] = now + timedelta(
+        seconds=COMPLETED_SESSION_RECOVERY_POLL_SECONDS
+    )
+    with provider.transaction(APP_ROLE, read_only=True) as unit:
+        scope = load_continuous_advanced_scheduler_scope_cursor(
+            unit.cursor,
+            session_date=session,
+        )
+    if scope is None:
+        state["finished"] = session
+        return False
+    rows = plan_session_windows(provider, scope, session, checked_at=now)
+    if not rows:
+        state["finished"] = session
+        return False
+    settings = catalog.profile_for_sha(
+        scope["runtime_profile_sha256"]
+    ).settings
+    row = next(
+        (
+            row
+            for row in rows
+            if row["ready"]
+            and row["next_attempt"]
+            <= (
+                settings.scheduler_window_retry_max_attempts
+                + COMPLETED_SESSION_EXTRA_ATTEMPTS
+            )
+        ),
+        None,
+    )
+    if row is None:
+        return False
+    with provider.transaction(APP_ROLE) as unit:
+        recovery = discover_advanced_window_recovery_cursor(
+            unit.cursor,
+            cohort_id=scope["cohort_id"],
+            cutoff=row["cutoff"],
+            checked_at=now,
+        )
+        scheduler_session = ensure_advanced_scheduler_session_cursor(
+            unit.cursor,
+            authorization_id=scope["authorization_id"],
+            ingress_plan_id=scope["plan_id"],
+            cohort_id=scope["cohort_id"],
+            session_date=session,
+            first_authorized_cutoff=row["cutoff"],
+            session_close_at=calendar.session_close(session),
+            drain_deadline=now,
+            checked_at=now,
+        )
+        retry = ensure_advanced_window_retry_cursor(
+            unit.cursor,
+            scheduler_session.scheduler_session_id,
+            cohort_id=scope["cohort_id"],
+            cutoff=row["cutoff"],
+            attempt=recovery.next_attempt,
+            retry_not_before=now,
+            input_receipt=recovery.input_receipt,
+            portal_receipt=recovery.portal_receipt,
+        )
+    (window_runner or run_window)(
+        _window_arguments(
+            args,
+            scope,
+            session_date=session,
+            cutoff=row["cutoff"],
+            retry=retry,
+        )
+    )
+    # Re-plan straight away so the rest of the session follows without a wait.
+    state["next_check_at"] = None
+    return True
+
+
 def _next_progress_check(
     windows,
     *,
@@ -255,6 +419,7 @@ def main(
     next_scope_reconcile_at = None
     next_progress_check_at = None
     pending_retry_not_before = None
+    completed_session_recovery = {}
     try:
         while not stop.is_set():
             now = utc_now()
@@ -270,6 +435,16 @@ def main(
                     ),
                 )
                 session_date = lifecycle.target_session_date
+                if _recover_completed_session_window(
+                    provider,
+                    args,
+                    catalog,
+                    calendar,
+                    lifecycle=lifecycle,
+                    now=now,
+                    state=completed_session_recovery,
+                ):
+                    continue
             refresh_scope = (
                 not continuous
                 or cached_session_date != session_date
@@ -572,43 +747,15 @@ def main(
                         reason_code="WINDOW_EXECUTION_STARTED",
                         checked_at=now,
                     )
-                window_args = [
-                    "--database",
-                    args.database,
-                    "--confirm-database-name",
-                    args.confirm_database_name,
-                    "--cohort-id",
-                    str(scope["cohort_id"]),
-                    "--session-date",
-                    session_date.isoformat(),
-                    "--cutoff",
-                    window.cutoff.isoformat(),
-                    "--finality-delay-seconds",
-                    str(args.finality_delay_seconds),
-                    "--completion-budget-seconds",
-                    str(args.completion_budget_seconds),
-                    "--authorization-reference",
-                    scope.get(
-                        "authorization_reference",
-                        args.authorization_reference,
-                    ),
-                    "--report-path",
-                    str(
-                        args.report_directory
-                        / retry.report_relative_path
-                    ),
-                    "--execute",
-                ]
-                if retry.attempt:
-                    window_args.extend((
-                        f"--window-key-suffix=-retry{retry.attempt}",
-                        "--retry-release-now",
-                    ))
-                if retry.reused_input_receipt:
-                    window_args.append("--reuse-input-receipt")
-                if retry.reused_portal_receipt:
-                    window_args.append("--reuse-portal-receipt")
-                result = run_window(window_args)
+                result = run_window(
+                    _window_arguments(
+                        args,
+                        scope,
+                        session_date=session_date,
+                        cutoff=window.cutoff,
+                        retry=retry,
+                    )
+                )
                 with provider.transaction(APP_ROLE) as unit:
                     after = discover_advanced_window_recovery_cursor(
                         unit.cursor,
@@ -649,6 +796,9 @@ def main(
                         checked_at=utc_now(),
                     )
                 next_progress_check_at = now
+                # Rediscover after one executed window, so a new live slot
+                # always runs ahead of the rest of the backlog.
+                break
             stop.wait(args.poll_seconds)
         return 0
     finally:

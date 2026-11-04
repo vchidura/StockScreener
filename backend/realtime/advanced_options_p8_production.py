@@ -17,7 +17,9 @@ from psycopg2.pool import ThreadedConnectionPool
 from .advanced_equity_control_plane import (
     build_advanced_equity_control_plane_plan,
     load_advanced_equity_control_plane_plan_cursor,
+    materialized_cohort_identity_payload,
     validate_active_target9_equity_source_cursor,
+    with_materialized_cohort_identity,
 )
 from .advanced_options_control_plane import (
     ADVANCED_OPTIONS_REST_LANES,
@@ -53,6 +55,7 @@ from .advanced_options_p8_selection_source import (
 )
 from .advanced_options_read_pin import (
     PostgresAdvancedOptionsStoredReadPort,
+    load_advanced_options_read_pin_cursor,
 )
 from .advanced_options_underlying_snapshot import (
     UnderlyingSnapshotBinding,
@@ -375,6 +378,7 @@ def run_p8_serial_window(
         _journal_root,
     )
     from .advanced_options_p8_window import (
+        _resident_owner_epoch,
         build_and_run_p8_serial_window,
     )
 
@@ -394,8 +398,8 @@ def run_p8_serial_window(
         registration=registration,
         source_flow=control.source_flow,
     )
-    flow_owner_epoch = int(
-        dependency_evidence["FLOW"].get("owner_epoch", 1)
+    flow_owner_epoch = _resident_owner_epoch(
+        dependency_evidence["FLOW"]
     )
     (
         flow_environment,
@@ -445,6 +449,7 @@ def run_v3_serial_window(
         _journal_root,
     )
     from .advanced_options_p8_window import (
+        _resident_owner_epoch,
         build_and_run_p8_serial_window,
     )
     from .stage_graph import STAGE_CATALOG_VERSION_V5
@@ -525,8 +530,8 @@ def run_v3_serial_window(
         registration=registration,
         source_flow=control.source_flow,
     )
-    flow_owner_epoch = int(
-        dependency_evidence["FLOW"].get("owner_epoch", 1)
+    flow_owner_epoch = _resident_owner_epoch(
+        dependency_evidence["FLOW"]
     )
     (
         flow_environment,
@@ -619,7 +624,12 @@ def run_v3_serial_window(
         dependency_evidence=dependency_evidence,
         catalog_version=STAGE_CATALOG_VERSION_V5,
         publication_authority_loader=publication_authority,
-        canonical_publisher=publisher.publish,
+        canonical_publisher=publisher_advancing_read_pin(
+            publisher.publish,
+            provider=provider,
+            cohort_id=control.cohort_id,
+            package_sha256=str(package["package_sha256"]),
+        ),
         window_stage_effect_authorizer=(
             AdvancedOptionsWindowStageEffectAuthorizer(
                 cycle_authority
@@ -627,6 +637,38 @@ def run_v3_serial_window(
         ),
         window_cutoff=cycle_authority.options_cutoff,
     )
+
+
+def publisher_advancing_read_pin(
+    publish,
+    *,
+    provider,
+    cohort_id: UUID,
+    package_sha256: str,
+):
+    """Readers see only the pinned release, so a continuous session moves the pin
+    with each current release. A late window never moves it, and a failed advance
+    fails the stage so the idempotent publication is retried."""
+
+    def publish_and_pin(batch, *, checked_at):
+        result = publish(batch, checked_at=checked_at)
+        if result.release.pointer_swapped:
+            with provider.transaction(APP_ROLE, read_only=True) as unit:
+                previous = load_advanced_options_read_pin_cursor(
+                    unit.cursor,
+                    cohort_id=cohort_id,
+                )
+            PostgresAdvancedOptionsStoredReadPort(
+                provider,
+                package_sha256=package_sha256,
+            ).advance(
+                cohort_id=cohort_id,
+                release_id=result.release.release_id,
+                previous=previous,
+            )
+        return result
+
+    return publish_and_pin
 
 
 def load_v3_pending_window_bindings(
@@ -653,10 +695,12 @@ def load_v3_pending_window_bindings(
             "AND cycle.target_cohort_id=%s "
             "AND window_run.state IN ('PENDING','RUNNING') "
             "AND window_run.release_at<=%s "
+            "AND window_run.deadline>%s "
             "ORDER BY cycle.options_cutoff,cycle.target_window_id",
             (
                 str(session.authorization_id),
                 str(binding.enrollment.control_plane.cohort_id),
+                checked,
                 checked,
             ),
         )
@@ -761,6 +805,15 @@ def _production_binding_payload(
             "schema_sha256": equity.schema_sha256,
             "security_policy_sha256": equity.security_policy_sha256,
             "configuration_sha256": equity.configuration_sha256,
+            **(
+                {}
+                if materialized_cohort_identity_payload(equity) is None
+                else {
+                    "materialized_identity": (
+                        materialized_cohort_identity_payload(equity)
+                    ),
+                }
+            ),
         },
         "control": {
             "option_underlyings": list(
@@ -956,6 +1009,11 @@ def p8_production_binding_from_payload(value):
         ],
         configuration_sha256=equity_value["configuration_sha256"],
     )
+    if equity_value.get("materialized_identity") is not None:
+        equity = with_materialized_cohort_identity(
+            equity,
+            equity_value["materialized_identity"],
+        )
     policy_value = control_value["manifest_policy"]
     policy = BoundedOptionManifestPolicy(
         version=policy_value["version"],

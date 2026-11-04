@@ -1,4 +1,5 @@
 import json
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 from uuid import UUID
@@ -8,6 +9,7 @@ import pytest
 from realtime.advanced_equity_ingress import (
     AdvancedEquityJournalPump,
     AdvancedJournalDecodeError,
+    AdvancedJournalProgress,
     BoundedAsyncProgressReporter,
 )
 from realtime.buffer import BufferLimits, RawMessageBuffer
@@ -53,6 +55,37 @@ def _admissions():
             0,
         )
     }
+
+
+def test_progress_reporter_consecutive_failures_reset_on_success(tmp_path):
+    outcomes = [ValueError(), ValueError(), None]
+    delivered = threading.Event()
+
+    def callback(_progress):
+        outcome = outcomes.pop(0)
+        if outcome is not None:
+            raise outcome
+        delivered.set()
+
+    reporter = BoundedAsyncProgressReporter(callback)
+    reporter.start()
+    progress = AdvancedJournalProgress(
+        last_raw_offset=1,
+        last_event_offset=1,
+        admitted_market_messages=1,
+        admitted_market_bytes=1,
+        event_time_watermark=None,
+    )
+    while outcomes:
+        reporter.publish(progress)
+        if len(outcomes) == 1:
+            assert reporter.failure_count <= 2
+        time.sleep(0.01)
+    assert delivered.wait(timeout=5)
+    reporter.stop(5)
+
+    assert reporter.failure_count == 2
+    assert reporter.consecutive_failures == 0
 
 
 def test_journal_pump_commits_and_normalizes_fractional_am_bytes(tmp_path):

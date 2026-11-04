@@ -103,7 +103,13 @@ def _canonical_value(value: object) -> object:
         }
     if isinstance(value, Mapping):
         return {str(key): _canonical_value(item) for key, item in value.items()}
-    if isinstance(value, (tuple, list, set, frozenset)):
+    if isinstance(value, (set, frozenset)):
+        # Set order changes with each process's hash seed, so it must not reach a hash.
+        return sorted(
+            (_canonical_value(item) for item in value),
+            key=lambda item: json.dumps(item, sort_keys=True, separators=(",", ":")),
+        )
+    if isinstance(value, (tuple, list)):
         return [_canonical_value(item) for item in value]
     if isinstance(value, (str, int, float, bool)) or value is None:
         return value

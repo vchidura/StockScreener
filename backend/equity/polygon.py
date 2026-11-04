@@ -591,8 +591,8 @@ def normalize_native_bars(
             provider_date = provider_start.tz_convert("America/New_York").date()
             if interval == "1wk":
                 if provider_date.weekday() == 6:
-                    period_start = provider_date - timedelta(days=6)
-                    period_end = provider_date - timedelta(days=2)
+                    period_start = provider_date + timedelta(days=1)
+                    period_end = provider_date + timedelta(days=5)
                 else:
                     iso = provider_date.isocalendar()
                     period_start = date.fromisocalendar(iso.year, iso.week, 1)

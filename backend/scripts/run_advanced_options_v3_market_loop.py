@@ -468,7 +468,8 @@ def _prepare_session_authority(
             strike=strike,
             spot=spot,
             absolute_moneyness=abs(strike - spot) / spot,
-            day_volume=int(snapshot["day"]["volume"]),
+            # A contract with no trades yet today has an empty day object.
+            day_volume=int((snapshot.get("day") or {}).get("volume") or 0),
             open_interest=open_interest,
             catalog_payload_sha256=str(row["payload_sha256"]),
             snapshot_payload_sha256=canonical_sha256(snapshot),

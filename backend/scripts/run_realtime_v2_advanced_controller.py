@@ -47,6 +47,10 @@ from realtime.advanced_equity_lifecycle import (  # noqa: E402
 from realtime.advanced_scheduler import (  # noqa: E402
     load_advanced_scheduler_progress_cursor,
 )
+from realtime.advanced_stream_gap_repair import (  # noqa: E402
+    first_missing_minute_range,
+    load_stored_minutes_cursor,
+)
 from realtime.advanced_realtime_desired_state_repository import (  # noqa: E402
     load_effective_desired_state_reconciliation_cursor,
 )
@@ -107,6 +111,10 @@ from scripts.run_realtime_v2_advanced_equity_ingress import (  # noqa: E402
 
 
 UTC = timezone.utc
+# A journal-backed minute normally lands within seconds of its bar closing, so a
+# minute older than this is missing rather than merely in flight.
+REPAIR_STORAGE_GRACE_SECONDS = 180
+REPAIR_BLOCKED_RETRY_SECONDS = 300
 ACTIVE_EXTERNAL_INGRESS_STATUSES = frozenset({
     "CONNECTING",
     "AUTHENTICATING",
@@ -957,7 +965,14 @@ def _load_hybrid_window_cursor(
     )
 
 
-def _load_hybrid_progress_cursor(cursor, plan_id, cohort_id):
+def _load_hybrid_progress_cursor(
+    cursor,
+    plan_id,
+    cohort_id,
+    *,
+    session_open,
+    through,
+):
     cursor.execute(
         "SELECT min(started_at) FROM rt.stream_sessions "
         "WHERE advanced_ingress_plan_id=%s AND subscribed_at IS NOT NULL",
@@ -975,24 +990,30 @@ def _load_hybrid_progress_cursor(cursor, plan_id, cohort_id):
     instrument_ids = tuple(int(row[0]) for row in cursor.fetchall())
     if not instrument_ids:
         raise ValueError("Advanced hybrid repair has no AM members")
-    cursor.execute(
-        "SELECT instrument_id,last_complete_bar_end "
-        "FROM rt.acquisition_watermarks "
-        "WHERE cohort_id=%s AND interval='1m' "
-        "AND source_kind='RECONCILED' AND terminal_state='COMPLETE' "
-        "AND instrument_id=ANY(%s::bigint[])",
-        (str(cohort_id), list(instrument_ids)),
-    )
-    retained = {
-        int(row[0]): row[1]
-        for row in cursor.fetchall()
-    }
-    complete_through = (
-        min(retained.values())
-        if set(retained) == set(instrument_ids)
+    # Stored bars define what is missing, not the first stream's start time:
+    # a reconnect or a stalled bridge leaves holes long after that.
+    hole = (
+        first_missing_minute_range(
+            load_stored_minutes_cursor(
+                cursor,
+                cohort_id=cohort_id,
+                instrument_ids=instrument_ids,
+                start=session_open,
+                end=through,
+            ),
+            instrument_ids=instrument_ids,
+            start=session_open,
+            end=through,
+        )
+        if through > session_open
         else None
     )
-    return stream_started_at, complete_through, instrument_ids
+    return (
+        stream_started_at,
+        hole[0] if hole is not None else None,
+        hole[1] if hole is not None else None,
+        instrument_ids,
+    )
 
 
 def _ensure_hybrid_window_cursor(
@@ -1198,67 +1219,35 @@ def _load_hybrid_bars_cursor(
     )
 
 
-def _incremental_repair_command(
+def _gap_repair_command(
     args,
     runtime_scope,
     identity,
     report_path,
-    settings,
-    attempt,
 ):
-    cutoff = identity.repair_end or identity.gap_end
     return [
         sys.executable,
         "-B",
         str(
             BACKEND_DIR
             / "scripts"
-            / "run_realtime_v2_incremental_equity.py"
+            / "run_realtime_v2_advanced_gap_repair.py"
         ),
         "--database",
         args.database,
         "--confirm-database-name",
         args.confirm_database_name,
-        "--cohort-id",
-        str(runtime_scope.cohort_id),
-        "--advanced-ingress-plan-id",
+        "--plan-id",
         str(runtime_scope.plan_id),
-        "--session-date",
-        runtime_scope.session_date.isoformat(),
-        "--interval",
-        "1m",
-        "--cutoff",
-        cutoff.isoformat(),
-        "--provider-delay-seconds",
-        str(settings.rest_provider_delay_seconds),
-        "--rest-endpoint-class",
-        settings.rest_aggregate_endpoint_class,
-        "--eligibility-policy-version",
-        settings.rest_eligibility_policy_version,
-        "--repair-attempt",
-        str(attempt),
+        "--gap-start",
+        identity.gap_start.isoformat(),
+        "--gap-end",
+        (identity.repair_end or identity.gap_end).isoformat(),
         "--response-byte-limit",
         str(args.rest_repair_response_byte_limit),
-        "--account-request-ceiling",
-        str(runtime_scope.budgets.rest_repair_requests),
-        "--account-decoded-byte-ceiling",
-        str(runtime_scope.budgets.rest_repair_decoded_bytes),
-        "--authorized-until",
-        runtime_scope.authorized_end_at.isoformat(),
-        "--authorization-reference",
-        runtime_scope.authorization_reference,
-        "--provider-authorization-reference",
-        "stocks-advanced",
-        "--expected-cost",
-        args.rest_repair_expected_cost,
-        "--minimum-spacing-seconds",
-        str(args.rest_repair_minimum_spacing_seconds),
-        "--timeout-seconds",
-        str(args.rest_repair_timeout_seconds),
         "--report-path",
         str(report_path),
-        "--once",
-        "--execute-shadow",
+        "--execute",
     ]
 
 
@@ -1294,15 +1283,31 @@ class _HybridRepairCoordinator:
         self.window = None
         self.instrument_ids = ()
         self.process = None
-        self.terminal_outcome = None
+        self.repair_blocked = None
+        self.next_plan_at = None
         self.stream_started_at = None
-        self.complete_through = None
+        self.first_missing_minute = None
         self.repaired_through = None
         self.provider_requests = 0
 
     @property
     def unresolved(self):
         return self.process is not None or self.window is not None
+
+    def _block_repair(self, now, reason):
+        # A repair that cannot finish must never end the session: the feed is
+        # still live, and the input gate keeps the affected windows blocked.
+        if reason != self.repair_blocked:
+            print(
+                f"Advanced hybrid repair blocked: {reason}",
+                file=sys.stderr,
+                flush=True,
+            )
+        self.repair_blocked = reason
+        self.window = None
+        self.next_plan_at = now + timedelta(
+            seconds=REPAIR_BLOCKED_RETRY_SECONDS
+        )
 
     def _reload_window(self):
         with self.provider.transaction(APP_ROLE, read_only=True) as unit:
@@ -1313,28 +1318,41 @@ class _HybridRepairCoordinator:
             )
 
     def _plan_next(self, now):
+        if self.next_plan_at is not None and now < self.next_plan_at:
+            return
+        through = min(
+            (
+                now - timedelta(seconds=REPAIR_STORAGE_GRACE_SECONDS)
+            ).replace(second=0, microsecond=0),
+            self.runtime_scope.authorized_end_at,
+        )
         with self.provider.transaction(APP_ROLE, read_only=True) as unit:
             (
                 stream_started_at,
-                complete_through,
+                hole_start,
+                hole_end,
                 instrument_ids,
             ) = _load_hybrid_progress_cursor(
                 unit.cursor,
                 self.runtime_scope.plan_id,
                 self.runtime_scope.cohort_id,
+                session_open=self.session_open,
+                through=through,
             )
         if stream_started_at is None:
             return
         self.stream_started_at = stream_started_at
-        self.complete_through = complete_through
+        self.first_missing_minute = hole_start
+        if hole_start is None:
+            return
         startup = plan_hybrid_startup(
             session_open=self.session_open,
-            stream_started_at=stream_started_at,
+            stream_started_at=hole_end,
             checked_at=now,
             provider_delay=timedelta(
                 seconds=self.settings.rest_provider_delay_seconds
             ),
-            complete_through=complete_through,
+            complete_through=hole_start,
         )
         if startup.state is HybridStartupState.NO_GAP:
             return
@@ -1363,7 +1381,7 @@ class _HybridRepairCoordinator:
             self.runtime_scope.budgets.rest_repair_requests == 0
             or self.runtime_scope.budgets.rest_repair_decoded_bytes == 0
         ):
-            self.terminal_outcome = "AUTHORIZATION_EXHAUSTED"
+            self._block_repair(now, "AUTHORIZATION_EXHAUSTED")
             return
         required_requests = len(instrument_ids) * identity.maximum_attempts
         required_bytes = required_requests * (
@@ -1375,10 +1393,10 @@ class _HybridRepairCoordinator:
             or self.runtime_scope.budgets.rest_repair_decoded_bytes
             < required_bytes
         ):
-            self.terminal_outcome = "AUTHORIZATION_EXHAUSTED"
+            self._block_repair(now, "AUTHORIZATION_EXHAUSTED")
             return
         if identity.release_at >= self.deadline:
-            self.terminal_outcome = "AUTHORIZATION_EXHAUSTED"
+            self._block_repair(now, "AUTHORIZATION_EXHAUSTED")
             return
         with self.provider.transaction(APP_ROLE) as unit:
             self.window = _ensure_hybrid_window_cursor(
@@ -1414,7 +1432,7 @@ class _HybridRepairCoordinator:
                     state="RETAINED_GAP",
                     checked_at=now,
                 )
-                self.terminal_outcome = "BLOCKED_GAP"
+                self._block_repair(now, "BLOCKED_GAP")
                 return
             for instrument_id in self.instrument_ids:
                 advance_acquisition_watermark_cursor(
@@ -1434,7 +1452,8 @@ class _HybridRepairCoordinator:
                 state="COMPLETE",
                 checked_at=now,
             )
-        self.complete_through = through
+        self.first_missing_minute = None
+        self.repair_blocked = None
         self.repaired_through = through
         self.window = None
 
@@ -1466,11 +1485,8 @@ class _HybridRepairCoordinator:
         except (OSError, ValueError, json.JSONDecodeError):
             report = None
         if report is not None:
-            self.provider_requests += sum(
-                int(item.get("provider_requests") or 0)
-                for cycle in report.get("cycles") or ()
-                for item in cycle
-                if isinstance(item, dict)
+            self.provider_requests += int(
+                report.get("provider_requests") or 0
             )
         if (
             report is not None
@@ -1494,7 +1510,7 @@ class _HybridRepairCoordinator:
                     state="RETAINED_GAP",
                     checked_at=now,
                 )
-            self.terminal_outcome = "BLOCKED_GAP"
+            self._block_repair(now, "BLOCKED_GAP")
             return
         if return_code:
             if (
@@ -1521,7 +1537,10 @@ class _HybridRepairCoordinator:
                     state="FAILED",
                     checked_at=now,
                 )
-            self.terminal_outcome = failure.terminal_outcome
+            self._block_repair(
+                now,
+                failure.terminal_outcome or "FAILED_INFRASTRUCTURE",
+            )
             return
         self._verify_completed(now)
 
@@ -1541,18 +1560,18 @@ class _HybridRepairCoordinator:
         now = self.utc_clock()
         if self.process is not None:
             self._finish_process(now)
-        if self.terminal_outcome is not None or self.process is not None:
-            return self.terminal_outcome is None
+        if self.process is not None:
+            return True
         if self.window is None:
             self._plan_next(now)
-        if self.window is None or self.terminal_outcome is not None:
-            return self.terminal_outcome is None
+        if self.window is None:
+            return True
         if self.window.state == "COMPLETE":
             self.window = None
             return True
         if self.window.state in {"FAILED", "MISSED", "RETAINED_GAP"}:
-            self.terminal_outcome = "BLOCKED_GAP"
-            return False
+            self._block_repair(now, "BLOCKED_GAP")
+            return True
         if (
             self.window.state == "RUNNING"
             and self.window.report_path.exists()
@@ -1562,7 +1581,7 @@ class _HybridRepairCoordinator:
                 return_code=0,
                 stderr="",
             )
-            return self.terminal_outcome is None
+            return True
         if now < self.window.identity.release_at:
             return True
         if (
@@ -1597,18 +1616,16 @@ class _HybridRepairCoordinator:
                         state="RETAINED_GAP",
                         checked_at=now,
                     )
-                self.terminal_outcome = "BLOCKED_GAP"
-                return False
+                self._block_repair(now, "BLOCKED_GAP")
+                return True
             return True
         self._reload_window()
         self.process = self.popen_factory(
-            _incremental_repair_command(
+            _gap_repair_command(
                 self.args,
                 self.runtime_scope,
                 self.window.identity,
                 self.window.report_path,
-                self.settings,
-                epoch,
             ),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -2058,14 +2075,6 @@ def main(argv=None) -> int:
                         .rest_repair_decoded_bytes
                     ),
                 )
-                if hybrid.terminal_outcome is not None:
-                    _record_terminal(
-                        provider,
-                        plan.plan_id,
-                        hybrid.terminal_outcome,
-                        now,
-                    )
-                    break
                 with provider.transaction(APP_ROLE, read_only=True) as unit:
                     controller_status = (
                         advanced_ingress_controller_status_cursor(
@@ -2202,14 +2211,6 @@ def main(argv=None) -> int:
                     shutdown_seconds=settings.shutdown_deadline_seconds,
                     tick=hybrid.tick,
                 )
-                if hybrid.terminal_outcome is not None:
-                    _record_terminal(
-                        provider,
-                        plan.plan_id,
-                        hybrid.terminal_outcome,
-                        _now(),
-                    )
-                    break
                 if intentional:
                     if args.canary_end_at is not None and not stop.is_set():
                         continue
@@ -2307,10 +2308,10 @@ def main(argv=None) -> int:
                         if hybrid.stream_started_at is None
                         else hybrid.stream_started_at.isoformat()
                     ),
-                    "complete_through_utc": (
+                    "first_missing_minute_utc": (
                         None
-                        if hybrid.complete_through is None
-                        else hybrid.complete_through.isoformat()
+                        if hybrid.first_missing_minute is None
+                        else hybrid.first_missing_minute.isoformat()
                     ),
                     "repaired_through_utc": (
                         None
@@ -2319,9 +2320,7 @@ def main(argv=None) -> int:
                     ),
                 },
                 "hybrid_repair_pending": hybrid.unresolved,
-                "hybrid_repair_terminal_outcome": (
-                    hybrid.terminal_outcome
-                ),
+                "hybrid_repair_blocked": hybrid.repair_blocked,
                 "credentials_exposed": False,
             }
             controller_report = (

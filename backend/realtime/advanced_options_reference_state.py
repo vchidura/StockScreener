@@ -489,7 +489,8 @@ class AdvancedOptionsValuationReference:
             not isinstance(self.security_id, UUID)
             or not isinstance(self.valuation_date, date)
             or not isinstance(self.expiration_date, date)
-            or self.expiration_date <= self.valuation_date
+            # Same-day expiries are in scope; the rate lookup floors their tenor at one day.
+            or self.expiration_date < self.valuation_date
             or not rates
             or len({row.observation_id for row in rates}) != len(rates)
             or any(

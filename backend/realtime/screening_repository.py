@@ -12,6 +12,7 @@ import exchange_calendars
 from .contracts import canonical_sha256
 from .database_access import RealtimeDatabaseRole
 from .equity_portal_history import build_realtime_equity_portal_history_plan
+from .equity_history import EquityHistoryScope, resolve_equity_history_scopes_cursor
 from .portal_projection_repository import persist_screening_generation_cursor
 from .preflight import ProviderTier
 from .reference_continuity import (
@@ -101,6 +102,7 @@ class BarScope:
     history_source_provider_tier: str | None = None
     history_before: datetime | None = None
     history_binding_sha256: str | None = None
+    history_scopes: tuple[EquityHistoryScope, ...] = ()
 
 
 BAR_IDENTITY_FIELDS = (
@@ -236,6 +238,20 @@ def bar_columns(include_portal_history: bool) -> str:
 def _bar_scope_sql(scope: BarScope) -> tuple[str, tuple]:
     target = "(cohort_id=%s AND provider_tier=%s)"
     params: tuple = (str(scope.cohort_id), scope.provider_tier)
+    if scope.history_scopes:
+        histories = tuple(
+            "(cohort_id=%s AND provider_tier=%s AND bar_end<%s)"
+            for _history in scope.history_scopes
+        )
+        return (
+            "(" + target + " OR " + " OR ".join(histories) + ")",
+            (
+                *params,
+                *(value for history in scope.history_scopes for value in (
+                    str(history.cohort_id), history.provider_tier.value, history.history_before,
+                )),
+            ),
+        )
     if scope.history_source_cohort_id is None:
         return target, params
     if (
@@ -583,12 +599,19 @@ def load_screening_input(cursor, *, cohort_id: UUID, session: date,
     history_binding_sha256 = manifest.get("binding_sha256")
     if history_source_cohort_id is not None and (
         manifest["provider_tier"] != "MASSIVE_ADVANCED"
-        or history_source_provider_tier != "MASSIVE_DEVELOPER"
+        or history_source_provider_tier not in {"MASSIVE_DEVELOPER", "MASSIVE_ADVANCED"}
         or history_before is None
         or history_before > cutoff
         or history_binding_sha256 is None
     ):
         raise ValueError("Advanced cohort history binding is invalid")
+    history_scopes = ()
+    if history_source_cohort_id is not None:
+        _target_tier, history_scopes = resolve_equity_history_scopes_cursor(
+            cursor, cohort_id=cohort_id, checked_at=known_by,
+        )
+        if not history_scopes:
+            raise ValueError("Advanced cohort history binding is not causally available")
     cursor.execute(
         "SELECT DISTINCT ON (instrument.instrument_id) "
         "reference.security_id, reference.ticker, "
@@ -637,6 +660,7 @@ def load_screening_input(cursor, *, cohort_id: UUID, session: date,
         history_source_provider_tier=history_source_provider_tier,
         history_before=history_before,
         history_binding_sha256=history_binding_sha256,
+        history_scopes=history_scopes,
     )
     request = BarRequest(
         scope=scope, cutoff=cutoff, known_by=known_by,
@@ -650,6 +674,11 @@ def load_screening_input(cursor, *, cohort_id: UUID, session: date,
             history_before,
             history_binding_sha256,
             identity_continuity,
+            tuple(
+                (str(history.cohort_id), history.provider_tier.value,
+                 history.history_before, history.binding_sha256)
+                for history in history_scopes
+            ),
         ),
         slot=(
             str(cohort_id),
@@ -695,7 +724,10 @@ def load_screening_input(cursor, *, cohort_id: UUID, session: date,
         cohort_id=cohort_id, provider_tier=ProviderTier(manifest["provider_tier"]),
         source_manifest_sha256=source_manifest_identity(
             cohort_manifest_sha256=manifest["manifest_sha256"],
-            history_binding_sha256=history_binding_sha256,
+            history_binding_sha256=(
+                canonical_sha256([history.payload() for history in history_scopes])
+                if len(history_scopes) > 1 else history_binding_sha256
+            ),
             identity_continuity=identity_continuity,
         ),
         source_generation=source_generation,
@@ -708,6 +740,7 @@ def load_screening_input(cursor, *, cohort_id: UUID, session: date,
         ),
         history_before=scope.history_before,
         history_binding_sha256=scope.history_binding_sha256,
+        history_scopes=history_scopes,
         identity_continuity_sha256=(
             canonical_sha256(identity_continuity)
             if identity_continuity

@@ -58,6 +58,7 @@ export function SessionDateProvider({ children, enabled = true }: { children: Re
       : isAllTickers ? getAllTickersClosingSessions()
       : isStrategy ? getStrategyTradingSessions(selectedInterval, researchPin) : getTradingSessions(selectedInterval),
     staleTime: 60 * 1000,
+    placeholderData: previous => previous,
     enabled,
   })
 
@@ -117,8 +118,8 @@ export function SessionDateProvider({ children, enabled = true }: { children: Re
     isTicker,
     isPattern,
     isAllTickers,
-    error: persistedSelection ? error?.message ?? null : null,
-    loading: !!isFetching,
+    error: persistedSelection && !sessions.length ? error?.message ?? null : null,
+    loading: !!isFetching && !sessions.length,
     interval: selectedInterval,
     requestInterval,
     dataAsOf: data?.data_as_of ?? null,

@@ -5,6 +5,7 @@ import asyncio
 import json
 import os
 import re
+import sys
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -60,6 +61,8 @@ ACQUISITION_STATUS_SCHEMA = (
 )
 ACQUISITION_OWNER_NAME = "advanced-options-v3-session-acquisition-v1"
 CONTROL_MESSAGES_PER_ATTEMPT = 8
+ACQUISITION_GIL_SWITCH_SECONDS = 0.0005
+ACQUISITION_PING_TIMEOUT_SECONDS = 60
 STATUS_MESSAGE_RESERVATION_QUANTUM = 1024
 STATUS_BYTE_RESERVATION_MESSAGES = 2
 ZERO_FORBIDDEN_EFFECTS = {
@@ -706,6 +709,9 @@ def run_acquisition(
 ) -> dict[str, object]:
     if not api_key.strip():
         raise ValueError("Options acquisition provider key is required")
+    # The journal thread would otherwise hold the GIL for up to 5 ms after every
+    # socket call, capping the feed below its live rate until pings time out.
+    sys.setswitchinterval(ACQUISITION_GIL_SWITCH_SECONDS)
     now = _utc(clock(), "clock")
     if not binding.authority.prepared_at <= now < (
         binding.authority.acquisition_stop
@@ -784,6 +790,7 @@ def run_acquisition(
     configuration = GatewayConfiguration(
         MarketFeed.OPTIONS,
         GatewayConfiguration.options().endpoint,
+        ping_timeout_seconds=ACQUISITION_PING_TIMEOUT_SECONDS,
         maximum_message_bytes=binding.maximum_message_bytes,
         library_max_queue=binding.library_max_queue,
     )

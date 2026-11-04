@@ -96,6 +96,7 @@ def test_contract_pins_exact_000_through_024_and_historical_registry():
     }.issubset(POST024_RELATIONS)
     assert "rt.option_flow_events" in registry.relation_names
     assert "rt.advanced_ingress_plans" in registry.relation_names
+    assert registry.object_grants["rt.advanced_stream_authorizations"] == {"SELECT": ("app",)}
 
 
 def test_contract_binds_operator_and_runtime_source_separately():

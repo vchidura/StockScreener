@@ -3,8 +3,9 @@ from __future__ import annotations
 
 import json
 import re
+from collections import Counter
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Protocol
@@ -110,48 +111,125 @@ class P8ActivitySelectionCapture:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class P8SelectionProviderAttempt:
+    """One real provider request, whether or not its capture succeeded."""
+
+    http_status: int | None
+    response_bytes: int
+    row_count: int = 0
+
+
+class P8SelectionNoUsableContracts(ValueError):
+    """Every returned row was rejected; only the reasons are retained."""
+
+    def __init__(
+        self,
+        underlyer: str,
+        *,
+        row_count: int,
+        page_count: int,
+        rejections: Mapping[str, int],
+    ) -> None:
+        self.underlyer = underlyer
+        self.row_count = row_count
+        self.page_count = page_count
+        self.rejections = dict(rejections)
+        histogram = ",".join(
+            f"{reason}={count}"
+            for reason, count in sorted(
+                self.rejections.items(),
+                key=lambda item: (-item[1], item[0]),
+            )
+        )
+        self.reason_code = (
+            f"NO_USABLE_CONTRACTS:{underlyer}:rows={row_count}"
+            + (f":{histogram}" if histogram else "")
+        )
+        super().__init__(
+            f"P8 Massive selection has no usable contracts for {underlyer}: "
+            f"pages={page_count} rows={row_count}"
+            + (f" {histogram}" if histogram else "")
+        )
+
+
+def _snapshot_rejection_reason(row: Mapping[str, object]) -> str | None:
+    """Why a chain row cannot be a candidate; the provider marks every
+    snapshot field optional, so an absent field rejects only its own row."""
+    details = row.get("details")
+    quote_row = row.get("last_quote")
+    day_row = row.get("day", row.get("session"))
+    underlying = row.get("underlying_asset")
+    for value, reason in (
+        (details, "MISSING_DETAILS"),
+        (quote_row, "MISSING_LAST_QUOTE"),
+        (day_row, "MISSING_DAY"),
+        (underlying, "MISSING_UNDERLYING"),
+    ):
+        if not isinstance(value, Mapping):
+            return reason
+    if str(details.get("contract_type", "")).strip().lower() not in {
+        "call",
+        "put",
+    }:
+        return "UNKNOWN_CONTRACT_TYPE"
+    if (
+        details.get("expiration_date") is None
+        or details.get("strike_price") is None
+    ):
+        return "INCOMPLETE_DETAILS"
+    if quote_row.get("bid") is None or quote_row.get("ask") is None:
+        return "INCOMPLETE_QUOTE"
+    bid = _decimal(quote_row["bid"], "last_quote.bid")
+    ask = _decimal(quote_row["ask"], "last_quote.ask")
+    if bid < 0:
+        return "NEGATIVE_BID"
+    if ask <= 0:
+        return "NON_POSITIVE_ASK"
+    if ask < bid:
+        return "CROSSED_QUOTE"
+    if not quote_row.get("last_updated"):
+        return "INCOMPLETE_QUOTE"
+    if underlying.get("price", underlying.get("value")) is None:
+        return "MISSING_UNDERLYING_PRICE"
+    raw_open_interest = row.get("open_interest")
+    if (
+        int(day_row.get("volume") or 0) < 0
+        or raw_open_interest is not None
+        and int(raw_open_interest) < 0
+    ):
+        return "NEGATIVE_ACTIVITY"
+    return None
+
+
 def _candidate_from_snapshot(
     row: Mapping[str, object],
     *,
     session_date: date,
 ) -> P7TransportCandidate | None:
-    details = row.get("details")
-    quote_row = row.get("last_quote")
-    day_row = row.get("day", row.get("session"))
-    underlying = row.get("underlying_asset")
-    if not all(
-        isinstance(value, Mapping)
-        for value in (details, quote_row, day_row, underlying)
-    ):
+    if _snapshot_rejection_reason(row) is not None:
         return None
+    details = row["details"]
+    quote_row = row["last_quote"]
+    day_row = row.get("day", row.get("session"))
+    underlying = row["underlying_asset"]
     ticker = str(
         details.get("ticker", row.get("ticker", ""))
     ).strip().upper()
     option_type = {
         "call": "C",
         "put": "P",
-    }.get(str(details.get("contract_type", "")).strip().lower())
-    if option_type is None:
-        return None
+    }[str(details["contract_type"]).strip().lower()]
     expiration = date.fromisoformat(str(details["expiration_date"]))
     bid = _decimal(quote_row["bid"], "last_quote.bid")
     ask = _decimal(quote_row["ask"], "last_quote.ask")
-    day_volume = int(day_row.get("volume", 0))
+    day_volume = int(day_row.get("volume") or 0)
     raw_open_interest = row.get("open_interest")
     open_interest = (
         None
         if raw_open_interest is None
         else int(raw_open_interest)
     )
-    if (
-        bid < 0
-        or ask <= 0
-        or ask < bid
-        or day_volume < 0
-        or open_interest is not None
-        and open_interest < 0
-    ):
-        return None
     return P7TransportCandidate(
         contract_ticker=ticker,
         underlyer=str(underlying.get("ticker", "")),
@@ -614,6 +692,12 @@ class MassiveAdvancedOptionsSelectionSource:
         self._deadline = (
             None if deadline is None else _utc(deadline, "deadline")
         )
+        self._provider_attempts: list[P8SelectionProviderAttempt] = []
+
+    @property
+    def provider_attempts(self) -> tuple[P8SelectionProviderAttempt, ...]:
+        """Every request the latest capture really made, even if it failed."""
+        return tuple(self._provider_attempts)
 
     def _request(
         self,
@@ -717,7 +801,18 @@ class MassiveAdvancedOptionsSelectionSource:
                 raise ValueError(
                     "P8 Massive selection next_url is not approved"
                 )
-            response = self._transport.get(next_url, next_params)
+            try:
+                response = self._transport.get(next_url, next_params)
+            except Exception:
+                self._provider_attempts.append(P8SelectionProviderAttempt(
+                    getattr(self._transport, "http_status", None),
+                    getattr(self._transport, "response_bytes", 0),
+                ))
+                raise
+            self._provider_attempts.append(P8SelectionProviderAttempt(
+                response.status_code,
+                len(response.body),
+            ))
             if response.status_code != 200:
                 raise RuntimeError(
                     f"P8 Massive selection failed for {underlyer}: "
@@ -759,6 +854,10 @@ class MassiveAdvancedOptionsSelectionSource:
                     "P8 Massive selection scope changed for "
                     f"{underlyer}"
                 )
+            self._provider_attempts[-1] = replace(
+                self._provider_attempts[-1],
+                row_count=len(payload["results"]),
+            )
             for row in payload["results"]:
                 if not isinstance(row, dict):
                     raise TypeError(
@@ -797,8 +896,18 @@ class MassiveAdvancedOptionsSelectionSource:
             )
             next_params = {}
         if not candidates or not snapshot_clocks:
-            raise ValueError(
-                f"P8 Massive selection has no usable contracts for {underlyer}"
+            rows = tuple(
+                row
+                for page in pages
+                for row in page["results"]
+            )
+            raise P8SelectionNoUsableContracts(
+                underlyer,
+                row_count=len(rows),
+                page_count=len(pages),
+                rejections=Counter(
+                    _snapshot_rejection_reason(row) for row in rows
+                ),
             )
         aggregate = {
             "status": "OK",
@@ -831,6 +940,7 @@ class MassiveAdvancedOptionsSelectionSource:
         reviewed_at: datetime,
         session_date: date,
     ) -> P8ActivitySelectionCapture:
+        self._provider_attempts = []
         reviewed = _utc(reviewed_at, "reviewed_at")
         if reviewed.date() != session_date:
             raise ValueError("P8 selection session date changed")

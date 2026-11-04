@@ -24,6 +24,7 @@ x-advanced-environment: &advanced-environment
   REALTIME_V3_OPTIONS_ESTABLISHED_MEASURED_CAPACITY: "${REALTIME_V3_OPTIONS_ESTABLISHED_MEASURED_CAPACITY:-}"
   REALTIME_V3_OPTIONS_EFFECTIVE_PROVIDER_PROJECT_CEILING: "${REALTIME_V3_OPTIONS_EFFECTIVE_PROVIDER_PROJECT_CEILING:-}"
   REALTIME_V3_OPTIONS_MAXIMUM_PROVIDER_REQUESTS_PER_UNDERLYING: "${REALTIME_V3_OPTIONS_MAXIMUM_PROVIDER_REQUESTS_PER_UNDERLYING:-}"
+  REALTIME_V3_OPTIONS_CAPTURE_POLICY: "${REALTIME_V3_OPTIONS_CAPTURE_POLICY:-}"
 
 x-downstream-labels: &downstream-labels
   stockscreener.realtime.transition-plane: downstream
@@ -212,6 +213,7 @@ services:
       - continuous
       - --execute
     environment:
+      REALTIME_V3_OFF_HOURS_SLEEP: ${REALTIME_V3_OFF_HOURS_SLEEP:-ENABLED}
       <<: *advanced-environment
       REALTIME_V2_ADVANCED_JOURNAL_DIR: /var/lib/realtime-v2-advanced
     secrets:
@@ -224,6 +226,10 @@ services:
         - CMD
         - python
         - -B
+        - scripts/check_realtime_v2_role_sleep.py
+        - --
+        - python
+        - -B
         - scripts/run_realtime_v2_container.py
         - --component
         - ingress
@@ -231,6 +237,7 @@ services:
         - /run/secrets/realtime_v2_app_dsn
         - --provider-key-file
         - /run/secrets/realtime_v2_provider_key
+        - --health-probe
         - --
         - python
         - -B
@@ -270,6 +277,7 @@ services:
       - --continuous
       - --execute
     environment:
+      REALTIME_V3_OFF_HOURS_SLEEP: ${REALTIME_V3_OFF_HOURS_SLEEP:-ENABLED}
       REALTIME_V2_EQUITY_PIPELINE: MASSIVE_ADVANCED
       REALTIME_V2_OPTIONS_PIPELINE: DISABLED
       REALTIME_V2_ADVANCED_JOURNAL_DIR: /var/lib/realtime-v2-advanced
@@ -282,11 +290,16 @@ services:
         - CMD
         - python
         - -B
+        - scripts/check_realtime_v2_role_sleep.py
+        - --
+        - python
+        - -B
         - scripts/run_realtime_v2_container.py
         - --component
         - bridge
         - --app-dsn-file
         - /run/secrets/realtime_v2_app_dsn
+        - --health-probe
         - --
         - python
         - -B
@@ -326,12 +339,13 @@ services:
       - --finality-delay-seconds
       - ${REALTIME_V2_ADVANCED_FINALITY_DELAY_SECONDS:-5}
       - --publication-mode
-      - projection-only
+      - continuous-publication
       - --report-directory
       - /var/lib/realtime-v2-reports/windows
       - --continuous
       - --execute
     environment:
+      REALTIME_V3_OFF_HOURS_SLEEP: ${REALTIME_V3_OFF_HOURS_SLEEP:-ENABLED}
       <<: *advanced-environment
     secrets:
       - realtime_v2_app_dsn
@@ -342,11 +356,16 @@ services:
         - CMD
         - python
         - -B
+        - scripts/check_realtime_v2_role_sleep.py
+        - --
+        - python
+        - -B
         - scripts/run_realtime_v2_container.py
         - --component
         - scheduler
         - --app-dsn-file
         - /run/secrets/realtime_v2_app_dsn
+        - --health-probe
         - --
         - python
         - -B
@@ -390,6 +409,8 @@ services:
       - --claim-limit
       - ${REALTIME_V2_ADVANCED_FINALIZER_CLAIM_LIMIT:-1}
       - --execute
+    environment:
+      REALTIME_V3_OFF_HOURS_SLEEP: ${REALTIME_V3_OFF_HOURS_SLEEP:-ENABLED}
     secrets:
       - realtime_v2_app_dsn
     healthcheck:
@@ -397,11 +418,16 @@ services:
         - CMD
         - python
         - -B
+        - scripts/check_realtime_v2_role_sleep.py
+        - --
+        - python
+        - -B
         - scripts/run_realtime_v2_container.py
         - --component
         - finalizer
         - --app-dsn-file
         - /run/secrets/realtime_v2_app_dsn
+        - --health-probe
         - --
         - python
         - -B
@@ -440,6 +466,7 @@ services:
       - --continuous
       - --execute
     environment:
+      REALTIME_V3_OFF_HOURS_SLEEP: ${REALTIME_V3_OFF_HOURS_SLEEP:-ENABLED}
       <<: *advanced-environment
     secrets:
       - realtime_v2_app_dsn
@@ -448,11 +475,16 @@ services:
         - CMD
         - python
         - -B
+        - scripts/check_realtime_v2_role_sleep.py
+        - --
+        - python
+        - -B
         - scripts/run_realtime_v2_container.py
         - --component
         - detectors
         - --app-dsn-file
         - /run/secrets/realtime_v2_app_dsn
+        - --health-probe
         - --
         - python
         - -B
@@ -495,6 +527,7 @@ services:
       - --continuous
       - --execute
     environment:
+      REALTIME_V3_OFF_HOURS_SLEEP: ${REALTIME_V3_OFF_HOURS_SLEEP:-ENABLED}
       <<: *advanced-environment
       REALTIME_V2_ROLE_PREFIX: ${REALTIME_V2_ROLE_PREFIX:-stocks_realtime_v2}
     secrets:
@@ -504,11 +537,16 @@ services:
         - CMD
         - python
         - -B
+        - scripts/check_realtime_v2_role_sleep.py
+        - --
+        - python
+        - -B
         - scripts/run_realtime_v2_container.py
         - --component
         - canonical-stock-alerts
         - --app-dsn-file
         - /run/secrets/realtime_v2_app_dsn
+        - --health-probe
         - --
         - python
         - -B
@@ -553,7 +591,7 @@ services:
       - --execute
     environment:
       <<: *advanced-environment
-      REALTIME_V2_EQUITY_PIPELINE: DISABLED
+      REALTIME_V2_EQUITY_PIPELINE: MASSIVE_ADVANCED
       REALTIME_V2_OPTIONS_PIPELINE: MASSIVE_ADVANCED
       REALTIME_V3_OPTIONS_STATE_SOURCE: postgres
     secrets:
@@ -647,6 +685,7 @@ services:
       - --continuous
       - --execute
     environment:
+      REALTIME_V3_OFF_HOURS_SLEEP: ${REALTIME_V3_OFF_HOURS_SLEEP:-ENABLED}
       REALTIME_V2_EQUITY_PIPELINE: MASSIVE_ADVANCED
       REALTIME_V2_OPTIONS_PIPELINE: MASSIVE_ADVANCED
       REALTIME_V2_ROLE_PREFIX: ${REALTIME_V2_ROLE_PREFIX:-stocks_realtime_v2}
@@ -656,6 +695,21 @@ services:
     healthcheck:
       test:
         - CMD
+        - python
+        - -B
+        - scripts/check_realtime_v2_role_sleep.py
+        - --
+        - python
+        - -B
+        - scripts/run_realtime_v2_container.py
+        - --component
+        - options-scheduler
+        - --app-dsn-file
+        - /run/secrets/realtime_v2_app_dsn
+        - --provider-key-file
+        - /run/secrets/realtime_v2_provider_key
+        - --health-probe
+        - --
         - python
         - -B
         - scripts/check_advanced_realtime_v3_service.py
@@ -691,6 +745,7 @@ services:
       - postgres
       - --continuous
     environment:
+      REALTIME_V3_OFF_HOURS_SLEEP: ${REALTIME_V3_OFF_HOURS_SLEEP:-ENABLED}
       REALTIME_V2_EQUITY_PIPELINE: DISABLED
       REALTIME_V2_OPTIONS_PIPELINE: MASSIVE_ADVANCED
       REALTIME_V3_VALIDATION_MODE: ${REALTIME_V3_VALIDATION_MODE:-PRODUCTION_STRICT}
@@ -706,6 +761,19 @@ services:
     healthcheck:
       test:
         - CMD
+        - python
+        - -B
+        - scripts/check_realtime_v2_role_sleep.py
+        - --
+        - python
+        - -B
+        - scripts/run_realtime_v2_container.py
+        - --component
+        - options-p8-ingress
+        - --app-dsn-file
+        - /run/secrets/realtime_v2_app_dsn
+        - --health-probe
+        - --
         - python
         - -W
         - ignore
@@ -756,6 +824,7 @@ services:
       - --continuous
       - --execute
     environment:
+      REALTIME_V3_OFF_HOURS_SLEEP: ${REALTIME_V3_OFF_HOURS_SLEEP:-ENABLED}
       REALTIME_V2_EQUITY_PIPELINE: DISABLED
       REALTIME_V2_OPTIONS_PIPELINE: MASSIVE_ADVANCED
       REALTIME_V3_VALIDATION_MODE: ${REALTIME_V3_VALIDATION_MODE:-PRODUCTION_STRICT}
@@ -770,6 +839,21 @@ services:
     healthcheck:
       test:
         - CMD
+        - python
+        - -B
+        - scripts/check_realtime_v2_role_sleep.py
+        - --
+        - python
+        - -B
+        - scripts/run_realtime_v2_container.py
+        - --component
+        - options-v3-acquisition
+        - --app-dsn-file
+        - /run/secrets/realtime_v2_app_dsn
+        - --provider-key-file
+        - /run/secrets/realtime_v2_provider_key
+        - --health-probe
+        - --
         - python
         - -B
         - scripts/run_advanced_options_v3_acquisition.py
@@ -810,6 +894,7 @@ services:
       - postgres
       - --continuous
     environment:
+      REALTIME_V3_OFF_HOURS_SLEEP: ${REALTIME_V3_OFF_HOURS_SLEEP:-ENABLED}
       REALTIME_V2_EQUITY_PIPELINE: DISABLED
       REALTIME_V2_OPTIONS_PIPELINE: MASSIVE_ADVANCED
       REALTIME_V3_VALIDATION_MODE: ${REALTIME_V3_VALIDATION_MODE:-PRODUCTION_STRICT}
@@ -823,6 +908,19 @@ services:
     healthcheck:
       test:
         - CMD
+        - python
+        - -B
+        - scripts/check_realtime_v2_role_sleep.py
+        - --
+        - python
+        - -B
+        - scripts/run_realtime_v2_container.py
+        - --component
+        - options-p8-market-state
+        - --app-dsn-file
+        - /run/secrets/realtime_v2_app_dsn
+        - --health-probe
+        - --
         - python
         - -W
         - ignore
@@ -861,6 +959,7 @@ services:
       - postgres
       - --continuous
     environment:
+      REALTIME_V3_OFF_HOURS_SLEEP: ${REALTIME_V3_OFF_HOURS_SLEEP:-ENABLED}
       REALTIME_V2_EQUITY_PIPELINE: DISABLED
       REALTIME_V2_OPTIONS_PIPELINE: MASSIVE_ADVANCED
       REALTIME_V3_VALIDATION_MODE: ${REALTIME_V3_VALIDATION_MODE:-PRODUCTION_STRICT}
@@ -874,6 +973,19 @@ services:
     healthcheck:
       test:
         - CMD
+        - python
+        - -B
+        - scripts/check_realtime_v2_role_sleep.py
+        - --
+        - python
+        - -B
+        - scripts/run_realtime_v2_container.py
+        - --component
+        - options-p8-flow
+        - --app-dsn-file
+        - /run/secrets/realtime_v2_app_dsn
+        - --health-probe
+        - --
         - python
         - -W
         - ignore
@@ -912,6 +1024,7 @@ services:
       - postgres
       - --continuous
     environment:
+      REALTIME_V3_OFF_HOURS_SLEEP: ${REALTIME_V3_OFF_HOURS_SLEEP:-ENABLED}
       REALTIME_V2_EQUITY_PIPELINE: DISABLED
       REALTIME_V2_OPTIONS_PIPELINE: MASSIVE_ADVANCED
       REALTIME_V3_VALIDATION_MODE: ${REALTIME_V3_VALIDATION_MODE:-PRODUCTION_STRICT}
@@ -919,10 +1032,24 @@ services:
     secrets:
       - realtime_v2_app_dsn
     volumes:
+      - realtime_v2_advanced_journals:/var/lib/realtime-v2-advanced
       - realtime_v2_advanced_reports:/var/lib/realtime-v2-reports
     healthcheck:
       test:
         - CMD
+        - python
+        - -B
+        - scripts/check_realtime_v2_role_sleep.py
+        - --
+        - python
+        - -B
+        - scripts/run_realtime_v2_container.py
+        - --component
+        - options-p8-window
+        - --app-dsn-file
+        - /run/secrets/realtime_v2_app_dsn
+        - --health-probe
+        - --
         - python
         - -W
         - ignore
@@ -1330,8 +1457,6 @@ services:
       args:
         VITE_API_BASE_URL: /api
         VITE_REALTIME_ONLY: "true"
-        VITE_REALTIME_COHORT_ID: ${REALTIME_V2_ADVANCED_COHORT_ID:-00000000-0000-0000-0000-000000000000}
-        VITE_REALTIME_OPTIONS_V2: ${VITE_REALTIME_OPTIONS_V2:-false}
     container_name: stock-screener-realtime-v2-advanced-frontend
     restart: unless-stopped
     stop_grace_period: 20s

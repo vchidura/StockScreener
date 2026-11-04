@@ -6,7 +6,10 @@ from uuid import UUID
 
 from psycopg2.extras import execute_batch, execute_values, register_uuid
 
-from .equity_bar_adapter import RealtimeEquityBarFact
+from .equity_bar_adapter import (
+    MAXIMUM_HISTORY_BINDING_DEPTH,
+    RealtimeEquityBarFact,
+)
 
 
 register_uuid()
@@ -285,6 +288,7 @@ def load_current_bar_groups_cursor(
     history_source_cohort_id: UUID | None = None,
     history_source_provider_tier: str | None = None,
     history_before: datetime | None = None,
+    history_source_scopes: Sequence[tuple[UUID, str, datetime]] = (),
 ) -> dict[str, list[dict]]:
     """The bars `rt.bar_current` points at for one ticker, per lineage-head group (`interval:basis`).
 
@@ -307,7 +311,20 @@ def load_current_bar_groups_cursor(
         parameters.extend((interval, basis, first_bar_start, last_bar_end))
     scope_sql = "(cur.cohort_id=%s AND cur.provider_tier=%s)"
     scope_params: tuple = (str(cohort_id), provider_tier)
-    if history_source_cohort_id is not None:
+    if history_source_scopes:
+        if len(history_source_scopes) > MAXIMUM_HISTORY_BINDING_DEPTH:
+            raise ValueError("bar group history scope depth is too large")
+        for source_id, source_tier, before in history_source_scopes:
+            if (
+                not isinstance(source_id, UUID)
+                or source_tier not in {"MASSIVE_ADVANCED", "MASSIVE_DEVELOPER"}
+                or before.tzinfo is None or before.utcoffset() is None
+            ):
+                raise ValueError("bar group history source identity is invalid")
+            scope_sql += " OR (cur.cohort_id=%s AND cur.provider_tier=%s AND cur.bar_end<%s)"
+            scope_params = (*scope_params, str(source_id), source_tier, before)
+        scope_sql = "(" + scope_sql + ")"
+    elif history_source_cohort_id is not None:
         if (
             history_source_provider_tier is None
             or history_before is None
@@ -325,7 +342,8 @@ def load_current_bar_groups_cursor(
             history_before,
         )
     cursor.execute(
-        "SELECT cur.interval AS interval, cur.adjustment_basis AS adjustment_basis, "
+        "SELECT DISTINCT ON (cur.interval,cur.adjustment_basis,cur.bar_start) "
+        "cur.interval AS interval, cur.adjustment_basis AS adjustment_basis, "
         "revision.bar_revision_id AS bar_revision_id, revision.bar_start AS bar_start, "
         "revision.bar_end AS bar_end, revision.open_price AS open_price, "
         "revision.high_price AS high_price, revision.low_price AS low_price, "
@@ -339,7 +357,9 @@ def load_current_bar_groups_cursor(
         "WHERE " + scope_sql + " AND cur.instrument_id=%s "
         "AND cur.session_scope='RTH' AND revision.security_id=%s AND revision.ticker=%s "
         "AND revision.is_final AND (" + " OR ".join(predicates) + ") "
-        "ORDER BY cur.interval, cur.adjustment_basis, cur.bar_start",
+        "ORDER BY cur.interval,cur.adjustment_basis,cur.bar_start,"
+        + _current_source_precedence("cur")
+        + " DESC,revision.observed_at DESC,revision.created_at DESC,revision.bar_revision_id",
         (
             *scope_params,
             instrument_id,

@@ -34,50 +34,27 @@ BASE = [
 ]
 
 
-def test_exact_nine_reference_seed_satisfies_readiness():
+def _run_reference_gate(rows, *, continuous_publication=False):
     statements = []
+    remaining = iter(rows)
+    readiness = []
 
     class Cursor:
-        rows = iter((
-            (
-                "seed-1",
-                "READY",
-                script.datetime(
-                    2026,
-                    10,
-                    27,
-                    12,
-                    tzinfo=script.timezone.utc,
-                ),
-                script.datetime(
-                    2026,
-                    10,
-                    27,
-                    18,
-                    tzinfo=script.timezone.utc,
-                ),
-            ),
-            (9, 9),
-        ))
-
         def execute(self, statement, _parameters=None):
             statements.append(statement)
 
         def fetchone(self):
-            return next(self.rows)
+            return next(remaining)
 
     @contextmanager
     def transaction(*_args, **_kwargs):
         yield SimpleNamespace(cursor=Cursor())
 
-    readiness = []
-    repository = SimpleNamespace(
-        upsert_readiness=lambda *args: readiness.append(args)
-    )
     args = SimpleNamespace(
         cohort_id=script.UUID(
             "11111111-1111-1111-1111-111111111111"
         ),
+        session_date=script.datetime(2026, 10, 27).date(),
         cutoff=script.datetime(
             2026,
             10,
@@ -85,20 +62,136 @@ def test_exact_nine_reference_seed_satisfies_readiness():
             14,
             tzinfo=script.timezone.utc,
         ),
+        continuous_publication=continuous_publication,
+    )
+    try:
+        script._ensure_reference_readiness(
+            SimpleNamespace(transaction=transaction),
+            SimpleNamespace(
+                upsert_readiness=lambda *values: readiness.append(values)
+            ),
+            args,
+        )
+    except ValueError as error:
+        return statements, readiness, error
+    return statements, readiness, None
+
+
+def _seed_row(valid_until_hour):
+    return (
+        "seed-1",
+        "READY",
+        script.datetime(2026, 10, 27, 12, tzinfo=script.timezone.utc),
+        script.datetime(
+            2026,
+            10,
+            27,
+            valid_until_hour,
+            tzinfo=script.timezone.utc,
+        ),
     )
 
-    script._ensure_reference_readiness(
-        SimpleNamespace(transaction=transaction),
-        repository,
-        args,
+
+def test_exact_nine_reference_seed_satisfies_readiness():
+    statements, readiness, error = _run_reference_gate(
+        (None, _seed_row(18), (9, 9))
     )
 
-    assert "EQUITY_VALIDATION_REFERENCES" in statements[0]
+    assert error is None
+    assert "realtime_desired_session_snapshots" in statements[0]
+    assert "EQUITY_VALIDATION_REFERENCES" in statements[1]
     assert readiness[0][1:4] == (
         "REFERENCE",
         "stages_v3",
         "READY",
     )
+    assert readiness[0][5] == "advanced-reference:seed-1"
+
+
+def test_continuous_cohort_is_proven_without_a_global_seed():
+    statements, readiness, error = _run_reference_gate(
+        (("a" * 64,), (9, 9, 9))
+    )
+
+    assert error is None
+    assert not any("rt.seed_current" in row for row in statements)
+    assert "ref.corporate_action_coverage" in statements[1]
+    assert readiness[0][1:4] == (
+        "REFERENCE",
+        "stages_v3",
+        "READY",
+    )
+    assert readiness[0][5] == "advanced-reference-c4:" + "a" * 64
+
+
+@pytest.mark.parametrize(
+    "members",
+    ((9, 8, 9), (9, 9, 10), (10, 9, 9), None),
+)
+def test_continuous_cohort_requires_every_member_and_never_falls_back(
+    members,
+):
+    statements, readiness, error = _run_reference_gate(
+        (("a" * 64,), members)
+    )
+
+    assert "continuous member references" in str(error)
+    assert readiness == []
+    assert not any("rt.seed_current" in row for row in statements)
+
+
+@pytest.mark.parametrize(
+    "rows",
+    (
+        (None, _seed_row(13), (9, 9)),
+        (None, None, (9, 9)),
+        (None, _seed_row(18), (9, 8)),
+    ),
+)
+def test_other_cohorts_still_require_a_current_global_seed(rows):
+    _statements, readiness, error = _run_reference_gate(rows)
+
+    assert "reference readiness is unavailable" in str(error)
+    assert readiness == []
+
+
+def test_continuous_publication_requires_a_desired_snapshot_cohort():
+    _statements, readiness, error = _run_reference_gate(
+        (None, _seed_row(18), (9, 9)),
+        continuous_publication=True,
+    )
+
+    assert "requires a desired-snapshot cohort" in str(error)
+    assert readiness == []
+
+
+def test_continuous_publication_enables_the_publish_stage_without_a_file():
+    args = script.parse_args([*BASE, "--continuous-publication"])
+
+    assert "PORTAL_PUBLISH" in args.enabled_stages
+    assert args.publication_authority is None
+    assert "PORTAL_PUBLISH" not in script.parse_args(BASE).enabled_stages
+
+
+def test_continuous_publication_replaces_the_one_shot_publish_path():
+    with pytest.raises(SystemExit):
+        script.parse_args([
+            *BASE,
+            "--continuous-publication",
+            "--publish",
+            "--publication-reference=one-shot",
+        ])
+
+
+def test_diagnostic_mode_cannot_publish_continuously():
+    with pytest.raises(RuntimeError, match="cannot publish"):
+        script._validation_policy(
+            SimpleNamespace(publish=False, continuous_publication=True),
+            {
+                "REALTIME_V3_VALIDATION_MODE": "DEVELOPMENT_DIAGNOSTIC",
+                "REALTIME_V3_PROVIDER_FREE_QUALIFICATION": "ENABLED",
+            },
+        )
 
 
 def test_stock_alert_projection_reads_v2_repeatable_snapshot(monkeypatch):
@@ -175,7 +268,7 @@ def test_development_diagnostic_equity_stops_at_projection():
         "REALTIME_V3_PROVIDER_FREE_QUALIFICATION": "ENABLED",
     }
     policy = script._validation_policy(
-        SimpleNamespace(publish=False),
+        SimpleNamespace(publish=False, continuous_publication=False),
         environment,
     )
 

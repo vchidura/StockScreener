@@ -1,6 +1,14 @@
 import { useEffect, useState } from 'react'
 import { useLocation, useSearchParams } from 'react-router-dom'
-import { fetchMarketNotificationWindow, fetchMaterializationStatus, type MaterializationStatus, type MarketNotificationWindow } from '../services/api'
+import {
+  fetchMarketNotificationWindow,
+  fetchMaterializationStatus,
+  fetchOptionsMaterializationStatus,
+  fetchScreeningMaterializationStatus,
+  type MaterializationStatus,
+  type MarketNotificationWindow,
+} from '../services/api'
+import { realtimeOptionsReadsEnabled } from '../services/portalIdentity'
 import { activeTickerSymbol } from './navigation'
 import { isDailyStrategyPath } from '../pages/publicationNavigation'
 
@@ -34,10 +42,24 @@ function formatMarketTime(value: string | null): string {
 }
 
 function describe(status: MaterializationStatus): string {
-  const asOf = formatMarketTime(status.last_market_time)
+  const asOf = formatMarketTime(status.oldest_stale_market_time ?? status.last_market_time)
   const intervals = status.stale_intervals.join(', ')
   const scope = intervals ? ` Affected timeframes: ${intervals}.` : ''
-  return `Showing the latest retained values as of ${asOf}.${scope}`
+  const sessions = status.staleness_sessions === 1
+    ? '1 session behind.'
+    : `${status.staleness_sessions} sessions behind.`
+  return `Showing the latest retained content. ${sessions} Oldest published timestamp: ${asOf}.${scope}`
+}
+
+function age(value: string | null | undefined, now: number): string {
+  if (!value) return 'unknown'
+  const elapsed = Math.max(0, now - Date.parse(value))
+  if (!Number.isFinite(elapsed)) return 'unknown'
+  const minutes = Math.floor(elapsed / 60_000)
+  if (minutes < 60) return `${minutes}m`
+  const hours = Math.floor(minutes / 60)
+  if (hours < 48) return `${hours}h ${minutes % 60}m`
+  return `${Math.floor(hours / 24)}d ${hours % 24}h`
 }
 
 export function StalenessBanner() {
@@ -46,14 +68,21 @@ export function StalenessBanner() {
   const [params] = useSearchParams()
   const location = useLocation()
   const ticker = activeTickerSymbol(location.pathname) ?? undefined
-  const historicalTicker = realtimeOnly && (ticker !== undefined || location.pathname === '/pattern-watch' || location.pathname === '/overview')
+  const historicalView = realtimeOnly
+    && (params.has('session_date') || params.has('evaluation_session'))
+  const optionsSurface = realtimeOnly && location.pathname.startsWith('/options/')
+  const screeningSurface = realtimeOnly && location.pathname === '/stocks/screener'
   const snapshotId = params.get('snapshot_id') ?? undefined
   const dailyStrategies = isDailyStrategyPath(location.pathname)
   const interval = params.get('interval') === '1h' ? '1h' : '1d'
-  const scope = JSON.stringify([realtimeOnly, snapshotId, ticker, dailyStrategies, interval, historicalTicker])
+  const optionsEnabled = realtimeOptionsReadsEnabled()
+  const scope = JSON.stringify([
+    realtimeOnly, snapshotId, ticker, dailyStrategies, interval,
+    historicalView, optionsSurface, optionsEnabled, screeningSurface,
+  ])
 
   useEffect(() => {
-    if (historicalTicker) return
+    if (historicalView || optionsSurface && !optionsEnabled) return
     let cancelled = false
     let inFlight = false
     let boundaryTimer: ReturnType<typeof window.setTimeout> | undefined
@@ -78,7 +107,11 @@ export function StalenessBanner() {
           }, remaining)
         }
         if (!marketNotificationsEnabled(market)) return
-        const next = await fetchMaterializationStatus(snapshotId, ticker, dailyStrategies, interval)
+        const next = optionsSurface
+          ? await fetchOptionsMaterializationStatus(market.session, market.checked_at)
+          : screeningSurface
+            ? await fetchScreeningMaterializationStatus()
+            : await fetchMaterializationStatus(snapshotId, ticker, dailyStrategies, interval)
         if (!cancelled) {
           setNotification({ ...current, status: next })
         }
@@ -97,9 +130,12 @@ export function StalenessBanner() {
       window.clearInterval(timer)
       if (boundaryTimer !== undefined) window.clearTimeout(boundaryTimer)
     }
-  }, [realtimeOnly, snapshotId, ticker, dailyStrategies, scope, historicalTicker])
+  }, [
+    realtimeOnly, snapshotId, ticker, dailyStrategies, interval, scope,
+    historicalView, optionsSurface, optionsEnabled, screeningSurface,
+  ])
 
-  if (historicalTicker || !notification || notification.scope !== scope
+  if (historicalView || optionsSurface && !optionsEnabled || !notification || notification.scope !== scope
     || !marketNotificationsEnabled(notification.market, Date.now() - notification.receivedAt)) return null
   const { status, unavailable } = notification
 
@@ -107,7 +143,7 @@ export function StalenessBanner() {
     if (!unavailable) return null
     return (
       <div className="tm-staleness" role="status" aria-live="polite">
-        <span className="tm-staleness__badge">Market data status unavailable</span>
+        <span className="tm-staleness__badge">DATA STATUS UNAVAILABLE</span>
         <span className="tm-staleness__text">Pages remain available with their latest retained content.</span>
         <span className="tm-staleness__hint">Use the timestamps shown in each view.</span>
       </div>
@@ -125,16 +161,17 @@ export function StalenessBanner() {
       aria-live="polite"
     >
       <span className="tm-staleness__badge">
-        {updating ? 'Updating market data' : 'Delayed market data'}
+        STALE DATA{updating ? ' - updating' : ''}
       </span>
       <span className="tm-staleness__text">
         {updating
           ? `Equity ${active} analysis is processing. ${describe(status)}`
           : describe(status)}
       </span>
-      {updating && (
-        <span className="tm-staleness__hint">Pages remain available while a newer publication is prepared.</span>
-      )}
+      <span className="tm-staleness__hint">
+        Retained setup age: {age(status.retained_setup_generated_at, Date.now())}.
+        {updating ? ' Pages remain available while a newer publication is prepared.' : ''}
+      </span>
     </div>
   )
 }

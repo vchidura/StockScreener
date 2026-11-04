@@ -1,11 +1,11 @@
 import api from './api'
+import { realtimeCohortId } from './portalIdentity'
 import type { GapDetails, GapPredicate, HourlyDetails, ScreeningCatalog, ScreeningRequest, ScreeningResult } from '../pages/screeningModel'
 
 const screeningParams = () => {
   if (import.meta.env.VITE_REALTIME_ONLY !== 'true') return undefined
-  const cohort_id = import.meta.env.VITE_REALTIME_COHORT_ID?.trim()
-  if (!cohort_id) throw new Error('Realtime screening requires VITE_REALTIME_COHORT_ID')
-  return { cohort_id }
+  const cohort_id = realtimeCohortId()
+  return cohort_id ? { cohort_id, read_mode: 'retained' } : { read_mode: 'retained' }
 }
 
 export const getScreeningCatalog = async (signal?: AbortSignal): Promise<ScreeningCatalog> => (await api.get('/stocks/screening/catalog', { signal, params: screeningParams() })).data

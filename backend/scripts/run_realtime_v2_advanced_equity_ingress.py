@@ -114,11 +114,17 @@ from scripts.realtime_script_support import write_report  # noqa: E402
 
 
 UTC = timezone.utc
+# Progress is published several times a minute, so this is about one minute.
+STATUS_REJECTION_LIMIT = 6
 
 
 class AdvancedConnectionLeaseLost(RuntimeError):
     def __init__(self, detail: str = "CONNECTION_LEASE_LOST") -> None:
         super().__init__(detail)
+
+
+class AdvancedStreamStatusRejected(RuntimeError):
+    pass
 
 
 def _now() -> datetime:
@@ -314,12 +320,26 @@ async def _run_once(gateway, messages, duration, *, deadline=None, utc_clock=_no
     )
 
 
+def _raise_if_status_rejected(status_reporter) -> None:
+    # Durable state refusing progress means nothing reads this journal any
+    # more. End the session so a new journal resumes the feed, instead of
+    # keeping a healthy socket whose frames never become bars.
+    if (
+        status_reporter.consecutive_failures >= STATUS_REJECTION_LIMIT
+        and status_reporter.last_failure_name == "ValueError"
+    ):
+        raise AdvancedStreamStatusRejected(
+            "Advanced stream status updates were rejected"
+        )
+
+
 async def _run_continuous(
     gateway,
     stop,
     poll_interval_seconds,
     drain_deadline,
     utc_clock=_now,
+    status_check=None,
 ):
     remaining = (drain_deadline - utc_clock()).total_seconds()
     if remaining <= 0 or stop.is_set():
@@ -334,6 +354,8 @@ async def _run_continuous(
             and utc_clock() < drain_deadline
             and loop.time() < monotonic_deadline
         ):
+            if status_check is not None:
+                status_check()
             await asyncio.sleep(min(
                 poll_interval_seconds,
                 max(0, (drain_deadline - utc_clock()).total_seconds()),
@@ -509,6 +531,8 @@ def _durably_close_failed_ingress(
     failure_code = (
         "CONNECTION_LEASE_LOST"
         if isinstance(error, AdvancedConnectionLeaseLost)
+        else "STREAM_STATUS_REJECTED"
+        if isinstance(error, AdvancedStreamStatusRejected)
         else str(error)
         if isinstance(
             error,
@@ -909,6 +933,9 @@ def main(argv=None) -> int:
                     stop,
                     settings.ingress_poll_interval_seconds,
                     provider_deadline,
+                    status_check=lambda: _raise_if_status_rejected(
+                        status_reporter
+                    ),
                 )
             )
         pump.request_stop()
@@ -998,6 +1025,7 @@ def main(argv=None) -> int:
         ValueError,
         JournalCapacityError,
         AdvancedConnectionLeaseLost,
+        AdvancedStreamStatusRejected,
     ) as error:
         failure = _durably_close_failed_ingress(
             provider=provider,

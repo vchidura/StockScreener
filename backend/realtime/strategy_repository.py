@@ -27,6 +27,7 @@ from .portal_projection_repository import (
     RELEASE_CLASS_SESSION_CLOSE,
 )
 from .preflight import ProviderTier
+from .reference_continuity import source_manifest_identity_cursor
 from .screening_repository import load_realtime_screening_input
 from .strategy_projection import (STRATEGY_KEY, STRATEGY_VERSION, HISTORY_VERSION, RECONSTRUCTED_VERSION,
     ROLLING_VERSION, HOURLY_ROLLING_VERSION, project_realtime_daily_strategies,
@@ -705,18 +706,39 @@ class RealtimeDailyStrategyRepository(_RealtimeCompatibilityRepository):
             self._begin(cursor)
             pinned = str(snapshot_id) if snapshot_id else None
             if pinned is None:
-                release = self._release(cursor, cohort_id)
-                entries = [entry for entry in (release.entry(version, STRATEGY_KEY) for version in versions)
-                           if entry is not None] if release is not None else []
+                if read_mode == "retained":
+                    entries = list(
+                        self._latest_release_entries(
+                            cursor,
+                            cohort_id,
+                            versions,
+                            STRATEGY_KEY,
+                            cutoff,
+                        )
+                    )
+                else:
+                    release = self._release(cursor, cohort_id)
+                    entries = [
+                        entry
+                        for entry in (
+                            release.entry(version, STRATEGY_KEY)
+                            for version in versions
+                        )
+                        if entry is not None
+                    ] if release is not None else []
                 if not entries:
                     raise StrategyPublicationUnavailable("No retained independent daily strategy release for this exact pin/cohort")
                 pinned = str(min(entries, key=lambda entry: (
                     -datetime.fromisoformat(entry["generated_at"]).timestamp(),
                     -int(entry["source_generation"]), str(entry["snapshot_id"])))["snapshot_id"])
             cursor.execute(
-                "SELECT snapshot.*, manifest.manifest_sha256 AS cohort_manifest_sha256, manifest.stock_count "
+                "SELECT snapshot.*, manifest.manifest_id AS cohort_manifest_id, "
+                "manifest.manifest_sha256 AS cohort_manifest_sha256, manifest.stock_count, "
+                "history_binding.binding_sha256 AS history_binding_sha256 "
                 "FROM " + SNAPSHOT_RELATION + " JOIN rt.cohorts AS cohort ON cohort.cohort_id=snapshot.cohort_id "
                 "JOIN rt.subscription_manifests AS manifest ON manifest.manifest_id=cohort.manifest_id "
+                "LEFT JOIN rt.cohort_history_bindings AS history_binding "
+                "ON history_binding.target_cohort_id=cohort.cohort_id "
                 "WHERE snapshot.cohort_id=%s AND snapshot.snapshot_type=ANY(%s) AND snapshot.snapshot_key=%s "
                 "AND snapshot.generated_at<=%s AND cohort.created_at<=%s AND cohort.effective_at<=%s AND manifest.created_at<=%s "
                 "AND snapshot.snapshot_id=%s",
@@ -725,10 +747,18 @@ class RealtimeDailyStrategyRepository(_RealtimeCompatibilityRepository):
             if stored is None or stored["payload"] is None:
                 raise StrategyPublicationUnavailable("No retained independent daily strategy release for this exact pin/cohort")
             manifest, payload = stored["source_manifest"], stored["payload"]
+            expected_source_manifest_sha256, _ = source_manifest_identity_cursor(
+                cursor,
+                manifest,
+                manifest_id=stored["cohort_manifest_id"],
+                cohort_manifest_sha256=stored["cohort_manifest_sha256"],
+                history_binding_sha256=stored["history_binding_sha256"],
+                cutoff=stored["generated_at"],
+            )
             checks = dict(
                 source_checksum=canonical_sha256(manifest) == stored["source_manifest_sha256"],
                 payload_checksum=canonical_sha256(payload) == stored["payload_sha256"],
-                cohort_manifest=manifest["source_manifest_sha256"] == stored["cohort_manifest_sha256"],
+                cohort_manifest=manifest["source_manifest_sha256"] == expected_source_manifest_sha256,
                 provider_tier=manifest["provider_tier"] == stored["provider_tier"],
                 source_generation=manifest["source_generation"] == stored["source_generation"],
                 member_count=manifest["expected_members"] == stored["stock_count"],

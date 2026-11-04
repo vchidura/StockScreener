@@ -17,6 +17,7 @@ from .contracts import canonical_sha256
 from .dashboard_projection import DAILY_SCANNER_CONTRACTS, SCANNER_BASIS, dashboard_frames, _overview
 from .portal_projection import build_portal_snapshot
 from .preflight import ProviderTier
+from .reference_continuity import source_manifest_continuity_fields
 from .screening_projection import SCREENING_BASIS, _validate_bars
 from .setup_summary_projection import produce_daily_setup_summary, produce_hourly_setup_summary
 from .strategy_persistence import build_strategy_persistence
@@ -215,6 +216,7 @@ def project_realtime_daily_strategies(inputs, *, reconstructed=False, interval="
              Path(__file__).parents[1] / "equity" / "materialization.py",
              Path(__file__).parents[1] / "equity" / "technicals.py",
              Path(__file__).parents[1] / "equity" / "setup_composition.py")})
+    manifest.update(source_manifest_continuity_fields(inputs))
     payload = dict(version=version, cohort_id=str(inputs.cohort_id), session=str(inputs.session),
         market_time=market_time.isoformat(), generated_at=inputs.cutoff.isoformat(),
         scope_note=f"Selected realtime cohort: {len(tickers)} tickers; not full-market or sector coverage.",

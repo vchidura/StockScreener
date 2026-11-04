@@ -13,6 +13,7 @@ from realtime.advanced_options_resident_barrier import (
     ResidentCompletionStatus,
     advanced_options_v3_session_status_cursor,
     evaluate_resident_completion_barrier_cursor,
+    load_ready_resident_window_targets_cursor,
     record_resident_completion_cursor,
     resident_completion_stage_outcome,
 )
@@ -399,3 +400,23 @@ def test_complete_resident_evidence_requires_downstream_offset_keys():
             reason_codes=(),
             completed_at=NOW,
         )
+
+
+def test_stopped_stream_releases_later_resident_window():
+    window_id, cohort_id, generation = uuid4(), uuid4(), uuid4()
+    cursor = BarrierCursor(rows=(
+        (str(window_id), str(cohort_id), str(generation), NOW),
+    ))
+
+    targets = load_ready_resident_window_targets_cursor(
+        cursor,
+        session_authorization_id=uuid4(),
+        member=ResidentCompletionMember.INGRESS,
+    )
+
+    assert targets[0].target_window_id == window_id
+    assert "stream.event_time_watermark>=cycle.options_cutoff" in (
+        cursor.statement
+    )
+    assert "stream.status='STOPPED'" in cursor.statement
+    assert "stream.ended_at<=cycle.options_cutoff" in cursor.statement

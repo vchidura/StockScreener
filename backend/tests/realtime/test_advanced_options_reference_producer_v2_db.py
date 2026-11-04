@@ -359,16 +359,8 @@ def _seed_reference_inputs(
     for index, bar_session in enumerate(sessions):
         revision_id = uuid4()
         source_revision_id = uuid4()
-        bar_start = datetime.combine(
-            bar_session,
-            time(13, 30),
-            tzinfo=UTC,
-        )
-        bar_end = datetime.combine(
-            bar_session,
-            time(20),
-            tzinfo=UTC,
-        )
+        bar_start = OptionExchangeCalendar().session_open(bar_session)
+        bar_end = OptionExchangeCalendar().session_close(bar_session)
         observed_at = bar_end + timedelta(minutes=5)
         close = Decimal("470") + Decimal(index)
         payload_sha256 = _digest(("bar", ticker, index))
@@ -394,10 +386,10 @@ def _seed_reference_inputs(
             "adjustment_basis,bar_start,bar_end,open_price,high_price,"
             "low_price,close_price,volume,vwap,transaction_count,"
             "source_kind,availability_mode,is_final,observed_at,"
-            "ingestion_segment_id,source_revision_ids,payload_sha256"
+            "ingestion_segment_id,source_revision_ids,payload_sha256,created_at"
             ") VALUES (%s,%s,'MASSIVE_ADVANCED',%s,%s,%s,'1d',%s,"
-            "'FULL_DAY','ADJUSTED',%s,%s,%s,%s,%s,%s,%s,%s,100,"
-            "'DERIVED','HISTORICAL_RECONSTRUCTED',true,%s,%s,%s,%s)",
+            "'RTH','ADJUSTED',%s,%s,%s,%s,%s,%s,%s,%s,100,"
+            "'DERIVED','HISTORICAL_RECONSTRUCTED',true,%s,%s,%s,%s,%s)",
             (
                 str(revision_id),
                 str(history_cohort_id),
@@ -417,6 +409,7 @@ def _seed_reference_inputs(
                 str(uuid4()),
                 [source_revision_id],
                 payload_sha256,
+                observed_at,
             ),
         )
         database_cursor.execute(
@@ -424,7 +417,7 @@ def _seed_reference_inputs(
             "cohort_id,provider_tier,instrument_id,interval,bar_start,"
             "session_scope,adjustment_basis,source_kind,bar_revision_id,"
             "bar_end,observed_at,updated_at) VALUES ("
-            "%s,'MASSIVE_ADVANCED',%s,'1d',%s,'FULL_DAY','ADJUSTED',"
+            "%s,'MASSIVE_ADVANCED',%s,'1d',%s,'RTH','ADJUSTED',"
             "'DERIVED',%s,%s,%s,%s)",
             (
                 str(history_cohort_id),

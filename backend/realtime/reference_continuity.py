@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from uuid import UUID
 
 from .contracts import canonical_sha256
 
@@ -129,6 +130,15 @@ def reference_continuity_manifest_fields(inputs):
     }
 
 
+def source_manifest_continuity_fields(inputs):
+    fields = reference_continuity_manifest_fields(inputs)
+    if len(inputs.history_scopes) > 1:
+        fields["history_scope_chain"] = [
+            scope.payload() for scope in inputs.history_scopes
+        ]
+    return fields
+
+
 def source_manifest_identity(
     *,
     cohort_manifest_sha256,
@@ -158,6 +168,23 @@ def source_manifest_identity_cursor(
     history_binding_sha256,
     cutoff,
 ):
+    history_chain = manifest.get("history_scope_chain", ())
+    if history_chain:
+        from .equity_history import validate_equity_history_scope_chain_cursor
+
+        # Readers pass the key with no value when the release recorded no known_by.
+        chain_known_by = manifest.get("known_by") or cutoff
+        if isinstance(chain_known_by, str):
+            chain_known_by = datetime.fromisoformat(chain_known_by)
+        scopes = validate_equity_history_scope_chain_cursor(
+            cursor,
+            cohort_id=UUID(str(manifest["cohort_id"])),
+            checked_at=chain_known_by,
+            expected_chain=history_chain,
+        )
+        if scopes[0].binding_sha256 != history_binding_sha256:
+            raise ValueError("publication history scope chain changed")
+        history_binding_sha256 = canonical_sha256(history_chain)
     continuity_sha256 = manifest.get("identity_continuity_sha256")
     known_by_value = manifest.get("known_by")
     if continuity_sha256 is None and known_by_value is None:

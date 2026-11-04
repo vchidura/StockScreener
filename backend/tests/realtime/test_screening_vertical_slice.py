@@ -20,11 +20,58 @@ from realtime.portal_projection_repository import persist_screening_generation_c
 from realtime.portal_projection import build_screening_generation
 from realtime.preflight import ProviderTier
 from realtime.equity_bar_adapter import adapt_developer_equity_bar
-from realtime.screening_projection import RealtimeScreeningInput, produce_realtime_screening
+from realtime.screening_projection import RealtimeScreeningInput, produce_realtime_screening, _validate_bars
 from realtime.screening_repository import load_realtime_screening_input
+from realtime.ticker_references import BarLineageChanged
 from research.screening import FIELDS, PATTERNS, VERSION, GapDetailRequest, Query, SnapshotRowRequest
 from equity.derivation import derive_canonical_bars
 from tests.realtime.test_equity_validation_history import COHORT_ID, OBSERVED_AT, _bar, _facts, _security
+
+
+@pytest.mark.parametrize("interval", ("1wk", "1mo"))
+def test_derived_calendar_periods_require_all_daily_sessions_not_overnight_adjacency(interval):
+    inputs = screening_fixture()
+    member = next(row for row in inputs.members if row["ticker"] == "AAPL")
+    first = date(2026, 9, 21) if interval == "1wk" else date(2026, 9, 1)
+    last = date(2026, 9, 25) if interval == "1wk" else date(2026, 9, 30)
+    sources = sorted((
+        row for row in inputs.bars
+        if row["ticker"] == "AAPL" and row["interval"] == "1d"
+        and row["adjustment_basis"] == "ADJUSTED" and first <= row["session_date"] <= last
+    ), key=lambda row: row["bar_start"])
+    target = {
+        **sources[0], "bar_revision_id": uuid5(NAMESPACE_URL, f"calendar-period-test:{interval}"),
+        "interval": interval, "session_date": last, "bar_end": sources[-1]["bar_end"],
+        "source_kind": "DERIVED", "source_revision_ids": tuple(row["bar_revision_id"] for row in sources),
+        "open": sources[0]["open"], "high": max(row["high"] for row in sources),
+        "low": min(row["low"] for row in sources), "close": sources[-1]["close"],
+        "volume": sum(row["volume"] for row in sources),
+    }
+    _validate_bars((*sources, target), member, inputs)
+    missing = sources[:2] + sources[3:]
+    incomplete = {**target, "source_revision_ids": tuple(row["bar_revision_id"] for row in missing)}
+    with pytest.raises(ValueError, match="source window/basis drift"):
+        _validate_bars((*missing, incomplete), member, inputs)
+
+
+def test_screening_retained_window_excludes_older_daily_lineage_sources():
+    inputs = screening_fixture()
+    adjusted = [
+        row for row in inputs.bars
+        if row["ticker"] == "AAPL" and row["interval"] == "1d" and row["adjustment_basis"] == "ADJUSTED"
+    ]
+    first = min(adjusted, key=lambda row: row["session_date"])
+    calendar = exchange_calendars.get_calendar("XNYS")
+    prior = calendar.previous_session(str(first["session_date"]))
+    extra = {
+        **first, "bar_revision_id": uuid5(NAMESPACE_URL, "older-daily-lineage-source"),
+        "session_date": prior.date(), "bar_start": calendar.session_open(prior).to_pydatetime(),
+        "bar_end": calendar.session_close(prior).to_pydatetime(),
+    }
+
+    generation = produce_realtime_screening(replace(inputs, bars=(*inputs.bars, extra)))
+
+    assert len(generation.rows) == 9
 
 
 def screening_fixture(session=date(2026, 10, 2), *, current=True):
@@ -109,10 +156,28 @@ def test_intraday_asof_projection_uses_prior_daily_session_and_completed_intrada
     inputs = screening_fixture()
     calendar = exchange_calendars.get_calendar("XNYS")
     cutoff = calendar.session_open(str(inputs.session)).to_pydatetime() + timedelta(hours=2)
+    # An as-of read retains 283 sessions ending at the prior session, one session
+    # earlier than the fixture's 283-session window starts.
+    older = []
+    for ticker in {row["ticker"] for row in inputs.members}:
+        first = min(
+            (
+                row for row in inputs.bars
+                if row["ticker"] == ticker and row["interval"] == "1d"
+                and row["adjustment_basis"] == "ADJUSTED"
+            ),
+            key=lambda row: row["session_date"],
+        )
+        prior = calendar.previous_session(str(first["session_date"]))
+        older.append({
+            **first, "bar_revision_id": uuid5(NAMESPACE_URL, f"asof-older-session:{ticker}"),
+            "session_date": prior.date(), "bar_start": calendar.session_open(prior).to_pydatetime(),
+            "bar_end": calendar.session_close(prior).to_pydatetime(),
+        })
     asof = replace(
         inputs,
         cutoff=cutoff,
-        bars=tuple(row for row in inputs.bars if row["bar_end"] <= cutoff),
+        bars=(*older, *(row for row in inputs.bars if row["bar_end"] <= cutoff)),
         known_by=cutoff + timedelta(minutes=15),
     )
 
@@ -182,6 +247,9 @@ class ScreeningStore:
             self.result = sorted(records, key=lambda r: (r["session_date"], r["generated_at"]), reverse=True)
         elif "FROM rt.screening_rows" in sql:
             self.result = sorted(self.rows.get(params[0], []), key=lambda r: (r["ticker"], r["security_id"]))
+        elif "FROM rt.portal_release_current" in sql:
+            # This store holds screening generations only; it has no release pointer.
+            self.result = []
         else:
             raise AssertionError(f"Unexpected SQL: {sql}")
 
@@ -220,7 +288,7 @@ def current_bars_of(inputs):
     return load
 
 
-def screening_app(bar_loader=None):
+def screening_app(bar_loader=None, clock=lambda: OBSERVED_AT):
     store = ScreeningStore()
     previous = produce_realtime_screening(screening_fixture(date(2026, 10, 1), current=False))
     inputs = screening_fixture()
@@ -229,7 +297,7 @@ def screening_app(bar_loader=None):
     store.publish(current)
     reader = RealtimeScreeningRepository(store.cursor, bar_loader=bar_loader or current_bars_of(inputs))
     app = create_realtime_portal_app(
-        RealtimePortalRepositories(None, None, None, reader), clock=lambda: OBSERVED_AT,
+        RealtimePortalRepositories(None, None, None, reader), clock=clock,
     )
     return app, store, previous, current
 
@@ -291,6 +359,42 @@ def test_nine_ticker_real_projection_persists_complete_frontend_contracts_and_de
             assert row.payload["missing"].get("discovery_state") == "LOW_LIQUIDITY"
     assert all("equity_bar_" not in sql and "equity_portal_" not in sql for sql in store.statements)
     assert any("legacy.manifest->>'version' IS DISTINCT FROM" in sql for sql in store.statements)
+
+
+def test_retained_screening_survives_lag_and_live_lineage_advance():
+    def changed_bars(*_args, **_kwargs):
+        raise BarLineageChanged("newer bars are now current")
+
+    app, _store, _previous, current = screening_app(
+        bar_loader=changed_bars,
+        clock=lambda: OBSERVED_AT + timedelta(days=10),
+    )
+    params = {"cohort_id": str(COHORT_ID)}
+    with TestClient(app) as client:
+        current_read = client.post(
+            "/api/stocks/screening/query",
+            params=params,
+            json=Query().model_dump(),
+        )
+        assert current_read.status_code == 404
+        retained = client.post(
+            "/api/stocks/screening/query",
+            params={**params, "read_mode": "retained"},
+            json=Query().model_dump(),
+        )
+        assert retained.status_code == 200, retained.text
+        body = retained.json()
+        assert body["generation"]["generation"] == current.manifest["generation"]
+        assert body["rows"]
+        assert body["stale"] is True
+        assert body["read_mode"] == "RETAINED"
+        status = client.get(
+            "/api/stocks/screening/status",
+            params={**params, "read_mode": "retained"},
+        )
+        assert status.status_code == 200, status.text
+        assert status.json()["status"] in {"STALE", "EXPIRED"}
+        assert status.json()["serving_latest_available"] is True
 
 
 @pytest.mark.parametrize("drift", ["history", "basis", "cohort", "identity", "coverage", "actions", "split", "quote", "hourly_lineage", "reference"])

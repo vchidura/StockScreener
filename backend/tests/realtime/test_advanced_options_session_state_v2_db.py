@@ -2072,6 +2072,7 @@ def test_c8_real_executor_provider_free_end_to_end_with_retry():
             seed = _seed_session(
                 database_cursor,
                 options_ready=False,
+                canonical_equity=True,
             )
             _seed_c8_equity_history(database_cursor, seed)
             _seed_complete_c8_reference(database_cursor, seed)
@@ -2211,6 +2212,7 @@ def test_c8_real_executor_uses_v2_allocation_for_generalized_membership():
             seed = _seed_session(
                 database_cursor,
                 options_ready=False,
+                canonical_equity=True,
             )
             _add_desired_option_underlying(database_cursor, "IWM")
             _seed_c8_equity_history(
@@ -2753,7 +2755,7 @@ def test_c8_real_executor_activates_from_full_size_paginated_chains(
         transports.chain_for = chain_for
         monkeypatch.setattr(
             preparation_module,
-            "RequestsPolygonHttpTransport",
+            "SingleAttemptPolygonHttpTransport",
             transports,
         )
         provider = _provider(pool)
@@ -3206,6 +3208,7 @@ def test_c8_stale_capture_refresh_survives_restart_before_allocation_freeze():
             seed = _seed_session(
                 database_cursor,
                 options_ready=False,
+                canonical_equity=True,
             )
             _seed_c8_equity_history(
                 database_cursor,
@@ -3661,6 +3664,397 @@ def test_c8_budget_exhaustion_persists_wait_and_releases_claim():
         assert lifecycle.reason_codes == (
             "WAITING_PROVIDER_BUDGET:CATALOG_QUOTE",
         )
+
+
+def test_c8_rejected_chain_is_accounted_and_cannot_drain_the_budget(
+    monkeypatch,
+):
+    """Replays 2026-11-02: every row rejected from a pre-open capture."""
+    calendar = OptionExchangeCalendar("XNYS")
+    session_open = calendar.session_open(SESSION_DATE)
+    hard_stop = calendar.session_close(SESSION_DATE) + timedelta(minutes=5)
+    transports = type(
+        "_Transport",
+        (_FullSizeChainTransport,),
+        {"instances": []},
+    )
+    with disposable_v2_database(
+        f"test_realtime_v2_c8_rejected_{uuid4().hex[:8]}"
+    ) as pool:
+        with cursor(pool) as database_cursor:
+            seed = _seed_session(
+                database_cursor,
+                options_ready=False,
+                canonical_equity=True,
+            )
+            _seed_c8_equity_history(database_cursor, seed)
+            _seed_c8_minute_spots(database_cursor, seed)
+            _seed_c8_dividend_coverage(database_cursor)
+            # 2026-11-02 failed four minutes before the open.
+            checked_at = session_open - timedelta(minutes=4)
+            reconcile_advanced_options_lifecycle_cursor(
+                database_cursor,
+                target_session_date=SESSION_DATE,
+                checked_at=checked_at,
+            )
+            database_cursor.connection.commit()
+
+        now = {"value": checked_at}
+
+        def chain_for(_transport, ticker):
+            rows = _full_size_chain(
+                ticker,
+                now["value"],
+                underlying_at=now["value"],
+            )[:500]
+            for row in rows:
+                row["last_quote"].update(bid=0, ask=0)
+            return rows
+
+        transports.chain_for = chain_for
+        monkeypatch.setattr(
+            preparation_module,
+            "SingleAttemptPolygonHttpTransport",
+            transports,
+        )
+        provider = _provider(pool)
+        executor = PostgresAutomaticOptionsPreparationExecutor(
+            provider,
+            api_key="provider-free",
+            backend_image_id="sha256:" + "c" * 64,
+            maximum_provider_requests_per_underlying=4,
+            clock=lambda: now["value"],
+        )
+        owner_id = uuid4()
+        retry_floor = session_open + timedelta(seconds=90)
+
+        def cycle(at):
+            now["value"] = at
+            return run_advanced_options_preparation_cycle(
+                provider,
+                executor,
+                owner_id=owner_id,
+                checked_at=at,
+                clock=lambda: at,
+            )
+
+        first = cycle(checked_at)
+        assert first["status"] == "RETRY"
+        assert first["ticker"] == "QQQ"
+        assert first["provider_requests"] == 2
+        assert first["retry_at_utc"] == retry_floor.isoformat()
+        assert first["reason"] == (
+            "NO_USABLE_CONTRACTS:QQQ:rows=500:NON_POSITIVE_ASK=500"
+        )
+        assert first["response_bytes"] > 0
+
+        with cursor(pool) as database_cursor:
+            database_cursor.execute(
+                "SELECT state,outcome,http_status,response_bytes,row_count,"
+                "pages_fetched,failure_code FROM rt.provider_request_ledger "
+                "ORDER BY pages_fetched DESC,failure_code"
+            )
+            ledger = database_cursor.fetchall()
+            database_cursor.execute(
+                "SELECT status,next_retry_at,retry_reason,"
+                "provider_request_count,response_bytes "
+                "FROM rt.advanced_options_preparation_work "
+                "WHERE ticker='QQQ' AND stage='CATALOG_QUOTE'"
+            )
+            work = database_cursor.fetchone()
+            lifecycle = reconcile_advanced_options_lifecycle_cursor(
+                database_cursor,
+                target_session_date=SESSION_DATE,
+                checked_at=checked_at,
+            )
+            database_cursor.execute(
+                "SELECT last_error FROM "
+                "rt.advanced_options_preparation_sessions"
+            )
+            last_error = database_cursor.fetchone()[0]
+            database_cursor.connection.commit()
+        used = [row for row in ledger if row[5] == 1]
+        unused = [row for row in ledger if row[5] == 0]
+        assert len(used) == 2
+        assert {row[:3] for row in used} == {("FAILED", "INVALID", 200)}
+        assert sum(row[3] for row in used) == first["response_bytes"]
+        assert [row[4] for row in used] == [250, 250]
+        assert len(unused) == 2
+        assert {row[6] for row in unused} == {"RESERVATION_NOT_USED"}
+        assert {row[3] for row in unused} == {0}
+        assert work == (
+            "RETRY",
+            retry_floor,
+            first["reason"],
+            2,
+            first["response_bytes"],
+        )
+        assert lifecycle.status == "PREPARING"
+        assert last_error.startswith(first["reason"])
+
+        # Before the open neither underlying can be retried, so a restart
+        # loop finds no work and reserves nothing more.
+        assert cycle(checked_at + timedelta(seconds=1))["ticker"] == "SPY"
+        for offset in (2, 3, 4):
+            idle = cycle(checked_at + timedelta(seconds=offset))
+            assert idle["status"] == "IDLE"
+        with cursor(pool) as database_cursor:
+            database_cursor.execute(
+                "SELECT count(*) FROM rt.provider_request_ledger"
+            )
+            assert database_cursor.fetchone()[0] == 8
+            database_cursor.connection.commit()
+
+        # After the open each underlying spends only its own three rounds.
+        statuses = []
+        at = retry_floor
+        for _ in range(12):
+            report = cycle(at)
+            statuses.append((report["status"], report.get("ticker")))
+            at += timedelta(minutes=10)
+        assert statuses.count(("RETRY", "QQQ")) == 2
+        assert statuses.count(("RETRY", "SPY")) == 2
+        assert ("WAITING_BUDGET", "QQQ") in statuses
+        assert ("WAITING_BUDGET", "SPY") in statuses
+        with cursor(pool) as database_cursor:
+            database_cursor.execute(
+                "SELECT count(*),count(*) FILTER (WHERE pages_fetched=1),"
+                "count(DISTINCT budget_scope_sha256) "
+                "FROM rt.provider_request_ledger"
+            )
+            assert database_cursor.fetchone() == (24, 12, 1)
+            database_cursor.execute(
+                "SELECT ticker,next_retry_at,retry_reason "
+                "FROM rt.advanced_options_preparation_work "
+                "WHERE stage='CATALOG_QUOTE' ORDER BY ticker"
+            )
+            assert database_cursor.fetchall() == [
+                ("QQQ", hard_stop, "PROVIDER_BUDGET_EXHAUSTED"),
+                ("SPY", hard_stop, "PROVIDER_BUDGET_EXHAUSTED"),
+            ]
+            database_cursor.connection.commit()
+
+
+def _exact_equity_snapshot(cursor, extra_ticker, *, identity_until):
+    """A desired snapshot whose manifest declares exactly its AM members."""
+    cursor.execute(
+        "SELECT revision_id::text,recorded_at "
+        "FROM rt.realtime_desired_revisions LIMIT 1"
+    )
+    revision_id, recorded_at = cursor.fetchone()
+    cursor.execute(
+        "SELECT manifest_id::text FROM rt.subscription_members "
+        "WHERE channel='AM' GROUP BY manifest_id "
+        "ORDER BY count(*) DESC LIMIT 1"
+    )
+    source_manifest_id = cursor.fetchone()[0]
+    security_id = _security_id(extra_ticker)
+    cursor.execute(
+        "INSERT INTO ref.securities ("
+        "security_id,asset_type,source_origin,created_at"
+        ") VALUES (%s,'STOCK','c4-gate-fixture',%s)",
+        (str(security_id), recorded_at - timedelta(days=1)),
+    )
+    cursor.execute(
+        "INSERT INTO ref.security_revisions ("
+        "revision_id,security_id,ticker,exchange,calendar_id,"
+        "effective_from,effective_to,observed_at,payload_sha256,"
+        "security_type,active"
+        ") VALUES (%s,%s,%s,'XNYS','XNYS',%s,%s,%s,%s,'CS',true)",
+        (
+            str(uuid4()),
+            str(security_id),
+            extra_ticker,
+            recorded_at - timedelta(hours=1),
+            identity_until,
+            recorded_at - timedelta(hours=1),
+            _digest(f"security:{extra_ticker}"),
+        ),
+    )
+    cursor.execute(
+        "INSERT INTO rt.instruments (asset_class,security_id) "
+        "VALUES ('EQUITY',%s) RETURNING instrument_id",
+        (str(security_id),),
+    )
+    extra_instrument_id = int(cursor.fetchone()[0])
+    cursor.execute(
+        "SELECT count(*) FROM rt.subscription_members "
+        "WHERE manifest_id=%s AND channel='AM'",
+        (source_manifest_id,),
+    )
+    member_count = int(cursor.fetchone()[0]) + 1
+    manifest_id = uuid4()
+    cursor.execute(
+        "INSERT INTO rt.subscription_manifests ("
+        "manifest_id,manifest_sha256,universe_sha256,session_date,"
+        "effective_at,profile_id,manifest_kind,stock_count,"
+        "option_underlying_count,member_count,allocation_policy_sha256"
+        ") SELECT %s,%s,universe_sha256,session_date,effective_at,"
+        "profile_id,'EQUITY_VALIDATION',%s,0,%s,allocation_policy_sha256 "
+        "FROM rt.subscription_manifests WHERE manifest_id=%s",
+        (
+            str(manifest_id),
+            _digest(f"exact-manifest:{manifest_id}"),
+            member_count,
+            member_count,
+            source_manifest_id,
+        ),
+    )
+    cursor.execute(
+        "INSERT INTO rt.subscription_members ("
+        "manifest_id,instrument_id,channel,priority,purpose,"
+        "option_underlying) SELECT %s,instrument_id,channel,priority,"
+        "purpose,false FROM rt.subscription_members "
+        "WHERE manifest_id=%s AND channel='AM'",
+        (str(manifest_id), source_manifest_id),
+    )
+    cursor.execute(
+        "INSERT INTO rt.subscription_members ("
+        "manifest_id,instrument_id,channel,priority,purpose,"
+        "option_underlying) VALUES (%s,%s,'AM',1,'PRIMARY',false)",
+        (str(manifest_id), extra_instrument_id),
+    )
+    cohort_id = uuid4()
+    cursor.execute(
+        "INSERT INTO rt.cohorts ("
+        "cohort_id,cohort_sha256,manifest_id,configuration_sha256,"
+        "model_bundle_sha256,valuation_sha256,effective_at,mode"
+        ") SELECT %s,%s,%s,configuration_sha256,model_bundle_sha256,"
+        "valuation_sha256,effective_at,mode FROM rt.cohorts "
+        "WHERE manifest_id=%s LIMIT 1",
+        (
+            str(cohort_id),
+            _digest(f"exact-cohort:{cohort_id}"),
+            str(manifest_id),
+            source_manifest_id,
+        ),
+    )
+    snapshot_sha256 = _digest(f"exact-snapshot:{cohort_id}")
+    cursor.execute(
+        "INSERT INTO rt.realtime_desired_session_snapshots ("
+        "revision_id,session_date,manifest_id,cohort_id,"
+        "snapshot_sha256,materialized_at"
+        ") VALUES (%s,%s,%s,%s,%s,%s)",
+        (
+            revision_id,
+            SESSION_DATE,
+            str(manifest_id),
+            str(cohort_id),
+            snapshot_sha256,
+            recorded_at,
+        ),
+    )
+    cursor.execute(
+        "SELECT DISTINCT reference.ticker,reference.security_id::text "
+        "FROM ref.security_revisions AS reference "
+        "JOIN rt.instruments AS instrument USING(security_id) "
+        "JOIN rt.subscription_members AS member USING(instrument_id) "
+        "WHERE member.manifest_id=%s AND member.channel='AM'",
+        (str(manifest_id),),
+    )
+    return (
+        str(cohort_id),
+        snapshot_sha256,
+        recorded_at,
+        dict(cursor.fetchall()),
+    )
+
+
+def test_equity_reference_gate_uses_member_facts_at_the_cutoff():
+    from scripts.run_realtime_v2_advanced_equity_window import (
+        _continuous_reference_evidence_cursor as evidence,
+    )
+
+    extra = "ZGATE"
+    with disposable_v2_database(
+        f"test_realtime_v2_c8_reference_gate_{uuid4().hex[:8]}"
+    ) as pool:
+        with cursor(pool) as database_cursor:
+            _seed_session(
+                database_cursor,
+                materialize_desired_snapshot=False,
+            )
+            database_cursor.execute(
+                "SELECT recorded_at FROM rt.realtime_desired_revisions LIMIT 1"
+            )
+            recorded_at = database_cursor.fetchone()[0]
+            cutoff = recorded_at + timedelta(minutes=5)
+            cohort_id, snapshot_sha256, materialized_at, members = (
+                _exact_equity_snapshot(
+                    database_cursor,
+                    extra,
+                    identity_until=cutoff + timedelta(hours=1),
+                )
+            )
+            assert extra in members and len(members) > 1
+            fresh = recorded_at - timedelta(minutes=30)
+
+            def insert_coverage(ticker, action_type, *, at):
+                suffix = uuid4().hex
+                database_cursor.execute(
+                    "INSERT INTO ref.corporate_action_coverage ("
+                    "coverage_id,security_id,action_type,window_start,"
+                    "window_end,source,source_key,response_action_count,"
+                    "response_sha256,observed_at,received_at,payload_sha256"
+                    ") VALUES (%s,%s,%s,%s,%s,'massive',%s,0,%s,%s,%s,%s)",
+                    (
+                        str(uuid4()),
+                        members[ticker],
+                        action_type,
+                        SESSION_DATE - timedelta(days=180),
+                        SESSION_DATE + timedelta(days=365),
+                        f"{ticker}:{action_type}:{suffix}",
+                        _digest(f"response-{suffix}"),
+                        at,
+                        at,
+                        _digest(f"payload-{suffix}"),
+                    ),
+                )
+
+            def gate(at=cutoff, cohort=cohort_id):
+                return evidence(
+                    database_cursor,
+                    SimpleNamespace(
+                        cohort_id=cohort,
+                        session_date=SESSION_DATE,
+                        cutoff=at,
+                    ),
+                )
+
+            for ticker in members:
+                if ticker != extra:
+                    insert_coverage(ticker, "SPLIT", at=fresh)
+                    insert_coverage(ticker, "DIVIDEND", at=fresh)
+            insert_coverage(extra, "SPLIT", at=fresh)
+            # One member lacks DIVIDEND coverage: closed, and no seed fallback.
+            with pytest.raises(ValueError, match="continuous member"):
+                gate()
+            # Coverage older than the member's current identity is stale.
+            insert_coverage(
+                extra,
+                "DIVIDEND",
+                at=recorded_at - timedelta(hours=2),
+            )
+            with pytest.raises(ValueError, match="continuous member"):
+                gate()
+            # Coverage received after the cutoff was not yet known.
+            insert_coverage(
+                extra,
+                "DIVIDEND",
+                at=cutoff + timedelta(seconds=1),
+            )
+            with pytest.raises(ValueError, match="continuous member"):
+                gate()
+            insert_coverage(extra, "DIVIDEND", at=fresh)
+            assert gate() == f"advanced-reference-c4:{snapshot_sha256}"
+            # The member's identity expires on its own clock.
+            with pytest.raises(ValueError, match="continuous member"):
+                gate(at=cutoff + timedelta(hours=1))
+            # A cohort that is not a desired snapshot stays on the seed gate.
+            assert gate(cohort=str(uuid4())) is None
+            # A snapshot is not authority before it was materialized.
+            assert gate(at=materialized_at - timedelta(seconds=1)) is None
+            database_cursor.connection.rollback()
 
 
 def test_c8_obsolete_unfinished_session_expires_once_and_is_not_reclaimed():
