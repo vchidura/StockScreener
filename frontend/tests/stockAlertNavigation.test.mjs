@@ -174,7 +174,7 @@ test('Day History defaults to newest trigger and tab switches clear incompatible
 })
 
 test('Latest Run required plan columns survive old hidden preferences and every preset shape', () => {
-  const required = ['stop', 'target', 'reward_risk', 'success_probability', 'risk_assessment']
+  const required = ['stop', 'target', 'reward_risk']
   const columns = [{ key: 'ticker', locked: true }, ...required.map(key => ({ key })), { key: 'rsi' }, { key: 'entry_price', history: true }]
   for (const hidden of [new Set(columns.map(column => column.key)), new Set(required), new Set(['rsi']), new Set()]) {
     const before = [...hidden]

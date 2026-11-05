@@ -148,7 +148,7 @@ def test_option_flow_does_not_substitute_an_unavailable_cohort():
     assert response.status_code == 200
     assert response.json()["reason"] == "ACTIVE_COHORT_UNAVAILABLE"
     assert response.json()["data"] == {
-        "underlyers": [], "selected": "SPY", "session_date": None,
+        "underlyers": [], "selected": None, "session_date": None,
     }
     assert not any("subscription_manifests" in sql for sql in store.statements)
 

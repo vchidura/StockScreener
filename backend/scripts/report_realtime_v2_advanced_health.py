@@ -6,7 +6,7 @@ import argparse
 import json
 import os
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from uuid import UUID
 
 import psycopg2
@@ -672,6 +672,9 @@ def collect_health(cursor, args, *, checked_at=None):
 def _json_default(value):
     if isinstance(value, datetime):
         return value.astimezone(UTC).isoformat()
+    # A role's session date reaches here once a session is selected.
+    if isinstance(value, date):
+        return value.isoformat()
     raise TypeError(f"unsupported health value: {type(value).__name__}")
 
 

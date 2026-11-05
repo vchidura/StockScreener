@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from decimal import Decimal
 from enum import Enum
@@ -21,7 +21,9 @@ from .advanced_options_control_plane import (
 from .advanced_options_reference_state import AdvancedOptionsReferenceState
 from .advanced_options_rolling_state import (
     AdvancedOptionsRollingState,
+    OPTION_CONTRACTS_EXCLUDED_ABOVE_LIMIT,
     RollingAvailability,
+    excluded_contract_share_exceeded,
 )
 from .contracts import canonical_sha256
 from .database_access_v2 import APP_ROLE, V2ConnectionProvider
@@ -38,6 +40,14 @@ from .option_source_flow import OptionSourceFlowIdentity
 ADVANCED_NBBO_MARK_PLAN_VERSION = "advanced-options-nbbo-mark-plan-v1"
 ADVANCED_NBBO_MAXIMUM_AGE_SECONDS = 1
 _RETRYABLE_POSTGRES_SQLSTATES = frozenset({"40001", "40P01"})
+# A contract left out for these has a good quote that is not fresh enough to value
+# at this moment. That is a quiet contract, so it costs that contract its mark and
+# does not count toward the share that says the data is broken.
+_QUIET_MARK_REASONS = frozenset({
+    "OPTION_NBBO_STALE_OR_NONCAUSAL",
+    "OPTION_SPOT_SKEW_EXCEEDED",
+    "UNDERLYING_SNAPSHOT_STALE_OR_NONCAUSAL",
+})
 
 
 def _utc(value: datetime, name: str) -> datetime:
@@ -120,6 +130,7 @@ class AdvancedOptionsMarkProducerPlan:
     expected_marks_sha256: str | None = None
     provider_calls_authorized: bool = False
     runtime_actions_authorized: bool = False
+    market_state_committed_offset: int | None = None
 
     @property
     def control_plane(self):
@@ -160,6 +171,9 @@ class AdvancedOptionsMarkPreflight:
 
     @property
     def reason_codes(self) -> tuple[str, ...]:
+        """What blocks the window. A ready result's rows name only what it left out."""
+        if self.status is AdvancedOptionsMarkStatus.READY:
+            return ()
         return tuple(sorted({
             reason
             for row in self.evidence
@@ -189,6 +203,7 @@ def _plan_identity(
     maximum_source_age_seconds: int,
     maximum_package_quote_skew_ms: int,
     expected_marks_sha256: str | None,
+    market_state_committed_offset: int | None = None,
 ) -> dict[str, object]:
     control = enrollment.control_plane
     return {
@@ -227,6 +242,15 @@ def _plan_identity(
         "expected_marks_sha256": expected_marks_sha256,
         "provider_calls_authorized": False,
         "runtime_actions_authorized": False,
+        **(
+            {}
+            if market_state_committed_offset is None
+            else {
+                "market_state_committed_offset": (
+                    market_state_committed_offset
+                ),
+            }
+        ),
     }
 
 
@@ -291,6 +315,13 @@ def _validate_plan(
         < plan.reference_state.valid_until
         or plan.provider_calls_authorized
         or plan.runtime_actions_authorized
+        or (
+            plan.market_state_committed_offset is not None
+            and (
+                type(plan.market_state_committed_offset) is not int
+                or plan.market_state_committed_offset < 0
+            )
+        )
     ):
         raise ValueError("Advanced Options mark clocks, bounds or authority changed")
     build_sha256 = _sha256(
@@ -316,6 +347,7 @@ def _validate_plan(
             plan.maximum_package_quote_skew_ms
         ),
         expected_marks_sha256=expected,
+        market_state_committed_offset=plan.market_state_committed_offset,
     )
     digest = canonical_sha256(identity)
     identifier = uuid5(
@@ -338,6 +370,7 @@ def build_advanced_options_mark_producer_plan(
     producer_build_sha256: str,
     valuation_policy: ValuationPolicy,
     expected_marks_sha256: str | None = None,
+    market_state_committed_offset: int | None = None,
 ) -> AdvancedOptionsMarkProducerPlan:
     normalized_cutoff = _utc(cutoff, "cutoff")
     identity = _plan_identity(
@@ -352,6 +385,7 @@ def build_advanced_options_mark_producer_plan(
         maximum_source_age_seconds=ADVANCED_NBBO_MAXIMUM_AGE_SECONDS,
         maximum_package_quote_skew_ms=MAX_PACKAGE_QUOTE_SKEW_MS,
         expected_marks_sha256=expected_marks_sha256,
+        market_state_committed_offset=market_state_committed_offset,
     )
     digest = canonical_sha256(identity)
     plan = AdvancedOptionsMarkProducerPlan(
@@ -369,6 +403,7 @@ def build_advanced_options_mark_producer_plan(
         producer_build_sha256=producer_build_sha256,
         valuation_policy=valuation_policy,
         expected_marks_sha256=expected_marks_sha256,
+        market_state_committed_offset=market_state_committed_offset,
     )
     _validate_plan(plan)
     return plan
@@ -403,6 +438,7 @@ def freeze_advanced_options_mark_producer_plan(
         producer_build_sha256=plan.producer_build_sha256,
         valuation_policy=plan.valuation_policy,
         expected_marks_sha256=preflight.marks_sha256,
+        market_state_committed_offset=plan.market_state_committed_offset,
     )
 
 
@@ -481,15 +517,18 @@ def assemble_advanced_options_marks_cursor(
     }
     evidence_rows = []
     marks = []
-    market_times = []
     sessions = set(plan.source_flow.stream_session_ids)
+    underlyer_by_id = {item.instrument_id: item.underlyer for item in selected}
+    # Option heads hold normalized offsets, and the rolling state's own offset is
+    # the raw offset of the flow checkpoint.
+    head_offset_limit = (
+        plan.rolling_state.committed_offset
+        if plan.market_state_committed_offset is None
+        else plan.market_state_committed_offset
+    )
     for row in rows:
         reasons = []
-        ticker = next(
-            item.underlyer
-            for item in selected
-            if item.instrument_id == int(row["instrument_id"])
-        )
+        ticker = underlyer_by_id[int(row["instrument_id"])]
         tick = tick_by_ticker.get(ticker)
         if row["journal_generation"] is None:
             reasons.append("OPTION_NBBO_ABSENT")
@@ -502,11 +541,13 @@ def assemble_advanced_options_marks_cursor(
             reasons.append("OPTION_NBBO_SOURCE_SESSION_MISMATCH")
         elif row["source_session"] != control.session_date:
             reasons.append("OPTION_NBBO_SOURCE_DATE_MISMATCH")
-        elif int(row["source_offset"]) > plan.rolling_state.committed_offset:
+        elif int(row["source_offset"]) > head_offset_limit:
             reasons.append("OPTION_NBBO_AHEAD_OF_ROLLING_CHECKPOINT")
+        # A quote from at or before the cutoff can arrive just after it, so the
+        # event time decides whether it belongs to this window.
         if row["event_at"] is not None and (
             row["event_at"] > row["received_at"]
-            or row["received_at"] > plan.cutoff
+            or row["event_at"] > plan.cutoff
             or (
                 plan.cutoff - row["received_at"]
             ).total_seconds() > plan.maximum_source_age_seconds
@@ -641,32 +682,42 @@ def assemble_advanced_options_marks_cursor(
             producer_plan_sha256=plan.producer_build_sha256,
         )
         marks.append(mark)
-        market_times.append(mark.market_time)
         evidence_rows.append(AdvancedOptionsMarkEvidence(
             instrument_id=mark.instrument_id,
             contract_ticker=str(row["contract_ticker"]),
             status=AdvancedOptionsMarkStatus.READY,
             evidence_sha256=mark.payload_sha256,
         ))
-    if market_times and (
-        max(market_times) - min(market_times)
-    ).total_seconds() * 1000 > plan.maximum_package_quote_skew_ms:
+    # A contract without a mark is left out for this window. Quote skew belongs to
+    # the legs of one package and is checked when that package is marked, never
+    # across the whole contract set.
+    totals: dict[str, int] = {}
+    broken: dict[str, int] = {}
+    for row in evidence_rows:
+        underlyer = underlyer_by_id[row.instrument_id]
+        totals[underlyer] = totals.get(underlyer, 0) + 1
+        if set(row.reason_codes) - _QUIET_MARK_REASONS:
+            broken[underlyer] = broken.get(underlyer, 0) + 1
+    over_limit = {
+        underlyer
+        for underlyer, count in broken.items()
+        if excluded_contract_share_exceeded(count, totals[underlyer])
+    }
+    if over_limit:
         marks = []
         evidence_rows = [
-            AdvancedOptionsMarkEvidence(
-                row.instrument_id,
-                row.contract_ticker,
-                AdvancedOptionsMarkStatus.BLOCKED,
-                row.evidence_sha256,
-                ("PACKAGE_QUOTE_TIME_SKEW_EXCEEDED",),
+            replace(
+                row,
+                reason_codes=(
+                    *row.reason_codes,
+                    OPTION_CONTRACTS_EXCLUDED_ABOVE_LIMIT,
+                ),
             )
+            if row.reason_codes
+            and underlyer_by_id[row.instrument_id] in over_limit
+            else row
             for row in evidence_rows
         ]
-    if any(
-        row.status is AdvancedOptionsMarkStatus.BLOCKED
-        for row in evidence_rows
-    ):
-        marks = []
     marks_sha256 = canonical_sha256(tuple(
         (
             row.evidence_id,
@@ -677,9 +728,9 @@ def assemble_advanced_options_marks_cursor(
         for row in marks
     ))
     status = (
-        AdvancedOptionsMarkStatus.READY
-        if marks and len(marks) == len(rows)
-        else AdvancedOptionsMarkStatus.BLOCKED
+        AdvancedOptionsMarkStatus.BLOCKED
+        if over_limit
+        else AdvancedOptionsMarkStatus.READY
     )
     result_identity = {
         "plan_id": plan.plan_id,

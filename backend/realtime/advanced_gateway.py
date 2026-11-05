@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import socket
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
@@ -96,6 +98,12 @@ class GatewayOverload(RuntimeError):
         return self.reason_code
 
 
+_LOGGER = logging.getLogger(__name__)
+# The Options feed is closed only after this long with no data frame and no pong.
+OPTIONS_SILENCE_CLOSE_SECONDS = 60
+_SILENCE_POLL_SECONDS = 1.0
+
+
 @dataclass(frozen=True, slots=True)
 class GatewayConfiguration:
     feed: MarketFeed
@@ -109,6 +117,7 @@ class GatewayConfiguration:
     maximum_control_messages: int = 8
     compression: str | None = None
     allow_insecure_loopback: bool = False
+    silence_close_seconds: int = OPTIONS_SILENCE_CLOSE_SECONDS
 
     def __post_init__(self) -> None:
         parsed = urlsplit(self.endpoint)
@@ -128,8 +137,18 @@ class GatewayConfiguration:
             self.maximum_message_bytes,
             self.library_max_queue,
             self.maximum_control_messages,
+            self.silence_close_seconds,
         ) <= 0:
             raise ValueError("Advanced gateway bounds must be positive")
+        # A quiet feed shows only pongs, one per ping, so a shorter limit would
+        # close a healthy connection.
+        if (
+            self.feed is MarketFeed.OPTIONS
+            and self.silence_close_seconds <= self.ping_interval_seconds
+        ):
+            raise ValueError(
+                "Advanced gateway silence limit must outlast the ping interval"
+            )
 
     @classmethod
     def stocks(cls) -> GatewayConfiguration:
@@ -178,6 +197,40 @@ _CHANNEL_ORDER = {
 }
 
 
+class _WatchedConnection:
+    """The configured connection, and for Options its silence watcher. A class, as
+    contextlib would write to GatewayOverload's traceback, and that is frozen."""
+
+    def __init__(self, gateway: AdvancedGateway) -> None:
+        self._gateway = gateway
+        self._context = gateway._connection_context()
+        self._connection = None
+        self._watcher: asyncio.Task | None = None
+
+    async def __aenter__(self):
+        gateway = self._gateway
+        self._connection = await self._context.__aenter__()
+        if gateway.configuration.feed is MarketFeed.OPTIONS:
+            gateway._awaiting_frame_since = None
+            gateway._last_frame_at = None
+            gateway._last_pong_at = None
+            self._watcher = asyncio.create_task(
+                gateway._close_when_silent(self._connection)
+            )
+        return self._connection
+
+    async def __aexit__(self, *exc_info):
+        if self._watcher is not None:
+            self._watcher.cancel()
+            await asyncio.gather(self._watcher, return_exceptions=True)
+        try:
+            return await self._context.__aexit__(*exc_info)
+        finally:
+            close_code = getattr(self._connection, "close_code", None)
+            if self._watcher is not None and close_code != 1000:
+                self._gateway._log_liveness("connection_closed", close_code)
+
+
 class AdvancedGateway:
     def __init__(
         self,
@@ -224,6 +277,9 @@ class AdvancedGateway:
         self._stop_requested: Callable[[], bool] | None = None
         self._stop_at: datetime | None = None
         self._receive_poll_seconds = 1.0
+        self._awaiting_frame_since: float | None = None
+        self._last_frame_at: float | None = None
+        self._last_pong_at: float | None = None
 
     @property
     def state(self) -> GatewayFeedState:
@@ -300,13 +356,75 @@ class AdvancedGateway:
             compression=self.configuration.compression,
             open_timeout=self.configuration.open_timeout_seconds,
             ping_interval=self.configuration.ping_interval_seconds,
-            ping_timeout=self.configuration.ping_timeout_seconds,
+            # A pong queued behind a backlog of data must not end an Options
+            # connection that is still delivering frames: see _close_when_silent.
+            ping_timeout=(
+                None
+                if self.configuration.feed is MarketFeed.OPTIONS
+                else self.configuration.ping_timeout_seconds
+            ),
             close_timeout=self.configuration.close_timeout_seconds,
             max_size=self.configuration.maximum_message_bytes,
             max_queue=self.configuration.library_max_queue,
         )
 
+    def _watched_connection(self) -> _WatchedConnection:
+        return _WatchedConnection(self)
+
+    def _log_liveness(self, event: str, close_code: int | None = None) -> None:
+        now = time.monotonic()
+
+        def age(at: float | None) -> str:
+            return "never" if at is None else f"{now - at:.1f}"
+
+        _LOGGER.warning(
+            "advanced_gateway_%s feed=%s close_code=%s "
+            "last_frame_age_seconds=%s last_pong_age_seconds=%s",
+            event,
+            self.configuration.feed.value,
+            close_code,
+            age(self._last_frame_at),
+            age(self._last_pong_at),
+        )
+
+    async def _close_when_silent(self, connection) -> None:
+        """The library's pong timeout ends a connection while frames keep arriving,
+        because it reads a pong only after the frames queued ahead of it. So the
+        library keeps pinging, and this closes only when nothing at all has arrived.
+        A pong has arrived when the library's measured latency changes."""
+        limit = self.configuration.silence_close_seconds
+        opened_at = time.monotonic()
+        latency = getattr(connection, "latency", None)
+        pong_late_logged = False
+        while True:
+            await asyncio.sleep(_SILENCE_POLL_SECONDS)
+            now = time.monotonic()
+            current = getattr(connection, "latency", None)
+            if current != latency:
+                latency = current
+                self._last_pong_at = now
+            newest_pong = self._last_pong_at or opened_at
+            pong_late = now - newest_pong >= limit
+            if pong_late and not pong_late_logged:
+                self._log_liveness("pong_late")
+            pong_late_logged = pong_late
+            waiting_since = self._awaiting_frame_since
+            # With the consumer busy, frames can be queued unread, so nothing here
+            # says the feed has gone quiet.
+            if (
+                waiting_since is None
+                or now - max(waiting_since, newest_pong) < limit
+            ):
+                continue
+            self._log_liveness("silence_close", 1011)
+            await connection.close(
+                code=1011,
+                reason="no frame or pong within the silence limit",
+            )
+            return
+
     async def _receive_bytes(self, connection) -> bytes:
+        self._awaiting_frame_since = time.monotonic()
         while True:
             if (
                 self._stop_requested is not None
@@ -329,6 +447,8 @@ class AdvancedGateway:
                 break
             except asyncio.TimeoutError:
                 continue
+        self._awaiting_frame_since = None
+        self._last_frame_at = time.monotonic()
         if type(message) is not bytes:
             raise GatewayControlError("ADVANCED_NON_BYTES_MESSAGE")
         self._received_messages += 1
@@ -586,7 +706,7 @@ class AdvancedGateway:
         self._set_state(GatewayFeedState.CONNECTING)
         connection = None
         try:
-            async with self._connection_context() as connection:
+            async with self._watched_connection() as connection:
                 self._set_state(GatewayFeedState.AUTHENTICATING)
                 await connection.send(
                     json.dumps(
@@ -736,7 +856,7 @@ class AdvancedGateway:
         stop_reason = None
         self._set_state(GatewayFeedState.CONNECTING)
         try:
-            async with self._connection_context() as connection:
+            async with self._watched_connection() as connection:
                 transport = getattr(connection, "transport", None)
                 network_socket = (
                     None

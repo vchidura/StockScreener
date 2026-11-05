@@ -17,6 +17,7 @@ export interface PortalIdentity {
   options: PortalPublicationIdentity | null
   options_reads_enabled: boolean
   session_cohorts: Record<string, string>
+  options_session_cohorts: Record<string, string>
 }
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || '/api'
@@ -32,7 +33,10 @@ const subscribe = (listener: () => void) => {
 const snapshot = () => identity
 
 export const realtimeCohortId = () => identity?.equity?.cohort_id
-export const realtimeOptionsCohortId = () => identity?.options?.cohort_id
+export const realtimeOptionsCohortId = (sessionDate?: string) =>
+  sessionDate
+    ? identity?.options_session_cohorts[sessionDate]
+    : identity?.options?.cohort_id
 export const realtimeOptionsReadsEnabled = () => identity?.options_reads_enabled === true
 export const usePortalIdentity = () => useSyncExternalStore(subscribe, snapshot)
 

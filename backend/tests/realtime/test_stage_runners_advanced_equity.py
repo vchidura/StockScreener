@@ -236,7 +236,9 @@ def test_advanced_input_gate_binds_session_checkpoint_and_budget():
     assert "FROM rt.bar_revisions AS revision" in bar_query
     assert "rt.bar_current" not in bar_query
     assert "revision.created_at<=%s" in bar_query
-    assert "checkpoint.committed_at<=%s" in checkpoint_query
+    # Each generation and shard keeps one moving row, so filtering it by a past
+    # clock hides the head whenever the feed is running.
+    assert "checkpoint.committed_at<=%s" not in checkpoint_query
 
 
 def test_advanced_input_gate_accepts_explicit_repair_before_subscription():
@@ -267,19 +269,19 @@ def test_advanced_input_gate_digest_is_lineage_not_retry_window_identity():
     assert retry == first
 
 
-def test_advanced_input_gate_digest_changes_with_bar_or_checkpoint():
+def test_advanced_input_gate_digest_follows_bars_not_moving_checkpoint_heads():
     baseline = advanced_input_gate_identity(Database(), _context())
     changed_bar = advanced_input_gate_identity(
         Database(bar_payload_suffix=10),
         _context(),
     )
-    changed_checkpoint = advanced_input_gate_identity(
+    moved_checkpoint = advanced_input_gate_identity(
         Database(checkpoint_state_hash="c" * 64),
         _context(),
     )
 
     assert changed_bar != baseline
-    assert changed_checkpoint != baseline
+    assert moved_checkpoint == baseline
 
 
 def test_advanced_input_gate_refuses_an_overlapping_gap():

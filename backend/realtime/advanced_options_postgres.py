@@ -64,13 +64,17 @@ from .advanced_options_rolling_producer import (
     AdvancedOptionsRollingProducerPreflight,
     PostgresAdvancedOptionsRollingProducer,
     RollingProducerStatus,
+    advanced_options_unresolved_gaps_sha256,
     assemble_advanced_options_rolling_state_cursor,
 )
 from .advanced_options_rolling_repository import (
     PostgresAdvancedOptionsRollingStateRepository,
     decode_advanced_options_rolling_state,
 )
-from .advanced_options_rolling_state import RollingAvailability
+from .advanced_options_rolling_state import (
+    AdvancedOptionsWindowRetryDiverged,
+    RollingAvailability,
+)
 from .advanced_options_runtime import (
     AdvancedOptionsCloseStageData,
     EvidenceBuilder,
@@ -422,6 +426,13 @@ class PostgresAdvancedOptionsCanonicalRuntimePort(
         context: StageContext,
     ) -> OptionCycleInput:
         control = self._scope.control_plane
+        # A resident session's selection stores its batches under the time the cycle
+        # was planned, a few minutes before the cutoff it serves.
+        scheduled_cycle = (
+            context.window.cutoff
+            if self._scope.require_discovery_pages
+            else control.planned_at
+        )
         cursor.execute(
             "SELECT discovery_batch_id FROM rt.option_discovery_batches "
             "WHERE profile_id=%s AND provider_tier=%s "
@@ -431,7 +442,7 @@ class PostgresAdvancedOptionsCanonicalRuntimePort(
             (
                 str(control.profile_id),
                 ProviderTier.MASSIVE_ADVANCED.value,
-                context.window.cutoff,
+                scheduled_cycle,
                 control.manifest_policy.sha256,
                 list(control.universe.option_underlyings),
             ),
@@ -499,7 +510,7 @@ class PostgresAdvancedOptionsCanonicalRuntimePort(
         )
         cycle_input = OptionCycleInput(
             provider_tier=ProviderTier.MASSIVE_ADVANCED,
-            scheduled_cycle=context.window.cutoff,
+            scheduled_cycle=scheduled_cycle,
             profile_id=control.profile_id,
             profile_sha256=control.profile_sha256,
             universe_sha256=control.universe.sha256,
@@ -638,7 +649,8 @@ class PostgresAdvancedOptionsCanonicalRuntimePort(
     def _unresolved_gaps_sha256(cursor, control) -> str:
         cursor.execute(
             "SELECT gap_id::text,session_id::text,instrument_id,channel,"
-            "gap_start,gap_end,reason,last_durable_offset,recovery_status "
+            "gap_start,gap_end,journal_generation::text,last_durable_offset,"
+            "reason,recovery_status "
             "FROM rt.stream_gaps WHERE session_id=ANY(%s::uuid[]) "
             "AND recovery_status IN ('UNRESOLVED','WARMING') "
             "ORDER BY gap_start,gap_id",
@@ -649,7 +661,22 @@ class PostgresAdvancedOptionsCanonicalRuntimePort(
                 ],
             ),
         )
-        return canonical_sha256(tuple(tuple(row) for row in cursor.fetchall()))
+        # The same digest the rolling state binds, so a tolerated gap agrees.
+        names = (
+            "gap_id",
+            "session_id",
+            "instrument_id",
+            "channel",
+            "gap_start",
+            "gap_end",
+            "journal_generation",
+            "last_durable_offset",
+            "reason",
+            "recovery_status",
+        )
+        return advanced_options_unresolved_gaps_sha256(
+            tuple(dict(zip(names, row)) for row in cursor.fetchall())
+        )
 
     @staticmethod
     def _market_state_heads_sha256(cursor, control) -> str:
@@ -959,8 +986,14 @@ class PostgresAdvancedOptionsCanonicalRuntimePort(
             or window.cohort_id != control.cohort_id
             or window.provider_tier != control.binding.options_tier.value
             or window.cutoff != input_plan.cutoff
-            or window.state != "PENDING"
-            or row[16] is not None
+            # A retry finds its window as an earlier attempt left it: RUNNING
+            # after a crash, or PENDING with its last owner after a deferred
+            # stage. Reading it writes nothing, and claim_window fences the retry.
+            or (
+                lock_window
+                and (window.state != "PENDING" or row[16] is not None)
+            )
+            or window.state not in {"PENDING", "RUNNING"}
         ):
             raise ValueError(
                 "Advanced Options input-ready window fence changed"
@@ -1012,7 +1045,7 @@ class PostgresAdvancedOptionsCanonicalRuntimePort(
             for mark in marks
         }
         if not expected:
-            return ("IMMUTABLE_ADVANCED_NBBO_MARKS_ABSENT",)
+            return ()
         cursor.execute(
             "SELECT evidence_id::text,instrument_id,contract_id,"
             "catalog_version_id,provider_tier,source_kind,mark_source,"
@@ -1391,7 +1424,7 @@ class PostgresAdvancedOptionsCanonicalRuntimePort(
                 receipt.input_sha256,
                 receipt.build_id,
             ):
-                raise ValueError(
+                raise AdvancedOptionsWindowRetryDiverged(
                     "durable OPTIONS_INPUT_READY receipt identity changed"
                 )
         digest = canonical_sha256({

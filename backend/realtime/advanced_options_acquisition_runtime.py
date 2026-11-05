@@ -407,13 +407,22 @@ def _load_status(
     path: Path,
     binding: AdvancedOptionsAcquisitionBinding,
 ) -> dict[str, object]:
+    fresh = {
+        "connection_attempts": 0,
+        "decoded_messages": 0,
+        "decoded_bytes": 0,
+    }
     if not path.is_file():
-        return {
-            "connection_attempts": 0,
-            "decoded_messages": 0,
-            "decoded_bytes": 0,
-        }
+        return fresh
     value = json.loads(path.read_text(encoding="utf-8"))
+    # The path is fixed across sessions, so another journal's file is the last
+    # session's status, not a change to this one.
+    if (
+        isinstance(value, dict)
+        and value.get("journal_generation")
+        != str(binding.authority.journal_generation)
+    ):
+        return fresh
     if (
         not isinstance(value, dict)
         or value.get("schema") != ACQUISITION_STATUS_SCHEMA
@@ -525,6 +534,19 @@ class _AcquisitionStatusPublisher:
                 self._failure = error
                 self._stop.set()
                 return
+
+
+def _close_detail(error: BaseException) -> dict[str, object]:
+    """Which side closed a dropped socket and why, when the close frames say."""
+    detail = {}
+    for side, frame in (
+        ("received", getattr(error, "rcvd", None)),
+        ("sent", getattr(error, "sent", None)),
+    ):
+        if frame is not None:
+            detail[f"close_{side}_code"] = frame.code
+            detail[f"close_{side}_reason"] = str(frame.reason or "")[:200]
+    return detail
 
 
 def _transient_transport_failure(error: BaseException) -> bool:
@@ -652,7 +674,7 @@ def acquisition_health(
     checked = _utc(checked_at, "checked_at")
     if (
         status.get("state")
-        not in {"READY", "CAPTURING", "DRAINING", "COMPLETE"}
+        not in {"READY", "CAPTURING", "DRAINING", "PAUSED", "COMPLETE"}
         or heartbeat > checked
         or (checked - heartbeat).total_seconds() > maximum_age_seconds
     ):
@@ -844,6 +866,22 @@ def run_acquisition(
     )
     publisher_holder[0] = publisher
     publisher.start()
+
+    def stop_pauses_session() -> bool:
+        """Only the authority's end or a spent ceiling ends a session. A stop
+        before that leaves the journal open for a restart to continue."""
+        return (
+            stop_event.is_set()
+            and not diagnostic
+            and _utc(clock(), "clock")
+            < binding.authority.acquisition_stop
+            and attempts < binding.connection_attempt_ceiling
+            and decoded_messages + CONTROL_MESSAGES_PER_ATTEMPT
+            < binding.decoded_message_ceiling
+            and decoded_bytes < binding.decoded_byte_ceiling
+        )
+
+    paused = False
     try:
         while (
             not stop_event.is_set()
@@ -1047,6 +1085,7 @@ def run_acquisition(
                         _utc(clock(), "clock").isoformat()
                     ),
                     "error_type": type(error).__name__,
+                    **_close_detail(error),
                 })
                 publisher.update(
                     persist=True,
@@ -1086,13 +1125,14 @@ def run_acquisition(
             stop_event.wait(min(30.0, 0.5 * (2 ** (attempts - 1))))
     finally:
         status_failure = None
+        paused = stop_pauses_session()
         try:
             if not str(publisher.snapshot().get("state", "")).startswith(
                 "FAILED_"
             ):
                 publisher.update(
                     persist=True,
-                    state="DRAINING",
+                    state="PAUSED" if paused else "DRAINING",
                     subscription_ready=False,
                 )
         except BaseException as error:
@@ -1117,6 +1157,28 @@ def run_acquisition(
             raise RuntimeError(
                 "Options acquisition stopped after status persistence failure"
             ) from status_failure
+    if paused:
+        # The socket is down until a restart, so the journal has a hole here.
+        gaps.append({
+            "attempt": attempts,
+            "status": "OPEN",
+            "disconnected_at_utc": _utc(clock(), "clock").isoformat(),
+            "error_type": "STOP_REQUESTED",
+        })
+        publisher.update(
+            persist=True,
+            state="PAUSED",
+            socket_state=GatewayFeedState.STOPPED.value,
+            subscription_ready=False,
+            stream_session_id=str(active_stream_session_id),
+            connection_attempts=attempts,
+            decoded_messages=decoded_messages,
+            decoded_bytes=decoded_bytes,
+            reserved_decoded_messages=decoded_messages,
+            reserved_decoded_bytes=decoded_bytes,
+            transport_gaps=list(gaps),
+        )
+        return publisher.snapshot()
     if final.last_raw_offset <= 0 or final.last_event_offset <= 0:
         publisher.update(
             persist=True,

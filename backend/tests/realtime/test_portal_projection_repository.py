@@ -321,6 +321,65 @@ def test_release_pointer_rollback_is_exact_and_never_deletes_a_release():
     )
 
 
+def test_first_release_pointer_rollback_restores_exact_absence():
+    current_release = UUID(int=4)
+    cursor = MagicMock()
+    cursor.fetchone.return_value = (
+        str(current_release),
+        NOW,
+        NOW.date(),
+        7,
+        None,
+        None,
+    )
+    cursor.rowcount = 1
+
+    restore_portal_release_pointer_cursor(
+        cursor,
+        cohort_id=COHORT,
+        provider_tier=ProviderTier.MASSIVE_DEVELOPER,
+        expected_current_release_id=current_release,
+        previous=None,
+    )
+
+    statements = _statements(cursor)
+    assert statements[-1].startswith(
+        "DELETE FROM rt.portal_release_current"
+    )
+    assert not any(
+        statement.startswith("DELETE FROM rt.portal_releases")
+        for statement in statements
+    )
+
+
+def test_release_pointer_rollback_refuses_to_overwrite_a_newer_pointer():
+    published_release = UUID(int=4)
+    newer_release = UUID(int=5)
+    cursor = MagicMock()
+    cursor.fetchone.return_value = (
+        str(newer_release),
+        NOW + timedelta(minutes=1),
+        NOW.date(),
+        8,
+        None,
+        None,
+    )
+
+    with pytest.raises(ValueError, match="changed before rollback"):
+        restore_portal_release_pointer_cursor(
+            cursor,
+            cohort_id=COHORT,
+            provider_tier=ProviderTier.MASSIVE_DEVELOPER,
+            expected_current_release_id=published_release,
+            previous=None,
+        )
+
+    assert not any(
+        statement.startswith(("UPDATE", "DELETE"))
+        for statement in _statements(cursor)
+    )
+
+
 def test_intraday_release_carries_forward_other_lanes_and_keeps_newer_generations():
     older_strategy = {"snapshot_id": str(UUID(int=1)), "snapshot_class": "SESSION_CLOSE",
                       "snapshot_type": "DAILY_STRATEGY_ROLLING_V1", "snapshot_key": "COHORT",

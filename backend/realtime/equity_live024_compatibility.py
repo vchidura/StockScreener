@@ -194,6 +194,11 @@ def _registry_identity() -> dict[str, object]:
     }
     authorization_table = "rt.advanced_stream_authorizations"
     baseline[authorization_table] = replace(baseline[authorization_table], writes="NONE")
+    portal_pointer_table = "rt.portal_release_current"
+    baseline[portal_pointer_table] = replace(
+        baseline[portal_pointer_table],
+        delete=False,
+    )
     baseline_grants = {
         name: privileges
         for name, privileges in grants().items()
@@ -201,6 +206,13 @@ def _registry_identity() -> dict[str, object]:
     }
     baseline_grants[authorization_table] = {
         "SELECT": baseline_grants[authorization_table]["SELECT"],
+    }
+    baseline_grants[portal_pointer_table] = {
+        privilege: role_names
+        for privilege, role_names in baseline_grants[
+            portal_pointer_table
+        ].items()
+        if privilege != "DELETE"
     }
     return {
         "contract_id": CONTRACT_ID,

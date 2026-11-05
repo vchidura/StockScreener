@@ -344,7 +344,11 @@ def test_market_state_queries_only_option_heads_with_snapshot_prices():
             ),
         ),
     )
-    plan = replace(original, equity_live_head_binding=binding)
+    plan = replace(
+        original,
+        equity_live_head_binding=binding,
+        market_state_committed_offset=10,
+    )
     at = original.known_at - timedelta(milliseconds=100)
     rows = (
         _head(
@@ -393,4 +397,46 @@ def test_market_state_queries_only_option_heads_with_snapshot_prices():
     assert result is not None
     assert isinstance(result[0][0], UnderlyingSnapshotTick)
     assert cursor.parameters == ([option_id], [option_id])
+    assert evidence[-1].availability.value == "READY"
+
+    # One bad quote among an underlying's five contracts leaves out that contract.
+    ids = tuple(option_id + index for index in range(5))
+    rows = tuple(
+        {
+            **row,
+            "instrument_id": instrument_id,
+            "quality": (
+                "CROSSED"
+                if instrument_id == ids[1] and row["kind"] == "Q"
+                else row["quality"]
+            ),
+        }
+        for instrument_id in ids
+        for row in rows
+    )
+    evidence = []
+    result = _market_state(
+        cursor,
+        plan,
+        tuple(
+            {
+                "instrument_id": instrument_id,
+                "underlying_security_id": str(security_id),
+            }
+            for instrument_id in ids
+        ),
+        ({
+            "instrument_id": equity_id,
+            "security_id": str(security_id),
+            "ticker": selected.underlyer,
+        },),
+        evidence,
+    )
+
+    assert isinstance(result[0][0], UnderlyingSnapshotTick)
+    assert [
+        row.member_key
+        for row in evidence
+        if row.member_kind == "EXCLUDED_CONTRACT"
+    ] == [str(ids[1])]
     assert evidence[-1].availability.value == "READY"

@@ -1,6 +1,8 @@
 """Canonical PostgreSQL loader for exact Advanced Options native inputs."""
 from __future__ import annotations
 
+import json
+import sys
 import time
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
@@ -74,6 +76,17 @@ def _sha256(value: str, name: str) -> str:
     return value
 
 
+class AdvancedOptionsNativePreflightBlocked(ValueError):
+    """The window's inputs are not ready yet. A retry can pass, so the role stays up."""
+
+    def __init__(self, result) -> None:
+        self.result = result
+        super().__init__(
+            "P8 native input preflight blocked: "
+            + ",".join(result.reason_codes)
+        )
+
+
 class NativeInputPlanStatus(str, Enum):
     READY = "READY"
     BLOCKED = "BLOCKED"
@@ -134,6 +147,7 @@ class AdvancedOptionsNativeInputPlan:
     expected_input_sha256: str | None = None
     provider_calls_authorized: bool = False
     runtime_actions_authorized: bool = False
+    unmarked_instrument_ids: tuple[int, ...] = ()
 
     @property
     def control_plane(self):
@@ -210,6 +224,7 @@ def _plan_identity(
         ...,
     ],
     expected_input_sha256: str | None,
+    unmarked_instrument_ids: tuple[int, ...] = (),
 ) -> dict[str, object]:
     control = enrollment.control_plane
     return {
@@ -256,6 +271,11 @@ def _plan_identity(
         "expected_input_sha256": expected_input_sha256,
         "provider_calls_authorized": False,
         "runtime_actions_authorized": False,
+        **(
+            {"unmarked_instrument_ids": unmarked_instrument_ids}
+            if unmarked_instrument_ids
+            else {}
+        ),
     }
 
 
@@ -340,6 +360,7 @@ def _validate_plan(plan: AdvancedOptionsNativeInputPlan) -> dict[str, object]:
         history_source_cohort_id=plan.history_source_cohort_id,
         equity_context_requirements=plan.equity_context_requirements,
         expected_input_sha256=expected,
+        unmarked_instrument_ids=plan.unmarked_instrument_ids,
     )
     digest = canonical_sha256(identity)
     identifier = uuid5(
@@ -370,6 +391,7 @@ def build_advanced_options_native_input_plan(
         ...,
     ],
     expected_input_sha256: str | None = None,
+    unmarked_instrument_ids: tuple[int, ...] = (),
 ) -> AdvancedOptionsNativeInputPlan:
     normalized_cutoff = _utc(cutoff, "cutoff")
     identity = _plan_identity(
@@ -389,6 +411,7 @@ def build_advanced_options_native_input_plan(
         history_source_cohort_id=history_source_cohort_id,
         equity_context_requirements=equity_context_requirements,
         expected_input_sha256=expected_input_sha256,
+        unmarked_instrument_ids=unmarked_instrument_ids,
     )
     digest = canonical_sha256(identity)
     plan = AdvancedOptionsNativeInputPlan(
@@ -413,6 +436,7 @@ def build_advanced_options_native_input_plan(
         history_source_cohort_id=history_source_cohort_id,
         equity_context_requirements=equity_context_requirements,
         expected_input_sha256=expected_input_sha256,
+        unmarked_instrument_ids=unmarked_instrument_ids,
     )
     _validate_plan(plan)
     return plan
@@ -454,6 +478,7 @@ def freeze_advanced_options_native_input_plan(
         history_source_cohort_id=plan.history_source_cohort_id,
         equity_context_requirements=plan.equity_context_requirements,
         expected_input_sha256=preflight.input_sha256,
+        unmarked_instrument_ids=plan.unmarked_instrument_ids,
     )
 
 
@@ -629,11 +654,24 @@ def _verify_scope(
     return True
 
 
+def _has_unmarked_leg(
+    package: RealtimeOptionPackage,
+    unmarked_instrument_ids: tuple[int, ...],
+) -> bool:
+    """A contract left out of a window has no mark, so a package on it cannot be
+    valued there. Selecting it would fail the whole window later."""
+    return any(
+        leg.instrument_id in unmarked_instrument_ids
+        for leg in package.legs
+    )
+
+
 def _packages_for_events(
     cursor,
     *,
     cohort_id: UUID,
     event_ids: tuple[UUID, ...],
+    unmarked_instrument_ids: tuple[int, ...] = (),
 ) -> dict[UUID, RealtimeOptionPackage]:
     if not event_ids:
         return {}
@@ -663,6 +701,10 @@ def _packages_for_events(
     return {
         event_id: by_candidate[candidates[0]]
         for event_id, candidates in grouped.items()
+        if not _has_unmarked_leg(
+            by_candidate[candidates[0]],
+            unmarked_instrument_ids,
+        )
     }
 
 
@@ -672,7 +714,7 @@ def _load_o1(
     evidence: list[AdvancedOptionsNativeInputEvidence],
 ) -> tuple[AdvancedOptionsLaneInputs, object]:
     cursor.execute(
-        "SELECT event.event_id::text,event.event_time,event.contract_id,"
+        "SELECT event.event_id::text,event.event_time,contract.contract_id,"
         "event.contract_ticker,event.underlyer,event.cumulative_volume_after,"
         "event.prior_open_interest,event.open_interest_as_of,"
         "event.source_flow_id::text,event.source_offset,event.created_at,"
@@ -680,8 +722,10 @@ def _load_o1(
         "version.expiration,event.flow_policy_sha256,"
         "array_agg(profile.profile ORDER BY profile.profile) AS profiles "
         "FROM rt.option_flow_events AS event "
+        # Flow writes contract_ticker and leaves contract_id empty, so joining on the id
+        # matched nothing and O1 evaluated no event at all (found Nov 5: 0 of 6,851).
         "JOIN ref.option_contracts AS contract "
-        "ON contract.contract_id=event.contract_id "
+        "ON contract.contract_ticker=event.contract_ticker "
         "JOIN rt.slot_set_current AS current "
         "ON current.cohort_id=event.cohort_id "
         "JOIN rt.slot_set_members AS member "
@@ -690,17 +734,20 @@ def _load_o1(
         "AND member.channel='T' "
         "JOIN rt.instruments AS instrument "
         "ON instrument.instrument_id=member.instrument_id "
-        "AND instrument.contract_id=event.contract_id "
+        "AND instrument.contract_id=contract.contract_id "
         "JOIN ref.option_contract_versions AS version "
         "ON version.version_id=member.catalog_version_id "
-        "AND version.contract_id=event.contract_id "
+        "AND version.contract_id=contract.contract_id "
         "JOIN rt.option_flow_event_profiles AS profile "
         "ON profile.event_id=event.event_id "
         "AND profile.event_time=event.event_time "
         "WHERE event.cohort_id=%s AND event.session_date=%s "
         "AND event.source_flow_id=%s AND event.source_offset<=%s "
-        "AND event.event_time<=%s AND event.trade_treatment='INCLUDED' "
-        "GROUP BY event.event_id,event.event_time,event.contract_id,"
+        # Each window evaluates recent events, and 10 minutes covers one missed window.
+        # Re-evaluating the whole day at every window timed out the stage (found Nov 5).
+        "AND event.event_time<=%s AND event.event_time>%s "
+        "AND event.trade_treatment='INCLUDED' "
+        "GROUP BY event.event_id,event.event_time,contract.contract_id,"
         "event.contract_ticker,event.underlyer,event.cumulative_volume_after,"
         "event.prior_open_interest,event.open_interest_as_of,"
         "event.source_flow_id,event.source_offset,event.created_at,"
@@ -713,6 +760,7 @@ def _load_o1(
             str(plan.source_flow.source_flow_id),
             plan.rolling_state.committed_offset,
             plan.cutoff,
+            plan.cutoff - timedelta(minutes=10),
         ),
     )
     rows = tuple(cursor.fetchall())
@@ -720,45 +768,66 @@ def _load_o1(
         cursor,
         cohort_id=plan.control_plane.cohort_id,
         event_ids=tuple(UUID(str(row["event_id"])) for row in rows),
+        unmarked_instrument_ids=plan.unmarked_instrument_ids,
     )
     calendar = OptionExchangeCalendar()
     invocations = []
+    rejected: dict[str, int] = {}
     for row in rows:
         event_id = UUID(str(row["event_id"]))
         observed_at = max(row["created_at"], row["event_time"])
-        source = ActivitySource(
-            security_id=UUID(str(row["underlying_security_id"])),
-            underlyer=str(row["underlyer"]),
-            contract_id=int(row["contract_id"]),
-            contract_ticker=str(row["contract_ticker"]),
-            contract_type=str(row["call_put"]),
-            expiration_date=row["expiration"],
-            expiration_cutoff=calendar.session_close(row["expiration"]),
-            snapshot_id=event_id,
-            snapshot_payload_sha256=canonical_sha256(tuple(row.values())),
-            batch_id=plan.source_flow.source_flow_id,
-            matrix_id=plan.rolling_state.state_id,
-            configuration_sha256=plan.source_flow.source_flow_sha256,
-            market_policy_sha256=canonical_sha256(tuple(row["profiles"])),
-            volume_session=plan.control_plane.session_date,
-            day_volume=row["cumulative_volume_after"],
-            open_interest=row["prior_open_interest"],
-            oi_settlement_session=row["open_interest_as_of"],
-            oi_observed_at=(
-                None
-                if row["prior_open_interest"] is None
-                else plan.reference_state.known_at
-            ),
-            market_time=row["event_time"],
-            observed_at=observed_at,
-            recorded_at=observed_at,
-            received_at=observed_at,
-        )
+        # One event the detector's contract refuses must not stop the Options window,
+        # so it is left out and counted. The evidence below records the rows it read.
+        try:
+            source = ActivitySource(
+                security_id=UUID(str(row["underlying_security_id"])),
+                underlyer=str(row["underlyer"]),
+                contract_id=int(row["contract_id"]),
+                contract_ticker=str(row["contract_ticker"]),
+                # The catalog stores C and P; the detector's input takes CALL and PUT.
+                contract_type={"C": "CALL", "P": "PUT"}.get(
+                    str(row["call_put"]),
+                    str(row["call_put"]),
+                ),
+                expiration_date=row["expiration"],
+                expiration_cutoff=calendar.session_close(row["expiration"]),
+                snapshot_id=event_id,
+                snapshot_payload_sha256=canonical_sha256(tuple(row.values())),
+                batch_id=plan.source_flow.source_flow_id,
+                matrix_id=plan.rolling_state.state_id,
+                configuration_sha256=plan.source_flow.source_flow_sha256,
+                market_policy_sha256=canonical_sha256(tuple(row["profiles"])),
+                volume_session=plan.control_plane.session_date,
+                day_volume=row["cumulative_volume_after"],
+                open_interest=row["prior_open_interest"],
+                oi_settlement_session=row["open_interest_as_of"],
+                # Open interest settled before the session, so it was known by the
+                # event's own receipt even when this window's reference loaded later.
+                oi_observed_at=(
+                    None
+                    if row["prior_open_interest"] is None
+                    else min(plan.reference_state.known_at, observed_at)
+                ),
+                market_time=row["event_time"],
+                observed_at=observed_at,
+                recorded_at=observed_at,
+                received_at=observed_at,
+            )
+        except ValueError as error:
+            reason = str(error).splitlines()[-1][:120] if str(error) else type(error).__name__
+            rejected[reason] = rejected.get(reason, 0) + 1
+            continue
         invocations.append(AdvancedO1Invocation(
             event_id,
             source,
             packages.get(event_id),
         ))
+    if rejected:
+        print(
+            json.dumps({"event": "advanced_options_o1_events_rejected", "reasons": rejected}),
+            file=sys.stderr,
+            flush=True,
+        )
     value = tuple(tuple(row.values()) for row in rows)
     evidence.append(_evidence("O1", "RETAINED_FLOW", value))
     identity = tuple(
@@ -808,12 +877,14 @@ def _load_o3(
         return AdvancedOptionsLaneInputs(
             blocked_reason_codes=reasons,
         ), {"blocked_reason_codes": reasons}, True
+    # A mark's source offset is a normalized event offset, and the rolling state holds
+    # the raw offset of the flow checkpoint, so they cannot be compared. The mark
+    # producer already bounds each head by the market-state barrier.
     if any(
         str(row["journal_generation"])
         != str(plan.source_flow.journal_generation)
         or UUID(str(row["stream_session_id"]))
         not in plan.source_flow.stream_session_ids
-        or int(row["source_offset"]) > plan.rolling_state.committed_offset
         for row in latest_marks.values()
     ):
         raise ValueError("native O3 mark source generation changed")
@@ -840,9 +911,11 @@ def _load_o3(
             (),
             reasons=reasons,
         ))
+        # No producer writes these yet, so a window with none is normal: this lane
+        # is unavailable for the window, and the other lanes still run.
         return AdvancedOptionsLaneInputs(
             blocked_reason_codes=reasons,
-        ), {"blocked_reason_codes": reasons}, False
+        ), {"blocked_reason_codes": reasons}, True
     candidate_ids = tuple(
         UUID(str(row["retained_input"]["package_candidate_id"]))
         for row in rows
@@ -853,6 +926,16 @@ def _load_o3(
         cohort_id=plan.control_plane.cohort_id,
     )
     by_candidate = {row.candidate_id: row for row in packages}
+    rows = tuple(
+        row
+        for row in rows
+        if not _has_unmarked_leg(
+            by_candidate[
+                UUID(str(row["retained_input"]["package_candidate_id"]))
+            ],
+            plan.unmarked_instrument_ids,
+        )
+    )
     invocations = tuple(
         decode_advanced_o3_invocation_document(
             row["retained_input"],
@@ -909,6 +992,7 @@ def _load_equity_context(
         requirements=plan.equity_context_requirements,
         underlyings=plan.control_plane.universe.option_underlyings,
         allow_shared_history_source=plan.control_plane.stored_identity is not None,
+        equity_receipt_id=plan.equity_input_receipt_id,
     )
     reasons_by_lane = {}
     identities = []
@@ -1016,6 +1100,22 @@ def _load_os(
             {"blocked_reason_codes": reasons},
         )
     member_ids = tuple(row.bar_revision_id for row in context.members)
+    # Bound by what the Equity window accepted, as the context above is: a bar is
+    # always stored after it ends, so the cutoff itself would exclude the newest one.
+    cursor.execute(
+        "SELECT known_by FROM rt.cycle_receipts "
+        "WHERE receipt_id=%s AND receipt_kind='INPUT_READY'",
+        (str(plan.equity_input_receipt_id),),
+    )
+    receipt = cursor.fetchone()
+    known_by = max(
+        plan.equity_input_receipt.cutoff,
+        (
+            plan.equity_input_receipt.cutoff
+            if receipt is None or receipt["known_by"] is None
+            else receipt["known_by"]
+        ),
+    )
     cursor.execute(
         "SELECT * FROM rt.bar_revisions "
         "WHERE bar_revision_id=ANY(%s::uuid[]) "
@@ -1023,8 +1123,8 @@ def _load_os(
         "ORDER BY ticker,interval,bar_end,bar_revision_id",
         (
             [str(value) for value in member_ids],
-            plan.equity_input_receipt.cutoff,
-            plan.equity_input_receipt.cutoff,
+            known_by,
+            known_by,
         ),
     )
     rows = tuple(cursor.fetchall())

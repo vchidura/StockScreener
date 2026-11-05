@@ -7,6 +7,8 @@ from uuid import UUID
 
 import pytest
 from websockets.asyncio.server import serve
+from websockets.exceptions import ConnectionClosed
+from websockets.frames import Opcode
 
 from realtime.advanced_gateway import (
     AdvancedGateway,
@@ -796,6 +798,303 @@ def test_option_gateway_uses_real_loopback_server():
             return await gateway.run_session(maximum_market_messages=1)
 
     assert asyncio.run(scenario()).accepted_messages == 1
+
+
+def _liveness_gateway(endpoint_or_connection, buffer=None):
+    real = isinstance(endpoint_or_connection, str)
+    return AdvancedGateway(
+        GatewayConfiguration(
+            MarketFeed.OPTIONS,
+            (
+                endpoint_or_connection
+                if real
+                else GatewayConfiguration.options().endpoint
+            ),
+            ping_interval_seconds=1,
+            silence_close_seconds=2,
+            allow_insecure_loopback=real,
+        ),
+        _manifest(),
+        buffer or _buffer(10_000, 4_000_000),
+        api_key="never-print-this",
+        **(
+            {}
+            if real
+            else {"connection_factory": lambda _: endpoint_or_connection}
+        ),
+        utc_clock=lambda: NOW,
+        monotonic_ns=lambda: 100,
+        session_id_factory=lambda: SESSION,
+    )
+
+
+class _SilentAfterControls(FakeConnection):
+    """Closes as the real client does: a waiting receive then ends."""
+
+    def __init__(self, incoming):
+        super().__init__(incoming)
+        self.latency = 0.0
+        self.arrived = None
+        self.close_code = None
+
+    def deliver(self, frame):
+        self.incoming.append(frame)
+        if self.arrived is not None:
+            self.arrived.set()
+
+    async def recv(self, *, decode=None):
+        while not self.incoming:
+            if self.close_code is not None:
+                raise ConnectionError("closed")
+            self.arrived = asyncio.Event()
+            await self.arrived.wait()
+        return await super().recv(decode=decode)
+
+    async def close(self, *, code, reason):
+        await super().close(code=code, reason=reason)
+        # As on the real client, a second close changes nothing.
+        self.close_code = code if self.close_code is None else self.close_code
+        if self.arrived is not None:
+            self.arrived.set()
+
+
+_LIVE_CONTROLS = (_status("auth_success"), _status("success"))
+_OPTION_FRAME = (
+    b'[{"ev":"Q","sym":"O:SPY261218C00000001",'
+    b'"bp":1,"ap":1.1,"bs":2,"as":3,"t":1}]'
+)
+
+
+def test_options_connection_closes_when_nothing_has_arrived(caplog):
+    connection = _SilentAfterControls(_LIVE_CONTROLS)
+    gateway = _liveness_gateway(connection)
+
+    async def scenario():
+        await asyncio.wait_for(gateway.run_session(), timeout=8)
+
+    with caplog.at_level("WARNING", logger="realtime.advanced_gateway"):
+        with pytest.raises(ConnectionError):
+            asyncio.run(scenario())
+
+    assert connection.close_code == 1011
+    closing = [
+        row.getMessage()
+        for row in caplog.records
+        if "silence_close" in row.getMessage()
+    ]
+    assert len(closing) == 1
+    assert "last_frame_age_seconds=" in closing[0]
+    assert "last_pong_age_seconds=never" in closing[0]
+    assert "never-print-this" not in caplog.text
+
+
+async def _session_for(connection, seconds, during):
+    gateway = _liveness_gateway(connection)
+    run = asyncio.create_task(gateway.run_session())
+    for tick in range(int(seconds * 10)):
+        during(connection, tick)
+        await asyncio.sleep(0.1)
+    closed = connection.closed
+    run.cancel()
+    await asyncio.gather(run, return_exceptions=True)
+    return closed
+
+
+def test_options_connection_stays_open_while_only_frames_arrive(caplog):
+    with caplog.at_level("WARNING", logger="realtime.advanced_gateway"):
+        closed = asyncio.run(_session_for(
+            _SilentAfterControls(_LIVE_CONTROLS),
+            3.5,
+            lambda connection, _tick: connection.deliver(_OPTION_FRAME),
+        ))
+
+    assert closed is None
+    # The next real run can tell a late pong from a dead feed.
+    assert any("pong_late" in row.getMessage() for row in caplog.records)
+
+
+def test_options_connection_stays_open_while_only_pongs_arrive():
+    def pong(connection, tick):
+        connection.latency = 0.001 * (1 + tick // 5)
+
+    assert asyncio.run(_session_for(
+        _SilentAfterControls(_LIVE_CONTROLS),
+        3.5,
+        pong,
+    )) is None
+
+
+def test_options_connection_is_not_closed_while_the_consumer_is_busy():
+    async def scenario():
+        connection = _SilentAfterControls(())
+        gateway = _liveness_gateway(connection)
+        # Not waiting in a receive, as when a frame is being journaled.
+        gateway._awaiting_frame_since = None
+        watch = asyncio.create_task(gateway._close_when_silent(connection))
+        await asyncio.sleep(3.5)
+        closed = connection.closed
+        watch.cancel()
+        await asyncio.gather(watch, return_exceptions=True)
+        return closed
+
+    assert asyncio.run(scenario()) is None
+
+
+def test_only_the_options_feed_loses_the_library_pong_timeout(monkeypatch):
+    captured = {}
+    import websockets.asyncio.client as client
+
+    monkeypatch.setattr(
+        client,
+        "connect",
+        lambda endpoint, **kwargs: captured.setdefault(endpoint, kwargs),
+    )
+    for configuration in (
+        GatewayConfiguration.stocks(),
+        GatewayConfiguration.options(),
+    ):
+        AdvancedGateway(
+            configuration,
+            _manifest(),
+            _buffer(),
+            api_key="unused",
+            monotonic_ns=lambda: 100,
+        )._connection_context()
+
+    stocks = captured[GatewayConfiguration.stocks().endpoint]
+    options = captured[GatewayConfiguration.options().endpoint]
+    assert (stocks["ping_interval"], stocks["ping_timeout"]) == (20, 10)
+    assert (options["ping_interval"], options["ping_timeout"]) == (20, None)
+
+
+def test_stock_session_runs_no_silence_watcher():
+    async def scenario():
+        connection = QuietConnection(_LIVE_CONTROLS)
+        gateway = _gateway(MarketFeed.STOCKS, connection)
+        run = asyncio.create_task(gateway.run_session())
+        await asyncio.sleep(0.05)
+        tasks = [task.get_coro().__name__ for task in asyncio.all_tasks()]
+        run.cancel()
+        await asyncio.gather(run, return_exceptions=True)
+        return tasks
+
+    assert "_close_when_silent" not in asyncio.run(scenario())
+
+
+def test_silence_limit_must_outlast_the_ping_interval():
+    endpoint = GatewayConfiguration.options().endpoint
+    with pytest.raises(ValueError, match="outlast the ping interval"):
+        GatewayConfiguration(
+            MarketFeed.OPTIONS,
+            endpoint,
+            ping_interval_seconds=20,
+            silence_close_seconds=20,
+        )
+    with pytest.raises(ValueError, match="bounds must be positive"):
+        GatewayConfiguration(
+            MarketFeed.OPTIONS,
+            endpoint,
+            silence_close_seconds=0,
+        )
+    assert GatewayConfiguration.options().silence_close_seconds == 60
+
+
+def _withhold_pongs(websocket):
+    send_frame = websocket.protocol.send_frame
+    websocket.protocol.send_frame = lambda frame: (
+        None if frame.opcode is Opcode.PONG else send_frame(frame)
+    )
+
+
+def _controls_then(behaviour):
+    async def handler(websocket):
+        await websocket.recv()
+        await websocket.send(_status("auth_success").decode("ascii"))
+        await websocket.recv()
+        await websocket.send(_status("success").decode("ascii"))
+        await behaviour(websocket)
+
+    return handler
+
+
+async def _run_for(gateway, seconds):
+    started = asyncio.get_running_loop().time()
+    try:
+        await gateway.run_session(
+            stop_requested=lambda: (
+                asyncio.get_running_loop().time() - started > seconds
+            ),
+            receive_poll_seconds=0.1,
+        )
+    except ConnectionClosed as closed:
+        return closed
+    return None
+
+
+def test_real_client_stays_open_on_pongs_alone_with_no_frames():
+    async def scenario():
+        async with serve(
+            _controls_then(lambda websocket: websocket.wait_closed()),
+            "127.0.0.1",
+            0,
+        ) as server:
+            port = server.sockets[0].getsockname()[1]
+            gateway = _liveness_gateway(f"ws://127.0.0.1:{port}")
+            return await _run_for(gateway, 3.5), gateway
+
+    closed, gateway = asyncio.run(scenario())
+
+    assert closed is None
+    assert gateway._last_pong_at is not None
+
+
+def test_real_client_stays_open_on_frames_when_pongs_never_come():
+    async def behaviour(websocket):
+        _withhold_pongs(websocket)
+        try:
+            while True:
+                await websocket.send(_OPTION_FRAME.decode("ascii"))
+                await asyncio.sleep(0.05)
+        except ConnectionClosed:
+            pass
+
+    async def scenario():
+        async with serve(_controls_then(behaviour), "127.0.0.1", 0) as server:
+            port = server.sockets[0].getsockname()[1]
+            gateway = _liveness_gateway(f"ws://127.0.0.1:{port}")
+            return await _run_for(gateway, 3.5), gateway
+
+    closed, gateway = asyncio.run(scenario())
+
+    assert closed is None
+    assert gateway._last_frame_at is not None
+    assert gateway._last_pong_at is None
+
+
+def test_real_client_closes_when_neither_frames_nor_pongs_come(caplog):
+    async def behaviour(websocket):
+        _withhold_pongs(websocket)
+        await websocket.wait_closed()
+
+    async def scenario():
+        async with serve(_controls_then(behaviour), "127.0.0.1", 0) as server:
+            port = server.sockets[0].getsockname()[1]
+            gateway = _liveness_gateway(f"ws://127.0.0.1:{port}")
+            return await _run_for(gateway, 8.0)
+
+    with caplog.at_level("WARNING", logger="realtime.advanced_gateway"):
+        closed = asyncio.run(scenario())
+
+    assert isinstance(closed, ConnectionClosed)
+    assert any(
+        "silence_close" in row.getMessage() for row in caplog.records
+    )
+    assert any(
+        "connection_closed" in row.getMessage()
+        and "close_code=1011" in row.getMessage()
+        for row in caplog.records
+    )
+    assert "never-print-this" not in caplog.text
 
 
 def test_gateway_subscription_rejection_is_blocked():

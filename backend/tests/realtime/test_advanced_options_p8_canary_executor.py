@@ -3,10 +3,12 @@ from __future__ import annotations
 import json
 import hashlib
 import os
+from contextlib import nullcontext
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
+from types import SimpleNamespace
 from uuid import UUID, uuid4
 
 import pytest
@@ -22,6 +24,7 @@ from realtime.advanced_options_p8_canary_authorization import (
     canonical_sha256,
 )
 from realtime.advanced_options_p8_canary_executor import (
+    AdvancedOptionsP8LifecyclePort,
     P8CanaryExecutionBinding,
     P8CanaryExecutionError,
     P8CanaryExecutor,
@@ -43,6 +46,9 @@ from realtime.option_slot_set import (
     SlotSetPurpose,
     SlotSetVersion,
 )
+from realtime.portal_projection_repository import PortalReleasePointer
+from realtime.portal_publisher import PortalPublicationConfig
+from realtime.preflight import ProviderTier
 from tests.realtime.test_advanced_options_control_plane import (
     _enrollment_plan,
 )
@@ -560,6 +566,8 @@ class FakeLifecyclePort:
 
 
 def _executor(package, report, semantic, file_sha, port):
+    for path in (_lock_path(package), _receipt_path(package)):
+        path.parent.mkdir(parents=True, exist_ok=True)
     return P8CanaryExecutor(
         port,
         repository_root=ROOT,
@@ -830,6 +838,189 @@ def test_failure_after_stored_read_activation_disables_exact_pin(
         assert receipt["state"] == "CONSUMED_ROLLED_BACK"
     finally:
         _dispose(package)
+
+
+class _StoredReadRollbackProbe:
+    def __init__(self, previous, log, *, fail_restore=False):
+        self.previous = previous
+        self.log = log
+        self.fail_restore = fail_restore
+
+    def snapshot(self, *, cohort_id):
+        self.log.append("snapshot")
+        return self.previous
+
+    def advance(self, *, cohort_id, release_id, previous):
+        assert previous is self.previous
+        self.log.append("advance")
+        return {
+            "cohort_id": str(cohort_id),
+            "release_id": str(release_id),
+            "verified": True,
+        }
+
+    def restore(
+        self,
+        *,
+        cohort_id,
+        expected_release_id,
+        previous,
+    ):
+        assert previous is self.previous
+        self.log.append("restore-pin")
+        if self.fail_restore:
+            raise RuntimeError("newer pin is present")
+        return previous
+
+
+@pytest.mark.parametrize(
+    "previous_pin",
+    (
+        None,
+        {
+            "cohort_id": "11111111-2222-3333-4444-555555555555",
+            "release_id": "11111111-1111-1111-1111-111111111111",
+            "package_sha256": "1" * 64,
+            "enabled": False,
+        },
+    ),
+)
+def test_lifecycle_restores_pin_before_pointer_for_absent_or_existing_state(
+    monkeypatch,
+    previous_pin,
+):
+    cohort_id = UUID("11111111-2222-3333-4444-555555555555")
+    release_id = UUID("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+    binding = SimpleNamespace(
+        enrollment=SimpleNamespace(
+            control_plane=SimpleNamespace(cohort_id=cohort_id)
+        )
+    )
+    log = []
+    stored_reads = _StoredReadRollbackProbe(previous_pin, log)
+    lifecycle = AdvancedOptionsP8LifecyclePort(
+        capture=object(),
+        enrollment_connection=object(),
+        resident_launcher=object(),
+        orchestrator=object(),
+        publisher_database=SimpleNamespace(
+            transaction=lambda: nullcontext(object())
+        ),
+        publication_config=PortalPublicationConfig(
+            cohort_id=cohort_id,
+            provider_tier=ProviderTier.MASSIVE_ADVANCED,
+            owner_id=UUID(int=3),
+            owner_epoch=1,
+            dispatch_authorized=False,
+        ),
+        publication_batch=lambda *_args: None,
+        publication_observation=lambda *_args: {},
+        stored_reads=stored_reads,
+    )
+    previous_pointer = (
+        None
+        if previous_pin is None
+        else PortalReleasePointer(
+            cohort_id,
+            ProviderTier.MASSIVE_ADVANCED,
+            UUID(previous_pin["release_id"]),
+            START,
+            START.date(),
+            1,
+            None,
+            None,
+        )
+    )
+    lifecycle._previous_pointer = previous_pointer
+    lifecycle._published_pointer = PortalReleasePointer(
+        cohort_id,
+        ProviderTier.MASSIVE_ADVANCED,
+        release_id,
+        CHECKED,
+        CHECKED.date(),
+        2,
+        None,
+        None,
+    )
+
+    def restore_pointer(_cursor, **kwargs):
+        assert kwargs["previous"] is previous_pointer
+        log.append("restore-pointer")
+
+    monkeypatch.setattr(
+        executor_module,
+        "restore_portal_release_pointer_cursor",
+        restore_pointer,
+    )
+    publication = {"release_id": str(release_id)}
+
+    lifecycle.enable_stored_reads(binding, publication)
+    lifecycle.rollback(binding, publication)
+
+    assert log == [
+        "snapshot",
+        "advance",
+        "restore-pin",
+        "restore-pointer",
+    ]
+
+
+def test_lifecycle_does_not_restore_pointer_when_pin_has_advanced(
+    monkeypatch,
+):
+    cohort_id = UUID("11111111-2222-3333-4444-555555555555")
+    release_id = UUID("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+    binding = SimpleNamespace(
+        enrollment=SimpleNamespace(
+            control_plane=SimpleNamespace(cohort_id=cohort_id)
+        )
+    )
+    log = []
+    lifecycle = AdvancedOptionsP8LifecyclePort(
+        capture=object(),
+        enrollment_connection=object(),
+        resident_launcher=object(),
+        orchestrator=object(),
+        publisher_database=SimpleNamespace(
+            transaction=lambda: nullcontext(object())
+        ),
+        publication_config=PortalPublicationConfig(
+            cohort_id=cohort_id,
+            provider_tier=ProviderTier.MASSIVE_ADVANCED,
+            owner_id=UUID(int=3),
+            owner_epoch=1,
+            dispatch_authorized=False,
+        ),
+        publication_batch=lambda *_args: None,
+        publication_observation=lambda *_args: {},
+        stored_reads=_StoredReadRollbackProbe(
+            None,
+            log,
+            fail_restore=True,
+        ),
+    )
+    lifecycle._published_pointer = PortalReleasePointer(
+        cohort_id,
+        ProviderTier.MASSIVE_ADVANCED,
+        release_id,
+        CHECKED,
+        CHECKED.date(),
+        2,
+        None,
+        None,
+    )
+    monkeypatch.setattr(
+        executor_module,
+        "restore_portal_release_pointer_cursor",
+        lambda *_args, **_kwargs: log.append("restore-pointer"),
+    )
+    publication = {"release_id": str(release_id)}
+    lifecycle.enable_stored_reads(binding, publication)
+
+    with pytest.raises(RuntimeError, match="newer pin"):
+        lifecycle.rollback(binding, publication)
+
+    assert log == ["snapshot", "advance", "restore-pin"]
 
 
 def test_owned_disposable_executor_qualification(

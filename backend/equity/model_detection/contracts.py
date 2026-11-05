@@ -109,6 +109,8 @@ class GateStatus(str, Enum):
     PASS = "PASS"
     FAIL = "FAIL"
     UNAVAILABLE = "UNAVAILABLE"
+    # Optional context with no data: it does not stop a match, and it never reads as a pass.
+    NOT_APPLICABLE = "NOT_APPLICABLE"
 
 
 class Phase(str, Enum):
@@ -424,7 +426,7 @@ class Decision:
             if self.direction is None or self.geometry is None or self.trigger_identity is None:
                 raise ValueError("match requires direction, geometry and trigger")
             sha256(self.trigger_identity)
-            if self.direction != self.geometry.direction or not self.gates or any(gate.status is not GateStatus.PASS for gate in self.gates):
+            if self.direction != self.geometry.direction or not self.gates or any(gate.status not in {GateStatus.PASS, GateStatus.NOT_APPLICABLE} for gate in self.gates):
                 raise ValueError("inconsistent match geometry or gates")
         elif self.direction is not None or self.geometry is not None or self.trigger_identity is not None:
             raise ValueError("non-match cannot suggest a trade")

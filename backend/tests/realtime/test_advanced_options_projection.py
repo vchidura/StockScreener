@@ -1,3 +1,6 @@
+from datetime import timedelta
+from decimal import Decimal
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 from uuid import UUID, uuid4
 
@@ -19,10 +22,13 @@ from realtime.advanced_options_projection import (
     OPTIONS_PAGE_SNAPSHOT_TYPES,
     OPTIONS_PROJECTION_TYPES,
     OPTIONS_SNAPSHOT_TYPES,
+    ADVANCED_OPTIONS_PAGE_FLOW_EVENT_DETAIL_LIMIT,
     authorize_advanced_options_canary_publication,
     authorize_advanced_options_publication,
     build_advanced_options_projection_batch,
     build_advanced_options_publisher_handoff,
+    load_advanced_options_page_release_cursor,
+    load_advanced_options_page_source_cursor,
     persist_advanced_options_projection_cursor,
     read_advanced_options_projection_cursor,
 )
@@ -50,6 +56,185 @@ def _cycle():
         reference_repository=_reference_repository(),
         build_id="p4-build",
     )
+
+
+def test_page_release_loader_uses_the_selected_release_identity():
+    cursor = MagicMock()
+    cursor.fetchone.return_value = None
+    cursor.fetchall.return_value = ()
+    release_id = uuid4()
+
+    assert load_advanced_options_page_release_cursor(
+        cursor,
+        cohort_id=UUID(int=2),
+        available_by=NOW,
+        artifact_kind="FLOW",
+        release_id=release_id,
+        release_cutoff=NOW,
+    ) is None
+
+    statement, parameters = cursor.execute.call_args.args
+    assert "portal_release_current" not in statement
+    assert "WHERE release.release_id=%s" in statement
+    assert parameters[1:4] == (
+        str(release_id),
+        NOW,
+        str(UUID(int=2)),
+    )
+
+
+def test_page_source_uses_complete_aggregates_and_bounded_detail():
+    control = _control_plane()
+    underlyer = control.universe.option_underlyings[0]
+    contract_ticker = (
+        f"O:{underlyer}{NOW:%y%m%d}C00500000"
+    )
+    aggregate = {
+        "event_id": uuid4(),
+        "event_time": NOW,
+        "first_event_time": NOW - timedelta(minutes=5),
+        "contract_ticker": contract_ticker,
+        "contract_id": 1,
+        "underlyer": underlyer,
+        "price": Decimal("1.25"),
+        "size": 6001,
+        "multiplier": 100,
+        "premium": Decimal("750125"),
+        "prior_open_interest": None,
+        "event_count": 6001,
+    }
+    detail = {
+        key: value
+        for key, value in aggregate.items()
+        if key not in {"first_event_time", "event_count"}
+    }
+    cursor = MagicMock()
+    admitted = tuple(
+        (
+            member.instrument_id,
+            index + 100,
+            f"O:{underlyer}{NOW:%y%m%d}C{index + 1:08d}",
+            underlyer,
+            "C",
+            NOW.date() + timedelta(days=30),
+            Decimal(index + 1),
+            "ELIGIBLE",
+            NOW,
+        )
+        for index, member in enumerate(control.slot_set.members)
+    )
+    cursor.fetchall.side_effect = (
+        (aggregate,),
+        (detail,),
+        admitted,
+    )
+    cycle = SimpleNamespace(
+        input_gate=SimpleNamespace(
+            closure=SimpleNamespace(
+                cycle_input=SimpleNamespace(
+                    cohort_id=control.cohort_id,
+                )
+            )
+        ),
+        evaluations=(),
+    )
+
+    source = load_advanced_options_page_source_cursor(
+        cursor,
+        control_plane=control,
+        cycle=cycle,
+        generated_at=NOW,
+    )
+
+    assert source.flow_events[0]["event_count"] == 6001
+    assert source.flow_event_detail == (detail,)
+    assert source.admitted_contracts[0]["instrument_id"] == (
+        control.slot_set.members[0].instrument_id
+    )
+    aggregate_query = cursor.execute.call_args_list[0].args[0]
+    detail_query, detail_parameters = (
+        cursor.execute.call_args_list[1].args
+    )
+    assert "GROUP BY event.contract_ticker" in aggregate_query
+    assert "LIMIT" not in aggregate_query
+    assert "event.event_time>%s" not in aggregate_query
+    assert detail_query.endswith(
+        "ORDER BY event.event_time DESC,event.event_id DESC LIMIT %s"
+    )
+    assert detail_parameters[-1] == (
+        ADVANCED_OPTIONS_PAGE_FLOW_EVENT_DETAIL_LIMIT
+    )
+
+
+def test_page_source_recomputes_full_session_for_late_inserts_and_corrections():
+    control = _control_plane()
+    underlyer = control.universe.option_underlyings[0]
+    contract_ticker = f"O:{underlyer}{NOW:%y%m%d}C00500000"
+    base = {
+        "event_id": uuid4(),
+        "event_time": NOW - timedelta(minutes=2),
+        "first_event_time": NOW - timedelta(minutes=5),
+        "contract_ticker": contract_ticker,
+        "contract_id": 1,
+        "underlyer": underlyer,
+        "price": Decimal("1.25"),
+        "size": 20,
+        "multiplier": 100,
+        "premium": Decimal("2500"),
+        "prior_open_interest": None,
+        "event_count": 2,
+    }
+    corrected = {
+        **base,
+        "event_id": uuid4(),
+        "size": 15,
+        "premium": Decimal("1875"),
+        "event_count": 3,
+    }
+    detail = {
+        key: value
+        for key, value in corrected.items()
+        if key not in {"first_event_time", "event_count"}
+    }
+    admitted = tuple(
+        {"instrument_id": member.instrument_id}
+        for member in control.slot_set.members
+    )
+    cycle = SimpleNamespace(
+        input_gate=SimpleNamespace(
+            closure=SimpleNamespace(
+                cycle_input=SimpleNamespace(
+                    cohort_id=control.cohort_id,
+                )
+            )
+        ),
+        evaluations=(),
+    )
+
+    def load(aggregate):
+        cursor = MagicMock()
+        cursor.fetchall.side_effect = (
+            (aggregate,),
+            (detail,),
+            admitted,
+        )
+        source = load_advanced_options_page_source_cursor(
+            cursor,
+            control_plane=control,
+            cycle=cycle,
+            generated_at=NOW,
+        )
+        return source, cursor
+
+    original, _ = load(base)
+    recomputed, cursor = load(corrected)
+
+    assert original.flow_events[0]["size"] == 20
+    assert recomputed.flow_events[0]["size"] == 15
+    assert recomputed.flow_events[0]["event_count"] == 3
+    aggregate_query = cursor.execute.call_args_list[0].args[0]
+    assert "event.event_time>%s" not in aggregate_query
+    assert "portal_release_current" not in aggregate_query
 
 
 def test_projection_batch_is_deterministic_complete_and_nonpublishing():

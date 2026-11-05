@@ -10,6 +10,7 @@ from realtime.contracts import canonical_json, canonical_sha256
 from realtime.lineage_head import BOUNDED_MANIFEST_BYTES, bar_lineage_head
 from realtime.ticker_projection import (
     _DerivationVerifier,
+    TickerProjectionCancelled,
     TickerProjectionState,
     _fact,
     _security,
@@ -56,6 +57,14 @@ def _identity(projection):
 
 def _later(inputs):
     return replace(inputs, cutoff=inputs.cutoff + timedelta(minutes=5))
+
+
+def _cache_keys(state, kind):
+    return {
+        key
+        for key in state._previous
+        if key[0] == kind
+    }
 
 
 @pytest.fixture(scope="module")
@@ -165,10 +174,15 @@ def test_a_long_lived_state_never_changes_the_result(primed):
     assert cold_stats["fact_built"] == len(two_names().bars) and cold_stats.get("fact_reused", 0) == 0
 
     later = _later(two_names())
+    materializations = _cache_keys(state, "materialization")
     warm = project_realtime_ticker_workspace(later, state=state)
     assert _identity(warm) == _identity(project_realtime_ticker_workspace(later))
     assert state.stats["fact_built"] == 0 and state.stats["fact_reused"] == len(later.bars)
-    assert state.stats["materialization_built"] == 0 and state.stats["materialization_reused"] == 24
+    assert state.stats["materialization_built"] == 0
+    assert state.stats["materialization_reused"] == len(
+        materializations
+    )
+    assert _cache_keys(state, "materialization") == materializations
     assert state.stats["lineage_session_built"] == 0 and state.stats["derived_windows_built"] == 0
     # Same bars, later cutoff: the manifest head is unchanged except for the cutoff-bound input digest.
     for before, after in zip(first.snapshots, warm.snapshots):
@@ -176,15 +190,49 @@ def test_a_long_lived_state_never_changes_the_result(primed):
         assert before.source_manifest["input_sha256"] != after.source_manifest["input_sha256"]
 
 
+def test_cancelled_projection_does_not_replace_the_last_complete_state():
+    state = TickerProjectionState()
+    project_realtime_ticker_workspace(two_names(), state=state)
+    retained = len(state)
+    checks = 0
+
+    def should_stop():
+        nonlocal checks
+        checks += 1
+        return checks > 4
+
+    with pytest.raises(TickerProjectionCancelled):
+        project_realtime_ticker_workspace(
+            _later(two_names()),
+            state=state,
+            should_stop=should_stop,
+        )
+
+    assert len(state) == retained
+
+
 def test_a_revised_interval_rebuilds_only_that_tickers_interval(primed):
     state, first, _ = primed
     state_for_run = TickerProjectionState()
     project_realtime_ticker_workspace(two_names(), state=state_for_run)
+    prior_materializations = _cache_keys(
+        state_for_run,
+        "materialization",
+    )
     revised = _revise_monthly(two_names(), "AAPL")
     projection = project_realtime_ticker_workspace(revised, state=state_for_run)
     stats = state_for_run.stats
+    current_materializations = _cache_keys(
+        state_for_run,
+        "materialization",
+    )
     # AAPL's 1mo setup and 1mo pattern; every other interval and every MSFT interval is reused.
-    assert stats["materialization_built"] == 2 and stats["materialization_reused"] == 22
+    assert stats["materialization_built"] == len(
+        current_materializations - prior_materializations
+    ) == 2
+    assert stats["materialization_reused"] == len(
+        current_materializations & prior_materializations
+    )
     assert stats["fact_built"] == sum(1 for row in revised.bars if row["ticker"] == "AAPL" and row["interval"] == "1mo")
     by_key = {snapshot.snapshot_key: snapshot for snapshot in projection.snapshots}
     original = {snapshot.snapshot_key: snapshot for snapshot in first.snapshots}

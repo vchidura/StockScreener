@@ -412,7 +412,10 @@ def verify_option_cycle_input_against_tables(
         if different:
             raise ValueError(f"stored discovery batch for {entry.underlyer} differs from the cycle input: "
                 + ", ".join(different))
-        if len(stored.coverage) != 8 or stored.coverage_digest != entry.coverage_sha256:
+        # A resident session selects from one snapshot, so it has no crawl coverage.
+        # Where coverage was recorded, or pages are required, it must be whole.
+        expected_coverage = 8 if require_pages or stored.coverage else 0
+        if len(stored.coverage) != expected_coverage or stored.coverage_digest != entry.coverage_sha256:
             raise ValueError(f"stored discovery coverage for {entry.underlyer} differs from the cycle input")
         if not stored.pages:
             if require_pages:

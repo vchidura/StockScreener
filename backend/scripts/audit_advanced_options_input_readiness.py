@@ -35,6 +35,7 @@ from realtime.advanced_options_rolling_repository import (  # noqa: E402
 )
 from realtime.advanced_options_rolling_producer import (  # noqa: E402
     advanced_options_consumer_checkpoint_sha256,
+    advanced_options_gap_blocks,
     advanced_options_unresolved_gaps_sha256,
 )
 from realtime.advanced_options_rolling_state import (  # noqa: E402
@@ -1384,6 +1385,14 @@ def _classify(
 
     gaps = tuple(snapshot["gaps"])
     gap_digest = advanced_options_unresolved_gaps_sha256(gaps)
+    # The producer binds tolerated gaps into its digest, so a clean digest is not
+    # always the empty one. With no binding yet, every gap is reported as blocking.
+    tolerated_gaps = tuple(
+        row
+        for row in gaps
+        if binding is not None
+        and not advanced_options_gap_blocks(row, binding.known_at)
+    )
     if len(source_flows) != 1:
         categories["unresolved_gaps"] = _blocked(
             (
@@ -1397,7 +1406,7 @@ def _classify(
             },
             observed_at=observed_at,
         )
-    elif gaps:
+    elif len(tolerated_gaps) != len(gaps):
         categories["unresolved_gaps"] = _blocked(
             ("UNRESOLVED_OR_WARMING_STREAM_GAPS",),
             evidence={
@@ -1415,18 +1424,19 @@ def _classify(
             ("UNRESOLVED_GAP_DIGEST_MISMATCH",),
             evidence={
                 "table": "rt.stream_gaps",
-                "unresolved_count": 0,
+                "unresolved_count": len(gaps),
                 "digest": gap_digest,
             },
             observed_at=observed_at,
         )
     else:
         categories["unresolved_gaps"] = _result(
-            "COMPLETE_ZERO",
+            "AVAILABLE" if gaps else "COMPLETE_ZERO",
             (),
             evidence={
                 "table": "rt.stream_gaps",
-                "unresolved_count": 0,
+                "unresolved_count": len(gaps),
+                "tolerated_count": len(tolerated_gaps),
                 "stream_session_ids": source_flows[0][
                     "stream_session_ids"
                 ],
@@ -1768,7 +1778,15 @@ def _classify(
         source_clock_reasons.append("ROLLING_CLOCKS_ABSENT")
     watermarks = tuple(snapshot.get("source_watermarks", ()))
     watermark_digest = canonical_sha256(tuple(
-        tuple(row.values()) for row in watermarks
+        (
+            str(row["session_id"]),
+            str(row["manifest_id"]),
+            int(row["owner_epoch"]),
+            str(row["journal_generation"]),
+            row["started_at"],
+            row["subscribed_at"],
+        )
+        for row in watermarks
     ))
     if binding is not None and (
         not watermarks

@@ -295,6 +295,27 @@ class AdvancedOptionsJournalSource:
         )
         self._reader = reader_factory(self.path)
         self.generation = registration.journal_generation
+        self._maximum_raw_offset: int | None = None
+        self._maximum_event_offset: int | None = None
+
+    def set_read_limits(
+        self,
+        *,
+        raw_offset: int | None,
+        event_offset: int | None,
+    ) -> None:
+        for value, name in (
+            (raw_offset, "raw_offset"),
+            (event_offset, "event_offset"),
+        ):
+            if value is not None and (
+                type(value) is not int or value < 0
+            ):
+                raise ValueError(
+                    f"Advanced Options {name} read limit is invalid"
+                )
+        self._maximum_raw_offset = raw_offset
+        self._maximum_event_offset = event_offset
 
     def registered_session_id(self, stream_session_id: UUID) -> UUID:
         """rt.stream_sessions holds the one bound session; the journal names each attempt."""
@@ -307,10 +328,20 @@ class AdvancedOptionsJournalSource:
         return self.registration.stream_session_id
 
     def last_offset(self) -> int:
-        return self.registration.raw_committed_offset
+        if self._maximum_raw_offset is None:
+            return self.registration.raw_committed_offset
+        return min(
+            self.registration.raw_committed_offset,
+            self._maximum_raw_offset,
+        )
 
     def last_event_offset(self) -> int:
-        return self.registration.normalized_committed_offset
+        if self._maximum_event_offset is None:
+            return self.registration.normalized_committed_offset
+        return min(
+            self.registration.normalized_committed_offset,
+            self._maximum_event_offset,
+        )
 
     def read_after(
         self,
@@ -318,7 +349,17 @@ class AdvancedOptionsJournalSource:
         *,
         limit: int = 1000,
     ) -> Sequence[RawJournalRecord]:
-        records = self._reader.read_after(raw_offset, limit=limit)
+        records = tuple(
+            record
+            for record in self._reader.read_after(
+                raw_offset,
+                limit=limit,
+            )
+            if (
+                self._maximum_raw_offset is None
+                or record.raw_offset <= self._maximum_raw_offset
+            )
+        )
         previous = raw_offset
         session_ids = _journal_session_ids(self.source_flow.stream_session_ids)
         for record in records:
@@ -348,9 +389,16 @@ class AdvancedOptionsJournalSource:
         *,
         limit: int = 1000,
     ) -> Sequence[NormalizedJournalRecord]:
-        records = self._reader.read_normalized_after(
-            event_offset,
-            limit=limit,
+        records = tuple(
+            record
+            for record in self._reader.read_normalized_after(
+                event_offset,
+                limit=limit,
+            )
+            if (
+                self._maximum_event_offset is None
+                or record.event_offset <= self._maximum_event_offset
+            )
         )
         previous = event_offset
         session_ids = _journal_session_ids(self.source_flow.stream_session_ids)

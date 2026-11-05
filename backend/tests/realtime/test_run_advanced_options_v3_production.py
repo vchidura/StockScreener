@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import json
 from datetime import datetime, timezone
 from pathlib import Path
@@ -8,6 +9,7 @@ from uuid import UUID
 
 import pytest
 
+from realtime import advanced_options_p8_production as p8_production
 from realtime.advanced_options_control_plane import (
     advanced_options_history_binding_payload,
     build_advanced_options_history_binding,
@@ -738,6 +740,16 @@ def test_market_loop_capture_binding_is_provider_free(
     assert selection is selection_capture
     assert build_calls[0]["provider_free_selection"] is True
     assert "POLYGON_API_KEY" not in market_loop.os.environ
+
+
+def test_p8_publication_snapshot_sql_aliases_catalog_manifest():
+    source = inspect.getsource(p8_production)
+
+    assert (
+        '"catalog.manifest_sha256 AS source_manifest_sha256,"'
+        in source
+    )
+    assert "catalog.source_manifest_sha256" not in source
 
 
 def test_preopen_package_report_returns_cli_identity(tmp_path):

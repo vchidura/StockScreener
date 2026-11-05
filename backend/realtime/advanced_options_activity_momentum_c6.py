@@ -2393,6 +2393,28 @@ class ActivityMomentumResolution:
         )
 
 
+_TARGET_BAND_WIDTH = Decimal("0.10")
+_FLOW_EXCLUDED_DTES = frozenset(
+    dte
+    for band in json.loads(
+        (
+            Path(__file__).resolve().parent
+            / "policies"
+            / "advanced_options_flow_v1.json"
+        ).read_text(encoding="utf-8")
+    )["excluded_dte_bands"]
+    for dte in range(band["minimum_dte"], band["maximum_dte"] + 1)
+)
+
+
+def _target_band(distance: Decimal) -> int:
+    """Contracts about equally near the target compete on activity. Sorting by spread
+    first favoured expensive in-the-money contracts that hardly trade."""
+    if not distance.is_finite():
+        return 1_000_000
+    return int(distance / _TARGET_BAND_WIDTH)
+
+
 def _criterion_candidate_rank(
     candidate: ActivityMomentumCandidate,
     criterion: ActivityMomentumSelectionCriterion,
@@ -2428,19 +2450,21 @@ def _criterion_candidate_rank(
         missing_delta = True
     return (
         candidate.bid is None,
-        Decimal("Infinity") if spread is None else spread,
+        candidate.dte_for(session_date) in _FLOW_EXCLUDED_DTES,
         candidate.prior_open_interest is None,
-        -(
-            Decimal("-1")
-            if notional is None
-            else notional
-        ),
+        missing_delta,
+        _target_band(relevance_distance),
         -(
             -1
             if candidate.completed_session_volume is None
             else candidate.completed_session_volume
         ),
-        missing_delta,
+        -(
+            Decimal("-1")
+            if notional is None
+            else notional
+        ),
+        Decimal("Infinity") if spread is None else spread,
         relevance_distance,
         abs(
             candidate.dte_for(session_date)
@@ -4759,18 +4783,20 @@ def _candidate_rank(
     return (
         bool(candidate.unavailable_reasons),
         candidate.bid is None,
-        Decimal("Infinity") if spread is None else spread,
+        candidate.dte_for(session_date) in _FLOW_EXCLUDED_DTES,
         candidate.prior_open_interest is None,
-        -(
-            Decimal("-1")
-            if notional is None
-            else notional
-        ),
+        _target_band(target_distance),
         -(
             -1
             if candidate.completed_session_volume is None
             else candidate.completed_session_volume
         ),
+        -(
+            Decimal("-1")
+            if notional is None
+            else notional
+        ),
+        Decimal("Infinity") if spread is None else spread,
         target_distance,
         expiry_distance,
         candidate.contract_ticker,

@@ -5,6 +5,8 @@ from zoneinfo import ZoneInfo
 from collections.abc import Mapping
 from uuid import UUID
 
+import exchange_calendars
+
 from research.stock_alert_review import build_stock_eod_review
 from research.stock_alerts import alert_page, session_dates
 
@@ -370,6 +372,38 @@ class RealtimeStockAlertViewRepository(_RealtimeCompatibilityRepository):
             ]
         return result, row["generated_at"]
 
+    def _add_regenerated_alerts(self, snapshot, cutoff, cohort_id, session):
+        """A session regenerated under a later policy shows those alerts, labelled as such.
+
+        The stored release keeps its original rows; see canonical_stock_alert_regeneration.py.
+        """
+        with self._cursor() as cursor:
+            self._begin(cursor)
+            cursor.execute(
+                "SELECT alert_id::text AS alert_id,projection FROM rt.alert_current "
+                "WHERE cohort_id=%s AND alert_kind='STOCK' "
+                "AND projection->>'regenerated'='true' AND projection->>'session'=%s "
+                "AND as_of<=%s ORDER BY as_of,alert_id",
+                (str(cohort_id), session, cutoff),
+            )
+            rows = tuple(cursor.fetchall())
+        if not rows:
+            return
+        publications = {}
+        for row in rows:
+            publication = row["projection"]["publication"]
+            publications[publication["run_id"]] = publication
+        snapshot["publications"] = [*snapshot.get("publications", []), *publications.values()]
+        snapshot["alerts"] = [
+            *snapshot.get("alerts", []),
+            *(dict(row["projection"], alert_id=row["alert_id"]) for row in rows),
+        ]
+        regenerated_at = rows[0]["projection"]["regenerated_at"][:10]
+        snapshot["warnings"] = [
+            f"Regenerated on {regenerated_at} from stored bars, with event and sector context unavailable "
+            "(N/A). These alerts were not published live on this day."
+        ]
+
     def alert_view(self, *, available_by, cohort_id=None, source="SHADOW", session_date=None,
                    combined=None, offset=0, limit=100, **filters):
         cutoff = _utc(available_by, "available_by")
@@ -386,19 +420,36 @@ class RealtimeStockAlertViewRepository(_RealtimeCompatibilityRepository):
                 raise StockAlertPublicationUnavailable("Realtime intraday forward stream is unavailable")
         dates = session_dates(cutoff.astimezone(ZoneInfo("America/New_York")).date().isoformat())
         snapshot.update(sessions=dates, current_session=dates[-1])
-        if cutoff - generated_at > timedelta(minutes=50):
+        # Stale means a publication was due and did not come, so a past session or one
+        # whose close has already been published is final, not stale.
+        calendar = exchange_calendars.get_calendar("XNYS")
+        published_session = generated_at.astimezone(ZoneInfo("America/New_York")).date().isoformat()
+        session_is_final = (
+            calendar.is_session(published_session)
+            and generated_at >= calendar.session_close(published_session).to_pydatetime()
+        )
+        viewing_today = session_date is None or str(session_date) == dates[-1]
+        staleness_applies = (
+            not payload.get("canonical_product")
+            or (viewing_today and not session_is_final)
+        )
+        if staleness_applies and cutoff - generated_at > timedelta(minutes=50):
             snapshot["warnings"].append("Realtime retained alert data stale; no request-time refresh performed")
             for stream in snapshot.get("strategy_streams", []):
                 stream.update(status="STALE", projector_stale=True)
+        if session_date is not None and cohort_id is not None:
+            self._add_regenerated_alerts(snapshot, cutoff, cohort_id, str(session_date))
         try:
             page = alert_page(snapshot, session=str(session_date) if session_date else None,
                               offset=offset, limit=limit, **filters)
         except ValueError as error:
             raise StockAlertQueryRejected(str(error)) from error
         schedules = payload["schedule_streams"]
-        for name in ("intraday", "swing"):
-            if not any(stream["stream"] == name for stream in schedules):
-                schedules.append(dict(stream=name, label=name.title(), status="UNAVAILABLE"))
+        # The canonical product has one stream of its own and no intraday or swing schedule.
+        if not payload.get("canonical_product"):
+            for name in ("intraday", "swing"):
+                if not any(stream["stream"] == name for stream in schedules):
+                    schedules.append(dict(stream=name, label=name.title(), status="UNAVAILABLE"))
         for schedule in schedules:
             if schedule.get("publication_deadline") and datetime.fromisoformat(schedule["publication_deadline"]) < cutoff:
                 schedule["status"] = "OVERDUE"

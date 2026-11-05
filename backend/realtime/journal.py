@@ -6,7 +6,7 @@ import sqlite3
 import threading
 from contextlib import closing
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from typing import TYPE_CHECKING, Iterable
@@ -698,6 +698,43 @@ class RawJournalWriter:
         self.close()
 
 
+# An event stamped this far past when its frame was received has a bad source
+# clock, so it says nothing about how far the feed has come. Normalized events
+# hold only the source time, and their frame's raw row holds the receive time.
+MAXIMUM_EVENT_AHEAD_OF_RECEIPT_MS = 60_000
+_EVENT_IS_CREDIBLE_SQL = (
+    "event.source_timestamp<=CAST(("
+    "julianday(frame.received_at)-2440587.5"
+    f")*86400000 AS INTEGER)+{MAXIMUM_EVENT_AHEAD_OF_RECEIPT_MS}"
+)
+# Walks each instrument's time index, so the cost is the events past the cutoff
+# and not the length of the journal. The upper bound leaves far-future stamps out
+# through the index, without reading a row for each of them.
+_FIRST_EVENT_AFTER_TEMPLATE = (
+    "WITH RECURSIVE instrument(instrument_id) AS ("
+    "SELECT MIN(instrument_id) FROM normalized_events "
+    "UNION ALL SELECT ("
+    "SELECT MIN(event.instrument_id) FROM normalized_events AS event "
+    "WHERE event.instrument_id>instrument.instrument_id"
+    ") FROM instrument WHERE instrument.instrument_id IS NOT NULL"
+    ") SELECT MIN(("
+    "SELECT MIN(event.event_offset) FROM normalized_events AS event {join}"
+    "WHERE event.instrument_id=instrument.instrument_id "
+    "AND event.source_timestamp>? AND event.source_timestamp<=? {check}"
+    ")) FROM instrument WHERE instrument.instrument_id IS NOT NULL"
+)
+_FIRST_EVENT_AFTER_SQL = _FIRST_EVENT_AFTER_TEMPLATE.format(join="", check="")
+_FIRST_CREDIBLE_EVENT_AFTER_SQL = _FIRST_EVENT_AFTER_TEMPLATE.format(
+    join="JOIN raw_messages AS frame ON frame.raw_offset=event.raw_offset ",
+    check=f"AND {_EVENT_IS_CREDIBLE_SQL}",
+)
+_EVENT_CREDIBLE_AT_OFFSET_SQL = (
+    f"SELECT {_EVENT_IS_CREDIBLE_SQL} FROM normalized_events AS event "
+    "JOIN raw_messages AS frame ON frame.raw_offset=event.raw_offset "
+    "WHERE event.event_offset=?"
+)
+
+
 class RawJournalReader:
     def __init__(self, path: str | Path, *, timeout_seconds: float = 5.0) -> None:
         self.path = Path(path)
@@ -892,9 +929,27 @@ class RawJournalReader:
         )
 
     def offsets_at(self, cutoff: datetime) -> tuple[int, int]:
+        """Where a window cut at this time ends: the last event before the frame
+        that holds the first event later than the cutoff.
+
+        The feed is not in event-time order and one frame can span the cutoff, so
+        the last event at or before the cutoff can sit behind later events, and it
+        moves whenever a late print arrives. This point cannot move once a later
+        event is durable, so every role gets the same answer whenever it asks.
+        Until then it is simply the newest event.
+
+        A later event counts only if it is credible: stamped at most
+        MAXIMUM_EVENT_AHEAD_OF_RECEIPT_MS past when its frame was received. That
+        never changes for an event, so the point above still holds, and one bad
+        stamp cannot freeze every later barrier until its time comes. The common
+        call reads the index only and checks one row. Only while a bad stamp is
+        the first candidate does it read each candidate's frame.
+        """
         if cutoff.tzinfo is None or cutoff.utcoffset() is None:
             raise ValueError("cutoff must be timezone-aware")
-        value = cutoff.astimezone(timezone.utc).isoformat()
+        epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
+        milliseconds = timedelta(milliseconds=1)
+        cutoff_ms = (cutoff.astimezone(timezone.utc) - epoch) // milliseconds
         with closing(
             _connect(
                 self.path,
@@ -902,11 +957,47 @@ class RawJournalReader:
                 read_only=True,
             )
         ) as connection:
-            row = connection.execute(
-                "SELECT raw_offset,event_offset FROM normalized_events "
-                "WHERE event_at <= ? ORDER BY event_offset DESC LIMIT 1",
-                (value,),
+            newest_frame = connection.execute(
+                "SELECT received_at FROM raw_messages "
+                "ORDER BY raw_offset DESC LIMIT 1"
             ).fetchone()
+            if newest_frame is None:
+                return 0, 0
+            latest_credible_ms = (
+                (_parse_stamp(newest_frame["received_at"]) - epoch)
+                // milliseconds
+                + MAXIMUM_EVENT_AHEAD_OF_RECEIPT_MS
+            )
+            bounds = (cutoff_ms, latest_credible_ms)
+            first_later = connection.execute(
+                _FIRST_EVENT_AFTER_SQL,
+                bounds,
+            ).fetchone()[0]
+            if (
+                first_later is not None
+                and not connection.execute(
+                    _EVENT_CREDIBLE_AT_OFFSET_SQL,
+                    (first_later,),
+                ).fetchone()[0]
+            ):
+                first_later = connection.execute(
+                    _FIRST_CREDIBLE_EVENT_AFTER_SQL,
+                    bounds,
+                ).fetchone()[0]
+            if first_later is None:
+                row = connection.execute(
+                    "SELECT raw_offset,event_offset FROM normalized_events "
+                    "ORDER BY event_offset DESC LIMIT 1"
+                ).fetchone()
+            else:
+                row = connection.execute(
+                    "SELECT raw_offset,event_offset FROM normalized_events "
+                    "WHERE event_offset<? AND raw_offset<("
+                    "SELECT raw_offset FROM normalized_events "
+                    "WHERE event_offset=?"
+                    ") ORDER BY event_offset DESC LIMIT 1",
+                    (first_later, first_later),
+                ).fetchone()
         if row is None:
             return 0, 0
         return int(row["raw_offset"]), int(row["event_offset"])

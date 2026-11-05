@@ -64,7 +64,7 @@ from scripts.run_realtime_v2_advanced_equity_window import (  # noqa: E402
 PROJECTION_ONLY = "projection-only"
 CONTINUOUS_PUBLICATION = "continuous-publication"
 COMPLETED_SESSION_RECOVERY_POLL_SECONDS = 60
-COMPLETED_SESSION_EXTRA_ATTEMPTS = 2
+COMPLETED_SESSION_EXTRA_ATTEMPTS = 1
 # A window can take its whole budget, so stop early enough to be idle by the
 # activation boundary at open minus 15 minutes.
 COMPLETED_SESSION_RECOVERY_LEAD = timedelta(minutes=25)
@@ -210,7 +210,16 @@ def _authorized_windows(windows, *, first_cutoff, started, ended):
     return selected
 
 
-def _window_arguments(args, scope, *, session_date, cutoff, retry):
+def _window_arguments(
+    args,
+    scope,
+    *,
+    session_date,
+    cutoff,
+    retry,
+    completion_budget_seconds=None,
+    execution_deadline=None,
+):
     window_args = [
         "--database",
         args.database,
@@ -225,7 +234,11 @@ def _window_arguments(args, scope, *, session_date, cutoff, retry):
         "--finality-delay-seconds",
         str(args.finality_delay_seconds),
         "--completion-budget-seconds",
-        str(args.completion_budget_seconds),
+        str(
+            args.completion_budget_seconds
+            if completion_budget_seconds is None
+            else completion_budget_seconds
+        ),
         "--authorization-reference",
         scope.get(
             "authorization_reference",
@@ -242,6 +255,11 @@ def _window_arguments(args, scope, *, session_date, cutoff, retry):
         window_args.extend((
             f"--window-key-suffix=-retry{retry.attempt}",
             "--retry-release-now",
+        ))
+    if execution_deadline is not None:
+        window_args.extend((
+            "--execution-deadline",
+            execution_deadline.isoformat(),
         ))
     if retry.reused_input_receipt:
         window_args.append("--reuse-input-receipt")
@@ -293,27 +311,38 @@ def _recover_completed_session_window(
     if scope is None:
         state["finished"] = session
         return False
-    rows = plan_session_windows(provider, scope, session, checked_at=now)
+    # Recovering a past session must never stop today's scheduler. A session closed before
+    # migration 048 has receipts with no visibility seal, which raised here until 25 minutes
+    # before the open (found Nov 5, G61).
+    try:
+        rows = plan_session_windows(provider, scope, session, checked_at=now)
+    except ValueError as error:
+        print(
+            f"Advanced completed-session recovery skipped for {session}: {error}",
+            file=sys.stderr,
+            flush=True,
+        )
+        state["finished"] = session
+        return False
     if not rows:
         state["finished"] = session
         return False
     settings = catalog.profile_for_sha(
         scope["runtime_profile_sha256"]
     ).settings
+    final_cutoff = calendar.session_close(session)
     row = next(
-        (
-            row
-            for row in rows
-            if row["ready"]
-            and row["next_attempt"]
-            <= (
-                settings.scheduler_window_retry_max_attempts
-                + COMPLETED_SESSION_EXTRA_ATTEMPTS
-            )
-        ),
+        (row for row in rows if row["cutoff"] == final_cutoff),
         None,
     )
     if row is None:
+        state["finished"] = session
+        return False
+    recovery_attempt = (
+        settings.scheduler_window_retry_max_attempts
+        + COMPLETED_SESSION_EXTRA_ATTEMPTS
+    )
+    if not row["ready"] or row["next_attempt"] != recovery_attempt:
         return False
     with provider.transaction(APP_ROLE) as unit:
         recovery = discover_advanced_window_recovery_cursor(
@@ -352,9 +381,37 @@ def _recover_completed_session_window(
             retry=retry,
         )
     )
-    # Re-plan straight away so the rest of the session follows without a wait.
+    state["finished"] = session
     state["next_check_at"] = None
     return True
+
+
+def _retry_completion_budget(
+    args,
+    windows,
+    *,
+    attempt,
+    now,
+    drain_deadline,
+) -> tuple[int, datetime]:
+    """Bound retries before the next live slot and the session drain."""
+    cap = drain_deadline
+    if attempt > 0:
+        next_live = min(
+            (
+                window.available_after
+                for window in windows
+                if window.available_after > now
+            ),
+            default=None,
+        )
+        if next_live is not None:
+            cap = min(cap, next_live)
+    budget = min(
+        args.completion_budget_seconds,
+        max(0, int((cap - now).total_seconds())),
+    )
+    return budget, cap
 
 
 def _next_progress_check(
@@ -730,6 +787,27 @@ def main(
                             next_scope_reconcile_at
                         )
                         continue
+                    retry_budget, retry_cap = _retry_completion_budget(
+                        args,
+                        all_windows,
+                        attempt=recovery.next_attempt,
+                        now=now,
+                        drain_deadline=drain_deadline,
+                    )
+                    if retry_budget < 1:
+                        pending_retry_not_before = (
+                            retry_cap
+                            if pending_retry_not_before is None
+                            else min(
+                                pending_retry_not_before,
+                                retry_cap,
+                            )
+                        )
+                        next_progress_check_at = min(
+                            next_progress_check_at,
+                            retry_cap,
+                        )
+                        continue
                     retry = ensure_advanced_window_retry_cursor(
                         unit.cursor,
                         scheduler_session.scheduler_session_id,
@@ -754,6 +832,12 @@ def main(
                         session_date=session_date,
                         cutoff=window.cutoff,
                         retry=retry,
+                        completion_budget_seconds=retry_budget,
+                        execution_deadline=(
+                            retry_cap
+                            if recovery.next_attempt > 0
+                            else None
+                        ),
                     )
                 )
                 with provider.transaction(APP_ROLE) as unit:

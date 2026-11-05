@@ -4,7 +4,7 @@ Decisions come from stage_graph.decide_window; state lives behind OrchestrationR
 are grouped into lanes by domain (Options stages in their own lane) and the lanes run concurrently, so a failing, blocked
 or slow Options stage never delays or blocks an equity, reference or portal stage. A stage failure
 is recorded against that stage only; its declared dependents are recorded BLOCKED_PREREQ and
-every other stage proceeds. Exception messages are never persisted (only the exception type).
+every other stage proceeds. Exception details are bounded, normalized and scrubbed before persistence.
 
 Lanes run in daemon threads and the coordinator waits for them only within a bounded budget (the
 window deadline plus a grace, capped by max_lane_seconds), renewing the window lease while it
@@ -20,6 +20,7 @@ context.transaction() (the only supported write path).
 from __future__ import annotations
 
 import logging
+import re
 import threading
 import time
 from collections import defaultdict
@@ -67,6 +68,35 @@ TRANSIENT_STAGE_REASONS = frozenset({
     "ROLE_NOT_COMPLETE",
 })
 DEFERRED_ATTEMPTS_EXHAUSTED = "DEFERRED_ATTEMPTS_EXHAUSTED"
+_EXCEPTION_DETAIL_LIMIT = 240
+_SECRET_ASSIGNMENT = re.compile(
+    r"(?i)\b(token|secret|password|passwd|api[_ -]?key|authorization|cookie)"
+    r"\s*[:=]\s*([^\s,;]+)"
+)
+_BEARER_TOKEN = re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]+")
+_URL_CREDENTIALS = re.compile(r"(://)[^/@\s:]+:[^/@\s]+@")
+_JWT = re.compile(
+    r"\beyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b"
+)
+
+
+def _stage_exception_reason(error: BaseException) -> str:
+    detail = " ".join(
+        str(error).translate({
+            character: " "
+            for character in range(32)
+        }).split()
+    )
+    detail = _SECRET_ASSIGNMENT.sub(
+        lambda match: f"{match.group(1)}=<redacted>",
+        detail,
+    )
+    detail = _BEARER_TOKEN.sub("Bearer <redacted>", detail)
+    detail = _URL_CREDENTIALS.sub(r"\1<redacted>@", detail)
+    detail = _JWT.sub("<redacted-jwt>", detail)
+    detail = detail[:_EXCEPTION_DETAIL_LIMIT].rstrip()
+    prefix = f"STAGE_EXCEPTION:{type(error).__name__}"
+    return prefix if not detail else f"{prefix}:{detail}"
 
 
 class CatalogMismatch(RuntimeError):
@@ -498,7 +528,7 @@ class StageOrchestrator:
                     f"RETRYABLE_POSTGRES:{sqlstate}",
                 )
             logger.exception("stage %s raised", context.stage.stage_id)
-            return StageOutcome.failed(f"STAGE_EXCEPTION:{type(error).__name__}")
+            return StageOutcome.failed(_stage_exception_reason(error))
         if not isinstance(outcome, StageOutcome):
             return StageOutcome.failed("STAGE_RETURNED_INVALID_OUTCOME")
         if (

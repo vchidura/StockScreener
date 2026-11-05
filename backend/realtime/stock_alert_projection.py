@@ -578,88 +578,21 @@ def produce_realtime_stock_alerts(
     )
 
 
-def _produce_canonical_realtime_stock_alerts(
-    inputs: RealtimeScreeningInput,
-    retained: Mapping[str, object],
+def _canonical_publication_rows(
+    batch,
+    evaluations,
+    *,
+    session: str,
+    partial_membership: bool,
 ):
-    body = dict(retained)
-    projection_sha256 = body.pop("projection_sha256", None)
-    batch = body.get("batch")
-    evaluations = body.get("evaluations")
-    if (
-        canonical_sha256(body) != projection_sha256
-        or not isinstance(batch, Mapping)
-        or not isinstance(evaluations, list)
-        or str(batch.get("cohort_id")) != str(inputs.cohort_id)
-        or batch.get("cutoff") != inputs.cutoff.isoformat()
-        or batch.get("detector_input_sha256") != inputs_sha256(inputs)
-    ):
-        raise ValueError(
-            "canonical Stock Alert projection is not bound to exact E"
-        )
-    expected_members = {
-        (str(row["security_id"]), row["ticker"])
-        for row in inputs.members
-    }
-    observed_members = {
-        (str(row["security_id"]), row["ticker"])
-        for row in evaluations
-    }
-    if observed_members != expected_members:
-        raise ValueError(
-            "canonical Stock Alert evaluation membership changed"
-        )
-    membership = batch.get("membership")
-    if not isinstance(membership, Mapping):
-        raise ValueError(
-            "canonical Stock Alert membership identity is unavailable"
-        )
-    membership_body = {
-        key: value
-        for key, value in membership.items()
-        if key != "membership_sha256"
-    }
-    effective_members = membership.get("effective_members")
-    if (
-        canonical_sha256(membership_body)
-        != membership.get("membership_sha256")
-        or batch.get("membership_sha256")
-        != membership.get("membership_sha256")
-        or not isinstance(effective_members, (list, tuple))
-        or {
-            (str(row["security_id"]), str(row["ticker"]))
-            for row in effective_members
-        }
-        != expected_members
-    ):
-        raise ValueError(
-            "canonical Stock Alert membership identity changed"
-        )
-    intended_members = membership.get("intended_members")
-    if not isinstance(intended_members, (list, tuple)):
-        raise ValueError(
-            "canonical Stock Alert intended membership is unavailable"
-        )
-    ready_intended = {
-        (str(row["security_id"]), str(row["ticker"]))
-        for row in intended_members
-        if row["enabled"]
-        and row["status"] == "READY"
-        and row["security_id"] is not None
-    }
-    partial_membership = (
-        ready_intended != expected_members
-        or any(
-            row["enabled"] and row["status"] != "READY"
-            for row in intended_members
-        )
-    )
     deliverable = bool(batch.get("deliverable", True))
     late_catch_up = bool(batch.get("late_catch_up", False))
     publication = {
         "run_id": str(batch["batch_id"]),
-        "strategy_instance_id": "canonical-equity-stock-alert-v1",
-        "session": str(inputs.session),
+        "strategy_instance_id": (
+            "canonical-equity-stock-alert-v1"
+        ),
+        "session": session,
         "published_at": batch["completed_at"],
         "selected": sum(
             row["disposition"] == "MATCH" for row in evaluations
@@ -713,7 +646,9 @@ def _produce_canonical_realtime_stock_alerts(
             "daily_context_at": None,
             "indicator_at": None,
             "indicator_interval": "5m",
-            "desired_revision_id": batch.get("desired_revision_id"),
+            "desired_revision_id": batch.get(
+                "desired_revision_id"
+            ),
             "desired_snapshot_sha256": batch.get(
                 "desired_snapshot_sha256"
             ),
@@ -730,6 +665,144 @@ def _produce_canonical_realtime_stock_alerts(
             "delivery_permission": False,
         })
         alerts.append(row)
+    return publication, alerts
+
+
+def _historical_membership_partial(entry) -> bool:
+    batch = entry["batch"]
+    evaluations = entry["evaluations"]
+    membership = batch.get("membership")
+    if not isinstance(membership, Mapping):
+        return True
+    effective = {
+        (str(row["security_id"]), str(row["ticker"]))
+        for row in membership.get("effective_members", ())
+    }
+    evaluated = {
+        (str(row["security_id"]), str(row["ticker"]))
+        for row in evaluations
+    }
+    intended = membership.get("intended_members", ())
+    ready = {
+        (str(row["security_id"]), str(row["ticker"]))
+        for row in intended
+        if row.get("enabled")
+        and row.get("status") == "READY"
+        and row.get("security_id") is not None
+    }
+    return (
+        effective != evaluated
+        or ready != evaluated
+        or any(
+            row.get("enabled") and row.get("status") != "READY"
+            for row in intended
+        )
+    )
+
+
+def _produce_canonical_realtime_stock_alerts(
+    inputs: RealtimeScreeningInput,
+    retained: Mapping[str, object],
+):
+    body = dict(retained)
+    projection_sha256 = body.pop("projection_sha256", None)
+    batch = body.get("batch")
+    evaluations = body.get("evaluations")
+    if (
+        canonical_sha256(body) != projection_sha256
+        or not isinstance(batch, Mapping)
+        or not isinstance(evaluations, list)
+        or str(batch.get("cohort_id")) != str(inputs.cohort_id)
+        or batch.get("cutoff") != inputs.cutoff.isoformat()
+        or batch.get("detector_input_sha256") != inputs_sha256(inputs)
+    ):
+        raise ValueError(
+            "canonical Stock Alert projection is not bound to exact E"
+        )
+    input_members = {
+        (str(row["security_id"]), row["ticker"])
+        for row in inputs.members
+    }
+    membership = batch.get("membership")
+    if not isinstance(membership, Mapping):
+        raise ValueError(
+            "canonical Stock Alert membership identity is unavailable"
+        )
+    membership_body = {
+        key: value
+        for key, value in membership.items()
+        if key != "membership_sha256"
+    }
+    effective_members = membership.get("effective_members")
+    expected_members = (
+        set()
+        if not isinstance(effective_members, (list, tuple))
+        else {
+            (str(row["security_id"]), str(row["ticker"]))
+            for row in effective_members
+        }
+    )
+    observed_members = {
+        (str(row["security_id"]), row["ticker"])
+        for row in evaluations
+    }
+    if (
+        canonical_sha256(membership_body)
+        != membership.get("membership_sha256")
+        or batch.get("membership_sha256")
+        != membership.get("membership_sha256")
+        or not isinstance(effective_members, (list, tuple))
+        or not expected_members.issubset(input_members)
+    ):
+        raise ValueError(
+            "canonical Stock Alert membership identity changed"
+        )
+    if observed_members != expected_members:
+        raise ValueError(
+            "canonical Stock Alert evaluation membership changed"
+        )
+    intended_members = membership.get("intended_members")
+    if not isinstance(intended_members, (list, tuple)):
+        raise ValueError(
+            "canonical Stock Alert intended membership is unavailable"
+        )
+    ready_intended = {
+        (str(row["security_id"]), str(row["ticker"]))
+        for row in intended_members
+        if row["enabled"]
+        and row["status"] == "READY"
+        and row["security_id"] is not None
+    }
+    partial_membership = (
+        ready_intended != expected_members
+        or any(
+            row["enabled"] and row["status"] != "READY"
+            for row in intended_members
+        )
+    )
+    publication, alerts = _canonical_publication_rows(
+        batch,
+        evaluations,
+        session=str(inputs.session),
+        partial_membership=partial_membership,
+    )
+    deliverable = bool(batch.get("deliverable", True))
+    late_catch_up = bool(batch.get("late_catch_up", False))
+    historical_publications = []
+    historical_alerts = []
+    for entry in body.get("history", ()):
+        historical_publication, entry_alerts = (
+            _canonical_publication_rows(
+                entry["batch"],
+                entry["evaluations"],
+                session=str(entry["batch"]["session_date"]),
+                partial_membership=(
+                    _historical_membership_partial(entry)
+                ),
+            )
+        )
+        historical_publications.append(historical_publication)
+        historical_alerts.extend(entry_alerts)
     unavailable_reasons = sorted({
         reason
         for row in evaluations
@@ -752,8 +825,11 @@ def _produce_canonical_realtime_stock_alerts(
         "price_as_of": inputs.cutoff.isoformat(),
         "sessions": session_dates(str(inputs.session)),
         "current_session": str(inputs.session),
-        "publications": [publication],
-        "alerts": alerts,
+        "publications": [
+            *historical_publications,
+            publication,
+        ],
+        "alerts": [*historical_alerts, *alerts],
         "observations": [],
         "hit_coverage": False,
         "warnings": [

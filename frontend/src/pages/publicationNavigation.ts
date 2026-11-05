@@ -3,6 +3,7 @@ import { useSearchParams } from 'react-router-dom'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import type { DashboardPublication } from '../services/api'
 import { realtimeCohortId, usePortalIdentity } from '../services/portalIdentity'
+import { useOptionalSessionDate } from '../layout/sessionDate'
 
 const isTickerPath = (path: string) => /^\/ticker\/[^/]+(?:\/|$)/.test(path)
 export const isTickerWorkspaceQuery = (name: string) => name.startsWith('ticker-workspace:')
@@ -73,7 +74,12 @@ export function usePublicationQuery<T extends { publication: Pick<DashboardPubli
   const internalSelection = !requireIdentity && pin === undefined
     && (internalWorkspace || name.startsWith('daily-'))
   const interval = name.startsWith('daily-') ? params.get('interval') ?? '1d' : '1d'
-  const sessionDate = name.startsWith('daily-') || internalWorkspace ? params.get('session_date') ?? undefined : undefined
+  // With no date chosen, a closing workspace reads the newest closed session by date, which the
+  // API serves from that session's cohort. The current cohort holds no close during a session.
+  const sessionStore = useOptionalSessionDate()
+  const sessionsLoading = sessionStore?.loading ?? false
+  const defaultSession = realtimeOnly && internalWorkspace ? sessionStore?.date || undefined : undefined
+  const sessionDate = name.startsWith('daily-') || internalWorkspace ? params.get('session_date') ?? defaultSession : undefined
   const scopeError = name.startsWith('daily-') && !['1d', '1h'].includes(interval)
     ? 'Unsupported strategy interval; no substitution was made.' : requireIdentity && earlierSession
     ? 'This research link belongs to another session; no substitution was made.'
@@ -107,7 +113,7 @@ export function usePublicationQuery<T extends { publication: Pick<DashboardPubli
       if (!internalWorkspace && !earlierSession && params.has('snapshot_id') && !pin) throw new Error('Requested snapshot identity is empty')
       return read(pin)
     },
-    enabled: realtimeOnly,
+    enabled: realtimeOnly && !(internalWorkspace && sessionDate === undefined && sessionsLoading),
     retry: false,
     staleTime: Infinity,
     refetchOnMount: internalSelection ? 'always' : undefined,

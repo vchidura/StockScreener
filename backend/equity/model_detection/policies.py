@@ -34,5 +34,25 @@ class BreakoutPolicy:
         return canonical_sha256(self)
 
     @property
+    def optional_context_names(self) -> frozenset[str]:
+        return frozenset(getattr(self, "optional_context", ()))
+
+    @property
     def identity(self) -> ModelIdentity:
         return ModelIdentity(self.model_id, self.version, self.style, self.origin, self.policy_sha256)
+
+
+@dataclass(frozen=True, slots=True)
+class ContextOptionalBreakoutPolicy(BreakoutPolicy):
+    """Evaluates without the context named here, showing its gate as NOT_APPLICABLE.
+
+    A separate class and version, so BreakoutPolicy's existing hashes do not change.
+    """
+
+    version: str = "2"
+    optional_context: tuple[str, ...] = ("event_risk", "sector_trend")
+
+    def __post_init__(self) -> None:
+        BreakoutPolicy.__post_init__(self)
+        if not set(self.optional_context) <= {"event_risk", "sector_trend"}:
+            raise ValueError("only event and sector context can be optional")

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import threading
 from datetime import date, datetime, timedelta, timezone
@@ -1149,6 +1150,171 @@ def test_acquisition_reconnects_transient_transport_and_records_gap(
     assert report["last_market_event_at_utc"] == NOW.isoformat()
 
 
+class _QuietFixtureConnection(_FixtureConnection):
+    """The feed goes quiet after its frames, and the socket stays open."""
+
+    async def recv(self, *, decode=None):
+        if self.incoming:
+            return await super().recv(decode=decode)
+        await asyncio.sleep(3600)
+
+
+def _run_until_stopped(
+    binding,
+    tmp_path,
+    *,
+    seconds=0.4,
+    clock=lambda: NOW,
+    on_timer=None,
+):
+    stop = threading.Event()
+
+    def fire():
+        if on_timer is not None:
+            on_timer()
+        stop.set()
+
+    timer = threading.Timer(seconds, fire)
+    timer.start()
+    try:
+        return run_acquisition(
+            binding,
+            provider=_Provider(),
+            api_key="provider-free",
+            journal_root=tmp_path / "journal",
+            status_path=tmp_path / "status.json",
+            lock_path=tmp_path / "socket.lock",
+            stop_event=stop,
+            connection_factory=lambda _: _QuietFixtureConnection(
+                binding,
+                now=NOW,
+            ),
+            clock=clock,
+            monotonic_ns=lambda: 100,
+        )
+    finally:
+        timer.cancel()
+
+
+def test_stop_before_the_session_end_pauses_and_restart_continues(
+    tmp_path,
+    monkeypatch,
+):
+    binding = _binding()
+    _install_runtime_fakes(monkeypatch, binding)
+    status_path = tmp_path / "status.json"
+
+    first = _run_until_stopped(binding, tmp_path)
+    stored = json.loads(status_path.read_text(encoding="utf-8"))
+
+    assert first["state"] == stored["state"] == "PAUSED"
+    assert "semantic_sha256" not in stored
+    assert first["connection_attempts"] == 1
+    assert stored["subscription_ready"] is False
+    assert stored["last_raw_offset"] > 0
+    assert stored["reserved_decoded_messages"] == stored["decoded_messages"]
+    assert stored["transport_gaps"][-1]["error_type"] == "STOP_REQUESTED"
+    assert stored["transport_gaps"][-1]["status"] == "OPEN"
+    assert acquisition_health(
+        status_path,
+        binding,
+        checked_at=NOW,
+    )["state"] == "PAUSED"
+
+    second = _run_until_stopped(binding, tmp_path)
+
+    assert second["state"] == "PAUSED"
+    assert second["journal_generation"] == first["journal_generation"]
+    assert second["owner_id"] == first["owner_id"]
+    assert second["connection_attempts"] == 2
+    assert second["decoded_messages"] > first["decoded_messages"]
+    assert second["decoded_bytes"] > first["decoded_bytes"]
+    assert second["last_raw_offset"] > first["last_raw_offset"]
+    assert second["last_event_offset"] > first["last_event_offset"]
+    assert second["stream_session_id"] != first["stream_session_id"]
+    assert second["transport_gaps"][0]["status"] == "RECONNECTED"
+    assert len(second["transport_gaps"]) == 2
+
+
+def test_stop_with_no_market_data_yet_is_a_pause_not_a_failure(
+    tmp_path,
+    monkeypatch,
+):
+    binding = _binding()
+    _install_runtime_fakes(monkeypatch, binding)
+
+    class _Silent(_QuietFixtureConnection):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.incoming = type(self.incoming)(
+                list(self.incoming)[:2]
+            )
+
+    stop = threading.Event()
+    timer = threading.Timer(0.3, stop.set)
+    timer.start()
+    try:
+        report = run_acquisition(
+            binding,
+            provider=_Provider(),
+            api_key="provider-free",
+            journal_root=tmp_path / "journal",
+            status_path=tmp_path / "status.json",
+            lock_path=tmp_path / "socket.lock",
+            stop_event=stop,
+            connection_factory=lambda _: _Silent(binding, now=NOW),
+            clock=lambda: NOW,
+            monotonic_ns=lambda: 100,
+        )
+    finally:
+        timer.cancel()
+
+    assert report["state"] == "PAUSED"
+    assert report["connection_attempts"] == 1
+
+
+def test_reaching_the_authority_stop_still_completes(tmp_path, monkeypatch):
+    binding = _binding()
+    _install_runtime_fakes(monkeypatch, binding)
+    current = [NOW]
+
+    def reach_stop():
+        current[0] = binding.authority.acquisition_stop
+
+    report = _run_until_stopped(
+        binding,
+        tmp_path,
+        clock=lambda: current[0],
+        on_timer=reach_stop,
+    )
+    stored = json.loads(
+        (tmp_path / "status.json").read_text(encoding="utf-8")
+    )
+
+    assert report["state"] == stored["state"] == "COMPLETE"
+    assert report["journal_integrity"] == "ok"
+    assert report["socket_state"] == GatewayFeedState.STOPPED.value
+    assert "semantic_sha256" in stored
+
+
+def test_stop_on_the_last_connection_attempt_completes(tmp_path, monkeypatch):
+    binding = build_acquisition_binding(
+        source_sha256="1" * 64,
+        backend_image_id=f"sha256:{'2' * 64}",
+        authority=_authority(),
+        contract_tickers=CONTRACTS,
+        connection_attempt_ceiling=1,
+        decoded_message_ceiling=18_874_386,
+        decoded_byte_ceiling=18_874_386,
+    )
+    _install_runtime_fakes(monkeypatch, binding)
+
+    report = _run_until_stopped(binding, tmp_path)
+
+    assert report["state"] == "COMPLETE"
+    assert report["connection_attempts"] == 1
+
+
 def test_acquisition_does_not_retry_permanent_provider_rejection(
     tmp_path,
     monkeypatch,
@@ -1176,6 +1342,46 @@ def test_acquisition_does_not_retry_permanent_provider_rejection(
     assert status["connection_attempts"] == 1
     assert status["state"] == "FAILED_PERMANENT"
     assert status["failure_class"] == "PERMANENT_PROVIDER_OR_SAFETY"
+
+
+def test_status_file_from_another_session_does_not_block_this_one(tmp_path):
+    binding = _binding()
+    status_path = tmp_path / "status.json"
+    last_session = {
+        "schema": runtime.ACQUISITION_STATUS_SCHEMA,
+        "binding_sha256": "0" * 64,
+        "owner_id": str(binding.owner_id),
+        "journal_generation": str(uuid5(NAMESPACE_URL, "last-session")),
+        "state": "COMPLETE",
+        "connection_attempts": 12,
+        "decoded_messages": 108466,
+        "decoded_bytes": 25961533,
+    }
+    status_path.write_text(json.dumps(last_session), encoding="utf-8")
+
+    assert runtime._load_status(status_path, binding) == {
+        "connection_attempts": 0,
+        "decoded_messages": 0,
+        "decoded_bytes": 0,
+    }
+
+
+def test_changed_status_for_this_session_still_fails_closed(tmp_path):
+    binding = _binding()
+    status_path = tmp_path / "status.json"
+    status_path.write_text(
+        json.dumps({
+            "schema": runtime.ACQUISITION_STATUS_SCHEMA,
+            "binding_sha256": "0" * 64,
+            "owner_id": str(binding.owner_id),
+            "journal_generation": str(binding.authority.journal_generation),
+            "connection_attempts": 3,
+        }),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="durable status changed"):
+        runtime._load_status(status_path, binding)
 
 
 def test_compose_exposes_only_the_acquisition_role():
@@ -1208,3 +1414,20 @@ def test_compose_exposes_only_the_acquisition_role():
     assert "REALTIME_V3_ACQUISITION_SPLIT: ENABLED" in ingress
     assert "realtime_v2_provider_key" not in ingress
     assert "POLYGON_API_KEY" not in ingress
+
+
+def test_a_dropped_socket_records_which_side_closed_it():
+    from websockets.exceptions import ConnectionClosedError
+    from websockets.frames import Close
+
+    keepalive = ConnectionClosedError(None, Close(1011, "keepalive ping timeout"))
+    assert runtime._close_detail(keepalive) == {
+        "close_sent_code": 1011,
+        "close_sent_reason": "keepalive ping timeout",
+    }
+    provider = ConnectionClosedError(Close(1008, "slow consumer"), None)
+    assert runtime._close_detail(provider) == {
+        "close_received_code": 1008,
+        "close_received_reason": "slow consumer",
+    }
+    assert runtime._close_detail(ConnectionError("reset")) == {}

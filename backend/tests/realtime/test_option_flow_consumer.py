@@ -339,6 +339,47 @@ def test_reconcile_and_mark_reconciled_clear_the_warming_and_gap_report_only_whe
     assert consumer.warming_reason is None and consumer.gaps_seen == 0
 
 
+def test_snapshot_reconcile_derives_the_stream_watermark():
+    feed = MockOptionFeed()
+    feed.add_trade(
+        CALL,
+        1,
+        T0,
+        5.0,
+        100,
+        conditions=(REGULAR,),
+    )
+    feed.add_trade(
+        CALL,
+        2,
+        T0 + 5_000,
+        5.0,
+        100,
+        conditions=(REGULAR,),
+    )
+    consumer, _, _ = consumer_for(
+        feed,
+        engine=engine_for(
+            feed,
+            volume=VolumeConfig(
+                initial_baseline=BaselineKind.WARMING
+            ),
+        ),
+    )
+    consumer.run_slice()
+
+    result = consumer.reconcile_snapshot(
+        CALL,
+        150,
+        T0 + 1_000,
+    )
+
+    assert result.accepted
+    assert result.cumulative_volume == 250
+    assert result.baseline_kind == "SNAPSHOT_RECONCILED"
+    assert consumer.volume_reconcile_required() is False
+
+
 def test_the_checkpoint_carries_the_continuity_state_so_a_gap_during_downtime_is_still_seen():
     feed = MockOptionFeed()
     feed.extend([trade(seq=i, time_ms=T0 + i, price=5.0, size=100) for i in range(1, 4)])

@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 import hashlib
 from pathlib import Path
@@ -18,7 +18,15 @@ from equity.model_detection.contracts import (
     canonical_value,
 )
 from equity.model_detection.engine import evaluate
-from equity.model_detection.policies import BreakoutPolicy
+from equity.model_detection.policies import (
+    BreakoutPolicy,
+    ContextOptionalBreakoutPolicy,
+)
+from research.gics_sectors import (
+    SECTOR_BENCHMARK_ETF,
+    resolve_benchmark_ticker,
+    sector_benchmark_ticker,
+)
 
 from .contracts import canonical_sha256
 from .detector_adapters import StableDetectorAdapterResult
@@ -39,6 +47,16 @@ CANONICAL_STOCK_ALERT_PRODUCT = "canonical-equity-stock-alert-v1"
 CANONICAL_STOCK_ALERT_SCHEMA = "canonical_equity_stock_alert_v1"
 CANONICAL_STOCK_EVALUATION_SCHEMA = "canonical_equity_stock_evaluation_v1"
 CANONICAL_STOCK_STATE_SCHEMA = "canonical_equity_stock_state_v1"
+CANONICAL_STOCK_CONTEXT_CONTRACT = "canonical-equity-context-v2"
+# Earnings and Fed data help but are not required: with none, the event gate reads
+# NOT_APPLICABLE and the evaluation continues. A known event still blocks. The user's decision, Nov 5.
+CANONICAL_STOCK_ALERT_POLICY = ContextOptionalBreakoutPolicy()
+CANONICAL_STOCK_EVENT_LOOKBACK = timedelta(days=1)
+CANONICAL_STOCK_EVENT_LOOKAHEAD = timedelta(hours=72)
+CANONICAL_STOCK_EVENT_TYPES = (
+    "EARNINGS",
+    "FED_RATE_DECISION",
+)
 _SOURCE_ROOT = Path(__file__).resolve().parents[1]
 _CODE_PATHS = (
     _SOURCE_ROOT / "equity/model_detection/contracts.py",
@@ -47,6 +65,7 @@ _CODE_PATHS = (
     _SOURCE_ROOT / "equity/model_detection/feature_engine.py",
     _SOURCE_ROOT / "equity/model_detection/engine.py",
     _SOURCE_ROOT / "equity/model_detection/policies.py",
+    _SOURCE_ROOT / "research/gics_sectors.py",
     Path(__file__),
 )
 
@@ -75,11 +94,11 @@ def canonical_stock_alert_code_sha256(paths=_CODE_PATHS) -> str:
 
 
 def canonical_stock_alert_version(
-    policy: BreakoutPolicy = BreakoutPolicy(),
+    policy: BreakoutPolicy = CANONICAL_STOCK_ALERT_POLICY,
 ) -> RealtimeDetectorVersion:
     return build_detector_version(
         detector_id=CANONICAL_STOCK_ALERT_PRODUCT,
-        version="1",
+        version="2",
         code_sha256=canonical_stock_alert_code_sha256(),
         policy_sha256=policy.policy_sha256,
         requirements={
@@ -96,6 +115,9 @@ def canonical_stock_alert_version(
                 "event_risk",
             ),
             "missing_context": "UNAVAILABLE",
+            "optional_context": tuple(
+                sorted(policy.optional_context_names)
+            ),
             "publication": "MATCH_ONLY",
             "execution_permission": False,
         },
@@ -112,8 +134,80 @@ class CanonicalStockAlertContext:
     source_sha256: str
     available_at: datetime
     received_at: datetime
-    contributors: tuple[tuple[str, str], ...] = ()
+    evidence: tuple[Mapping[str, object], ...]
+    document: Mapping[str, object]
     reason_codes: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        available_at = _utc(self.available_at)
+        received_at = _utc(self.received_at)
+        if received_at < available_at:
+            raise ValueError(
+                "canonical Stock Alert context receipt precedes availability"
+            )
+        document = canonical_value(self.document)
+        if (
+            document.get("contract") != CANONICAL_STOCK_CONTEXT_CONTRACT
+            or document.get("market_trend")
+            != (
+                None
+                if self.market_trend is None
+                else canonical_value(self.market_trend)
+            )
+            or document.get("sector_trend")
+            != (
+                None
+                if self.sector_trend is None
+                else canonical_value(self.sector_trend)
+            )
+            or document.get("event_risk") is not self.event_risk
+            or tuple(document.get("reason_codes", ())) != self.reason_codes
+            or tuple(document.get("evidence", ()))
+            != tuple(canonical_value(self.evidence))
+            or canonical_sha256(document) != self.source_sha256
+            or self.source_record_id
+            != uuid5(
+                NAMESPACE_URL,
+                f"canonical-equity-context:{self.source_sha256}",
+            )
+        ):
+            raise ValueError(
+                "canonical Stock Alert context identity changed"
+            )
+        for item in self.evidence:
+            payload_sha256 = str(item.get("payload_sha256", ""))
+            if (
+                not str(item.get("role", "")).strip()
+                or not str(item.get("source_kind", "")).strip()
+                or not str(item.get("source_id", "")).strip()
+                or len(payload_sha256) != 64
+                or any(
+                    character not in "0123456789abcdef"
+                    for character in payload_sha256
+                )
+            ):
+                raise ValueError(
+                    "canonical Stock Alert context evidence is invalid"
+                )
+        object.__setattr__(self, "available_at", available_at)
+        object.__setattr__(self, "received_at", received_at)
+        object.__setattr__(self, "document", document)
+        object.__setattr__(
+            self,
+            "evidence",
+            tuple(document["evidence"]),
+        )
+
+    @property
+    def contributors(self) -> tuple[tuple[str, str], ...]:
+        return tuple(
+            (
+                str(item["source_id"]),
+                str(item["payload_sha256"]),
+            )
+            for item in self.evidence
+            if item["role"] == "MARKET_BAR"
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -270,7 +364,11 @@ def canonical_stock_alert_membership(
                 "reason_codes": tuple(row.get("reason_codes", ())),
             }
             for row in sorted(
-                intended_members,
+                (
+                    row
+                    for row in intended_members
+                    if str(row["member_kind"]) == "EQUITY"
+                ),
                 key=lambda value: (
                     str(value["ticker"]),
                     str(value["member_kind"]),
@@ -305,6 +403,19 @@ def canonical_stock_alert_membership(
         and row["status"] == "READY"
         and row["security_id"] is not None
     }
+    if desired_revision_id is not None:
+        effective = tuple(
+            row
+            for row in effective
+            if (row["security_id"], row["ticker"]) in ready_identities
+        )
+        if not effective:
+            raise ValueError(
+                "canonical Stock Alert effective membership is unavailable"
+            )
+        effective_identities = {
+            (row["security_id"], row["ticker"]) for row in effective
+        }
     if (
         desired_revision_id is not None
         and not effective_identities.issubset(ready_identities)
@@ -318,6 +429,29 @@ def canonical_stock_alert_membership(
         intended_members=intended,
         effective_members=effective,
     )
+
+
+def _product_members(
+    inputs: RealtimeScreeningInput,
+    membership: CanonicalStockAlertMembership,
+) -> tuple[Mapping[str, object], ...]:
+    members = {
+        str(row["security_id"]): row for row in inputs.members
+    }
+    selected = []
+    for row in membership.effective_members:
+        identity = str(row["security_id"])
+        member = members.get(identity)
+        if (
+            member is None
+            or str(member["ticker"]) != str(row["ticker"])
+            or int(member["instrument_id"]) != int(row["instrument_id"])
+        ):
+            raise ValueError(
+                "canonical Stock Alert effective member input is unavailable"
+            )
+        selected.append(member)
+    return tuple(selected)
 
 
 def _member_bars(
@@ -372,20 +506,489 @@ def _bar_received_at(row: Mapping[str, object]) -> datetime:
     ))
 
 
+def _context_evidence(
+    *,
+    role: str,
+    source_kind: str,
+    source_id: object,
+    payload_sha256: object,
+    available_at: datetime,
+    received_at: datetime,
+    details: Mapping[str, object] | None = None,
+) -> Mapping[str, object]:
+    available = _utc(available_at)
+    received = _utc(received_at)
+    if received < available:
+        raise ValueError(
+            "canonical Stock Alert evidence receipt precedes availability"
+        )
+    return {
+        "role": role,
+        "source_kind": source_kind,
+        "source_id": str(source_id),
+        "payload_sha256": str(payload_sha256),
+        "available_at": available.isoformat(),
+        "received_at": received.isoformat(),
+        "details": {} if details is None else dict(details),
+    }
+
+
+def _bar_evidence(
+    row: Mapping[str, object],
+    *,
+    role: str,
+) -> Mapping[str, object]:
+    return _context_evidence(
+        role=role,
+        source_kind="BAR_REVISION",
+        source_id=row["bar_revision_id"],
+        payload_sha256=row["payload_sha256"],
+        available_at=_bar_available_at(row),
+        received_at=_bar_received_at(row),
+        details={
+            "security_id": str(row["security_id"]),
+            "ticker": str(row["ticker"]),
+            "interval": str(row["interval"]),
+            "bar_start": row["bar_start"].isoformat(),
+            "bar_end": row["bar_end"].isoformat(),
+        },
+    )
+
+
+def _reference_and_sector(
+    inputs: RealtimeScreeningInput,
+    member: Mapping[str, object],
+    members_by_ticker: Mapping[str, Mapping[str, object]],
+    bars: Mapping[str, tuple[Mapping[str, object], ...]],
+    policy: BreakoutPolicy,
+) -> tuple[
+    Decimal | None,
+    tuple[Mapping[str, object], ...],
+    Mapping[str, object],
+]:
+    reference_id = member.get("security_revision_id")
+    reference_sha256 = member.get("payload_sha256")
+    observed_at = member.get("observed_at")
+    if (
+        reference_id is None
+        or reference_sha256 is None
+        or observed_at is None
+    ):
+        return None, (), {
+            "status": "UNAVAILABLE",
+            "reason": "DATED_SECURITY_REFERENCE_MISSING",
+        }
+    reference = _context_evidence(
+        role="SECURITY_REFERENCE",
+        source_kind="SECURITY_REVISION",
+        source_id=reference_id,
+        payload_sha256=reference_sha256,
+        available_at=observed_at,
+        received_at=observed_at,
+        details={
+            "security_id": str(member["security_id"]),
+            "ticker": str(member["ticker"]),
+            "security_type": member.get("security_type"),
+            "sector": member.get("sector"),
+            "sic_code": member.get("sic_code"),
+        },
+    )
+    security_type = member.get("security_type")
+    retained_sector = member.get("sector")
+    if security_type == "CS":
+        if retained_sector not in SECTOR_BENCHMARK_ETF:
+            return None, (reference,), {
+                "status": "UNAVAILABLE",
+                "reason": "RETAINED_SECTOR_MAPPING_MISSING",
+                "security_type": security_type,
+                "sector": retained_sector,
+            }
+        candidate = sector_benchmark_ticker(str(retained_sector))
+    elif security_type == "ETF":
+        candidate = sector_benchmark_ticker(None)
+    else:
+        return None, (reference,), {
+            "status": "UNAVAILABLE",
+            "reason": "SECTOR_POLICY_NOT_APPLICABLE",
+            "security_type": security_type,
+            "sector": retained_sector,
+        }
+    benchmark_ticker = resolve_benchmark_ticker(
+        str(member["ticker"]),
+        candidate,
+    )
+    mapping = {
+        "contract": "canonical-stock-sector-benchmark-v1",
+        "mapping_basis": "RETAINED_SECTOR_EXISTING_BENCHMARK_HELPER",
+        "security_revision_id": str(reference_id),
+        "security_payload_sha256": str(reference_sha256),
+        "security_type": security_type,
+        "retained_sector": retained_sector,
+        "benchmark_ticker": benchmark_ticker,
+    }
+    mapping_sha256 = canonical_sha256(mapping)
+    mapping_evidence = _context_evidence(
+        role="SECTOR_MAPPING",
+        source_kind="DERIVED_REFERENCE",
+        source_id=uuid5(
+            NAMESPACE_URL,
+            f"canonical-stock-sector-mapping:{mapping_sha256}",
+        ),
+        payload_sha256=mapping_sha256,
+        available_at=observed_at,
+        received_at=observed_at,
+        details=mapping,
+    )
+    benchmark = members_by_ticker.get(benchmark_ticker)
+    benchmark_reference = None
+    if benchmark is not None:
+        benchmark_reference_id = benchmark.get(
+            "security_revision_id"
+        )
+        benchmark_reference_sha256 = benchmark.get(
+            "payload_sha256"
+        )
+        benchmark_observed_at = benchmark.get("observed_at")
+        if (
+            benchmark_reference_id is not None
+            and benchmark_reference_sha256 is not None
+            and benchmark_observed_at is not None
+        ):
+            benchmark_reference = _context_evidence(
+                role="SECTOR_BENCHMARK_REFERENCE",
+                source_kind="SECURITY_REVISION",
+                source_id=benchmark_reference_id,
+                payload_sha256=benchmark_reference_sha256,
+                available_at=benchmark_observed_at,
+                received_at=benchmark_observed_at,
+                details={
+                    "security_id": str(benchmark["security_id"]),
+                    "ticker": str(benchmark["ticker"]),
+                    "security_type": benchmark.get("security_type"),
+                },
+            )
+    benchmark_rows = (
+        ()
+        if benchmark is None or benchmark_reference is None
+        else bars[str(benchmark["security_id"])]
+    )
+    evidence = (
+        reference,
+        mapping_evidence,
+        *((benchmark_reference,) if benchmark_reference is not None else ()),
+        *(
+            _bar_evidence(row, role="SECTOR_BAR")
+            for row in benchmark_rows
+        ),
+    )
+    trend = (
+        _return(benchmark_rows)
+        if len(benchmark_rows) == policy.lookback + 1
+        else None
+    )
+    return trend, evidence, {
+        "status": "READY" if trend is not None else "UNAVAILABLE",
+        "reason": (
+            None
+            if trend is not None
+            else (
+                "CONTEXT_BENCHMARK_REFERENCE_MISSING"
+                if benchmark_reference is None
+                else "EXACT_SECTOR_BENCHMARK_WINDOW_MISSING"
+            )
+        ),
+        "security_type": security_type,
+        "sector": retained_sector,
+        "benchmark_ticker": benchmark_ticker,
+        "mapping_sha256": mapping_sha256,
+    }
+
+
+def _event_context(
+    inputs: RealtimeScreeningInput,
+    member: Mapping[str, object],
+    market_events: tuple[Mapping[str, object], ...],
+    market_event_coverage: tuple[Mapping[str, object], ...],
+) -> tuple[
+    bool | None,
+    tuple[Mapping[str, object], ...],
+    Mapping[str, object],
+]:
+    security_id = str(member["security_id"])
+    security_type = member.get("security_type")
+    window_start = inputs.cutoff - CANONICAL_STOCK_EVENT_LOOKBACK
+    window_end = inputs.cutoff + CANONICAL_STOCK_EVENT_LOOKAHEAD
+    if security_type == "CS":
+        applicable_types = CANONICAL_STOCK_EVENT_TYPES
+    elif security_type == "ETF":
+        applicable_types = ("FED_RATE_DECISION",)
+    else:
+        applicable_types = ()
+
+    def applies(row: Mapping[str, object]) -> bool:
+        event_type = row["event_type"]
+        row_security_id = row.get("security_id")
+        return (
+            event_type in applicable_types
+            and (
+                str(row_security_id) == security_id
+                if event_type == "EARNINGS"
+                else row_security_id is None
+            )
+        )
+
+    active_events = tuple(sorted(
+        (
+            row
+            for row in market_events
+            if applies(row)
+            and row["observed_at"] <= inputs.cutoff
+            and row["received_at"] <= inputs.cutoff
+            and row["valid_until"] > inputs.cutoff
+            and window_start.date()
+            <= row["event_date"]
+            <= window_end.date()
+            and row["status"] != "CANCELED"
+        ),
+        key=lambda row: (
+            str(row["event_type"]),
+            str(row["source"]),
+            str(row["event_key"]),
+            str(row["revision_id"]),
+        ),
+    ))
+    eligible_coverage = tuple(sorted(
+        (
+            row
+            for row in market_event_coverage
+            if applies(row)
+            and row["checked_at"] <= inputs.cutoff
+            and row["valid_until"] > inputs.cutoff
+            and row["window_start"] <= window_start.date()
+            and row["window_end"] >= window_end.date()
+        ),
+        key=lambda row: (
+            str(row["event_type"]),
+            str(row["source"]),
+            str(row["coverage_id"]),
+        ),
+    ))
+    coverage_by_type = {
+        event_type: tuple(
+            row
+            for row in eligible_coverage
+            if row["event_type"] == event_type
+        )
+        for event_type in applicable_types
+    }
+    known_types = {
+        event_type
+        for event_type, rows in coverage_by_type.items()
+        if any(
+            row["verdict"] in {"COVERED", "KNOWN_NO_EVENT"}
+            for row in rows
+        )
+    }
+    event_risk = (
+        None
+        if not applicable_types
+        else True
+        if active_events
+        else False
+        if known_types == set(applicable_types)
+        else None
+    )
+    event_evidence = tuple(
+        _context_evidence(
+            role="MARKET_EVENT",
+            source_kind="MARKET_EVENT_REVISION",
+            source_id=row["revision_id"],
+            payload_sha256=row["payload_sha256"],
+            available_at=row["observed_at"],
+            received_at=row["received_at"],
+            details={
+                "security_id": (
+                    None
+                    if row.get("security_id") is None
+                    else str(row["security_id"])
+                ),
+                "event_type": row["event_type"],
+                "event_key": row["event_key"],
+                "event_date": row["event_date"].isoformat(),
+                "status": row["status"],
+                "source": row["source"],
+            },
+        )
+        for row in active_events
+    )
+    coverage_evidence = tuple(
+        _context_evidence(
+            role="MARKET_EVENT_COVERAGE",
+            source_kind="MARKET_EVENT_COVERAGE",
+            source_id=row["coverage_id"],
+            payload_sha256=row["evidence_sha256"],
+            available_at=row["checked_at"],
+            received_at=row["checked_at"],
+            details={
+                "security_id": (
+                    None
+                    if row.get("security_id") is None
+                    else str(row["security_id"])
+                ),
+                "event_type": row["event_type"],
+                "window_start": row["window_start"].isoformat(),
+                "window_end": row["window_end"].isoformat(),
+                "source": row["source"],
+                "verdict": row["verdict"],
+            },
+        )
+        for row in eligible_coverage
+    )
+    return event_risk, (*event_evidence, *coverage_evidence), {
+        "status": (
+            "BLOCKED"
+            if event_risk is True
+            else "CLEAR"
+            if event_risk is False
+            else "UNAVAILABLE"
+        ),
+        "reason": (
+            "RELEVANT_RETAINED_EVENT"
+            if event_risk is True
+            else None
+            if event_risk is False
+            else "EVENT_COVERAGE_UNKNOWN"
+        ),
+        "security_type": security_type,
+        "applicable_event_types": applicable_types,
+        "window_start": window_start.isoformat(),
+        "window_end": window_end.isoformat(),
+        "known_event_types": tuple(sorted(known_types)),
+    }
+
+
+def _build_context(
+    *,
+    inputs: RealtimeScreeningInput,
+    membership: CanonicalStockAlertMembership,
+    identity: str,
+    market_trend: Decimal | None,
+    sector_trend: Decimal | None,
+    event_risk: bool | None,
+    evidence: tuple[Mapping[str, object], ...],
+    reason_codes: tuple[str, ...],
+    sector_policy: Mapping[str, object],
+    event_policy: Mapping[str, object],
+) -> CanonicalStockAlertContext:
+    document = {
+        "contract": CANONICAL_STOCK_CONTEXT_CONTRACT,
+        "security_id": identity,
+        "cohort_id": str(inputs.cohort_id),
+        "desired_revision_id": (
+            None
+            if membership.desired_revision_id is None
+            else str(membership.desired_revision_id)
+        ),
+        "desired_snapshot_sha256": membership.desired_snapshot_sha256,
+        "membership_sha256": membership.membership_sha256,
+        "cutoff": inputs.cutoff.isoformat(),
+        "market_trend": (
+            None if market_trend is None else canonical_value(market_trend)
+        ),
+        "sector_trend": (
+            None if sector_trend is None else canonical_value(sector_trend)
+        ),
+        "event_risk": event_risk,
+        "sector_policy": sector_policy,
+        "event_policy": event_policy,
+        "evidence": evidence,
+        "reason_codes": reason_codes,
+    }
+    source_sha256 = canonical_sha256(document)
+    source_record_id = uuid5(
+        NAMESPACE_URL,
+        f"canonical-equity-context:{source_sha256}",
+    )
+    available_at = (
+        inputs.cutoff
+        if not evidence
+        else max(
+            datetime.fromisoformat(str(row["available_at"]))
+            for row in evidence
+        )
+    )
+    received_at = (
+        inputs.recorded_by
+        if not evidence
+        else max(
+            datetime.fromisoformat(str(row["received_at"]))
+            for row in evidence
+        )
+    )
+    return CanonicalStockAlertContext(
+        market_trend=market_trend,
+        sector_trend=sector_trend,
+        event_risk=event_risk,
+        source_record_id=source_record_id,
+        source_sha256=source_sha256,
+        available_at=available_at,
+        received_at=received_at,
+        evidence=evidence,
+        document=document,
+        reason_codes=reason_codes,
+    )
+
+
 def canonical_stock_alert_contexts(
     inputs: RealtimeScreeningInput,
-    policy: BreakoutPolicy = BreakoutPolicy(),
+    policy: BreakoutPolicy = CANONICAL_STOCK_ALERT_POLICY,
     membership: CanonicalStockAlertMembership | None = None,
+    *,
+    context_members: tuple[Mapping[str, object], ...] = (),
+    market_events: tuple[Mapping[str, object], ...] = (),
+    market_event_coverage: tuple[Mapping[str, object], ...] = (),
 ) -> Mapping[str, CanonicalStockAlertContext]:
-    """Derive only context owned by E; unavailable event context stays explicit."""
+    """Freeze exact retained market, sector, and event context for each member."""
     membership = membership or canonical_stock_alert_membership(inputs)
-    members = {str(row["security_id"]): row for row in inputs.members}
+    product_members = _product_members(inputs, membership)
+    members = {
+        str(row["security_id"]): row for row in product_members
+    }
+    context_by_identity = {
+        str(row["security_id"]): row for row in context_members
+    }
+    if len(context_by_identity) != len(context_members):
+        raise ValueError(
+            "canonical Stock Alert context member identities are ambiguous"
+        )
+    all_members = dict(members)
+    for identity, member in context_by_identity.items():
+        existing = all_members.get(identity)
+        if (
+            existing is not None
+            and str(existing["ticker"]) != str(member["ticker"])
+        ):
+            raise ValueError(
+                "canonical Stock Alert context member identity changed"
+            )
+        all_members.setdefault(identity, member)
+    members_by_ticker = {
+        str(row["ticker"]): row for row in all_members.values()
+    }
+    if len(members_by_ticker) != len(all_members):
+        raise ValueError(
+            "canonical Stock Alert context member tickers are ambiguous"
+        )
     bars = {
         identity: _member_bars(inputs, UUID(identity), policy)
-        for identity in members
+        for identity in all_members
     }
     spy = next(
-        (identity for identity, member in members.items() if member["ticker"] == "SPY"),
+        (
+            identity
+            for identity, member in all_members.items()
+            if member["ticker"] == "SPY"
+        ),
         None,
     )
     market_rows = () if spy is None else bars[spy]
@@ -394,70 +997,51 @@ def canonical_stock_alert_contexts(
         if len(market_rows) == policy.lookback + 1
         else None
     )
-    contributors = tuple(
-        (
-            str(row["bar_revision_id"]),
-            str(row["payload_sha256"]),
-        )
+    market_evidence = tuple(
+        _bar_evidence(row, role="MARKET_BAR")
         for row in market_rows
-    )
-    available_at = (
-        inputs.cutoff
-        if not market_rows
-        else max(_bar_available_at(row) for row in market_rows)
-    )
-    received_at = (
-        inputs.recorded_by
-        if not market_rows
-        else max(_bar_received_at(row) for row in market_rows)
     )
     result = {}
     for identity, member in members.items():
-        sector_trend = None
+        sector_trend, sector_evidence, sector_policy = (
+            _reference_and_sector(
+                inputs,
+                member,
+                members_by_ticker,
+                bars,
+                policy,
+            )
+        )
+        event_risk, event_evidence, event_policy = _event_context(
+            inputs,
+            member,
+            market_events,
+            market_event_coverage,
+        )
         reasons = tuple(
             reason
             for value, reason in (
                 (market_trend, "MISSING_MARKET_CONTEXT"),
                 (sector_trend, "MISSING_SECTOR_CONTEXT"),
-                (None, "MISSING_EVENT_CONTEXT"),
+                (event_risk, "MISSING_EVENT_CONTEXT"),
             )
             if value is None
         )
-        payload = {
-            "contract": "canonical-equity-context-v1",
-            "security_id": identity,
-            "cohort_id": str(inputs.cohort_id),
-            "desired_revision_id": (
-                None
-                if membership.desired_revision_id is None
-                else str(membership.desired_revision_id)
-            ),
-            "desired_snapshot_sha256": (
-                membership.desired_snapshot_sha256
-            ),
-            "membership_sha256": membership.membership_sha256,
-            "cutoff": inputs.cutoff.isoformat(),
-            "market_trend": None if market_trend is None else str(market_trend),
-            "sector_trend": None if sector_trend is None else str(sector_trend),
-            "event_risk": None,
-            "contributors": contributors,
-            "reason_codes": reasons,
-        }
-        source_sha256 = canonical_sha256(payload)
-        source_record_id = uuid5(
-            NAMESPACE_URL,
-            f"canonical-equity-context:{source_sha256}",
-        )
-        result[identity] = CanonicalStockAlertContext(
+        result[identity] = _build_context(
+            inputs=inputs,
+            membership=membership,
+            identity=identity,
             market_trend=market_trend,
             sector_trend=sector_trend,
-            event_risk=None,
-            source_record_id=source_record_id,
-            source_sha256=source_sha256,
-            available_at=available_at,
-            received_at=received_at,
-            contributors=contributors,
+            event_risk=event_risk,
+            evidence=(
+                *market_evidence,
+                *sector_evidence,
+                *event_evidence,
+            ),
             reason_codes=reasons,
+            sector_policy=sector_policy,
+            event_policy=event_policy,
         )
     return result
 
@@ -532,6 +1116,10 @@ def _wire_input(
         "revision": "1",
         "payload_sha256": context.source_sha256,
     }
+    if canonical_sha256(context.document) != context.source_sha256:
+        raise ValueError(
+            "canonical Stock Alert context evidence checksum changed"
+        )
     return {
         "security": {
             "security_id": str(member["security_id"]),
@@ -554,13 +1142,8 @@ def _wire_input(
             "market_trend": None if context.market_trend is None else str(context.market_trend),
             "sector_trend": None if context.sector_trend is None else str(context.sector_trend),
             "event_risk": context.event_risk,
-            "contributors": [
-                {
-                    "bar_revision_id": revision_id,
-                    "payload_sha256": payload_sha256,
-                }
-                for revision_id, payload_sha256 in context.contributors
-            ],
+            "evidence": list(context.evidence),
+            "document": context.document,
             "reason_codes": list(context.reason_codes),
         },
         "market_cutoff": inputs.cutoff.isoformat(),
@@ -701,7 +1284,7 @@ def produce_canonical_stock_alert_batch(
     contexts: Mapping[str, CanonicalStockAlertContext] | None = None,
     membership: CanonicalStockAlertMembership | None = None,
     deadline: datetime | None = None,
-    policy: BreakoutPolicy = BreakoutPolicy(),
+    policy: BreakoutPolicy = CANONICAL_STOCK_ALERT_POLICY,
 ) -> CanonicalStockAlertBatch:
     prior_states = prior_states or {}
     membership = membership or canonical_stock_alert_membership(inputs)
@@ -717,7 +1300,7 @@ def produce_canonical_stock_alert_batch(
     )
     version = canonical_stock_alert_version(policy)
     evaluations = []
-    for member in inputs.members:
+    for member in _product_members(inputs, membership):
         identity = str(member["security_id"])
         wire = _wire_input(
             inputs,
@@ -768,6 +1351,10 @@ def produce_canonical_stock_alert_batch(
             "membership_sha256": membership.membership_sha256,
             "security_id": identity,
             "ticker": member["ticker"],
+            "context_source_record_id": str(
+                contexts[identity].source_record_id
+            ),
+            "context_source_sha256": contexts[identity].source_sha256,
             "decision": canonical_value(decision),
             "context_reason_codes": list(contexts[identity].reason_codes),
             "observation_session": inputs.session.isoformat(),

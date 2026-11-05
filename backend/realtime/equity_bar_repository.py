@@ -224,7 +224,9 @@ def persist_realtime_equity_bars_cursor(
         + _current_source_precedence("EXCLUDED") + " > "
         + _current_source_precedence("rt.bar_current")
         + " OR (rt.bar_current.source_kind=EXCLUDED.source_kind "
-        "AND rt.bar_current.observed_at < EXCLUDED.observed_at))",
+        # On a tie the later write wins: writes follow source offset, and two
+        # revisions can share one observed_at. The 5m bar uses the later one.
+        "AND rt.bar_current.observed_at <= EXCLUDED.observed_at))",
         [
             (
                 str(fact.cohort_id),

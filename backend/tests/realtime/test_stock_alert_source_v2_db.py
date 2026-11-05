@@ -11,16 +11,18 @@ from psycopg2.extras import Json, RealDictCursor
 
 from equity.stock_alert_results import retain_record
 from realtime.canonical_stock_alert_product import (
+    canonical_stock_alert_contexts,
     produce_canonical_stock_alert_batch,
 )
 from realtime.canonical_stock_alert_repository import (
+    _context_reference_rows_cursor,
     load_canonical_stock_alert_projection_cursor,
     persist_canonical_stock_alert_batch_cursor,
 )
 from realtime.runner_environment import StockAlertProjectionRequest
 from research.stock_idea_engine import digest
 from tests.realtime.test_canonical_stock_alert_product import (
-    _inputs as canonical_inputs,
+    _ready_context_inputs,
 )
 from tests.realtime.v2_database import (
     disposable_v2_database,
@@ -204,11 +206,13 @@ def test_v2_canonical_stock_alert_batch_matches_exact_receipt():
                 "INSERT INTO rt.cycle_receipts(" 
                 "receipt_id,window_id,cohort_id,receipt_kind,cutoff," 
                 "reference_generation,universe_sha256,input_sha256," 
-                "build_id) VALUES(%s,%s,%s,'INPUT_READY',%s,1,%s,%s,%s)",
+                "build_id,known_by) VALUES("
+                "%s,%s,%s,'INPUT_READY',%s,1,%s,%s,%s,%s)",
                 (
                     str(receipt_id), str(window_id), str(cohort_id),
                     cutoff, "a" * 64, "b" * 64,
                     "stock-alert-binding-test-v1",
+                    now,
                 ),
             )
             database_cursor.execute(
@@ -289,7 +293,9 @@ def test_v2_canonical_stock_alert_batch_persists_and_replays():
         "test_realtime_v2_canonical_stock_alert_"
         + uuid4().hex[:8]
     )
-    inputs = canonical_inputs()
+    inputs, context_members, _events, event_coverage = (
+        _ready_context_inputs()
+    )
     cutoff = inputs.cutoff
     known_by = max(
         inputs.recorded_by + timedelta(seconds=1),
@@ -324,8 +330,8 @@ def test_v2_canonical_stock_alert_batch_persists_and_replays():
                 "INSERT INTO rt.cycle_receipts("
                 "receipt_id,window_id,cohort_id,receipt_kind,cutoff,"
                 "reference_generation,universe_sha256,input_sha256,"
-                "build_id,created_at) VALUES("
-                "%s,%s,%s,'INPUT_READY',%s,1,%s,%s,%s,%s)",
+                "build_id,created_at,known_by) VALUES("
+                "%s,%s,%s,'INPUT_READY',%s,1,%s,%s,%s,%s,%s)",
                 (
                     str(receipt_id),
                     str(window_id),
@@ -335,10 +341,12 @@ def test_v2_canonical_stock_alert_batch_persists_and_replays():
                     "b" * 64,
                     "canonical-stock-alert-test-v1",
                     inputs.recorded_by,
+                    inputs.recorded_by,
                 ),
             )
             rebound = replace(inputs, cohort_id=cohort_id)
-            for member in rebound.members:
+            all_members = (*rebound.members, *context_members)
+            for member in all_members:
                 database_cursor.execute(
                     "INSERT INTO ref.securities("
                     "security_id,asset_type,source_origin,created_at) "
@@ -362,6 +370,30 @@ def test_v2_canonical_stock_alert_batch_persists_and_replays():
                         str(member["security_id"]),
                     ),
                 )
+            for row in event_coverage:
+                database_cursor.execute(
+                    "INSERT INTO ref.market_event_coverage("
+                    "coverage_id,security_id,event_type,window_start,"
+                    "window_end,source,verdict,checked_at,valid_until,"
+                    "evidence_sha256) VALUES("
+                    "%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                    (
+                        str(row["coverage_id"]),
+                        (
+                            None
+                            if row["security_id"] is None
+                            else str(row["security_id"])
+                        ),
+                        row["event_type"],
+                        row["window_start"],
+                        row["window_end"],
+                        row["source"],
+                        row["verdict"],
+                        row["checked_at"],
+                        row["valid_until"],
+                        row["evidence_sha256"],
+                    ),
+                )
             for bar in rebound.bars:
                 database_cursor.execute(
                     "INSERT INTO rt.bar_catalog("
@@ -374,7 +406,7 @@ def test_v2_canonical_stock_alert_batch_persists_and_replays():
                         str(cohort_id),
                         next(
                             int(member["instrument_id"])
-                            for member in rebound.members
+                            for member in all_members
                             if member["ticker"] == bar["ticker"]
                         ),
                         bar["bar_start"],
@@ -383,11 +415,25 @@ def test_v2_canonical_stock_alert_batch_persists_and_replays():
                         bar["session_date"],
                     ),
                 )
+            retained_events, retained_coverage = (
+                _context_reference_rows_cursor(
+                    database_cursor,
+                    rebound,
+                )
+            )
+            assert retained_events == ()
+            assert len(retained_coverage) == 2
             batch = produce_canonical_stock_alert_batch(
                 rebound,
                 window_id=window_id,
                 input_receipt_id=receipt_id,
                 receipt_input_sha256="b" * 64,
+                contexts=canonical_stock_alert_contexts(
+                    rebound,
+                    context_members=context_members,
+                    market_events=retained_events,
+                    market_event_coverage=retained_coverage,
+                ),
             )
             first = persist_canonical_stock_alert_batch_cursor(
                 database_cursor,
@@ -417,11 +463,36 @@ def test_v2_canonical_stock_alert_batch_persists_and_replays():
                 batch.batch_sha256
             )
             assert len(projection["evaluations"]) == 2
-            assert {
-                row["disposition"]
+            aapl = next(
+                row
                 for row in projection["evaluations"]
-            } == {"UNAVAILABLE"}
-            assert all(
-                row["alert"]["non_actionable"] is True
-                for row in projection["evaluations"]
+                if row["ticker"] == "AAPL"
             )
+            assert aapl["disposition"] == "MATCH"
+            assert aapl["alert"]["non_actionable"] is False
+            database_cursor.execute(
+                "SELECT retained_input,input_sha256 "
+                "FROM rt.detector_event_inputs "
+                "WHERE event_id=%s AND input_role='EQUITY_CONTEXT'",
+                (aapl["event_id"],),
+            )
+            retained_context = database_cursor.fetchone()
+            assert (
+                retained_context["retained_input"]["source"][
+                    "payload_sha256"
+                ]
+                == retained_context["input_sha256"]
+                == aapl["payload"]["context_source_sha256"]
+            )
+            assert {
+                row["role"]
+                for row in retained_context["retained_input"][
+                    "evidence"
+                ]
+            } >= {
+                "MARKET_BAR",
+                "SECTOR_MAPPING",
+                "SECTOR_BENCHMARK_REFERENCE",
+                "SECTOR_BAR",
+                "MARKET_EVENT_COVERAGE",
+            }

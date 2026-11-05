@@ -258,6 +258,27 @@ class VolumeBook:
             self._mark(cv, reason, gap_end_ms)
         return len(contracts)
 
+    def watermark_at(
+        self,
+        contract: str,
+        session_date: date,
+        snapshot_time_ms: int,
+    ) -> int:
+        if type(snapshot_time_ms) is not int or snapshot_time_ms < 0:
+            raise ValueError(
+                "snapshot_time_ms must be a nonnegative integer"
+            )
+        cv = self._contract(contract, session_date)
+        return max(
+            cv.evicted_max_seq,
+            *(
+                record.seq
+                for record in cv.history.values()
+                if record.time_ms <= snapshot_time_ms
+            ),
+            0,
+        )
+
     def reconcile(self, contract: str, session_date: date, snapshot_volume: int,
                   watermark_seq: int, snapshot_time_ms: int) -> ReconcileOutcome:
         """Set the cumulative to the snapshot volume plus the streamed prints after the watermark.

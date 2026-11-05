@@ -31,7 +31,7 @@ const columns: AlertColumn[] = [
   { key: 'entry_price', label: 'Paper entry', group: 'Paper outcomes', history: true }, { key: 'stop', label: 'Original stop', group: 'Trade plan' }, { key: 'target', label: 'Target price', group: 'Trade plan', tip: 'Original target frozen with the alert plan, not a price forecast' },
   { key: 'risk_pct', label: 'Risk to stop', group: 'Trade plan', tip: 'Distance from trigger price to stop, not a maximum-loss guarantee' },
   { key: 'reward_risk', label: 'Reward/risk', group: 'Trade plan', tip: 'Frozen trigger-price target room divided by stop risk' },
-  { key: 'hits', label: 'Hits', group: 'Alert details', tip: 'Distinct valid stock/direction publication windows over 21 sessions; not confidence' },
+  { key: 'hits', label: 'Hits', group: 'Alert details', hiddenByDefault: true, tip: 'Distinct valid stock/direction publication windows over 21 sessions; not confidence' },
   { key: 'success_probability', label: 'Success probability', group: 'Trade plan', hiddenByDefault: true, tip: unavailableAlertProbability.reason },
   { key: 'risk_assessment', label: 'Risk assessment', group: 'Trade plan', hiddenByDefault: true, tip: 'Original stop distance and retained cautions; not a calibrated risk score or maximum-loss guarantee' },
   { key: 'model', label: 'Model / interval', group: 'Alert details', tip: 'Swing: the daily setup owns the bracket and session horizon; intraday confirmation only times entry. Intraday: a separate short-duration plan.' },
@@ -180,7 +180,7 @@ export default function StockAlertsPage() {
   const windowOverdue = !!nextWindow && Date.parse(nextWindow.publication_deadline!) < Date.now()
   const skippedWindow = currentSchedules ? currentSchedules.some(stream => (stream.skipped_windows || 0) > 0)
     : displayedRuns.some(run => run.status === 'MISSED_PUBLICATION')
-  const scheduleWarnings = currentSchedules?.filter(stream => stream.status !== 'RETAINED') || []
+  const scheduleWarnings = currentSchedules?.filter(stream => stream.status !== 'RETAINED' && stream.status !== 'COMPLETE') || []
   const latestWorkerPublication = currentSchedules?.filter(stream => stream.latest_run?.status === 'PUBLISHED')
     .sort((left, right) => Date.parse(right.latest_run!.published_at) - Date.parse(left.latest_run!.published_at))[0]
   const retainedDataStale = data?.strategy_streams?.some(stream => stream.projector_stale || stream.status === 'STALE' || !!stream.error)

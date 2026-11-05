@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import replace
 from datetime import date, datetime, timezone
 from uuid import NAMESPACE_URL, UUID, uuid5
 
@@ -16,7 +17,11 @@ from equity.model_detection.contracts import (
 
 from .canonical_stock_alert_product import (
     CANONICAL_STOCK_ALERT_PRODUCT,
+    CANONICAL_STOCK_EVENT_LOOKAHEAD,
+    CANONICAL_STOCK_EVENT_LOOKBACK,
     CanonicalStockAlertBatch,
+    CanonicalStockAlertMembership,
+    canonical_stock_alert_contexts,
     canonical_stock_alert_membership,
     produce_canonical_stock_alert_batch,
 )
@@ -24,6 +29,7 @@ from .contracts import canonical_sha256
 from .runner_environment import StockAlertProjectionRequest
 from .screening_repository import (
     load_realtime_canonical_stock_alert_input,
+    select_canonical_stock_alert_context_bars,
 )
 
 
@@ -160,7 +166,7 @@ def _membership_cursor(cursor, inputs):
         "LEFT JOIN rt.realtime_desired_member_bindings AS binding "
         "ON binding.intent_id=intent.intent_id "
         "WHERE intent.revision_id=%s "
-        "AND intent.member_kind IN ('EQUITY','SECTOR_ETF') "
+        "AND intent.member_kind='EQUITY' "
         "ORDER BY intent.ticker,intent.member_kind",
         (str(revision_id),),
     )
@@ -191,6 +197,133 @@ def _membership_cursor(cursor, inputs):
     )
 
 
+def _context_reference_rows_cursor(cursor, inputs):
+    security_ids = [
+        str(member["security_id"]) for member in inputs.members
+    ]
+    window_start = (
+        inputs.cutoff - CANONICAL_STOCK_EVENT_LOOKBACK
+    ).date()
+    window_end = (
+        inputs.cutoff + CANONICAL_STOCK_EVENT_LOOKAHEAD
+    ).date()
+    cursor.execute(
+        "SELECT DISTINCT ON (event.security_id,event.source,event.event_key) "
+        "event.revision_id,event.security_id,event.event_key,"
+        "event.event_type,event.event_date,event.announced_at,"
+        "event.event_timezone,event.time_precision,event.status,"
+        "event.source,event.observed_at,event.received_at,"
+        "event.valid_until,event.payload_sha256 "
+        "FROM ref.market_event_revisions AS event "
+        "WHERE (event.security_id IS NULL "
+        "OR event.security_id=ANY(%s::uuid[])) "
+        "AND event.event_type IN ('EARNINGS','FED_RATE_DECISION') "
+        "AND event.event_date BETWEEN %s AND %s "
+        "AND event.observed_at<=%s AND event.received_at<=%s "
+        "AND event.valid_until>%s "
+        "AND NOT EXISTS (SELECT 1 "
+        "FROM ref.market_event_revisions AS newer "
+        "WHERE newer.supersedes_revision_id=event.revision_id "
+        "AND newer.observed_at<=%s AND newer.received_at<=%s) "
+        "ORDER BY event.security_id,event.source,event.event_key,"
+        "event.observed_at DESC,event.received_at DESC,event.revision_id",
+        (
+            security_ids,
+            window_start,
+            window_end,
+            inputs.cutoff,
+            inputs.cutoff,
+            inputs.cutoff,
+            inputs.cutoff,
+            inputs.cutoff,
+        ),
+    )
+    events = tuple(dict(row) for row in cursor.fetchall())
+    cursor.execute(
+        "SELECT DISTINCT ON (source,event_type,security_id,"
+        "window_start,window_end) coverage_id,security_id,event_type,"
+        "window_start,window_end,source,verdict,checked_at,valid_until,"
+        "evidence_sha256 FROM ref.market_event_coverage "
+        "WHERE (security_id IS NULL OR security_id=ANY(%s::uuid[])) "
+        "AND event_type IN ('EARNINGS','FED_RATE_DECISION') "
+        "AND window_start<=%s AND window_end>=%s "
+        "AND checked_at<=%s AND valid_until>%s "
+        "ORDER BY source,event_type,security_id,window_start,window_end,"
+        "checked_at DESC,coverage_id",
+        (
+            security_ids,
+            window_start,
+            window_end,
+            inputs.cutoff,
+            inputs.cutoff,
+        ),
+    )
+    return events, tuple(dict(row) for row in cursor.fetchall())
+
+
+def _context_benchmark_members_cursor(
+    cursor,
+    inputs,
+    membership: CanonicalStockAlertMembership,
+) -> tuple[Mapping[str, object], ...]:
+    if membership.desired_revision_id is None:
+        return ()
+    cursor.execute(
+        "SELECT intent.ticker,binding.security_id::text,"
+        "binding.instrument_id,binding.security_revision_id::text,"
+        "revision.payload_sha256,revision.observed_at,"
+        "revision.security_type,revision.sector,revision.sic_code "
+        "FROM rt.realtime_desired_member_intents AS intent "
+        "JOIN rt.realtime_desired_intent_readiness AS readiness "
+        "ON readiness.intent_id=intent.intent_id "
+        "JOIN rt.realtime_desired_member_bindings AS binding "
+        "ON binding.intent_id=intent.intent_id "
+        "JOIN ref.security_revisions AS revision "
+        "ON revision.revision_id=binding.security_revision_id "
+        "AND revision.security_id=binding.security_id "
+        "WHERE intent.revision_id=%s "
+        "AND intent.member_kind='SECTOR_ETF' "
+        "AND intent.enabled AND readiness.status='READY' "
+        "AND revision.effective_from<=%s "
+        "AND (revision.effective_to IS NULL "
+        "OR revision.effective_to>%s) "
+        "AND revision.observed_at<=%s "
+        "ORDER BY intent.ticker,binding.security_id",
+        (
+            str(membership.desired_revision_id),
+            inputs.cutoff,
+            inputs.cutoff,
+            inputs.recorded_by,
+        ),
+    )
+    names = (
+        "ticker",
+        "security_id",
+        "instrument_id",
+        "security_revision_id",
+        "payload_sha256",
+        "observed_at",
+        "security_type",
+        "sector",
+        "sic_code",
+    )
+    members = tuple(
+        dict(row)
+        if isinstance(row, Mapping)
+        else dict(zip(names, row, strict=True))
+        for row in cursor.fetchall()
+    )
+    if (
+        len({str(row["ticker"]) for row in members}) != len(members)
+        or len({str(row["security_id"]) for row in members})
+        != len(members)
+    ):
+        raise ValueError(
+            "canonical Stock Alert context benchmark ownership is ambiguous"
+        )
+    return members
+
+
 def build_canonical_stock_alert_batch_cursor(
     cursor,
     receipt: Mapping[str, object],
@@ -213,12 +346,43 @@ def build_canonical_stock_alert_batch_cursor(
     )
 
     version = canonical_stock_alert_version()
-    return produce_canonical_stock_alert_batch(
+    membership = _membership_cursor(cursor, inputs)
+    context_members = _context_benchmark_members_cursor(
+        cursor,
         inputs,
+        membership,
+    )
+    context_bars = select_canonical_stock_alert_context_bars(
+        cursor,
+        cohort_id=inputs.cohort_id,
+        provider_tier=inputs.provider_tier,
+        tickers=tuple(
+            sorted(str(row["ticker"]) for row in context_members)
+        ),
+        session=inputs.session,
+        cutoff=inputs.cutoff,
+        known_by=inputs.recorded_by,
+    )
+    context_inputs = replace(
+        inputs,
+        bars=(*inputs.bars, *context_bars),
+    )
+    market_events, market_event_coverage = (
+        _context_reference_rows_cursor(cursor, context_inputs)
+    )
+    return produce_canonical_stock_alert_batch(
+        context_inputs,
         window_id=UUID(str(receipt["window_id"])),
         input_receipt_id=UUID(str(receipt["receipt_id"])),
         receipt_input_sha256=str(receipt["input_sha256"]),
-        membership=_membership_cursor(cursor, inputs),
+        membership=membership,
+        contexts=canonical_stock_alert_contexts(
+            context_inputs,
+            membership=membership,
+            context_members=context_members,
+            market_events=market_events,
+            market_event_coverage=market_event_coverage,
+        ),
         deadline=_utc(receipt["deadline"], "receipt deadline"),
         prior_states=_prior_states_cursor(
             cursor,
@@ -366,6 +530,56 @@ def _persist_events_cursor(cursor, batch: CanonicalStockAlertBatch) -> None:
             "received_at,retained_input) VALUES %s ON CONFLICT DO NOTHING",
             inputs,
         )
+        expected = {
+            (
+                str(event.event_id),
+                row.input_role,
+                row.input_key,
+            ): (
+                row.source_kind,
+                row.input_sha256,
+                row.available_at,
+                row.received_at,
+                canonical_sha256(row.retained_input),
+            )
+            for event in events
+            for row in event.inputs
+        }
+        cursor.execute(
+            "SELECT event_id::text,input_role,input_key,source_kind,"
+            "input_sha256,available_at,received_at,retained_input "
+            "FROM rt.detector_event_inputs "
+            "WHERE event_id=ANY(%s::uuid[])",
+            ([str(event.event_id) for event in events],),
+        )
+        retained = {}
+        for row in cursor.fetchall():
+            values = _values(
+                row,
+                (
+                    "event_id",
+                    "input_role",
+                    "input_key",
+                    "source_kind",
+                    "input_sha256",
+                    "available_at",
+                    "received_at",
+                    "retained_input",
+                ),
+            )
+            retained[
+                (str(values[0]), values[1], values[2])
+            ] = (
+                values[3],
+                values[4],
+                values[5],
+                values[6],
+                canonical_sha256(values[7]),
+            )
+        if retained != expected:
+            raise ValueError(
+                "canonical detector retained input identity changed"
+            )
 
 
 def _persist_states_cursor(cursor, batch: CanonicalStockAlertBatch) -> None:
@@ -550,6 +764,18 @@ def persist_canonical_stock_alert_batch_cursor(
             "input_sha256": row.input_sha256,
             "disposition": row.decision.disposition.value,
             "reason_codes": list(row.decision.reason_codes),
+            "context_source_record_id": str(
+                next(
+                    item.source_record_id
+                    for item in row.event.inputs
+                    if item.input_role == "EQUITY_CONTEXT"
+                )
+            ),
+            "context_source_sha256": next(
+                item.input_sha256
+                for item in row.event.inputs
+                if item.input_role == "EQUITY_CONTEXT"
+            ),
             "desired_revision_id": (
                 None
                 if batch.membership.desired_revision_id is None
@@ -627,6 +853,164 @@ def persist_canonical_stock_alert_batch_cursor(
     return document
 
 
+def _projection_batch_document(batch) -> dict[str, object]:
+    return {
+        "batch_id": str(batch["batch_id"]),
+        "batch_sha256": batch["batch_sha256"],
+        "cohort_id": str(batch["cohort_id"]),
+        "window_id": str(batch["window_id"]),
+        "input_receipt_id": str(batch["input_receipt_id"]),
+        "cutoff": batch["cutoff"].isoformat(),
+        "receipt_input_sha256": batch["receipt_input_sha256"],
+        "detector_input_sha256": batch["detector_input_sha256"],
+        "detector_sha256": batch["detector_sha256"],
+        "session_date": batch["observation_session"].isoformat(),
+        "desired_revision_id": (
+            None
+            if batch["desired_revision_id"] is None
+            else str(batch["desired_revision_id"])
+        ),
+        "desired_snapshot_sha256": batch[
+            "desired_snapshot_sha256"
+        ],
+        "membership_sha256": batch["membership_sha256"],
+        "membership": batch["membership_document"],
+        "deadline": (
+            None
+            if batch["deadline"] is None
+            else batch["deadline"].isoformat()
+        ),
+        "late_catch_up": bool(batch["late_catch_up"]),
+        "deliverable": bool(batch["deliverable"]),
+        "completed_at": batch["completed_at"].isoformat(),
+    }
+
+
+def _projection_evaluation_document(row) -> dict[str, object]:
+    return {
+        "evaluation_id": str(row["evaluation_id"]),
+        "event_id": str(row["event_id"]),
+        "security_id": str(row["security_id"]),
+        "instrument_id": int(row["instrument_id"]),
+        "ticker": row["ticker"],
+        "disposition": row["disposition"],
+        "reason_codes": list(row["reason_codes"]),
+        "input_sha256": row["input_sha256"],
+        "evaluation_sha256": row["evaluation_sha256"],
+        "payload": row["evaluation_payload"],
+        "alert": row["evaluation_payload"].get("alert"),
+        "alert_id": (
+            None
+            if row["alert_id"] is None
+            else str(row["alert_id"])
+        ),
+        "observed_at": row["observed_at"].isoformat(),
+        "desired_revision_id": (
+            None
+            if row["desired_revision_id"] is None
+            else str(row["desired_revision_id"])
+        ),
+        "desired_snapshot_sha256": row[
+            "desired_snapshot_sha256"
+        ],
+        "membership_sha256": row["membership_sha256"],
+        "observation_session": row[
+            "observation_session"
+        ].isoformat(),
+        "observation_cutoff": row[
+            "observation_cutoff"
+        ].isoformat(),
+        "late_catch_up": bool(row["late_catch_up"]),
+        "deliverable": bool(row["deliverable"]),
+    }
+
+
+def _validate_replay_context_cursor(
+    cursor,
+    evaluations,
+    *,
+    known_by: datetime,
+) -> None:
+    for row in evaluations:
+        payload = row["evaluation_payload"]
+        if (
+            canonical_sha256(payload) != row["evaluation_sha256"]
+            or str(payload.get("evaluation_id"))
+            != str(row["evaluation_id"])
+            or str(payload.get("event_id")) != str(row["event_id"])
+            or str(payload.get("security_id"))
+            != str(row["security_id"])
+            or payload.get("input_sha256") != row["input_sha256"]
+            or payload.get("disposition") != row["disposition"]
+        ):
+            raise ValueError(
+                "canonical Stock Alert evaluation identity changed"
+            )
+    event_ids = [str(row["event_id"]) for row in evaluations]
+    if not event_ids:
+        return
+    cursor.execute(
+        "SELECT event_id::text,input_key,input_sha256,available_at,"
+        "received_at,source_record_id::text,retained_input "
+        "FROM rt.detector_event_inputs "
+        "WHERE event_id=ANY(%s::uuid[]) "
+        "AND input_role='EQUITY_CONTEXT'",
+        (event_ids,),
+    )
+    context_inputs = {
+        str(values[0]): {
+            "input_key": values[1],
+            "input_sha256": values[2],
+            "available_at": values[3],
+            "received_at": values[4],
+            "source_record_id": str(values[5]),
+            "retained_input": values[6],
+        }
+        for values in (
+            _values(
+                row,
+                (
+                    "event_id",
+                    "input_key",
+                    "input_sha256",
+                    "available_at",
+                    "received_at",
+                    "source_record_id",
+                    "retained_input",
+                ),
+            )
+            for row in cursor.fetchall()
+        )
+    }
+    if set(context_inputs) != set(event_ids):
+        raise ValueError(
+            "canonical Stock Alert replay context is incomplete"
+        )
+    for evaluation in evaluations:
+        context = context_inputs[str(evaluation["event_id"])]
+        retained_input = context["retained_input"]
+        source = retained_input.get("source")
+        document = retained_input.get("document")
+        payload = evaluation["evaluation_payload"]
+        if (
+            not isinstance(source, Mapping)
+            or not isinstance(document, Mapping)
+            or canonical_sha256(document) != context["input_sha256"]
+            or source.get("payload_sha256") != context["input_sha256"]
+            or source.get("source_id") != context["source_record_id"]
+            or context["input_key"] != context["source_record_id"]
+            or payload.get("context_source_record_id")
+            != context["source_record_id"]
+            or payload.get("context_source_sha256")
+            != context["input_sha256"]
+            or context["available_at"] > known_by
+            or context["received_at"] > known_by
+        ):
+            raise ValueError(
+                "canonical Stock Alert replay context identity changed"
+            )
+
+
 def load_canonical_stock_alert_projection_cursor(
     cursor,
     request: StockAlertProjectionRequest,
@@ -675,77 +1059,80 @@ def load_canonical_stock_alert_projection_cursor(
         raise ValueError(
             "canonical Stock Alert evaluation set changed"
         )
+    _validate_replay_context_cursor(
+        cursor,
+        evaluations,
+        known_by=request.known_by,
+    )
+    cursor.execute(
+        "SELECT batch.* FROM rt.canonical_stock_alert_batches AS batch "
+        "WHERE batch.cohort_id=%s "
+        "AND batch.observation_session=%s "
+        "AND batch.cutoff<%s AND batch.completed_at<=%s "
+        "AND batch.created_at<=%s "
+        "ORDER BY batch.cutoff DESC,batch.batch_id DESC LIMIT 77",
+        (
+            str(request.cohort_id),
+            batch["observation_session"],
+            request.cutoff,
+            request.known_by,
+            request.known_by,
+        ),
+    )
+    prior_batches = tuple(dict(row) for row in cursor.fetchall())
+    prior_evaluations = {}
+    if prior_batches:
+        cursor.execute(
+            "SELECT evaluation.* "
+            "FROM rt.canonical_stock_alert_evaluations AS evaluation "
+            "WHERE evaluation.batch_id=ANY(%s::uuid[]) "
+            "AND evaluation.observed_at<=%s "
+            "ORDER BY evaluation.batch_id,evaluation.ticker,"
+            "evaluation.evaluation_id",
+            (
+                [str(row["batch_id"]) for row in prior_batches],
+                request.known_by,
+            ),
+        )
+        for row in cursor.fetchall():
+            prior_evaluations.setdefault(
+                str(row["batch_id"]),
+                [],
+            ).append(dict(row))
+    for prior in prior_batches:
+        selected = tuple(prior_evaluations.get(
+            str(prior["batch_id"]),
+            (),
+        ))
+        if len(selected) != int(prior["evaluation_count"]):
+            raise ValueError(
+                "canonical Stock Alert historical evaluation set changed"
+            )
+        _validate_replay_context_cursor(
+            cursor,
+            selected,
+            known_by=request.known_by,
+        )
     document = {
         "contract": CANONICAL_STOCK_ALERT_RETAINED_CONTRACT,
         "loaded_at": request.known_by.isoformat(),
-        "batch": {
-            "batch_id": str(batch["batch_id"]),
-            "batch_sha256": batch["batch_sha256"],
-            "cohort_id": str(batch["cohort_id"]),
-            "window_id": str(batch["window_id"]),
-            "input_receipt_id": str(batch["input_receipt_id"]),
-            "cutoff": batch["cutoff"].isoformat(),
-            "receipt_input_sha256": batch["receipt_input_sha256"],
-            "detector_input_sha256": batch["detector_input_sha256"],
-            "detector_sha256": batch["detector_sha256"],
-            "session_date": batch["observation_session"].isoformat(),
-            "desired_revision_id": (
-                None
-                if batch["desired_revision_id"] is None
-                else str(batch["desired_revision_id"])
-            ),
-            "desired_snapshot_sha256": batch[
-                "desired_snapshot_sha256"
-            ],
-            "membership_sha256": batch["membership_sha256"],
-            "membership": batch["membership_document"],
-            "deadline": (
-                None
-                if batch["deadline"] is None
-                else batch["deadline"].isoformat()
-            ),
-            "late_catch_up": bool(batch["late_catch_up"]),
-            "deliverable": bool(batch["deliverable"]),
-            "completed_at": batch["completed_at"].isoformat(),
-        },
+        "batch": _projection_batch_document(batch),
         "evaluations": [
-            {
-                "evaluation_id": str(row["evaluation_id"]),
-                "event_id": str(row["event_id"]),
-                "security_id": str(row["security_id"]),
-                "instrument_id": int(row["instrument_id"]),
-                "ticker": row["ticker"],
-                "disposition": row["disposition"],
-                "reason_codes": list(row["reason_codes"]),
-                "input_sha256": row["input_sha256"],
-                "evaluation_sha256": row["evaluation_sha256"],
-                "payload": row["evaluation_payload"],
-                "alert": row["evaluation_payload"].get("alert"),
-                "alert_id": (
-                    None
-                    if row["alert_id"] is None
-                    else str(row["alert_id"])
-                ),
-                "observed_at": row["observed_at"].isoformat(),
-                "desired_revision_id": (
-                    None
-                    if row["desired_revision_id"] is None
-                    else str(row["desired_revision_id"])
-                ),
-                "desired_snapshot_sha256": row[
-                    "desired_snapshot_sha256"
-                ],
-                "membership_sha256": row["membership_sha256"],
-                "observation_session": row[
-                    "observation_session"
-                ].isoformat(),
-                "observation_cutoff": row[
-                    "observation_cutoff"
-                ].isoformat(),
-                "late_catch_up": bool(row["late_catch_up"]),
-                "deliverable": bool(row["deliverable"]),
-            }
+            _projection_evaluation_document(row)
             for row in evaluations
+        ],
+        "history": [
+            {
+                "batch": _projection_batch_document(prior),
+                "evaluations": [
+                    _projection_evaluation_document(row)
+                    for row in prior_evaluations.get(
+                        str(prior["batch_id"]),
+                        (),
+                    )
+                ],
+            }
+            for prior in reversed(prior_batches)
         ],
     }
     document["projection_sha256"] = canonical_sha256(document)

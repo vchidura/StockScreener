@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from uuid import UUID, uuid4
 
 import pytest
@@ -15,6 +15,7 @@ from realtime.advanced_options_resident_barrier import (
     evaluate_resident_completion_barrier_cursor,
     load_ready_resident_window_targets_cursor,
     record_resident_completion_cursor,
+    resident_consumer_hold_cursor,
     resident_completion_stage_outcome,
 )
 from realtime.contracts import canonical_sha256
@@ -39,6 +40,30 @@ class BarrierCursor:
 
     def fetchall(self):
         return list(self.rows)
+
+
+class HoldCursor:
+    def __init__(self, rows=()):
+        self.rows = tuple(rows)
+
+    def execute(self, statement, parameters):
+        assert (
+            "advanced_options_window_cycle_authorizations"
+            in statement
+        )
+        assert len(parameters) == 1
+
+    def fetchall(self):
+        return self.rows
+
+
+class HoldReader:
+    def __init__(self):
+        self.cutoffs = []
+
+    def offsets_at(self, cutoff):
+        self.cutoffs.append(cutoff)
+        return 12, 9
 
 
 class SessionStatusCursor:
@@ -412,11 +437,89 @@ def test_stopped_stream_releases_later_resident_window():
         cursor,
         session_authorization_id=uuid4(),
         member=ResidentCompletionMember.INGRESS,
+        checked_at=NOW,
     )
 
     assert targets[0].target_window_id == window_id
-    assert "stream.event_time_watermark>=cycle.options_cutoff" in (
+    assert "stream.event_time_watermark>cycle.options_cutoff" in (
         cursor.statement
     )
     assert "stream.status='STOPPED'" in cursor.statement
     assert "stream.ended_at<=cycle.options_cutoff" in cursor.statement
+
+
+def test_targets_skip_windows_nothing_will_run_again():
+    cursor = BarrierCursor(rows=())
+
+    load_ready_resident_window_targets_cursor(
+        cursor,
+        session_authorization_id=uuid4(),
+        member=ResidentCompletionMember.INGRESS,
+        checked_at=NOW,
+    )
+
+    assert "window_run.state IN ('PENDING','RUNNING')" in cursor.statement
+    assert "window_run.deadline>%s" in cursor.statement
+
+
+def _cycle(state, *, minute=20, deadline_minutes=5):
+    cutoff = NOW.replace(minute=minute)
+    return (
+        cutoff - timedelta(minutes=5),
+        str(uuid4()),
+        cutoff,
+        cutoff + timedelta(minutes=deadline_minutes),
+        state,
+    )
+
+
+def _hold(rows, checked_at):
+    return resident_consumer_hold_cursor(
+        HoldCursor(rows),
+        session_authorization_id=uuid4(),
+        reader=HoldReader(),
+        checked_at=checked_at,
+    )
+
+
+def test_no_open_cycle_means_no_hold():
+    assert _hold((), NOW) is None
+    assert _hold(
+        (_cycle("COMPLETE"), _cycle("FAILED", minute=25)),
+        NOW.replace(minute=26),
+    ) is None
+
+
+def test_hold_is_at_the_earliest_open_cycle_barrier():
+    first = _cycle("RUNNING")
+    later = _cycle("PENDING", minute=25)
+    reader = HoldReader()
+
+    hold = resident_consumer_hold_cursor(
+        HoldCursor((first, later)),
+        session_authorization_id=uuid4(),
+        reader=reader,
+        checked_at=first[2] + timedelta(seconds=10),
+    )
+
+    assert hold is not None
+    assert hold.target_window_id == UUID(first[1])
+    assert hold.cutoff == first[2]
+    assert hold.deadline == first[3]
+    assert (hold.raw_offset, hold.normalized_offset) == (12, 9)
+    assert reader.cutoffs == [first[2]]
+
+
+def test_hold_moves_on_when_a_window_ends_or_its_deadline_passes():
+    ended = _cycle("MISSED")
+    stuck = _cycle("RUNNING", minute=25)
+    upcoming = _cycle("PENDING", minute=30)
+    rows = (ended, stuck, upcoming)
+
+    hold = _hold(rows, stuck[2])
+    assert hold.target_window_id == UUID(stuck[1])
+
+    hold = _hold(rows, stuck[3])
+    assert hold.target_window_id == UUID(upcoming[1])
+
+    assert _hold(rows, upcoming[3]) is None

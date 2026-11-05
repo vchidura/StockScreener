@@ -178,7 +178,7 @@ export interface AlertViewResponse {
   session: string | null
   view: 'latest' | 'history' | 'open'
   combined?: boolean
-  schedule_streams?: Array<{ stream: string; label: string; status: 'RETAINED' | 'OVERDUE' | 'UNAVAILABLE';
+  schedule_streams?: Array<{ stream: string; label: string; status: 'RETAINED' | 'COMPLETE' | 'OVERDUE' | 'UNAVAILABLE';
     publication_window_start?: string; publication_deadline?: string; source_as_of?: string; skipped_windows?: number;
     latest_run?: { trigger_at: string; published_at: string; status: string; selected: number } | null }>
   latest_runs?: AlertPublication[]

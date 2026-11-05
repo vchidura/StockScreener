@@ -672,6 +672,90 @@ def load_advanced_options_cycle_cursor(
     )
 
 
+def _persist_native_detector_events_cursor(cursor, cycle, control_plane) -> None:
+    """An evaluation must point at a detector event, and nothing wrote one for these lanes,
+    so any window with a real evaluation failed on the foreign key (found Nov 5)."""
+    for row in cycle.evaluations:
+        version = {
+            "contract": "advanced-options-native-lane-v1",
+            "detector": row.detector.value,
+        }
+        detector_sha256 = canonical_sha256(version)
+        cursor.execute(
+            "INSERT INTO rt.detector_versions("
+            "detector_sha256,detector_id,version,code_sha256,policy_sha256,"
+            "valuation_sha256,requirements,output_kind) "
+            "VALUES(%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING",
+            (
+                detector_sha256,
+                f"ADVANCED_OPTIONS_{row.detector.value}",
+                "1",
+                detector_sha256,
+                detector_sha256,
+                detector_sha256,
+                canonical_json(version),
+                "OBSERVATION",
+            ),
+        )
+        cursor.execute(
+            "SELECT instrument.instrument_id FROM rt.option_flow_events AS event "
+            "JOIN ref.option_contracts AS contract "
+            "ON contract.contract_ticker=event.contract_ticker "
+            "JOIN rt.instruments AS instrument "
+            "ON instrument.contract_id=contract.contract_id "
+            "WHERE event.event_id=%s LIMIT 1",
+            (str(row.event_id),),
+        )
+        found = cursor.fetchone()
+        if found is None:
+            # OS1 and OS2 start from the stock, so their event is on the underlying.
+            cursor.execute(
+                "SELECT instrument.instrument_id FROM ref.security_revisions AS security "
+                "JOIN rt.instruments AS instrument "
+                "ON instrument.security_id=security.security_id "
+                "AND instrument.contract_id IS NULL "
+                "WHERE security.ticker=%s LIMIT 1",
+                (row.underlyer,),
+            )
+            found = cursor.fetchone()
+        if found is None:
+            raise ValueError("native detector evaluation has no instrument")
+        instrument_id = (
+            found["instrument_id"] if isinstance(found, Mapping) else found[0]
+        )
+        dedup_sha256 = canonical_sha256({
+            "detector_sha256": detector_sha256,
+            "event_id": str(row.event_id),
+        })
+        cursor.execute(
+            "INSERT INTO rt.detector_events("
+            "event_id,dedup_sha256,cohort_id,provider_tier,detector_sha256,"
+            "instrument_id,trigger_identity,trigger_at,decision_at,"
+            "disposition,reason_codes,readiness_epoch,evidence_sha256,"
+            "payload_schema,payload) "
+            "VALUES(%s,%s,%s,'MASSIVE_ADVANCED',%s,%s,%s,%s,%s,%s,%s,1,%s,%s,%s) "
+            "ON CONFLICT DO NOTHING",
+            (
+                str(row.event_id),
+                dedup_sha256,
+                str(control_plane.cohort_id),
+                detector_sha256,
+                instrument_id,
+                str(row.event_id),
+                row.observed_at,
+                row.observed_at,
+                row.selection_status,
+                [],
+                row.payload_sha256,
+                "advanced-options-native-evaluation-v1",
+                canonical_json({
+                    "detector": row.detector.value,
+                    "evaluation_payload_sha256": row.payload_sha256,
+                }),
+            ),
+        )
+
+
 def persist_advanced_options_cycle_cursor(
     cursor,
     cycle: AdvancedOptionsCycleResult,
@@ -780,6 +864,7 @@ def persist_advanced_options_cycle_cursor(
     }
     for package in packages.values():
         persist_realtime_option_package_cursor(cursor, package)
+    _persist_native_detector_events_cursor(cursor, cycle, control_plane)
     for row in cycle.evaluations:
         cursor.execute(
             "INSERT INTO rt.detector_evaluations ("

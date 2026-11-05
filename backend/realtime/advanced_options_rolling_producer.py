@@ -37,10 +37,14 @@ from .advanced_options_rolling_state import (
     AdvancedOptionsRollingProducerBinding,
     AdvancedOptionsRollingState,
     AdvancedOptionsUnderlyingTick,
+    OPTION_CONTRACTS_EXCLUDED,
+    OPTION_CONTRACTS_EXCLUDED_ABOVE_LIMIT,
     RollingAvailability,
+    TOLERATED_STREAM_GAPS,
     build_advanced_options_rolling_state,
     build_underlying_tick,
     contract_volume_state,
+    excluded_contract_share_exceeded,
 )
 from .advanced_options_underlying_snapshot import (
     UnderlyingSnapshotBinding,
@@ -61,6 +65,14 @@ from .option_source_flow import (
 
 ROLLING_PRODUCER_VERSION = "advanced-options-rolling-producer-v1"
 _RETRYABLE_POSTGRES_SQLSTATES = frozenset({"40001", "40P01"})
+# A gap this short that has ended no longer blocks a window. Nothing repairs an
+# Options gap, and the feed has been seen to reconnect within seconds.
+MAXIMUM_TOLERATED_GAP_SECONDS = 120
+# These evidence rows can be READY and still name what the window tolerated.
+_TOLERATING_EVIDENCE_KINDS = frozenset({
+    "UNRESOLVED_GAPS",
+    "EXCLUDED_CONTRACT",
+})
 
 
 def _utc(value: datetime, name: str) -> datetime:
@@ -112,6 +124,7 @@ class AdvancedOptionsRollingProducerEvidence:
         if (
             self.availability is RollingAvailability.READY
             and reasons
+            and kind not in _TOLERATING_EVIDENCE_KINDS
         ) or (
             self.availability is RollingAvailability.UNAVAILABLE
             and not reasons
@@ -375,9 +388,11 @@ class AdvancedOptionsRollingProducerPreflight:
 
     @property
     def reason_codes(self) -> tuple[str, ...]:
+        """What blocks the window. A ready row's reasons say only what it tolerated."""
         return tuple(sorted({
             reason
             for row in self.evidence
+            if row.availability is not RollingAvailability.READY
             for reason in row.reason_codes
         }))
 
@@ -775,6 +790,22 @@ def advanced_options_unresolved_gaps_sha256(
     ))
 
 
+def advanced_options_gap_blocks(
+    row: Mapping[str, object],
+    known_at: datetime,
+) -> bool:
+    """A gap still open, longer than the limit, not yet over at this window's
+    barrier, or WARMING blocks. Any other stays in the digest and does not block."""
+    gap_end = row["gap_end"]
+    return not (
+        str(row["recovery_status"]) == "UNRESOLVED"
+        and gap_end is not None
+        and gap_end < known_at
+        and (gap_end - row["gap_start"]).total_seconds()
+        <= MAXIMUM_TOLERATED_GAP_SECONDS
+    )
+
+
 def _evidence(
     kind: str,
     key: str,
@@ -796,6 +827,16 @@ def _evidence(
         valid_until=valid_until,
         reason_codes=reasons,
     )
+
+
+def _observed_by_known(
+    values,
+    plan: AdvancedOptionsRollingProducerPlan,
+) -> datetime | None:
+    """A row past the cutoff must block with its reason. Evidence that refuses
+    its own clocks would raise instead and end the role."""
+    observed = max(values, default=None)
+    return None if observed is None else min(observed, plan.known_at)
 
 
 def _result(
@@ -1130,21 +1171,29 @@ def _source_watermarks(
         if (
             str(row["status"]) not in {"LIVE", "STOPPED"}
             or int(row["last_event_offset"])
-            != plan.market_state_committed_offset
+            < plan.market_state_committed_offset
             or int(row["last_raw_offset"]) < plan.flow_committed_offset
             or row["event_time_watermark"] is None
-            or row["event_time_watermark"] > plan.known_at
+            or row["event_time_watermark"] < plan.known_at
             or row["heartbeat_at"] is None
-            or row["heartbeat_at"] > plan.known_at
+            or row["started_at"] is None
+            or row["started_at"] > plan.known_at
             or row["subscribed_at"] is None
             or row["subscribed_at"] > plan.known_at
-            or (
-                row["ended_at"] is not None
-                and row["ended_at"] > plan.known_at
-            )
         ):
             reasons.append("SOURCE_WATERMARK_OR_CLOCK_MISMATCH")
-    digest = canonical_sha256(tuple(tuple(row.values()) for row in rows))
+    identity = tuple(
+        (
+            str(row["session_id"]),
+            str(row["manifest_id"]),
+            int(row["owner_epoch"]),
+            str(row["journal_generation"]),
+            row["started_at"],
+            row["subscribed_at"],
+        )
+        for row in rows
+    )
+    digest = canonical_sha256(identity)
     evidence.append(_evidence(
         "SOURCE_WATERMARKS",
         str(plan.source_flow.journal_generation),
@@ -1153,15 +1202,8 @@ def _source_watermarks(
             if not reasons
             else RollingAvailability.UNAVAILABLE
         ),
-        tuple(tuple(row.values()) for row in rows),
-        observed_at=max(
-            (
-                row["event_time_watermark"]
-                for row in rows
-                if row["event_time_watermark"] is not None
-            ),
-            default=None,
-        ),
+        identity,
+        observed_at=plan.known_at,
         known_at=plan.known_at,
         valid_until=plan.valid_until,
         reasons=tuple(reasons),
@@ -1191,24 +1233,29 @@ def _gaps(
     ):
         raise ValueError("rolling unresolved gap generation drifted")
     digest = advanced_options_unresolved_gaps_sha256(rows)
+    blocked = any(
+        advanced_options_gap_blocks(row, plan.known_at) for row in rows
+    )
     evidence.append(_evidence(
         "UNRESOLVED_GAPS",
         str(plan.source_flow.journal_generation),
         (
             RollingAvailability.READY
-            if not rows
+            if not blocked
             else RollingAvailability.UNAVAILABLE
         ),
         tuple(tuple(row.values()) for row in rows),
         known_at=plan.known_at,
         valid_until=plan.valid_until,
         reasons=(
-            ()
-            if not rows
-            else ("UNRESOLVED_OR_WARMING_STREAM_GAPS",)
+            ("UNRESOLVED_OR_WARMING_STREAM_GAPS",)
+            if blocked
+            else (TOLERATED_STREAM_GAPS,)
+            if rows
+            else ()
         ),
     ))
-    return digest if not rows else None
+    return digest if not blocked else None
 
 
 def _checkpoints(
@@ -1271,8 +1318,11 @@ def _checkpoints(
                 != expected_shard_map_sha256
             ):
                 raise ValueError("rolling consumer checkpoint scope drifted")
+            # Each consumer's epoch is its own lease's and rises on restart, while
+            # the plan holds the journal owner's, so they need not match. Leases
+            # fence stale writers, and the offset is what proves the state.
             if (
-                int(row["owner_epoch"]) != plan.owner_epoch
+                int(row["owner_epoch"]) < 1
                 or int(row["committed_offset"])
                 != (
                     plan.market_state_committed_offset
@@ -1281,10 +1331,9 @@ def _checkpoints(
                 )
             ):
                 reasons.append("CONSUMER_CHECKPOINT_OFFSET_MISMATCH")
-            if (
-                row["committed_at"] < plan.control_plane.slot_set.effective_at
-                or row["committed_at"] > plan.known_at
-            ):
+            # committed_at is the wall clock of the write, always past a cutoff
+            # for the slice that reaches it; it says nothing about market time.
+            if row["committed_at"] < plan.control_plane.slot_set.effective_at:
                 reasons.append("CONSUMER_CHECKPOINT_CLOCK_INVALID")
         digest = advanced_options_consumer_checkpoint_sha256(selected)
         digests[owner] = digest
@@ -1298,9 +1347,9 @@ def _checkpoints(
                 else RollingAvailability.UNAVAILABLE
             ),
             tuple(tuple(row.values()) for row in selected),
-            observed_at=max(
+            observed_at=_observed_by_known(
                 (row["committed_at"] for row in selected),
-                default=None,
+                plan,
             ),
             known_at=plan.known_at,
             valid_until=plan.valid_until,
@@ -1487,16 +1536,26 @@ def _market_state(
         for row in rows
     }
     reasons = []
-    expected_keys = {
-        (kind, instrument_id)
-        for kind in ("Q", "T")
-        for instrument_id in (
-            option_ids
-            if snapshot_based
-            else (*option_ids, *equity_ids)
-        )
-    }
-    if set(by_key) != expected_keys:
+    # One bad or missing option head leaves out that contract alone. Equity heads
+    # price an underlying's every contract, so they stay strict.
+    excluded: dict[int, set[str]] = {}
+    # An option's last print only dates its head. A contract that has not traded,
+    # or whose last print was excluded, is a quiet contract, not a broken one.
+    for instrument_id in option_ids:
+        if ("Q", instrument_id) not in by_key:
+            excluded.setdefault(instrument_id, set()).add(
+                "CANONICAL_CURRENT_HEADS_INCOMPLETE"
+            )
+    expected_keys = (
+        set()
+        if snapshot_based
+        else {
+            (kind, instrument_id)
+            for kind in ("Q", "T")
+            for instrument_id in equity_ids
+        }
+    )
+    if not expected_keys <= set(by_key):
         reasons.append("CANONICAL_CURRENT_HEADS_INCOMPLETE")
     for row in rows:
         instrument_id = int(row["instrument_id"])
@@ -1522,11 +1581,20 @@ def _market_state(
             or str(row["session_id"]) not in expected_sessions
             or row["source_session"] != expected_session_date
         ):
-            raise ValueError(
-                "rolling current source session or generation drifted"
-            )
+            # The current tables keep a head until it is replaced. A contract with
+            # no quote yet this session shows its last session's, and that leaves
+            # it out. With no print yet, it is only a quiet contract.
+            if is_equity:
+                raise ValueError(
+                    "rolling current source session or generation drifted"
+                )
+            if str(row["kind"]) == "Q":
+                excluded.setdefault(instrument_id, set()).add(
+                    "CANONICAL_CURRENT_HEAD_OTHER_SESSION"
+                )
+            continue
         maximum_offset = (
-            plan.flow_committed_offset
+            plan.market_state_committed_offset
             if not is_equity or equity_binding is None or snapshot_based
             else equity_binding.committed_offset
         )
@@ -1535,12 +1603,20 @@ def _market_state(
             if not is_equity or equity_binding is None or snapshot_based
             else equity_binding.observed_at
         )
+        # An option event at or before the cutoff can arrive just after it. Its
+        # offset and event time say whether it belongs to this window. Within the
+        # offset, an option stamped past the cutoff can only be a bad source clock
+        # the barrier did not count, and that is one contract's fault.
         if (
             int(row["source_offset"]) > maximum_offset
-            or row["received_at"] > maximum_clock
-            or row["event_at"] > maximum_clock
+            or (is_equity and row["received_at"] > maximum_clock)
+            or (is_equity and row["event_at"] > maximum_clock)
         ):
             reasons.append("CANONICAL_CURRENT_HEAD_AHEAD_OF_CHECKPOINT")
+        elif row["event_at"] > maximum_clock:
+            excluded.setdefault(instrument_id, set()).add(
+                "CANONICAL_CURRENT_HEAD_AHEAD_OF_CHECKPOINT"
+            )
         if (
             str(row["kind"]) == "Q"
             and (
@@ -1551,6 +1627,7 @@ def _market_state(
             )
         ) or (
             str(row["kind"]) == "T"
+            and is_equity
             and (
                 str(row["eligibility"]) != "INCLUDED"
                 or tuple(row["reason_codes"])
@@ -1559,7 +1636,45 @@ def _market_state(
                 or row["exchange"] is None
             )
         ):
-            reasons.append("CANONICAL_CURRENT_HEAD_INVALID")
+            if is_equity:
+                reasons.append("CANONICAL_CURRENT_HEAD_INVALID")
+            else:
+                excluded.setdefault(instrument_id, set()).add(
+                    "CANONICAL_CURRENT_HEAD_INVALID"
+                )
+    contracts_by_underlying: dict[str, set[int]] = {}
+    ticker_by_id = {}
+    for row in contracts:
+        instrument_id = int(row["instrument_id"])
+        contracts_by_underlying.setdefault(
+            str(row["underlying_security_id"]),
+            set(),
+        ).add(instrument_id)
+        ticker_by_id[instrument_id] = row.get("contract_ticker")
+    for instrument_id, contract_reasons in sorted(excluded.items()):
+        ticker = ticker_by_id.get(instrument_id)
+        evidence.append(_evidence(
+            "EXCLUDED_CONTRACT",
+            str(instrument_id) if ticker is None else f"{instrument_id}:{ticker}",
+            RollingAvailability.READY,
+            tuple(
+                tuple(row.values())
+                for row in rows
+                if int(row["instrument_id"]) == instrument_id
+            ),
+            known_at=plan.known_at,
+            valid_until=plan.valid_until,
+            reasons=(OPTION_CONTRACTS_EXCLUDED, *sorted(contract_reasons)),
+        ))
+    for members in contracts_by_underlying.values():
+        out = members.intersection(excluded)
+        if excluded_contract_share_exceeded(len(out), len(members)):
+            reasons.append(OPTION_CONTRACTS_EXCLUDED_ABOVE_LIMIT)
+            reasons.extend(
+                reason
+                for instrument_id in sorted(out)
+                for reason in sorted(excluded[instrument_id])
+            )
     digest = (
         canonical_sha256({
             "option_heads": tuple(
@@ -1581,9 +1696,15 @@ def _market_state(
         option_time_by_security = {}
         for row in contracts:
             instrument_id = int(row["instrument_id"])
-            times = (
-                by_key[("Q", instrument_id)]["event_at"],
-                by_key[("T", instrument_id)]["event_at"],
+            if instrument_id in excluded:
+                continue
+            times = tuple(
+                by_key[(kind, instrument_id)]["event_at"]
+                for kind in ("Q", "T")
+                if (kind, instrument_id) in by_key
+                # A last session's print cannot date this session's market.
+                and by_key[(kind, instrument_id)]["source_session"]
+                == plan.control_plane.session_date
             )
             option_time_by_security[str(row["underlying_security_id"])] = max(
                 times
@@ -1683,7 +1804,10 @@ def _market_state(
             else RollingAvailability.UNAVAILABLE
         ),
         tuple(tuple(row.values()) for row in rows),
-        observed_at=max((row["event_at"] for row in rows), default=None),
+        observed_at=_observed_by_known(
+            (row["event_at"] for row in rows),
+            plan,
+        ),
         known_at=plan.known_at,
         valid_until=plan.valid_until,
         reasons=tuple(reasons),
@@ -1715,47 +1839,50 @@ def _volumes(
             list(tickers),
         ),
     )
-    rows = tuple(cursor.fetchall())
-    cursor.execute(
-        "SELECT contract_ticker,max(source_seq) AS last_source_seq,"
-        "max(event_time) AS last_event_time,max(source_offset) AS last_offset "
-        "FROM rt.option_flow_events WHERE cohort_id=%s AND session_date=%s "
-        "AND source_flow_id=%s AND contract_ticker=ANY(%s) "
-        "GROUP BY contract_ticker ORDER BY contract_ticker",
-        (
-            str(plan.control_plane.cohort_id),
-            plan.control_plane.session_date,
-            str(plan.source_flow.source_flow_id),
-            list(tickers),
-        ),
-    )
-    event_rows = {
-        str(row["contract_ticker"]): row for row in cursor.fetchall()
-    }
+    stored = tuple(cursor.fetchall())
     reasons = []
-    if tuple(str(row["contract_ticker"]) for row in rows) != tickers:
+    # Flow writes a checkpoint at a contract's first print, so a contract with none
+    # simply has not traded. That must not stop a window: its volume so far is zero,
+    # and it has no flow events for this window to value (found Nov 5, quiet feed).
+    by_ticker = {str(row["contract_ticker"]): row for row in stored}
+    if len(by_ticker) != len(stored) or set(by_ticker) - set(tickers):
         reasons.append("OPTION_VOLUME_CHECKPOINT_MEMBERSHIP_INCOMPLETE")
+    rows = tuple(
+        by_ticker.get(ticker)
+        or {
+            "cohort_id": str(plan.control_plane.cohort_id),
+            "session_date": plan.control_plane.session_date,
+            "contract_ticker": ticker,
+            "cumulative_volume": 0,
+            "last_source_seq": 0,
+            "last_event_time": None,
+            "baseline_kind": BaselineKind.SESSION_COMPLETE.value,
+            "snapshot_volume": None,
+            "snapshot_watermark_seq": None,
+        }
+        for ticker in tickers
+    )
     states = []
     for row in rows:
         ticker = str(row["contract_ticker"])
         baseline = BaselineKind(str(row["baseline_kind"]))
-        event = event_rows.get(ticker)
         if baseline not in COMPLETE_BASELINES:
             reasons.append("OPTION_VOLUME_CHECKPOINT_INCOMPLETE")
         if (
-            event is None
-            and (
-                int(row["cumulative_volume"]) != 0
-                or int(row["last_source_seq"]) != 0
-                or row["last_event_time"] is not None
+            (
+                int(row["last_source_seq"]) > 0
+                and row["last_event_time"] is None
             )
-        ) or (
-            event is not None
-            and (
-                int(event["last_offset"]) > plan.flow_committed_offset
-                or int(event["last_source_seq"])
-                != int(row["last_source_seq"])
-                or event["last_event_time"] != row["last_event_time"]
+            or (
+                row["last_event_time"] is not None
+                and row["last_event_time"] > plan.known_at
+            )
+            or (
+                baseline is BaselineKind.SNAPSHOT_RECONCILED
+                and (
+                    row["snapshot_volume"] is None
+                    or row["snapshot_watermark_seq"] is None
+                )
             )
         ):
             reasons.append("OPTION_VOLUME_CHECKPOINT_WATERMARK_MISMATCH")
@@ -1788,10 +1915,7 @@ def _volumes(
                 else None
             ),
         ))
-    value = (
-        tuple(tuple(row.values()) for row in rows),
-        tuple(tuple(row.values()) for row in event_rows.values()),
-    )
+    value = tuple(tuple(row.values()) for row in rows)
     digest = canonical_sha256(value)
     evidence.append(_evidence(
         "OPTION_VOLUME_CHECKPOINTS",
@@ -1802,13 +1926,13 @@ def _volumes(
             else RollingAvailability.UNAVAILABLE
         ),
         value,
-        observed_at=max(
+        observed_at=_observed_by_known(
             (
                 row["last_event_time"]
                 for row in rows
                 if row["last_event_time"] is not None
             ),
-            default=None,
+            plan,
         ),
         known_at=plan.known_at,
         valid_until=plan.valid_until,
@@ -1824,28 +1948,36 @@ def _order_windows(
     plan: AdvancedOptionsRollingProducerPlan,
     evidence: list[AdvancedOptionsRollingProducerEvidence],
 ) -> AdvancedOptionsOrderWindowState | None:
+    # Only clusters still inside their own window at the cutoff count. A whole
+    # session's clusters would grow without bound and cost more every window.
     cursor.execute(
         "WITH latest AS ("
         "SELECT DISTINCT ON (cluster_id,profile) cluster_id,revision,"
         "session_date,profile,window_seconds,print_count,status,"
         "source_flow_id::text,condition_semantics_sha256,"
         "flow_policy_sha256,advanced_flow_policy_sha256,"
-        "contract_scope_sha256,manifest_sha256,slot_sha256 "
+        "contract_scope_sha256,manifest_sha256,slot_sha256,window_end "
         "FROM rt.option_flow_clusters WHERE cohort_id=%s "
         "AND session_date=%s AND source_flow_id=%s "
         "ORDER BY cluster_id,profile,revision DESC"
-        ") SELECT * FROM latest ORDER BY window_seconds,cluster_id,profile",
+        ") SELECT cluster_id,revision,session_date,profile,window_seconds,"
+        "print_count,status,source_flow_id,condition_semantics_sha256,"
+        "flow_policy_sha256,advanced_flow_policy_sha256,"
+        "contract_scope_sha256,manifest_sha256,slot_sha256 FROM latest "
+        "WHERE window_end>=%s-make_interval(secs=>window_seconds) "
+        "ORDER BY window_seconds,cluster_id,profile",
         (
             str(plan.control_plane.cohort_id),
             plan.control_plane.session_date,
             str(plan.source_flow.source_flow_id),
+            plan.known_at,
         ),
     )
     headers = tuple(cursor.fetchall())
     cursor.execute(
         "WITH latest AS ("
         "SELECT DISTINCT ON (cluster_id,profile) cluster_id,revision,"
-        "session_date,profile,window_seconds,status "
+        "session_date,profile,window_seconds,status,window_end "
         "FROM rt.option_flow_clusters WHERE cohort_id=%s "
         "AND session_date=%s AND source_flow_id=%s "
         "ORDER BY cluster_id,profile,revision DESC"
@@ -1862,11 +1994,13 @@ def _order_windows(
         "ON event.event_id=member.event_id "
         "AND event.event_time=member.event_time "
         "WHERE latest.status<>'RETRACTED' "
+        "AND latest.window_end>=%s-make_interval(secs=>latest.window_seconds) "
         "ORDER BY latest.window_seconds,event.source_offset,event.event_id",
         (
             str(plan.control_plane.cohort_id),
             plan.control_plane.session_date,
             str(plan.source_flow.source_flow_id),
+            plan.known_at,
         ),
     )
     members = tuple(cursor.fetchall())
@@ -1947,9 +2081,9 @@ def _order_windows(
             else RollingAvailability.UNAVAILABLE
         ),
         value,
-        observed_at=max(
+        observed_at=_observed_by_known(
             (row["event_time"] for row in members),
-            default=None,
+            plan,
         ),
         known_at=plan.known_at,
         valid_until=plan.valid_until,
@@ -2054,6 +2188,18 @@ def assemble_advanced_options_rolling_state_cursor(
         contract_volumes=contract_volumes,
         order_windows=order_windows,
         producer_binding=binding,
+        degraded_reason_codes=tuple(sorted({
+            reason
+            for row in evidence
+            for reason in row.reason_codes
+            if row.member_kind == "UNRESOLVED_GAPS"
+            or reason == OPTION_CONTRACTS_EXCLUDED
+        })),
+        excluded_contracts=tuple(
+            (row.member_key, row.reason_codes)
+            for row in evidence
+            if row.member_kind == "EXCLUDED_CONTRACT"
+        ),
     )
     evidence.append(_evidence(
         "ROLLING_GENERATION",

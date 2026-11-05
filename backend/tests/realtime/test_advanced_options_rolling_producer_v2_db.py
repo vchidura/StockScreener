@@ -594,8 +594,12 @@ def test_owp4c_rolling_producer_and_disposable_readiness_audit(monkeypatch):
                 "MARKET_STATE_CHECKPOINT_INCOMPLETE",
                 "FLOW_CHECKPOINT_INCOMPLETE",
                 "CANONICAL_CURRENT_HEADS_INCOMPLETE",
-                "OPTION_VOLUME_CHECKPOINT_MEMBERSHIP_INCOMPLETE",
             }.issubset(blocked.reason_codes)
+            # A contract with no checkpoint has not traded, which never blocks a window.
+            assert (
+                "OPTION_VOLUME_CHECKPOINT_MEMBERSHIP_INCOMPLETE"
+                not in blocked.reason_codes
+            )
             with _role_cursor(
                 database_pool,
                 roles.name("admin"),

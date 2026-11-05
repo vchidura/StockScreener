@@ -45,9 +45,9 @@ def run_compute(monkeypatch, projection, store):
     monkeypatch.setattr(ticker_repository, "_load_ticker_fundamental_inputs", lambda cursor, members, cutoff: ((), ()))
     monkeypatch.setattr(ticker_repository, "project_realtime_ticker_workspace", lambda inputs, **context: projection)
     monkeypatch.setattr(ticker_repository, "produce_realtime_ticker_workspace_summary",
-                        lambda inputs, snapshots, charts: MagicMock())
+                        lambda inputs, snapshots, charts, **options: MagicMock())
     monkeypatch.setattr(ticker_repository, "produce_realtime_pattern_watch_publication",
-                        lambda inputs, snapshots: MagicMock())
+                        lambda inputs, snapshots, **options: MagicMock())
     monkeypatch.setattr(ticker_repository, "_verify_ticker_evidence_parity", lambda projection: None)
     monkeypatch.setattr(ticker_repository, "persist_realtime_equity_materialization_batch_cursor",
                         lambda cursor, writes: None)

@@ -272,12 +272,13 @@ def _seed_native_equity_inputs(
         equity.universe.sha256,
         _digest("equity-input"),
         "advanced-equity-owp4d-v1",
+        known_by=equity_cutoff + timedelta(seconds=1),
     )
     database_cursor.execute(
         "INSERT INTO rt.cycle_receipts ("
         "receipt_id,window_id,cohort_id,receipt_kind,cutoff,"
-        "reference_generation,universe_sha256,input_sha256,build_id"
-        ") VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+        "reference_generation,universe_sha256,input_sha256,build_id,"
+        "known_by) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
         (
             str(receipt_id),
             str(window_id),
@@ -288,6 +289,7 @@ def _seed_native_equity_inputs(
             receipt.universe_sha256,
             receipt.input_sha256,
             receipt.build_id,
+            receipt.known_by,
         ),
     )
     return (

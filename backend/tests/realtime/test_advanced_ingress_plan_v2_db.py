@@ -1825,6 +1825,7 @@ def test_scheduler_restart_uses_durable_receipts_retries_and_lifecycle(
     cutoff = SESSION_OPEN + timedelta(minutes=5)
     release_at = cutoff + timedelta(seconds=5)
     deadline = release_at + timedelta(minutes=2)
+    input_known_by = release_at + timedelta(seconds=30)
     service_plan_id = repository.create_plan(
         ingress_plan.cohort_id,
         ingress_plan.session_date,
@@ -1865,8 +1866,8 @@ def test_scheduler_restart_uses_durable_receipts_retries_and_lifecycle(
         unit.cursor.execute(
             "INSERT INTO rt.cycle_receipts ("
             "receipt_id,window_id,cohort_id,receipt_kind,cutoff,"
-            "reference_generation,universe_sha256,input_sha256,build_id"
-            ") VALUES (%s,%s,%s,'INPUT_READY',%s,1,%s,%s,%s)",
+            "reference_generation,universe_sha256,input_sha256,build_id,"
+            "known_by) VALUES (%s,%s,%s,'INPUT_READY',%s,1,%s,%s,%s,%s)",
             (
                 str(uuid4()),
                 str(failed_window.window_id),
@@ -1878,6 +1879,7 @@ def test_scheduler_restart_uses_durable_receipts_retries_and_lifecycle(
                     ADVANCED_WINDOW_BUILD_ID,
                     "c" * 64,
                 ),
+                input_known_by,
             ),
         )
         scheduler_session = ensure_advanced_scheduler_session_cursor(
@@ -1927,7 +1929,8 @@ def test_scheduler_restart_uses_durable_receipts_retries_and_lifecycle(
     assert retry == repeated
     assert retry.reused_input_receipt
     assert recovery.input_gate_sha256 == "c" * 64
-    assert recovery.input_known_by == release_at
+    assert recovery.input_known_by == input_known_by
+    assert recovery.input_receipt.known_by == input_known_by
     assert retry.report_relative_path.endswith("-retry1.json")
     with provider.transaction(APP_ROLE) as unit:
         blocked_backfill = plan_advanced_cold_start_cursor(

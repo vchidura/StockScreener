@@ -106,10 +106,12 @@ def _current_cohort(
     from the cohort that holds it. Options stays unresolved while its reads are off,
     because its page readers follow the release pointer directly."""
     if _is_options_read(path):
+        if not options_reads_enabled:
+            return None
+        if session_date is not None:
+            return identity.options_session_cohorts.get(session_date)
         return (
-            None
-            if identity.options is None or not options_reads_enabled
-            else identity.options.cohort_id
+            None if identity.options is None else identity.options.cohort_id
         )
     if session_date in identity.session_cohorts:
         return identity.session_cohorts[session_date]
@@ -409,7 +411,7 @@ def create_realtime_portal_app(
     @app.middleware("http")
     async def serve_current_publication(request: Request, call_next):
         """A reader naming no cohort gets the current publication. An explicit
-        cohort is always honored exactly, and is never substituted."""
+        cohort is never substituted; repositories still enforce authorization."""
         cohort_id = None
         if (
             repositories.portal_identity is not None
@@ -462,9 +464,33 @@ def create_realtime_portal_app(
             raise unavailable(error) from error
 
     def across_sessions(request: Request, cohort_id: UUID, read):
-        """Closing sessions span cohorts for a reader naming no cohort, because
-        each session has its own. An explicit cohort lists only that cohort."""
+        """Sessions span cohorts, because each session has its own.
+
+        A reader naming no cohort gets all of them, and so does one naming the
+        current cohort: the portal names the cohort it was just given, so its
+        date pickers listed only today (found Nov 5). Any other explicit cohort
+        lists only itself.
+        """
         identity = getattr(request.state, "portal_identity", None)
+        if (
+            identity is None
+            and cohort_id is not None
+            and repositories.portal_identity is not None
+        ):
+            try:
+                current = repositories.portal_identity.current(
+                    available_by=cutoff(),
+                )
+            except DatabaseError:
+                logging.getLogger(__name__).exception(
+                    "Realtime portal identity read failed"
+                )
+            else:
+                if (
+                    current.equity is not None
+                    and current.equity.cohort_id == cohort_id
+                ):
+                    identity = current
         if identity is None:
             return read(cohort_id)
         results = []
@@ -481,7 +507,7 @@ def create_realtime_portal_app(
         snapshots = {}
         for result in reversed(results):
             snapshots.update(result.get("snapshots") or {})
-        return {
+        merged = {
             **results[0],
             "sessions": sorted(
                 {
@@ -492,6 +518,11 @@ def create_realtime_portal_app(
             ),
             "snapshots": snapshots,
         }
+        # The named cohort may hold nothing yet, early in its session. The portal
+        # refuses a list answered for another cohort, so always answer for this one.
+        if "cohort_id" in merged:
+            merged["cohort_id"] = str(cohort_id)
+        return merged
 
     @app.get("/api/realtime/health")
     def health():
@@ -690,6 +721,7 @@ def create_realtime_portal_app(
 
     @app.get("/api/trading-sessions")
     def trading_sessions(
+        request: Request,
         interval: Literal["1m", "5m", "15m", "30m", "1h", "1d", "1wk", "1mo"] = "1d",
         limit: int = Query(260, ge=1, le=2_000),
         cohort_id: UUID | None = None,
@@ -697,11 +729,15 @@ def create_realtime_portal_app(
         if repositories.ticker_workspace is None:
             raise HTTPException(503, "Realtime Ticker Workspace repository is unavailable")
         try:
-            return repositories.ticker_workspace.trading_sessions(
-                interval=interval,
-                limit=limit,
-                available_by=cutoff(),
-                cohort_id=cohort_id,
+            return across_sessions(
+                request,
+                cohort_id,
+                lambda cohort: repositories.ticker_workspace.trading_sessions(
+                    interval=interval,
+                    limit=limit,
+                    available_by=cutoff(),
+                    cohort_id=cohort,
+                ),
             )
         except TickerPublicationUnavailable as error:
             raise HTTPException(503, str(error)) from error
@@ -826,6 +862,7 @@ def create_realtime_portal_app(
     def option_flow(
         underlyer: str | None = None, session_date: date | None = None,
         cohort_id: UUID | None = None,
+        read_mode: Literal["current", "retained"] = "current",
     ):
         if repositories.option_flow is None:
             raise HTTPException(503, "Realtime Options Flow repository is unavailable")
@@ -833,6 +870,7 @@ def create_realtime_portal_app(
             return repositories.option_flow.flow(
                 available_by=cutoff(), cohort_id=cohort_id,
                 underlyer=underlyer, session_date=session_date,
+                read_mode=read_mode,
             )
         except ValueError as error:
             raise HTTPException(422, str(error)) from error
@@ -847,9 +885,21 @@ def create_realtime_portal_app(
         return {**build_discovery_catalog(), "contract_filters": CONTRACT_FILTERS}
 
     @app.post("/api/options/eligible-chain/query")
-    def option_eligible_chain(request: EligibleChainQuery, cohort_id: UUID | None = None):
+    def option_eligible_chain(
+        request: EligibleChainQuery,
+        cohort_id: UUID | None = None,
+        session_date: date | None = None,
+    ):
         if repositories.option_screener is None:
             raise HTTPException(503, "Realtime Options Screener repository is unavailable")
+        if (
+            session_date is not None
+            and request.session_date != session_date
+        ):
+            raise HTTPException(
+                422,
+                "Options Screener session identity mismatch",
+            )
         try:
             return repositories.option_screener.eligible_chain(
                 request, available_by=cutoff(), cohort_id=cohort_id,

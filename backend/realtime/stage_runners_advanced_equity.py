@@ -232,12 +232,10 @@ def advanced_input_gate_identity(
             "FROM rt.consumer_checkpoints AS checkpoint "
             "WHERE checkpoint.cohort_id=%s "
             "AND checkpoint.journal_generation=ANY(%s::uuid[]) "
-            "AND checkpoint.committed_at<=%s "
             "ORDER BY checkpoint.journal_generation,checkpoint.shard_id",
             (
                 str(plan.cohort_id),
                 list(generations),
-                visibility_at,
             ),
         )
         checkpoints = tuple(cursor.fetchall())
@@ -275,13 +273,11 @@ def advanced_input_gate_identity(
                 (
                     generation,
                     int(own_session[2]),
-                    int(row[2]),
+                    maximum_offset,
                     session_id,
-                    row[4],
+                    maximum_bar_end,
                     int(row[5]),
                     str(journal[6]),
-                    str(row[7]),
-                    str(row[8]),
                 )
                 for row in own_checkpoints
             )

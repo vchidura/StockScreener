@@ -40,7 +40,12 @@ from .portal_projection_repository import (
 )
 from .reference_continuity import source_manifest_identity_cursor
 from .screening_repository import load_realtime_screening_input
-from .ticker_projection import TICKER_WORKSPACE_VERSION, TickerProjectionState, project_realtime_ticker_workspace
+from .ticker_projection import (
+    TICKER_WORKSPACE_VERSION,
+    TickerProjectionCancelled,
+    TickerProjectionState,
+    project_realtime_ticker_workspace,
+)
 from .ticker_projection import TICKER_WORKSPACE_SUMMARY_VERSION, produce_realtime_ticker_workspace_summary
 from .ticker_projection import PATTERN_WATCH_PUBLICATION_VERSION, produce_realtime_pattern_watch_publication
 from .ticker_references import BarLineageChanged, chart_group_ranges, compose_charts, evidence_expectations
@@ -270,13 +275,28 @@ class CycleRehydrationMismatch(ValueError):
     """The cycle rebuilt from durable data is not the one the EQUITY_CYCLE receipt names."""
 
 
-def _project_ticker_cycle(database: RealtimeProcessDatabase, *, state, loader, scope):
+def _projection_checkpoint(should_stop) -> None:
+    if should_stop is not None and should_stop():
+        raise TickerProjectionCancelled("ticker cycle was cancelled")
+
+
+def _project_ticker_cycle(
+    database: RealtimeProcessDatabase,
+    *,
+    state,
+    loader,
+    scope,
+    should_stop,
+):
     """Read-only half shared by compute and rehydration: load the inputs and project the cycle."""
     load_inputs = loader.load if loader is not None else load_realtime_screening_input
+    _projection_checkpoint(should_stop)
     with database.transaction(
         read_only=True, dict_cursor=True, isolation_level="REPEATABLE READ",
     ) as cursor:
+        _projection_checkpoint(should_stop)
         inputs = load_inputs(cursor, **scope, include_portal_history=True)
+        _projection_checkpoint(should_stop)
         market_events, market_event_coverage = _load_ticker_calendar_inputs(
             cursor, inputs.members, inputs.cutoff,
         )
@@ -286,11 +306,22 @@ def _project_ticker_cycle(database: RealtimeProcessDatabase, *, state, loader, s
         projection = project_realtime_ticker_workspace(
             inputs, market_events=market_events, market_event_coverage=market_event_coverage,
             fundamental_reports=fundamental_reports, fundamental_coverage=fundamental_coverage,
-            state=state,
+            state=state, should_stop=should_stop,
         )
+        _projection_checkpoint(should_stop)
         snapshots = projection.snapshots
-        summary = produce_realtime_ticker_workspace_summary(inputs, snapshots, projection.summary_charts)
-        pattern_publication = produce_realtime_pattern_watch_publication(inputs, snapshots)
+        summary = produce_realtime_ticker_workspace_summary(
+            inputs,
+            snapshots,
+            projection.summary_charts,
+            should_stop=should_stop,
+        )
+        pattern_publication = produce_realtime_pattern_watch_publication(
+            inputs,
+            snapshots,
+            should_stop=should_stop,
+        )
+        _projection_checkpoint(should_stop)
     return inputs, projection, summary, pattern_publication
 
 
@@ -312,7 +343,7 @@ def _materialization_write_groups(projection, inputs):
 
 def compute_realtime_ticker_cycle(
     compute_database: RealtimeProcessDatabase, *, state: TickerProjectionState | None = None,
-    loader=None, **scope,
+    loader=None, should_stop=None, **scope,
 ) -> TickerCycle:
     """EQUITY_EVIDENCE half: load inputs, project (incrementally with `state`) and persist the
     evidence. Nothing is published. `loader` is the runner's long-lived `ScreeningInputLoader`
@@ -322,18 +353,25 @@ def compute_realtime_ticker_cycle(
     if not isinstance(compute_database, RealtimeProcessDatabase) or compute_database.process_plan.role is not RealtimeDatabaseRole.COMPUTE:
         raise ValueError("Realtime ticker production requires the target-local COMPUTE role")
     inputs, projection, summary, pattern_publication = _project_ticker_cycle(
-        compute_database, state=state, loader=loader, scope=scope,
+        compute_database,
+        state=state,
+        loader=loader,
+        scope=scope,
+        should_stop=should_stop,
     )
+    _projection_checkpoint(should_stop)
     snapshots = projection.snapshots
     _verify_ticker_evidence_parity(projection)
     for writes in _materialization_write_groups(projection, inputs):
         for offset in range(0, len(writes), TICKER_EVIDENCE_CHUNK_SIZE):
+            _projection_checkpoint(should_stop)
             with compute_database.transaction() as cursor:
                 persist_realtime_equity_materialization_batch_cursor(
                     cursor, writes[offset:offset + TICKER_EVIDENCE_CHUNK_SIZE],
                 )
     generation = projection.screening_generation
     if generation is not None:
+        _projection_checkpoint(should_stop)
         _require_workspace_generation(inputs, snapshots, generation)
         with compute_database.transaction() as cursor:
             persist_screening_generation_cursor(cursor, generation)
@@ -359,7 +397,8 @@ def _require_workspace_generation(inputs, snapshots, generation):
 
 
 def rehydrate_realtime_ticker_cycle(
-    publication_database: RealtimeProcessDatabase, *, input_sha256: str, universe_sha256: str, **scope,
+    publication_database: RealtimeProcessDatabase, *, input_sha256: str, universe_sha256: str,
+    should_stop=None, **scope,
 ) -> TickerCycle:
     """PORTAL_PUBLISH recovery when the in-process hand-off is gone (a restart between the two stages).
 
@@ -376,13 +415,19 @@ def rehydrate_realtime_ticker_cycle(
     if not isinstance(publication_database, RealtimeProcessDatabase) or publication_database.process_plan.role is not RealtimeDatabaseRole.PUBLICATION:
         raise ValueError("Realtime ticker rehydration requires the target-local PUBLICATION role")
     inputs, projection, summary, pattern_publication = _project_ticker_cycle(
-        publication_database, state=None, loader=None, scope=scope,
+        publication_database,
+        state=None,
+        loader=None,
+        scope=scope,
+        should_stop=should_stop,
     )
+    _projection_checkpoint(should_stop)
     if inputs_sha256(inputs) != input_sha256 or reference_set(inputs.members)["sha256"] != universe_sha256:
         raise CycleRehydrationMismatch("the rebuilt cycle is not the one the EQUITY_CYCLE receipt names")
     try:
         with publication_database.transaction(read_only=True, dict_cursor=True) as cursor:
             for writes in _materialization_write_groups(projection, inputs):
+                _projection_checkpoint(should_stop)
                 verify_realtime_equity_materializations_persisted_cursor(cursor, writes)
     except ValueError as error:
         raise CycleRehydrationMismatch(str(error)) from error

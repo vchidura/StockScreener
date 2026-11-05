@@ -69,6 +69,7 @@ from realtime.stage_orchestrator import (  # noqa: E402
 )
 from realtime.stage_runners_equity import (  # noqa: E402
     reuse_advanced_input_ready_runner,
+    reuse_advanced_portal_ready_runner,
 )
 from realtime.stage_runners_v2 import build_runners  # noqa: E402
 from scripts.realtime_script_support import write_report  # noqa: E402
@@ -90,6 +91,7 @@ def parse_args(argv=None):
     parser.add_argument("--cutoff", type=datetime.fromisoformat, required=True)
     parser.add_argument("--finality-delay-seconds", type=int, required=True)
     parser.add_argument("--completion-budget-seconds", type=int, default=300)
+    parser.add_argument("--execution-deadline", type=datetime.fromisoformat)
     parser.add_argument("--authorization-reference", required=True)
     parser.add_argument("--window-key-suffix", default="")
     parser.add_argument("--retry-release-now", action="store_true")
@@ -124,6 +126,19 @@ def parse_args(argv=None):
         parser.error("--finality-delay-seconds must be in [1, 60]")
     if not 1 <= args.completion_budget_seconds <= 300:
         parser.error("--completion-budget-seconds must be in [1, 300]")
+    if args.execution_deadline is not None:
+        if (
+            args.execution_deadline.tzinfo is None
+            or args.execution_deadline.utcoffset() is None
+        ):
+            parser.error("--execution-deadline must be timezone-aware")
+        if not args.retry_release_now:
+            parser.error(
+                "--execution-deadline requires --retry-release-now"
+            )
+        args.execution_deadline = args.execution_deadline.astimezone(
+            timezone.utc
+        )
     if not args.authorization_reference.strip():
         parser.error("--authorization-reference cannot be blank")
     if args.window_key_suffix and (
@@ -551,7 +566,6 @@ def main(argv=None) -> int:
                     prior_pointer=prior_pointer,
                     checked_at=datetime.now(timezone.utc),
                 )
-        _ensure_reference_readiness(provider, repository, args)
         release_at = (
             datetime.now(timezone.utc)
             if args.retry_release_now
@@ -561,6 +575,11 @@ def main(argv=None) -> int:
         deadline = release_at + timedelta(
             seconds=args.completion_budget_seconds
         )
+        if args.execution_deadline is not None:
+            deadline = min(deadline, args.execution_deadline)
+            if deadline <= release_at:
+                return 2
+        _ensure_reference_readiness(provider, repository, args)
         scope_reference = (
             f"{args.authorization_reference}:"
             + (
@@ -577,6 +596,7 @@ def main(argv=None) -> int:
                 "cutoff": args.cutoff,
                 "window_key_suffix": args.window_key_suffix,
                 "retry_release_now": args.retry_release_now,
+                "execution_deadline": args.execution_deadline,
                 "enabled_stages": args.enabled_stages,
                 "validation_mode": (
                     validation_policy.validation_mode.value
@@ -683,36 +703,22 @@ def main(argv=None) -> int:
                     ),
                 )
             )
-            if args.publish:
-                runners["EQUITY_MATERIALIZE"] = (
-                    lambda _context: StageOutcome.complete(
-                        receipt=input_receipt,
-                        evidence_ref=(
-                            "publication-authorized-input-ready:"
-                            f"{input_receipt.input_sha256}"
-                        ),
-                    )
+            runners["EQUITY_MATERIALIZE"] = (
+                reuse_advanced_input_ready_runner(
+                    environment,
+                    receipt=input_receipt,
+                    input_known_by=recovery.input_known_by,
+                    expected_gate_sha256=(
+                        recovery.input_gate_sha256
+                    ),
                 )
-            else:
-                runners["EQUITY_MATERIALIZE"] = (
-                    reuse_advanced_input_ready_runner(
-                        environment,
-                        receipt=input_receipt,
-                        input_known_by=recovery.input_known_by,
-                        expected_gate_sha256=(
-                            recovery.input_gate_sha256
-                        ),
-                    )
-                )
+            )
         if args.reuse_portal_receipt:
             portal_receipt = recovery.portal_receipt
             runners["EQUITY_PROJECTION"] = (
-                lambda _context: StageOutcome.complete(
+                reuse_advanced_portal_ready_runner(
+                    environment,
                     receipt=portal_receipt,
-                    evidence_ref=(
-                        "reused-portal-ready:"
-                        f"{portal_receipt.input_sha256}"
-                    ),
                 )
             )
         orchestrator = StageOrchestrator(

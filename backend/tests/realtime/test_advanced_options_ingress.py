@@ -333,6 +333,16 @@ def test_registered_options_source_is_read_only_and_identity_checked(tmp_path):
     assert source.generation == control.source_flow.journal_generation
     assert source.last_offset() == progress.last_raw_offset
 
+    source.set_read_limits(raw_offset=0, event_offset=0)
+    assert source.last_offset() == 0
+    assert source.last_event_offset() == 0
+    assert source.read_after(0) == ()
+    assert source.read_normalized_after(0) == ()
+
+    source.set_read_limits(raw_offset=None, event_offset=None)
+    assert source.last_offset() == progress.last_raw_offset
+    assert source.last_event_offset() == progress.last_raw_offset
+
     class WrongFeedReader:
         def __init__(self, _path):
             pass

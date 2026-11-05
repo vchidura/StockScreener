@@ -24,10 +24,12 @@ from tests.realtime.test_advanced_options_control_plane import (
 
 
 class _Cursor:
-    def __init__(self, *, omit_qqq_context=False):
+    def __init__(self, *, omit_qqq_context=False, stored_after_end=None, receipt_known_by=None):
         self.query = ""
         self.parameters = ()
         self.omit_qqq_context = omit_qqq_context
+        self.stored_after_end = stored_after_end
+        self.receipt_known_by = receipt_known_by
         self.connection = self
 
     @contextmanager
@@ -38,6 +40,15 @@ class _Cursor:
         self.query = query
         self.parameters = parameters
 
+    def fetchone(self):
+        if "FROM rt.cycle_receipts" in self.query:
+            return (
+                None
+                if self.receipt_known_by is None
+                else {"known_by": self.receipt_known_by}
+            )
+        raise AssertionError(self.query)
+
     def fetchall(self):
         if "revision.bar_revision_id::text" in self.query:
             if (
@@ -46,7 +57,8 @@ class _Cursor:
                 == "44444444-4444-4444-8444-444444444444"
             ):
                 return []
-            cutoff = self.parameters[-2]
+            cutoff = self.parameters[-3]
+            known_by = self.parameters[-2]
             count = self.parameters[-1]
             interval = self.parameters[2]
             step = (
@@ -55,15 +67,17 @@ class _Cursor:
                 else timedelta(minutes=5)
             )
             start = 1 if interval == "1d" else 0
-            return [
+            late = self.stored_after_end or timedelta(0)
+            rows = [
                 {
                     "bar_revision_id": str(uuid4()),
                     "bar_end": cutoff - step * (index + start),
-                    "observed_at": cutoff - step * (index + start),
+                    "observed_at": cutoff - step * (index + start) + late,
                     "payload_sha256": f"{index:064x}",
                 }
-                for index in range(count)
+                for index in range(count + 1)
             ]
+            return [row for row in rows if row["observed_at"] <= known_by][:count]
         raise AssertionError(self.query)
 
 
@@ -154,6 +168,40 @@ def test_two_underlying_dependencies_are_exact_and_ready():
     assert result["lane_context"]["OS1"]["member_count"] == 34
     assert result["lane_context"]["OS2"]["status"] == "AVAILABLE"
     assert result["lane_context"]["OS2"]["member_count"] == 36
+
+
+def test_bars_stored_after_they_end_satisfy_the_lanes_through_the_equity_receipt():
+    # Real bars are always stored after they end: 15 s in the sim, 5 s or more on live.
+    equity, binding = _dependencies()
+    result = validate_advanced_options_equity_dependencies_cursor(
+        _Cursor(
+            stored_after_end=timedelta(seconds=15),
+            receipt_known_by=binding.equity_cutoff + timedelta(seconds=16),
+        ),
+        equity_plan=equity,
+        equity_input=binding,
+        history_source_cohort_id=uuid4(),
+        underlyings=("QQQ", "SPY"),
+    )
+
+    for lane in ("O3", "OS1", "OS2"):
+        assert result["lane_context"][lane]["status"] == "AVAILABLE"
+
+
+def test_bars_the_equity_window_had_not_accepted_still_block():
+    equity, binding = _dependencies()
+    result = validate_advanced_options_equity_dependencies_cursor(
+        _Cursor(
+            stored_after_end=timedelta(seconds=15),
+            receipt_known_by=binding.equity_cutoff + timedelta(seconds=5),
+        ),
+        equity_plan=equity,
+        equity_input=binding,
+        history_source_cohort_id=uuid4(),
+        underlyings=("QQQ", "SPY"),
+    )
+
+    assert result["lane_context"]["O3"]["status"] == "BLOCKED"
 
 
 def test_continuous_dependencies_can_reuse_the_same_equity_history_source():

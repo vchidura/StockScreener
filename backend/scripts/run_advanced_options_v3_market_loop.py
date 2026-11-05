@@ -1205,7 +1205,7 @@ def _rollback_post_publication(
 
 def _cleanup(environment, baseline):
     cleanup = {"stop": None, "remove": None}
-    scoped = (*EQUITY_SERVICES, *OPTIONS_SERVICES)
+    scoped = OPTIONS_SERVICES
     cleanup["stop"] = _compose(
         environment,
         "stop",

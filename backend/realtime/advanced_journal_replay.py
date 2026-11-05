@@ -112,6 +112,17 @@ def inspect_registered_journal(
         registration.relative_path,
     )
     if not path.is_file():
+        # The same moment as below, one step earlier: registered, file not created yet.
+        if (
+            allow_initializing
+            and registration.status in {"REGISTERED", "WRITING"}
+            and registration.raw_committed_offset == 0
+            and registration.normalized_committed_offset == 0
+            and registration.bridge_committed_offset == 0
+        ):
+            raise JournalReplayPending(
+                "raw journal initialization is pending"
+            )
         raise JournalReplayQuarantine(
             "MISSING_JOURNAL",
             registration.relative_path,
@@ -120,8 +131,11 @@ def inspect_registered_journal(
         reader = RawJournalReader(path)
         state = reader.recovery_state(registration.normalizer_version)
     except Exception as error:
+        # A journal can already read WRITING a moment before ingress writes its
+        # metadata. With nothing committed there is nothing to be corrupt, and treating
+        # it as corrupt blocks the day's plan: rehearsal, one stock feed reconnect.
         if (
-            registration.status == "REGISTERED"
+            registration.status in {"REGISTERED", "WRITING"}
             and registration.raw_committed_offset == 0
             and registration.normalized_committed_offset == 0
             and registration.bridge_committed_offset == 0

@@ -5,7 +5,7 @@ import json
 from datetime import date, datetime
 from decimal import Decimal
 from typing import Mapping
-from uuid import UUID
+from uuid import NAMESPACE_URL, UUID, uuid5
 
 from psycopg2.extras import Json
 
@@ -507,7 +507,24 @@ class PostgresAdvancedOptionsReferenceStateRepository(
                 (state.session_date,),
             )
             frozen = cursor.fetchone()
-            if frozen is None or UUID(str(frozen[0])) != state.state_id:
+            if frozen is None:
+                raise ValueError("consumed session reference state is frozen")
+            if UUID(str(frozen[0])) != state.state_id:
+                # Preparation froze its opening state, which has the whole chain's
+                # scope. A resident cycle's state has the selected contracts' scope,
+                # so it cannot bind here. Its input closure already pins this state.
+                cursor.execute(
+                    "SELECT first_cycle_id FROM "
+                    "rt.advanced_options_reference_session_freezes "
+                    "WHERE session_date=%s",
+                    (state.session_date,),
+                )
+                if UUID(str(cursor.fetchone()[0])) == uuid5(
+                    NAMESPACE_URL,
+                    "stockscreener:c8-reference-freeze:"
+                    f"{state.session_date}",
+                ):
+                    return
                 raise ValueError("consumed session reference state is frozen")
             cursor.execute(
                 "INSERT INTO rt.advanced_options_reference_cycle_bindings ("

@@ -264,6 +264,42 @@ def test_registered_zero_offset_journal_retries_until_metadata_exists(
         inspect_registered_journal(root, registration)
 
 
+@pytest.mark.parametrize("status", ("REGISTERED", "WRITING"))
+def test_a_new_journal_with_nothing_committed_is_pending_not_corrupt(tmp_path, status):
+    # Rehearsal: one stock feed reconnect, journal already WRITING and its metadata not
+    # yet written, was quarantined within 86 ms, and that blocked the day's plan.
+    root = tmp_path / "mounted"
+    root.mkdir()
+    path = root / "journal.sqlite"
+    path.touch()
+    registration = replace(_registration(root, path), status=status)
+
+    with pytest.raises(JournalReplayPending, match="initialization"):
+        inspect_registered_journal(root, registration, allow_initializing=True)
+
+    path.unlink()
+    with pytest.raises(JournalReplayPending, match="initialization"):
+        inspect_registered_journal(root, registration, allow_initializing=True)
+    with pytest.raises(JournalReplayQuarantine, match="MISSING_JOURNAL"):
+        inspect_registered_journal(root, registration)
+
+
+def test_a_journal_with_committed_data_and_no_file_is_still_quarantined(tmp_path):
+    root = tmp_path / "mounted"
+    root.mkdir()
+    path = root / "journal.sqlite"
+    path.touch()
+    registration = replace(
+        _registration(root, path),
+        status="WRITING",
+        raw_committed_offset=5,
+    )
+    path.unlink()
+
+    with pytest.raises(JournalReplayQuarantine, match="MISSING_JOURNAL"):
+        inspect_registered_journal(root, registration, allow_initializing=True)
+
+
 def test_live_raw_normalization_remains_owned_by_ingress(
     tmp_path,
     monkeypatch,

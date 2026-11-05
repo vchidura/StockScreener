@@ -1687,11 +1687,14 @@ def _default_components_factory(
                 )
             return port
 
-        def enable(self, **kwargs):
-            return self._port().enable(**kwargs)
+        def snapshot(self, **kwargs):
+            return self._port().snapshot(**kwargs)
 
-        def disable(self, **kwargs):
-            return self._port().disable(**kwargs)
+        def advance(self, **kwargs):
+            return self._port().advance(**kwargs)
+
+        def restore(self, **kwargs):
+            return self._port().restore(**kwargs)
 
     publication_config = PortalPublicationConfig(
         cohort_id=UUID(str(package["cohort"]["cohort_id"])),
@@ -2226,7 +2229,7 @@ def run_p8_docker_service(
                 f"P8 {kind.value} role failed"
             ) from role_failure[0]
         if (
-            role_result.get("status") != "COMPLETE"
+            role_result.get("status") not in {"COMPLETE", "PAUSED"}
             or role_result.get("kind") != kind.value
             or role_result.get("effects") != P8_EFFECT_DENIALS
         ):

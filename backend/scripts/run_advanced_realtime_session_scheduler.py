@@ -11,6 +11,7 @@ import signal
 import subprocess
 import sys
 import threading
+import time
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -187,6 +188,17 @@ def _write_json(path: Path, value: object) -> None:
         stream.write(encoded)
         stream.flush()
         os.fsync(stream.fileno())
+
+
+def _cleanup_report_path(
+    output_directory: Path,
+    cleanup: dict[str, object],
+) -> Path:
+    if cleanup.get("status") == "PRESERVED_FOR_RESUME":
+        return output_directory / (
+            f"COORDINATOR-INTERRUPTED-{time.time_ns()}.json"
+        )
+    return output_directory / "CLEANUP.json"
 
 
 def _file_sha256(path: Path) -> str:
@@ -3469,20 +3481,13 @@ def _run(args):
             )
         finally:
             pool.closeall()
-            if cleanup.get("status") == "PRESERVED_FOR_RESUME":
-                _write_json(
-                    args.output_directory
-                    / (
-                        "COORDINATOR-INTERRUPTED-"
-                        f"{time.time_ns()}.json"
-                    ),
+            _write_json(
+                _cleanup_report_path(
+                    args.output_directory,
                     cleanup,
-                )
-            else:
-                _write_json(
-                    args.output_directory / "CLEANUP.json",
-                    cleanup,
-                )
+                ),
+                cleanup,
+            )
     if (
         cleanup.get("containers")
         or cleanup.get("stop_returncode", 0)

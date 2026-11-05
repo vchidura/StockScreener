@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import replace
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from uuid import NAMESPACE_URL, uuid5
 
+import pytest
+
 from equity.model_detection.contracts import Disposition
+from equity.model_detection.policies import ContextOptionalBreakoutPolicy
 from realtime.canonical_stock_alert_product import (
-    CanonicalStockAlertContext,
     canonical_stock_alert_contexts,
     canonical_stock_alert_membership,
     produce_canonical_stock_alert_batch,
@@ -116,6 +119,119 @@ def _inputs():
     )
 
 
+def _ready_context_inputs(*, event_risk=False):
+    base = _inputs()
+    product_members = (
+        {
+            **base.members[0],
+            "security_type": "CS",
+            "sector": "IT - Semiconductors & Hardware",
+            "sic_code": "3571",
+        },
+        {
+            **base.members[1],
+            "security_type": "ETF",
+            "sector": "ETF",
+        },
+    )
+    context_members = (
+        {
+            **_member("SMH", 3),
+            "security_type": "ETF",
+            "sector": "ETF",
+        },
+        {
+            **_member("QQQ", 4),
+            "security_type": "ETF",
+            "sector": "ETF",
+        },
+    )
+    all_members = (*product_members, *context_members)
+    bars = tuple(
+        _bar(
+            member,
+            index,
+            closes=(
+                (100, 101, 103)
+                if member["ticker"] == "AAPL"
+                else (100, 101, 102)
+            ),
+            volumes=(100, 100, 250),
+        )
+        for member in all_members
+        for index in range(3)
+    )
+    inputs = replace(base, members=product_members, bars=bars)
+    checked_at = CUTOFF - timedelta(minutes=5)
+    valid_until = CUTOFF + timedelta(days=7)
+    coverage = (
+        {
+            "coverage_id": uuid5(
+                NAMESPACE_URL,
+                "canonical-event-coverage:aapl",
+            ),
+            "security_id": product_members[0]["security_id"],
+            "event_type": "EARNINGS",
+            "window_start": (
+                CUTOFF - timedelta(days=1)
+            ).date(),
+            "window_end": (
+                CUTOFF + timedelta(hours=72)
+            ).date(),
+            "source": "finnhub",
+            "verdict": "KNOWN_NO_EVENT",
+            "checked_at": checked_at,
+            "valid_until": valid_until,
+            "evidence_sha256": canonical_sha256(
+                ("earnings-coverage", "AAPL")
+            ),
+        },
+        {
+            "coverage_id": uuid5(
+                NAMESPACE_URL,
+                "canonical-event-coverage:fed",
+            ),
+            "security_id": None,
+            "event_type": "FED_RATE_DECISION",
+            "window_start": (
+                CUTOFF - timedelta(days=1)
+            ).date(),
+            "window_end": (
+                CUTOFF + timedelta(hours=72)
+            ).date(),
+            "source": "federal_reserve",
+            "verdict": "KNOWN_NO_EVENT",
+            "checked_at": checked_at,
+            "valid_until": valid_until,
+            "evidence_sha256": canonical_sha256("fed-coverage"),
+        },
+    )
+    events = ()
+    if event_risk:
+        events = ({
+            "revision_id": uuid5(
+                NAMESPACE_URL,
+                "canonical-event:aapl-earnings",
+            ),
+            "security_id": product_members[0]["security_id"],
+            "event_key": "aapl-earnings",
+            "event_type": "EARNINGS",
+            "event_date": (CUTOFF + timedelta(days=1)).date(),
+            "announced_at": None,
+            "event_timezone": "America/New_York",
+            "time_precision": "DATE_ONLY",
+            "status": "SCHEDULED",
+            "source": "finnhub",
+            "observed_at": checked_at,
+            "received_at": checked_at,
+            "valid_until": valid_until,
+            "payload_sha256": canonical_sha256(
+                ("earnings-event", "AAPL")
+            ),
+        },)
+    return inputs, context_members, events, coverage
+
+
 def _retained_projection(batch):
     retained = {
         "contract": "canonical-stock-alert-retained-projection-v1",
@@ -196,6 +312,9 @@ def _retained_projection(batch):
     }
     retained["projection_sha256"] = canonical_sha256(retained)
     return retained
+
+
+REQUIRED_CONTEXT = ContextOptionalBreakoutPolicy(optional_context=())
 
 
 def test_e_context_provides_market_only_and_retains_spy_lineage():
@@ -282,6 +401,7 @@ def test_missing_sector_and_event_context_retains_unavailable_alert_rows():
         window_id=WINDOW,
         input_receipt_id=RECEIPT,
         receipt_input_sha256="b" * 64,
+        policy=REQUIRED_CONTEXT,
     )
 
     assert len(batch.evaluations) == 2
@@ -298,22 +418,36 @@ def test_missing_sector_and_event_context_retains_unavailable_alert_rows():
     )
 
 
-def test_match_is_emitted_only_when_all_context_gates_are_available():
-    inputs = _inputs()
-    base = canonical_stock_alert_contexts(inputs)
-    contexts = {
-        identity: CanonicalStockAlertContext(
-            market_trend=context.market_trend,
-            sector_trend=Decimal("0.01"),
-            event_risk=False,
-            source_record_id=context.source_record_id,
-            source_sha256=context.source_sha256,
-            available_at=context.available_at,
-            received_at=context.received_at,
-            contributors=context.contributors,
-        )
-        for identity, context in base.items()
-    }
+def test_no_sector_or_event_context_still_opens_an_alert_and_says_so():
+    inputs, _context_members, _events, _coverage = _ready_context_inputs()
+    batch = produce_canonical_stock_alert_batch(
+        inputs,
+        window_id=WINDOW,
+        input_receipt_id=RECEIPT,
+        receipt_input_sha256="b" * 64,
+    )
+
+    aapl = next(row for row in batch.evaluations if row.ticker == "AAPL")
+    assert aapl.decision.disposition is Disposition.MATCH
+    assert aapl.alert is not None
+    assert aapl.alert.lifecycle == "OPEN"
+    assert aapl.alert.projection["non_actionable"] is False
+    assert aapl.alert.projection["execution_permission"] is False
+    assert aapl.alert.projection["trigger_price"] is not None
+    gates = {row["name"]: row["status"] for row in aapl.alert.projection["gates"]}
+    assert gates["sector"] == "NOT_APPLICABLE"
+    assert gates["event"] == "NOT_APPLICABLE"
+    assert gates["market"] == "PASS"
+
+
+def test_retained_sector_and_event_context_produce_match():
+    inputs, context_members, events, coverage = _ready_context_inputs()
+    contexts = canonical_stock_alert_contexts(
+        inputs,
+        context_members=context_members,
+        market_events=events,
+        market_event_coverage=coverage,
+    )
     batch = produce_canonical_stock_alert_batch(
         inputs,
         window_id=WINDOW,
@@ -327,6 +461,263 @@ def test_match_is_emitted_only_when_all_context_gates_are_available():
     assert aapl.alert is not None
     assert aapl.alert.lifecycle == "OPEN"
     assert aapl.alert.projection["non_actionable"] is False
+    context = contexts[str(aapl.security_id)]
+    assert context.event_risk is False
+    assert context.sector_trend is not None
+    assert {
+        row["role"] for row in context.evidence
+    } >= {
+        "MARKET_BAR",
+        "SECURITY_REFERENCE",
+        "SECTOR_MAPPING",
+        "SECTOR_BENCHMARK_REFERENCE",
+        "SECTOR_BAR",
+        "MARKET_EVENT_COVERAGE",
+    }
+
+
+def test_real_nine_member_shape_uses_context_only_sector_proxies():
+    tickers = (
+        "AAPL",
+        "AMZN",
+        "IWM",
+        "MSFT",
+        "NFLX",
+        "NVDA",
+        "QQQ",
+        "SPY",
+        "TSLA",
+    )
+    product_members = tuple(
+        {
+            **_member(ticker, index + 1),
+            "security_type": "ETF" if ticker in {"IWM", "QQQ", "SPY"} else "CS",
+            "sector": (
+                "ETF"
+                if ticker in {"IWM", "QQQ", "SPY"}
+                else "IT - Software & Services"
+                if ticker in {"MSFT", "NFLX"}
+                else "IT - Semiconductors & Hardware"
+            ),
+        }
+        for index, ticker in enumerate(tickers)
+    )
+    context_members = (
+        {
+            **_member("IGV", 101),
+            "security_type": "ETF",
+            "sector": "ETF",
+        },
+        {
+            **_member("SMH", 102),
+            "security_type": "ETF",
+            "sector": "ETF",
+        },
+    )
+    all_members = (*product_members, *context_members)
+    base = _inputs()
+    inputs = replace(
+        base,
+        members=product_members,
+        bars=tuple(
+            _bar(
+                member,
+                index,
+                closes=(100, 101, 103),
+                volumes=(100, 100, 250),
+            )
+            for member in all_members
+            for index in range(3)
+        ),
+    )
+    membership = canonical_stock_alert_membership(inputs)
+    contexts = canonical_stock_alert_contexts(
+        inputs,
+        membership=membership,
+        context_members=context_members,
+    )
+    batch = produce_canonical_stock_alert_batch(
+        inputs,
+        window_id=WINDOW,
+        input_receipt_id=RECEIPT,
+        receipt_input_sha256="b" * 64,
+        membership=membership,
+        contexts=contexts,
+    )
+
+    assert {row["ticker"] for row in membership.effective_members} == set(
+        tickers
+    )
+    assert {row.ticker for row in batch.evaluations} == set(tickers)
+    assert len(batch.evaluations) == 9
+    assert set(contexts) == {
+        str(row["security_id"]) for row in product_members
+    }
+    assert not {"IGV", "SMH"} & {
+        row["ticker"] for row in membership.effective_members
+    }
+    aapl = contexts[str(product_members[0]["security_id"])]
+    sector_bars = tuple(
+        row for row in aapl.evidence if row["role"] == "SECTOR_BAR"
+    )
+    expected = tuple(
+        row
+        for row in inputs.bars
+        if row["ticker"] == "SMH"
+    )
+    assert {
+        (row["source_id"], row["payload_sha256"])
+        for row in sector_bars
+    } == {
+        (str(row["bar_revision_id"]), row["payload_sha256"])
+        for row in expected
+    }
+    assert aapl.available_at == max(
+        row["provider_published_at"] for row in expected
+    )
+    assert aapl.received_at == max(
+        row["observed_at"] for row in expected
+    )
+
+
+def test_relevant_retained_event_vetoes_without_creating_alert():
+    inputs, context_members, events, coverage = _ready_context_inputs(
+        event_risk=True
+    )
+    coverage = tuple(
+        row for row in coverage if row["event_type"] != "EARNINGS"
+    )
+    contexts = canonical_stock_alert_contexts(
+        inputs,
+        context_members=context_members,
+        market_events=events,
+        market_event_coverage=coverage,
+    )
+    batch = produce_canonical_stock_alert_batch(
+        inputs,
+        window_id=WINDOW,
+        input_receipt_id=RECEIPT,
+        receipt_input_sha256="b" * 64,
+        contexts=contexts,
+    )
+
+    aapl = next(row for row in batch.evaluations if row.ticker == "AAPL")
+    assert contexts[str(aapl.security_id)].event_risk is True
+    assert aapl.decision.disposition is Disposition.NO_MATCH
+    assert aapl.decision.reason_codes == ("GATE_EVENT_FAILED",)
+    assert aapl.alert is None
+
+
+def test_missing_sector_mapping_is_member_local():
+    inputs, context_members, events, coverage = _ready_context_inputs()
+    members = tuple(
+        (
+            {
+                **member,
+                "sector": None,
+            }
+            if member["ticker"] == "AAPL"
+            else member
+        )
+        for member in inputs.members
+    )
+    inputs = replace(inputs, members=members)
+    contexts = canonical_stock_alert_contexts(
+        inputs,
+        context_members=context_members,
+        market_events=events,
+        market_event_coverage=coverage,
+    )
+    batch = produce_canonical_stock_alert_batch(
+        inputs,
+        window_id=WINDOW,
+        input_receipt_id=RECEIPT,
+        receipt_input_sha256="b" * 64,
+        contexts=contexts,
+        policy=REQUIRED_CONTEXT,
+    )
+
+    dispositions = {
+        row.ticker: row.decision.disposition
+        for row in batch.evaluations
+    }
+    assert dispositions["AAPL"] is Disposition.UNAVAILABLE
+    assert all(
+        disposition is not Disposition.UNAVAILABLE
+        for ticker, disposition in dispositions.items()
+        if ticker != "AAPL"
+    )
+
+
+def test_missing_event_coverage_is_member_local_and_never_clear():
+    inputs, context_members, events, coverage = _ready_context_inputs()
+    coverage = tuple(
+        row for row in coverage if row["event_type"] != "EARNINGS"
+    )
+    contexts = canonical_stock_alert_contexts(
+        inputs,
+        context_members=context_members,
+        market_events=events,
+        market_event_coverage=coverage,
+    )
+
+    aapl = contexts[str(inputs.members[0]["security_id"])]
+    spy = contexts[str(inputs.members[1]["security_id"])]
+    assert aapl.event_risk is None
+    assert "MISSING_EVENT_CONTEXT" in aapl.reason_codes
+    assert spy.event_risk is False
+
+
+@pytest.mark.parametrize("clock_state", ["late", "stale"])
+def test_late_or_stale_event_evidence_is_not_decision_visible(clock_state):
+    inputs, context_members, events, coverage = _ready_context_inputs()
+    if clock_state == "late":
+        coverage = tuple(
+            {
+                **row,
+                "checked_at": CUTOFF + timedelta(seconds=1),
+            }
+            if row["event_type"] == "EARNINGS"
+            else row
+            for row in coverage
+        )
+    else:
+        coverage = tuple(
+            {
+                **row,
+                "valid_until": CUTOFF,
+            }
+            if row["event_type"] == "EARNINGS"
+            else row
+            for row in coverage
+        )
+
+    contexts = canonical_stock_alert_contexts(
+        inputs,
+        context_members=context_members,
+        market_events=events,
+        market_event_coverage=coverage,
+    )
+
+    assert contexts[
+        str(inputs.members[0]["security_id"])
+    ].event_risk is None
+
+
+def test_context_checksum_drift_fails_closed():
+    inputs, context_members, events, coverage = _ready_context_inputs()
+    context = canonical_stock_alert_contexts(
+        inputs,
+        context_members=context_members,
+        market_events=events,
+        market_event_coverage=coverage,
+    )[str(inputs.members[0]["security_id"])]
+
+    with pytest.raises(
+        ValueError,
+        match="context identity changed",
+    ):
+        replace(context, source_sha256="0" * 64)
 
 
 def test_canonical_portal_snapshot_exposes_unavailable_reasons():
@@ -336,6 +727,7 @@ def test_canonical_portal_snapshot_exposes_unavailable_reasons():
         window_id=WINDOW,
         input_receipt_id=RECEIPT,
         receipt_input_sha256="b" * 64,
+        policy=REQUIRED_CONTEXT,
     )
     retained = _retained_projection(batch)
 
@@ -468,19 +860,67 @@ def test_variable_membership_and_one_warming_member_are_partial_not_blocked():
         retained_projection=_retained_projection(batch),
     )
 
-    assert len(batch.evaluations) == len(members) == 5
+    expected_members = tuple(
+        row for row in members if row["ticker"] != "XLF"
+    )
+    assert len(batch.evaluations) == len(expected_members) == 4
     assert {
         row.ticker for row in batch.evaluations
-    } == {row["ticker"] for row in members}
+    } == {row["ticker"] for row in expected_members}
     assert batch.membership.partial is True
     assert snapshot.payload["membership_status"] == "PARTIAL"
     assert snapshot.payload["shadow"]["membership_status"] == "PARTIAL"
     assert snapshot.payload["shadow"]["status"] == "DEGRADED"
-    assert snapshot.payload["shadow"]["publications"][0]["expected"] == 5
+    assert snapshot.payload["shadow"]["publications"][0]["expected"] == 4
     assert snapshot.payload["shadow"]["publications"][0]["status"] == "PARTIAL"
     assert any(
         row["ticker"] == "NVDA" and row["status"] == "WARMING"
         for row in snapshot.payload["membership"]["intended_members"]
+    )
+
+
+def test_canonical_snapshot_retains_prior_intraday_publications():
+    inputs = _inputs()
+    batch = produce_canonical_stock_alert_batch(
+        inputs,
+        window_id=WINDOW,
+        input_receipt_id=RECEIPT,
+        receipt_input_sha256="b" * 64,
+    )
+    retained = _retained_projection(batch)
+    prior = {
+        "batch": deepcopy(retained["batch"]),
+        "evaluations": deepcopy(retained["evaluations"]),
+    }
+    prior["batch"]["batch_id"] = str(uuid5(
+        NAMESPACE_URL,
+        "prior-canonical-alert-batch",
+    ))
+    prior["batch"]["cutoff"] = (
+        batch.cutoff - timedelta(minutes=5)
+    ).isoformat()
+    prior["batch"]["completed_at"] = (
+        batch.completed_at - timedelta(minutes=5)
+    ).isoformat()
+    retained["history"] = [prior]
+    retained["projection_sha256"] = canonical_sha256({
+        key: value
+        for key, value in retained.items()
+        if key != "projection_sha256"
+    })
+
+    snapshot = produce_realtime_stock_alerts(
+        inputs,
+        retained_projection=retained,
+    )
+
+    publications = snapshot.payload["shadow"]["publications"]
+    assert [row["run_id"] for row in publications] == [
+        prior["batch"]["batch_id"],
+        retained["batch"]["batch_id"],
+    ]
+    assert len(snapshot.payload["shadow"]["alerts"]) >= len(
+        retained["evaluations"]
     )
 
 

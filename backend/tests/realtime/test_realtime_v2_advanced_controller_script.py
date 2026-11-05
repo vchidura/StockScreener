@@ -562,6 +562,193 @@ def test_zero_repair_budget_blocks_repair_without_ending_the_session(
     assert coordinator.next_plan_at > now
 
 
+def _repair_identity():
+    return SimpleNamespace(
+        repair_id=script.UUID(int=7),
+        window_key="adv-hybrid-first",
+        release_at=datetime(2026, 11, 5, 15, 7, tzinfo=timezone.utc),
+    )
+
+
+class _WindowRows:
+    def __init__(self, rows):
+        self.rows = rows
+        self.asked = []
+
+    def execute(self, _statement, values):
+        self.asked.append(values[0])
+
+    def fetchone(self):
+        return self.rows.get(self.asked[-1])
+
+
+def _replace_namespace(monkeypatch):
+    def replace(value, **changes):
+        return SimpleNamespace(**{**vars(value), **changes})
+
+    monkeypatch.setattr(script.dataclasses, "replace", replace)
+
+
+def test_a_new_hole_uses_its_first_identity(monkeypatch):
+    identity = _repair_identity()
+
+    planned = script._resume_or_retry_identity_cursor(_WindowRows({}), identity)
+
+    assert planned is identity
+
+
+def test_a_repair_in_progress_keeps_its_stored_time(monkeypatch):
+    _replace_namespace(monkeypatch)
+    identity = _repair_identity()
+    stored = datetime(2026, 11, 5, 15, 6, tzinfo=timezone.utc)
+
+    planned = script._resume_or_retry_identity_cursor(
+        _WindowRows({str(identity.repair_id): ("RUNNING", stored)}),
+        identity,
+    )
+
+    assert planned.repair_id == identity.repair_id
+    assert planned.release_at == stored
+
+
+def test_a_repair_that_ended_retries_under_a_new_identity(monkeypatch):
+    _replace_namespace(monkeypatch)
+    identity = _repair_identity()
+
+    planned = script._resume_or_retry_identity_cursor(
+        _WindowRows({str(identity.repair_id): ("RETAINED_GAP", identity.release_at)}),
+        identity,
+    )
+
+    assert planned.repair_id != identity.repair_id
+    assert planned.window_key != identity.window_key
+    assert planned.window_key.startswith("adv-hybrid-")
+
+
+def test_retries_for_one_hole_stop(monkeypatch):
+    _replace_namespace(monkeypatch)
+
+    class AllEnded(_WindowRows):
+        def fetchone(self):
+            return ("RETAINED_GAP", _repair_identity().release_at)
+
+    assert script._resume_or_retry_identity_cursor(AllEnded({}), _repair_identity(), retries=2) is None
+
+
+def _gap_closing_coordinator(monkeypatch, tmp_path, now, stored, gap_open=True):
+    gap_id = script.UUID(int=9)
+    cursor = MagicMock()
+    cursor.fetchone.return_value = (gap_open,)
+    cursor.fetchall.side_effect = [
+        [(gap_id, now - timedelta(minutes=5), now - timedelta(minutes=4, seconds=30))],
+        stored,
+    ]
+    modes = []
+
+    class Transaction:
+        def __enter__(self):
+            return SimpleNamespace(cursor=cursor)
+
+        def __exit__(self, *_args):
+            return False
+
+    def transaction(*_args, **kwargs):
+        modes.append(kwargs.get("read_only", False))
+        return Transaction()
+
+    args = script.parse_args(_base())
+    monkeypatch.setattr(
+        script,
+        "load_stream_gap_repair_scope_cursor",
+        lambda *_args: SimpleNamespace(
+            plan_id=script.UUID(int=3),
+            cohort_id=script.UUID(int=2),
+            members=(SimpleNamespace(instrument_id=1),),
+        ),
+    )
+    monkeypatch.setattr(
+        script,
+        "_load_hybrid_progress_cursor",
+        lambda *_args, **_kwargs: (now - timedelta(minutes=40), None, None, (1,)),
+    )
+    coordinator = script._HybridRepairCoordinator(
+        SimpleNamespace(transaction=transaction),
+        args,
+        SimpleNamespace(
+            cohort_id=script.UUID(int=2),
+            plan_id=script.UUID(int=3),
+            budgets=args.budgets,
+            authorized_end_at=now + timedelta(hours=6),
+        ),
+        session_open=now - timedelta(minutes=40),
+        deadline=now + timedelta(minutes=5),
+        journal_root=tmp_path,
+        lease_seconds=60,
+        settings=SimpleNamespace(),
+    )
+    return coordinator, cursor, modes
+
+
+def _closed_gap(cursor):
+    return any(
+        "UPDATE rt.stream_gaps" in str(call.args[0])
+        for call in cursor.execute.call_args_list
+    )
+
+
+def test_a_drop_that_lost_no_minute_closes_its_gap_with_no_repair(
+    monkeypatch,
+    tmp_path,
+    capsys,
+):
+    # Sim, Nov 5: 36 s inside one minute. The bar arrived after the reconnect,
+    # so nothing was missing, no repair ran, and the gap stayed open for good.
+    now = datetime(2026, 11, 5, 15, 7, tzinfo=timezone.utc)
+    minute = now - timedelta(minutes=5)
+    coordinator, cursor, _modes = _gap_closing_coordinator(
+        monkeypatch,
+        tmp_path,
+        now,
+        [(1, minute)],
+    )
+
+    coordinator._plan_next(now)
+
+    assert _closed_gap(cursor)
+    assert coordinator.window is None
+    assert "closed by stored coverage" in capsys.readouterr().err
+
+
+def test_a_gap_with_a_missing_minute_stays_open(monkeypatch, tmp_path):
+    now = datetime(2026, 11, 5, 15, 7, tzinfo=timezone.utc)
+    coordinator, cursor, _modes = _gap_closing_coordinator(
+        monkeypatch,
+        tmp_path,
+        now,
+        [],
+    )
+
+    coordinator._plan_next(now)
+
+    assert not _closed_gap(cursor)
+
+
+def test_no_open_gap_takes_no_write_transaction(monkeypatch, tmp_path):
+    now = datetime(2026, 11, 5, 15, 7, tzinfo=timezone.utc)
+    coordinator, cursor, modes = _gap_closing_coordinator(
+        monkeypatch,
+        tmp_path,
+        now,
+        [],
+        gap_open=False,
+    )
+
+    coordinator._close_covered_gaps()
+
+    assert modes == [True]
+    assert not _closed_gap(cursor)
+
+
 def test_reconnect_hole_is_found_from_stored_bars_not_the_first_stream():
     # 2026-11-02: the stream began at the open, and the 16:22 hole came later.
     session_open = datetime(2026, 11, 2, 14, 30, tzinfo=timezone.utc)

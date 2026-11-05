@@ -520,6 +520,21 @@ class OptionFlowEngine:
         self._shards[route[1]].queue.append((None, _Control("RECONCILE", (
             contract, session_date, snapshot_volume, watermark_seq, snapshot_time_ms))))
 
+    def snapshot_watermark(
+        self,
+        contract: str,
+        snapshot_time_ms: int,
+    ) -> int:
+        route = self._route(contract)
+        if route is None:
+            raise ValueError(f"unroutable contract: {contract!r}")
+        session_date = self._clock.session_date(snapshot_time_ms)
+        return self._shards[route[1]].book.watermark_at(
+            contract,
+            session_date,
+            snapshot_time_ms,
+        )
+
     def submit_quote_universe(self, contracts: Iterable[str] | None) -> None:
         """Queue a change of the quote-subscribed contracts (a slot promotion or rotation)."""
         universe = None if contracts is None else frozenset(contracts)

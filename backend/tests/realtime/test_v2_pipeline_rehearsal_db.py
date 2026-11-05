@@ -358,8 +358,8 @@ class Runtime:
             provider, build_id=f"rehearsal-{label}", reference_service=rehearsal.reference_service,
             equity_source=rehearsal.source,
             universe=UniverseManifest(UNIVERSE.version, rehearsal.tickers, ()),
-            stock_alert_projection_loader=lambda known_by: (
-                _retained_alert_projection(known_by)
+            stock_alert_projection_loader=lambda request: (
+                _retained_alert_projection(request.known_by)
             ))
         self.transactions: list[Used] = []
         self.timings: dict[tuple, float] = {}
@@ -1340,6 +1340,80 @@ def test_a7b_a_bar_recorded_after_a_deadline_is_invisible_to_that_window_and_vis
         assert reader.read(ticker, "chart", interval="1m", period="5y", available_by=datetime.now(UTC),
                            cohort_id=rehearsal.cohort) == expected_chart(
             rehearsal, ticker, payload["chart_refs"]["1m"], (*w2.extra["revised"][ticker], *w3.extra["revised"][ticker]))
+
+
+def test_v3_equity_provider_free_close_restart_retry_and_next_slot(
+    rehearsal,
+    w1,
+):
+    runtime = rehearsal.deferred
+    ancillary = ("STOCK_ALERTS", "STRATEGY_PUBLISH")
+    close_spec = w1.spec
+    close_rows = {
+        stage: state
+        for stage, _attempt, state, _codes
+        in rehearsal.stage_rows("w1")
+    }
+    assert close_rows["EQUITY_INGEST"] == "COMPLETE"
+    assert close_rows["EQUITY_EVIDENCE"] == "COMPLETE"
+    assert close_rows["PORTAL_PUBLISH"] == "COMPLETE"
+    assert current_release(rehearsal)[3] == close_spec.cutoff
+
+    retry_spec = rehearsal.spec(
+        "v3-holistic-retry",
+        rehearsal.cutoff(1),
+    )
+    runtime.crash_before.add(
+        (retry_spec.window_key, "PORTAL_PUBLISH", 1)
+    )
+    with swallow_simulated_crash():
+        runtime.run_window(
+            retry_spec,
+            stub=ancillary,
+            max_attempts=3,
+        )
+    assert any(
+        stage == "PORTAL_PUBLISH"
+        and attempt == 1
+        and state == "RUNNING"
+        for stage, attempt, state, _codes
+        in rehearsal.stage_rows(retry_spec.window_key)
+    )
+
+    runtime.restart()
+    retry_report, _ = runtime.run_window(
+        retry_spec,
+        stub=ancillary,
+        max_attempts=3,
+    )
+
+    (retried,) = retry_report.windows
+    assert retried.window_state == "COMPLETE"
+    retry_rows = {
+        (stage, attempt): (state, codes)
+        for stage, attempt, state, codes
+        in rehearsal.stage_rows(retry_spec.window_key)
+    }
+    assert retry_rows[("PORTAL_PUBLISH", 1)] == (
+        "FAILED",
+        ("OWNER_LOST",),
+    )
+    assert retry_rows[("PORTAL_PUBLISH", 2)][0] == "COMPLETE"
+    assert current_release(rehearsal)[3] == retry_spec.cutoff
+
+    next_spec = rehearsal.spec(
+        "v3-holistic-next",
+        rehearsal.cutoff(2),
+    )
+    next_report, _ = runtime.run_window(
+        next_spec,
+        stub=ancillary,
+    )
+
+    (advanced,) = next_report.windows
+    assert advanced.window_state == "COMPLETE"
+    assert current_release(rehearsal)[3] == next_spec.cutoff
+    assert next_spec.cutoff > retry_spec.cutoff > close_spec.cutoff
 
 
 # --- Part A, W3b: a late arrival that forces a full reload ------------------------------------------------------------

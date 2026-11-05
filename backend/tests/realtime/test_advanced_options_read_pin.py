@@ -210,6 +210,56 @@ def test_read_pin_rollback_restores_exact_disabled_prior_pin():
     assert provider.cursor.pin == previous
 
 
+def test_read_pin_snapshot_captures_exact_prior_state():
+    provider = _Provider()
+    previous = {
+        "cohort_id": str(COHORT),
+        "release_id": str(UUID(int=3)),
+        "package_sha256": "2" * 64,
+        "release_cutoff": CUTOFF - timedelta(minutes=1),
+        "enabled": False,
+        "enabled_at": NOW - timedelta(minutes=2),
+        "disabled_at": NOW - timedelta(minutes=1),
+        "updated_at": NOW - timedelta(minutes=1),
+    }
+    provider.cursor.pin = dict(previous)
+    port = PostgresAdvancedOptionsStoredReadPort(
+        provider,
+        package_sha256=PACKAGE,
+        clock=lambda: NOW,
+    )
+
+    assert port.snapshot(cohort_id=COHORT) == previous
+
+
+def test_read_pin_rollback_refuses_to_overwrite_a_newer_pin():
+    provider = _Provider()
+    provider.cursor.pin = {
+        "cohort_id": str(COHORT),
+        "release_id": str(RELEASE_2),
+        "package_sha256": PACKAGE,
+        "release_cutoff": CUTOFF + timedelta(minutes=5),
+        "enabled": True,
+        "enabled_at": NOW,
+        "disabled_at": None,
+        "updated_at": NOW,
+    }
+    port = PostgresAdvancedOptionsStoredReadPort(
+        provider,
+        package_sha256=PACKAGE,
+        clock=lambda: NOW,
+    )
+
+    with pytest.raises(RuntimeError, match="changed before rollback"):
+        port.restore(
+            cohort_id=COHORT,
+            expected_release_id=RELEASE,
+            previous=None,
+        )
+
+    assert provider.cursor.pin["release_id"] == str(RELEASE_2)
+
+
 def test_read_pin_advances_from_exact_prior_release():
     provider = _Provider()
     port = PostgresAdvancedOptionsStoredReadPort(

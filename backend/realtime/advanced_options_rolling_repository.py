@@ -17,6 +17,7 @@ from .advanced_options_rolling_state import (
     AdvancedOptionsRollingProducerBinding,
     AdvancedOptionsRollingState,
     AdvancedOptionsUnderlyingTick,
+    AdvancedOptionsWindowRetryDiverged,
     RollingAvailability,
 )
 from .contracts import AssetClass, canonical_json
@@ -263,6 +264,13 @@ def decode_advanced_options_rolling_state(
         iv_surface=_optional_lane(document["iv_surface"]),
         dark_pool=_optional_lane(document["dark_pool"]),
         producer_binding=_producer_binding(document.get("producer_binding")),
+        degraded_reason_codes=tuple(
+            document.get("degraded_reason_codes", ())
+        ),
+        excluded_contracts=tuple(
+            (str(key), tuple(reasons))
+            for key, reasons in document.get("excluded_contracts", ())
+        ),
     )
 
 
@@ -294,7 +302,9 @@ def persist_advanced_options_rolling_state_cursor(
             or str(existing[1]) != state.state_sha256
             or canonical_json(existing[2]) != canonical_json(document)
         ):
-            raise ValueError("persisted rolling checkpoint conflicts")
+            raise AdvancedOptionsWindowRetryDiverged(
+                "persisted rolling checkpoint conflicts"
+            )
         return state
     cursor.execute(
         "SELECT state_id,state_sha256,state_document,journal_generation,"
@@ -316,7 +326,9 @@ def persist_advanced_options_rolling_state_cursor(
             or latest_epoch == state.owner_epoch
             and latest_offset > state.committed_offset
         ):
-            raise ValueError("rolling checkpoint regressed")
+            raise AdvancedOptionsWindowRetryDiverged(
+                "rolling checkpoint regressed"
+            )
     cursor.execute(
         "INSERT INTO rt.advanced_options_rolling_checkpoints ("
         "state_id,state_sha256,state_version,cohort_id,session_date,"

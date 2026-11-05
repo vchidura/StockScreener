@@ -469,6 +469,29 @@ class OptionFlowConsumer:
             raise RuntimeError("the engine returned no reconcile result")
         return out.reconciles[0]
 
+    def reconcile_snapshot(
+        self,
+        contract: str,
+        snapshot_volume: int,
+        snapshot_time_ms: int,
+    ) -> ReconcileResult:
+        return self.reconcile(
+            contract,
+            snapshot_volume,
+            self._engine.snapshot_watermark(
+                contract,
+                snapshot_time_ms,
+            ),
+            snapshot_time_ms,
+        )
+
+    def volume_reconcile_required(self) -> bool:
+        counts = baseline_counts(self._engine)
+        return not counts or any(
+            BaselineKind(kind) not in COMPLETE_BASELINES
+            for kind in counts
+        )
+
     def mark_reconciled(self) -> bool:
         """Clear the WARMING/gap report once no contract is WARMING or INCOMPLETE. False: still unreconciled."""
         counts = baseline_counts(self._engine)

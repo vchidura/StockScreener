@@ -523,6 +523,46 @@ def select_canonical_stock_alert_bars(
     )
 
 
+def select_canonical_stock_alert_context_bars(
+    cursor,
+    *,
+    cohort_id: UUID,
+    provider_tier: ProviderTier,
+    tickers: tuple[str, ...],
+    session: date,
+    cutoff: datetime,
+    known_by: datetime,
+) -> tuple[dict, ...]:
+    if not tickers:
+        return ()
+    clocks = BarClocks(cutoff, known_by)
+    cursor.execute(
+        "SELECT DISTINCT ON (ticker, interval, adjustment_basis, bar_start) "
+        + bar_columns(True)
+        + " FROM rt.bar_revisions WHERE "
+        "cohort_id=%s AND provider_tier=%s AND ticker=ANY(%s) "
+        "AND session_scope='RTH' AND is_final AND "
+        + _BAR_VISIBLE_AT
+        + "AND interval='5m' "
+        "AND adjustment_basis='RAW_UNADJUSTED' "
+        "AND session_date=%s AND bar_end<=%s "
+        "ORDER BY ticker, interval, adjustment_basis, bar_start, "
+        + source_precedence_case(False)
+        + " DESC, observed_at DESC, created_at DESC, bar_revision_id",
+        (
+            str(cohort_id),
+            provider_tier.value,
+            list(tickers),
+            *clocks.params(),
+            session,
+            cutoff,
+        ),
+    )
+    return tuple(
+        share_bar_values([dict(row) for row in cursor.fetchall()])
+    )
+
+
 def load_realtime_canonical_stock_alert_input(
     cursor,
     *,

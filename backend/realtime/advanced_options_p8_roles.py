@@ -69,6 +69,19 @@ from .advanced_options_resident_barrier import (
     evaluate_resident_completion_barrier_cursor,
     load_ready_resident_window_targets_cursor,
     record_resident_completion_cursor,
+    resident_consumer_hold_cursor,
+)
+from .advanced_options_native_loader import (
+    AdvancedOptionsNativePreflightBlocked,
+)
+from .advanced_options_mark_producer import (
+    AdvancedOptionsMarkPreflightBlocked,
+)
+from .advanced_options_rolling_producer import (
+    AdvancedOptionsRollingPreflightBlocked,
+)
+from .advanced_options_rolling_state import (
+    AdvancedOptionsWindowRetryDiverged,
 )
 from .advanced_options_v3_authority import (
     consume_session_acquisition_authority_cursor,
@@ -140,6 +153,30 @@ _EFFECTS = {
     "broker": False,
     "trading": False,
 }
+_BLOCKED_WINDOW_RETRY_SECONDS = 5.0
+
+
+def _log_window_attempt(logged, window_key, result, seconds) -> None:
+    """One line per change of outcome, so a waiting window leaves a trace without
+    filling the log every few seconds."""
+    outcome = (
+        result.get("status"),
+        result.get("window_state"),
+        tuple(result.get("reason_codes") or ()),
+    )
+    if logged.get(window_key) == outcome:
+        return
+    logged[window_key] = outcome
+    print(json.dumps({
+        "event": "advanced_options_window_attempt",
+        "window_id": window_key,
+        "status": outcome[0],
+        "window_state": outcome[1],
+        "reason_codes": list(outcome[2]),
+        "seconds": round(seconds, 1),
+        "executed": result.get("executed") or [],
+        "lane_errors": result.get("lane_errors") or {},
+    }, sort_keys=True), flush=True)
 
 
 def _record_v3_resident_completion(
@@ -208,6 +245,7 @@ def _snapshot_v3_resident_windows(
             unit.cursor,
             session_authorization_id=session.authorization_id,
             member=member,
+            checked_at=datetime.now(UTC),
         )
     recorded = 0
     for target in targets:
@@ -561,6 +599,102 @@ def _registration(provider, generation):
         )
 
 
+def _stop_pauses_session(bundle, stop_event, registration) -> bool:
+    """A stop before the session's end leaves its journal open for a restart.
+    At or past the end, or once the journal is sealing, roles drain as before."""
+    if (
+        not stop_event.is_set()
+        or bundle.get("orchestration", {}).get("catalog_version")
+        != STAGE_CATALOG_VERSION_V5
+        or (
+            registration is not None
+            and registration.status in {"DRAINING", "DRAINED"}
+        )
+    ):
+        return False
+    session = session_acquisition_authorization_from_payload(
+        bundle["v3_authorities"]["session_acquisition"]
+    )
+    return datetime.now(UTC) < session.acquisition_stop
+
+
+def _paused_role_evidence(kind, **offsets) -> dict[str, object]:
+    return {
+        "status": "PAUSED",
+        "kind": kind.value,
+        **offsets,
+        "effects": dict(_EFFECTS),
+    }
+
+
+def _checkpoint_flow_at_hold(consumer, hold, *, checked_at) -> None:
+    """Rows and offsets only flush when something is fed, so a consumer stopped at
+    the barrier would never write the checkpoint its window needs. Write it once."""
+    if (
+        hold is not None
+        and checked_at >= hold.cutoff
+        and hold.raw_offset > 0
+        and consumer.fed_offset == hold.raw_offset
+        and consumer.checkpointed_offset < consumer.fed_offset
+    ):
+        consumer.flush(reason="HOLD_BARRIER", full=True)
+
+
+class _ResidentConsumerHoldController:
+    def __init__(
+        self,
+        provider,
+        bundle,
+        source,
+        *,
+        refresh_seconds: float = 1.0,
+    ):
+        authorities = bundle.get("v3_authorities")
+        if not isinstance(authorities, dict):
+            raise RuntimeError("V3 session authority is unavailable")
+        session = session_acquisition_authorization_from_payload(
+            authorities.get("session_acquisition")
+        )
+        self._provider = provider
+        self._session_authorization_id = session.authorization_id
+        self._reader = RawJournalReader(source.path)
+        self._refresh_seconds = refresh_seconds
+        self._next_refresh = 0.0
+        self._hold = None
+
+    def apply(self, source):
+        now_monotonic = time.monotonic()
+        if now_monotonic >= self._next_refresh:
+            with self._provider.transaction(
+                APP_ROLE,
+                read_only=True,
+            ) as unit:
+                self._hold = resident_consumer_hold_cursor(
+                    unit.cursor,
+                    session_authorization_id=(
+                        self._session_authorization_id
+                    ),
+                    reader=self._reader,
+                    checked_at=datetime.now(UTC),
+                )
+            self._next_refresh = (
+                now_monotonic + self._refresh_seconds
+            )
+        source.set_read_limits(
+            raw_offset=(
+                None
+                if self._hold is None
+                else self._hold.raw_offset
+            ),
+            event_offset=(
+                None
+                if self._hold is None
+                else self._hold.normalized_offset
+            ),
+        )
+        return self._hold
+
+
 def _wait_registration(provider, generation, stop_event):
     while not stop_event.is_set():
         registration = _registration(provider, generation)
@@ -796,6 +930,7 @@ def _run_v3_acquisition_observer(
     last_physical_signature = None
     watermark_event_offset = 0
     event_time_watermark = None
+    acquisition_complete = False
     while not stop_event.is_set():
         try:
             status = json.loads(status_path.read_text(encoding="utf-8"))
@@ -917,8 +1052,23 @@ def _run_v3_acquisition_observer(
                 connection_attempts=connection_attempts,
             )
         if status.get("state") == "COMPLETE":
+            acquisition_complete = True
             break
         stop_event.wait(0.1)
+    if not acquisition_complete and _stop_pauses_session(
+        bundle,
+        stop_event,
+        registration,
+    ):
+        return _paused_role_evidence(
+            AdvancedOptionsProcessKind.INGRESS,
+            raw_end_offset=last_raw_offset,
+            normalized_end_offset=last_event_offset,
+            connection_attempts=connection_attempts,
+            journal_generation=str(
+                acquisition.authority.journal_generation
+            ),
+        )
     if last_raw_offset <= 0 or last_event_offset <= 0:
         raise RuntimeError("V3 acquisition journal has no durable data")
     if not _terminal_journal_is_exact(
@@ -1437,6 +1587,16 @@ def _run_market_state(
         registration=registration,
         source_flow=control.source_flow,
     )
+    hold_controller = (
+        _ResidentConsumerHoldController(
+            provider,
+            bundle,
+            source,
+        )
+        if bundle.get("orchestration", {}).get("catalog_version")
+        == STAGE_CATALOG_VERSION_V5
+        else None
+    )
     selection_plan = _selection_plan(session_state)
     layout = _shard_layout(binding, selection_plan)
     leases = AdvancedOptionsPostgresLeasePort(provider)
@@ -1599,6 +1759,8 @@ def _run_market_state(
             )
             if current is not None:
                 source.registration = current
+            if hold_controller is not None:
+                hold_controller.apply(source)
             now = datetime.now(UTC)
             monotonic_now = time.monotonic()
             made_progress = False
@@ -1728,6 +1890,11 @@ def _run_market_state(
                 shard_map_sha256_value=layout.shard_map.sha256,
                 shard_ids_value=shard_ids,
             )
+            if _stop_pauses_session(bundle, stop_event, current):
+                return _paused_role_evidence(
+                    AdvancedOptionsProcessKind.MARKET_STATE,
+                    normalized_end_offset=completed_offset,
+                )
             if (
                 current is not None
                 and current.status in {"DRAINING", "DRAINED"}
@@ -1900,6 +2067,152 @@ class _FlowUnavailableContract:
 class _FlowScopeResolution:
     scope: AdvancedOptionsContractScope | None
     unavailable: tuple[_FlowUnavailableContract, ...]
+
+
+class _FlowVolumeBaselineReconciler:
+    def __init__(
+        self,
+        *,
+        session_state,
+        bundle,
+        source,
+        refresh_seconds: float = 0.5,
+    ):
+        self._session_state = session_state
+        self._session_binding = (
+            None
+            if session_state is None
+            else session_state.load_preopen_session_binding(bundle)
+        )
+        self._reader = RawJournalReader(source.path)
+        self._refresh_seconds = refresh_seconds
+        self._next_refresh = 0.0
+        self._seen_sequence = 0
+        self._pending = {}
+
+    @staticmethod
+    def _baselines(downstream):
+        values = downstream.production_binding.get(
+            "volume_baselines"
+        )
+        if values is None:
+            return ()
+        if not isinstance(values, list):
+            raise RuntimeError(
+                "P8 volume baseline evidence is invalid"
+            )
+        baselines = []
+        for value in values:
+            if (
+                not isinstance(value, dict)
+                or set(value)
+                != {
+                    "contract_ticker",
+                    "snapshot_volume",
+                    "snapshot_at",
+                    "source_sha256",
+                }
+                or not isinstance(value["contract_ticker"], str)
+                or not value["contract_ticker"].strip()
+                or type(value["snapshot_volume"]) is not int
+                or value["snapshot_volume"] < 0
+                or not isinstance(value["source_sha256"], str)
+                or len(value["source_sha256"]) != 64
+                or any(
+                    character not in "0123456789abcdef"
+                    for character in value["source_sha256"]
+                )
+            ):
+                raise RuntimeError(
+                    "P8 volume baseline evidence is invalid"
+                )
+            snapshot_at = datetime.fromisoformat(
+                str(value["snapshot_at"])
+            )
+            if (
+                snapshot_at.tzinfo is None
+                or snapshot_at.utcoffset() is None
+            ):
+                raise RuntimeError(
+                    "P8 volume baseline evidence is invalid"
+                )
+            baselines.append({
+                **value,
+                "contract_ticker": (
+                    value["contract_ticker"].strip().upper()
+                ),
+                "snapshot_at": snapshot_at.astimezone(UTC),
+            })
+        if len({
+            row["contract_ticker"] for row in baselines
+        }) != len(baselines):
+            raise RuntimeError(
+                "P8 volume baseline membership is ambiguous"
+            )
+        return tuple(sorted(
+            baselines,
+            key=lambda row: row["contract_ticker"],
+        ))
+
+    def _refresh(self):
+        if self._session_binding is None:
+            return
+        now = time.monotonic()
+        if now < self._next_refresh:
+            return
+        bindings = self._session_state.load_downstream_bindings(
+            self._session_binding
+        )
+        for binding in bindings:
+            if binding.sequence <= self._seen_sequence:
+                continue
+            for baseline in self._baselines(binding):
+                key = (
+                    baseline["contract_ticker"],
+                    baseline["snapshot_at"],
+                )
+                self._pending[key] = baseline
+            self._seen_sequence = binding.sequence
+        self._next_refresh = now + self._refresh_seconds
+
+    def apply(self, consumer):
+        self._refresh()
+        if not self._pending:
+            return ()
+        ready = tuple(
+            (key, row)
+            for key, row in sorted(
+                self._pending.items(),
+                key=lambda item: (
+                    item[1]["snapshot_at"],
+                    item[1]["contract_ticker"],
+                ),
+            )
+            if self._reader.offsets_at(row["snapshot_at"])[0]
+            <= consumer.fed_offset
+        )
+        if not ready:
+            return ()
+        results = tuple(
+            consumer.reconcile_snapshot(
+                row["contract_ticker"],
+                row["snapshot_volume"],
+                int(row["snapshot_at"].timestamp() * 1000),
+            )
+            for _key, row in ready
+        )
+        for key, _row in ready:
+            self._pending.pop(key)
+        if not self._pending and all(result.accepted for result in results):
+            if not consumer.mark_reconciled():
+                raise RuntimeError(
+                    "P8 volume baseline remained incomplete"
+                )
+            consumer.flush(
+                reason="SNAPSHOT_RECONCILE",
+                full=True,
+            )
+        return results
 
 
 def _contract_scope_resolution(binding, policy):
@@ -2239,6 +2552,16 @@ def _run_flow(
                 evidence=evidence,
             )
         return evidence
+    hold_controller = (
+        _ResidentConsumerHoldController(
+            provider,
+            bundle,
+            source,
+        )
+        if bundle.get("orchestration", {}).get("catalog_version")
+        == STAGE_CATALOG_VERSION_V5
+        else None
+    )
     plan = PostgresOrchestrationRepository(provider).load_plan(
         control.plan_id
     )
@@ -2266,6 +2589,17 @@ def _run_flow(
         fenced=False,
     )
     runner = options_flow_runner(runner_environment)
+    volume_reconciler = (
+        _FlowVolumeBaselineReconciler(
+            session_state=session_state,
+            bundle=bundle,
+            source=source,
+        )
+        if bundle.get("orchestration", {}).get("catalog_version")
+        == STAGE_CATALOG_VERSION_V5
+        else None
+    )
+    volume_reconciliations = []
     outcome = None
     while True:
         current = _registration(
@@ -2274,6 +2608,11 @@ def _run_flow(
         )
         if current is not None:
             source.registration = current
+        hold = (
+            None
+            if hold_controller is None
+            else hold_controller.apply(source)
+        )
         outcome = runner(context)
         if outcome.state != "COMPLETE":
             raise RuntimeError(
@@ -2281,6 +2620,16 @@ def _run_flow(
                 + ",".join(outcome.reason_codes)
             )
         session = runner_environment.options_flow_state.session
+        if session is not None and volume_reconciler is not None:
+            volume_reconciliations.extend(
+                volume_reconciler.apply(session.consumer)
+            )
+        if session is not None:
+            _checkpoint_flow_at_hold(
+                session.consumer,
+                hold,
+                checked_at=datetime.now(UTC),
+            )
         if session is not None and outcome.evidence_ref is not None:
             _snapshot_v3_resident_windows(
                 provider,
@@ -2303,6 +2652,15 @@ def _run_flow(
                     runner_environment.options_flow_settings.shard_count
                 )),
                 evidence_ref=outcome.evidence_ref,
+            )
+        if _stop_pauses_session(bundle, stop_event, current):
+            if session is not None:
+                session.consumer.flush(reason="PAUSE", full=True)
+            return _paused_role_evidence(
+                AdvancedOptionsProcessKind.FLOW,
+                raw_end_offset=(
+                    0 if session is None else session.consumer.fed_offset
+                ),
             )
         if (
             session is not None
@@ -2340,6 +2698,17 @@ def _run_flow(
         "flow_unavailable_contracts": (
             _flow_unavailable_payload(resolution)
         ),
+        "volume_reconciliations": [
+            {
+                "contract_ticker": result.contract_ticker,
+                "session_date": result.session_date.isoformat(),
+                "accepted": result.accepted,
+                "reason": result.reason,
+                "cumulative_volume": result.cumulative_volume,
+                "baseline_kind": result.baseline_kind,
+            }
+            for result in volume_reconciliations
+        ],
         "effects": dict(_EFFECTS),
     }
     with provider.transaction(APP_ROLE) as unit:
@@ -2438,6 +2807,7 @@ def _run_window(
         if pool is None:
             raise RuntimeError("V3 WINDOW publication pool is unavailable")
         from .advanced_options_p8_production import (
+            fail_v3_window_attempt,
             load_v3_pending_window_bindings,
             run_v3_serial_window,
         )
@@ -2445,6 +2815,7 @@ def _run_window(
         results: dict[str, dict[str, object]] = {}
         observed_bindings: set[UUID] = set()
         terminal_windows: set[UUID] = set()
+        attempt_outcomes: dict[str, tuple] = {}
         while not stop_event.is_set():
             windows = load_v3_pending_window_bindings(
                 provider=provider,
@@ -2456,6 +2827,7 @@ def _run_window(
                 stop_event.wait(0.1)
                 continue
             progressed = False
+            blocked = False
             for window_binding in windows:
                 if window_binding.window_id in terminal_windows:
                     continue
@@ -2482,17 +2854,62 @@ def _run_window(
                             dependencies["reason_codes"]
                         ),
                     }
+                    _log_window_attempt(
+                        attempt_outcomes,
+                        window_key,
+                        results[window_key],
+                        0.0,
+                    )
                     continue
-                result = run_v3_serial_window(
-                    provider=provider,
-                    pool=pool,
-                    binding=window_binding,
-                    package=package,
-                    bundle=bundle,
-                    environment=environment,
-                    dependency_evidence=dependencies,
-                )
+                attempt_started = time.monotonic()
+                try:
+                    result = run_v3_serial_window(
+                        provider=provider,
+                        pool=pool,
+                        binding=window_binding,
+                        package=package,
+                        bundle=bundle,
+                        environment=environment,
+                        dependency_evidence=dependencies,
+                    )
+                except (
+                    AdvancedOptionsRollingPreflightBlocked,
+                    AdvancedOptionsMarkPreflightBlocked,
+                    AdvancedOptionsNativePreflightBlocked,
+                ) as error:
+                    results[window_key] = {
+                        "status": "DEFERRED",
+                        "reason_codes": list(
+                            error.result.reason_codes
+                        ),
+                    }
+                    _log_window_attempt(
+                        attempt_outcomes,
+                        window_key,
+                        results[window_key],
+                        time.monotonic() - attempt_started,
+                    )
+                    blocked = True
+                    continue
+                except AdvancedOptionsWindowRetryDiverged as error:
+                    result = fail_v3_window_attempt(
+                        provider=provider,
+                        window_id=window_binding.window_id,
+                        reason=str(error),
+                        checked_at=datetime.now(UTC),
+                    )
                 results[window_key] = dict(result)
+                _log_window_attempt(
+                    attempt_outcomes,
+                    window_key,
+                    results[window_key],
+                    time.monotonic() - attempt_started,
+                )
+                # A window still leased by an earlier attempt waits as long as a
+                # blocked one: each attempt writes a new reference generation.
+                if result.get("status") in {"DEFERRED", "NOT_CLAIMED"}:
+                    blocked = True
+                    continue
                 if result.get("window_state") in {
                     "COMPLETE",
                     "FAILED",
@@ -2505,7 +2922,11 @@ def _run_window(
                     result.get("status") != "NOT_CLAIMED"
                     and result.get("persisted", True) is not False
                 )
-            if not progressed:
+            if blocked:
+                # Each attempt writes a new reference generation, and a held
+                # state will not change within a second.
+                stop_event.wait(_BLOCKED_WINDOW_RETRY_SECONDS)
+            elif not progressed:
                 stop_event.wait(0.1)
         return {
             "status": "COMPLETE",

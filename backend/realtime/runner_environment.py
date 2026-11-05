@@ -136,6 +136,9 @@ class RunnerEnvironment:
     universe: UniverseManifest | None = None
     reference_scope: str = "MARKET_REFERENCES"
     input_known_by: datetime | None = None
+    input_visibility_clock: Callable[[], datetime] = (
+        lambda: datetime.now(timezone.utc)
+    )
     allow_late_identity_continuity: bool = False
     options_flow_source: OptionFlowSource | None = None
     options_flow_semantics: ConditionSemantics | None = None
@@ -160,10 +163,10 @@ class RunnerEnvironment:
     heap_frozen: bool = False
 
     def known_by(self, window) -> datetime:
-        value = self.input_known_by or getattr(
-            window,
-            "release_at",
-            getattr(window, "deadline", window.cutoff),
+        value = (
+            self.input_known_by
+            if self.input_known_by is not None
+            else self.input_visibility_clock()
         )
         if value.tzinfo is None or value.utcoffset() is None:
             raise ValueError("runner input visibility clock must be timezone-aware")

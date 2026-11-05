@@ -665,7 +665,7 @@ def test_ready_realtime_mark_persists_immutable_evidence_before_current_pointer(
         mark.outcome.estimated_cost,
         mark.outcome.net_pnl,
         mark.outcome.capital_at_risk,
-        mark.outcome.net_return,
+        mark.outcome.net_return.quantize(Decimal("0.000000000001")),
         mark.outcome.availability_flag,
         list(mark.outcome.quality_flags),
         mark.evidence_batch_id,
@@ -719,6 +719,10 @@ def test_realtime_mark_reader_filters_exact_cohort_and_tier():
         cohort_id=cohort, provider_tier=ProviderTier.MASSIVE_DEVELOPER)
     assert result["ready"] is True and result["rows"] == {}
     query, arguments = cursor.execute.call_args.args
+    assert (
+        "JOIN rt.option_packages AS package "
+        "ON package.candidate_id=current.candidate_id"
+    ) in query
     assert "package.cohort_id=%s::uuid" in query and "package.provider_tier=%s::text" in query
     assert arguments[2:6] == (str(cohort), str(cohort), "MASSIVE_DEVELOPER", "MASSIVE_DEVELOPER")
     assert all(not call.args[0].startswith("SET") for call in cursor.execute.call_args_list)

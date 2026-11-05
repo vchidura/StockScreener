@@ -1,5 +1,6 @@
 """Provider-free Ticker Workspace contracts over retained realtime evidence."""
 from collections import Counter
+from collections.abc import Callable
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import datetime, time, timedelta, timezone
@@ -63,6 +64,17 @@ CALENDAR_MODEL_VERSION = "realtime_ticker_calendar_v1"
 OPTIONS_DATA_TIER = "15-MINUTE DELAYED RESEARCH DATA"
 
 
+class TickerProjectionCancelled(RuntimeError):
+    """The owning stage abandoned a projection before it could have effects."""
+
+
+def _check_cancelled(
+    should_stop: Callable[[], bool] | None,
+) -> None:
+    if should_stop is not None and should_stop():
+        raise TickerProjectionCancelled("ticker projection was cancelled")
+
+
 @dataclass(frozen=True, slots=True)
 class RealtimeTickerWorkspaceProjection:
     """`snapshots` are the compact, by-reference workspaces that get hashed and stored. `summary_charts`
@@ -123,14 +135,16 @@ class TickerProjectionState:
         self._current[slot] = value
         return value
 
-    def facts(self, rows, inputs):
+    def facts(self, rows, inputs, *, should_stop=None):
         """Bar facts for rows, rebuilding only revisions not seen in the previous cycle. A revision is
         immutable, so (tier, revision id, payload hash) fully identifies the fact."""
         current, previous, tier = self._current, self._previous, inputs.provider_tier.value
         built = reused = 0
         prices = {}  # one ticker's facts share their Decimal prices
         facts = []
-        for row in rows:
+        for index, row in enumerate(rows):
+            if index % 256 == 0:
+                _check_cancelled(should_stop)
             slot = ("fact", tier, row["bar_revision_id"], row["payload_sha256"])
             fact = current.get(slot)
             if fact is None:
@@ -709,21 +723,25 @@ def _ticker_code_sha256():
 def project_realtime_ticker_workspace(
     inputs: RealtimeScreeningInput, *, market_events=(), market_event_coverage=(),
     fundamental_reports=(), fundamental_coverage=(), state: TickerProjectionState | None = None,
+    should_stop: Callable[[], bool] | None = None,
 ):
     """Pass a long-lived `state` to reuse unchanged facts, derivation checks and interval
     materializations across cycles. The result is identical with or without it."""
     state = TickerProjectionState() if state is None else state
+    _check_cancelled(should_stop)
     with state.cycle():
         return _project_realtime_ticker_workspace(
             inputs, market_events=market_events, market_event_coverage=market_event_coverage,
             fundamental_reports=fundamental_reports, fundamental_coverage=fundamental_coverage,
-            state=state,
+            state=state, should_stop=should_stop,
         )
 
 
 def _project_realtime_ticker_workspace(
     inputs, *, market_events, market_event_coverage, fundamental_reports, fundamental_coverage, state,
+    should_stop,
 ):
+    _check_cancelled(should_stop)
     calendar = exchange_calendars.get_calendar("XNYS")
     partial_session = (
         inputs.cutoff
@@ -762,6 +780,7 @@ def _project_realtime_ticker_workspace(
     }
     pending = list(selected)
     while pending:
+        _check_cancelled(should_stop)
         row = indexed[pending.pop()]
         for source in row["source_revision_ids"]:
             key = str(source)
@@ -774,6 +793,7 @@ def _project_realtime_ticker_workspace(
     screening = produce_realtime_screening(replace(
         inputs, bars=tuple(row for key, row in zip(keys, inputs.bars) if key in selected),
     ))
+    _check_cancelled(should_stop)
     code_sha256 = _ticker_code_sha256()
     adjusted_session_set = frozenset(plan.adjusted_sessions)
     raw_session_sets = {
@@ -804,6 +824,7 @@ def _project_realtime_ticker_workspace(
         native_source_kinds.add(BarSourceKind.REALTIME_STREAM)
     recorded_by = inputs.recorded_by  # known_by, else the cutoff: the bound of every recording clock below
     for member in sorted(inputs.members, key=lambda row: row["ticker"]):
+        _check_cancelled(should_stop)
         security = _security(member)
         own_security_id = str(security.security_id)
         own = rows_by_ticker.get(security.ticker, [])
@@ -846,7 +867,11 @@ def _project_realtime_ticker_workspace(
                 or (created is not None and created > recorded_by)
             ):
                 raise ValueError(f"Ticker source identity/availability drift: {security.ticker}")
-        facts = state.facts(own, inputs)
+        facts = state.facts(
+            own,
+            inputs,
+            should_stop=should_stop,
+        )
         if len({fact.revision.bar_revision_id for fact in facts}) != len(facts):
             raise ValueError("Ticker source revisions are duplicated")
         buckets = {}
@@ -1093,6 +1118,7 @@ def _project_realtime_ticker_workspace(
             return result
 
         for interval in SETUP_INTERVALS:
+            _check_cancelled(should_stop)
             bars = adjusted if interval == "1d" else available.get(interval, ())
             basis = "ADJUSTED" if interval in {"1d", "1wk", "1mo"} else "RAW_UNADJUSTED"
             if len(bars) < 50:
@@ -1118,6 +1144,7 @@ def _project_realtime_ticker_workspace(
                 is_serveable=True, price_basis=basis,
             )
         for interval in PATTERN_WATCH_INTERVALS:
+            _check_cancelled(should_stop)
             bars = available.get(interval, ())
             if len(bars) < 50:
                 missing[f"patterns:{interval}"] = "PATTERN_HISTORY_UNAVAILABLE"
@@ -1147,6 +1174,7 @@ def _project_realtime_ticker_workspace(
                 last_close=last_close, channel=channel, computed_at=inputs.cutoff.isoformat(),
             )
         for interval in RETIRED_PATTERN_WATCH_INTERVALS:
+            _check_cancelled(should_stop)
             missing[f"patterns:{interval}"] = "PATTERN_INTERVAL_RETIRED"
             bars = available.get(interval, ())[-300:]
             if len(bars) < 50:
@@ -1290,6 +1318,7 @@ def _project_realtime_ticker_workspace(
             source_generation=inputs.source_generation, source_manifest=source_manifest,
             payload=payload, generated_at=inputs.cutoff,
         ))
+    _check_cancelled(should_stop)
     return RealtimeTickerWorkspaceProjection(
         snapshots=tuple(snapshots), materializations=tuple(materializations),
         pattern_materializations=tuple(pattern_materializations), summary_charts=summary_charts,
@@ -1310,7 +1339,13 @@ def produce_realtime_ticker_workspace(
     ).snapshots
 
 
-def produce_realtime_pattern_watch_publication(inputs, snapshots):
+def produce_realtime_pattern_watch_publication(
+    inputs,
+    snapshots,
+    *,
+    should_stop: Callable[[], bool] | None = None,
+):
+    _check_cancelled(should_stop)
     snapshots = tuple(sorted(snapshots, key=lambda snapshot: snapshot.snapshot_key))
     if (len(snapshots) != len(inputs.members)
             or {snapshot.snapshot_key for snapshot in snapshots} != {member["ticker"] for member in inputs.members}
@@ -1320,8 +1355,10 @@ def produce_realtime_pattern_watch_publication(inputs, snapshots):
         raise ValueError("Pattern Watch publication requires one exact same-generation workspace per member")
     views = {}
     for interval in PATTERN_WATCH_INTERVALS:
+        _check_cancelled(should_stop)
         rows, missing, market_times, analysis_refs = [], [], [], {}
         for snapshot in snapshots:
+            _check_cancelled(should_stop)
             payload = snapshot.payload
             patterns = payload["patterns"].get(interval)
             channel = payload["channels"].get(interval)
@@ -1375,9 +1412,16 @@ def _without_negative_zero(row):
     return {key: value + 0.0 if isinstance(value, float) else value for key, value in row.items()}
 
 
-def produce_realtime_ticker_workspace_summary(inputs, snapshots, charts):
+def produce_realtime_ticker_workspace_summary(
+    inputs,
+    snapshots,
+    charts,
+    *,
+    should_stop: Callable[[], bool] | None = None,
+):
     """`charts` is the projection's `summary_charts`: the 1d and 1wk chart points the stored workspaces
     only reference."""
+    _check_cancelled(should_stop)
     snapshots = tuple(sorted(snapshots, key=lambda snapshot: snapshot.snapshot_key))
     if (
         len(snapshots) != len(inputs.members)
@@ -1388,6 +1432,7 @@ def produce_realtime_ticker_workspace_summary(inputs, snapshots, charts):
     overview, setup_rows = [], []
     references, workspaces = [], []
     for snapshot in snapshots:
+        _check_cancelled(should_stop)
         payload = snapshot.payload
         chart = charts[snapshot.snapshot_key]["1d"]
         weekly = charts[snapshot.snapshot_key]["1wk"]

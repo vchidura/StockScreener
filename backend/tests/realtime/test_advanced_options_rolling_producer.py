@@ -22,6 +22,8 @@ from realtime.advanced_options_rolling_producer import (
     build_advanced_options_rolling_producer_plan,
     _equity_live_head_source,
     _market_state,
+    _source_watermarks,
+    _volumes,
 )
 from realtime.database_access_v2 import V2ConnectionProvider
 from realtime.option_source_flow import build_option_source_flow_identity
@@ -324,7 +326,10 @@ def _separate_head_inputs(plan, binding):
 
 def test_market_state_accepts_separate_frozen_equity_and_options_identities():
     binding = _equity_binding()
-    plan = _plan(equity_live_head_binding=binding)
+    plan = _plan(
+        equity_live_head_binding=binding,
+        market_state_committed_offset=10,
+    )
     rows, contracts, equities = _separate_head_inputs(plan, binding)
     evidence = []
 
@@ -345,7 +350,10 @@ def test_market_state_accepts_separate_frozen_equity_and_options_identities():
 
 def test_market_state_refuses_missing_and_cross_swapped_head_identities():
     binding = _equity_binding()
-    plan = _plan(equity_live_head_binding=binding)
+    plan = _plan(
+        equity_live_head_binding=binding,
+        market_state_committed_offset=10,
+    )
     rows, contracts, equities = _separate_head_inputs(plan, binding)
     evidence = []
     assert _market_state(
@@ -374,6 +382,122 @@ def test_market_state_refuses_missing_and_cross_swapped_head_identities():
             equities,
             [],
         )
+
+
+def test_market_state_uses_normalized_option_head_offset():
+    binding = _equity_binding()
+    plan = _plan(equity_live_head_binding=binding)
+    rows, contracts, equities = _separate_head_inputs(plan, binding)
+    evidence = []
+
+    assert _market_state(
+        _HeadCursor(rows),
+        plan,
+        contracts,
+        equities,
+        evidence,
+    ) is None
+    assert "CANONICAL_CURRENT_HEAD_AHEAD_OF_CHECKPOINT" in (
+        evidence[-1].reason_codes
+    )
+
+
+def test_volume_production_path_seals_complete_checkpoint_evidence():
+    plan = _plan()
+    contracts = tuple(
+        {"contract_ticker": row.contract_ticker}
+        for row in plan.enrollment.activity_selection.contracts
+    )
+    rows = tuple(
+        {
+            "cohort_id": str(plan.control_plane.cohort_id),
+            "session_date": plan.control_plane.session_date,
+            "contract_ticker": row["contract_ticker"],
+            "cumulative_volume": 0,
+            "last_source_seq": 0,
+            "last_event_time": None,
+            "baseline_kind": "SESSION_COMPLETE",
+            "snapshot_volume": None,
+            "snapshot_watermark_seq": None,
+        }
+        for row in contracts
+    )
+    evidence = []
+
+    result = _volumes(
+        _HeadCursor(rows),
+        plan,
+        contracts,
+        evidence,
+    )
+
+    assert result is not None
+    states, digest = result
+    assert len(states) == len(contracts)
+    assert len(digest) == 64
+    assert evidence[-1].availability.value == "READY"
+
+
+class _WatermarkCursor:
+    def __init__(self, row):
+        self.row = row
+
+    def execute(self, _statement, _parameters):
+        return None
+
+    def fetchall(self):
+        return (self.row,)
+
+
+def test_source_watermark_identity_ignores_moving_live_values():
+    plan = _plan()
+    session_id = plan.source_flow.stream_session_ids[0]
+    stable = {
+        "session_id": str(session_id),
+        "manifest_id": str(plan.control_plane.manifest_id),
+        "owner_epoch": plan.owner_epoch,
+        "journal_generation": str(
+            plan.source_flow.journal_generation
+        ),
+        "started_at": plan.known_at - timedelta(minutes=10),
+        "subscribed_at": plan.known_at - timedelta(minutes=9),
+    }
+
+    def row(*, raw_offset, event_offset, heartbeat):
+        return {
+            **stable,
+            "status": "LIVE",
+            "last_raw_offset": raw_offset,
+            "last_event_offset": event_offset,
+            "event_time_watermark": plan.known_at,
+            "heartbeat_at": heartbeat,
+            "ended_at": None,
+        }
+
+    first_evidence = []
+    first = _source_watermarks(
+        _WatermarkCursor(row(
+            raw_offset=plan.flow_committed_offset,
+            event_offset=plan.market_state_committed_offset,
+            heartbeat=plan.known_at + timedelta(seconds=1),
+        )),
+        plan,
+        first_evidence,
+    )
+    second_evidence = []
+    second = _source_watermarks(
+        _WatermarkCursor(row(
+            raw_offset=plan.flow_committed_offset + 100,
+            event_offset=plan.market_state_committed_offset + 100,
+            heartbeat=plan.known_at + timedelta(minutes=1),
+        )),
+        plan,
+        second_evidence,
+    )
+
+    assert first == second
+    assert first_evidence[-1].availability.value == "READY"
+    assert second_evidence[-1].availability.value == "READY"
 
 
 def test_rolling_plan_refuses_stale_equity_binding():

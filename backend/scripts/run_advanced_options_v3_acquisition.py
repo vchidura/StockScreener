@@ -488,6 +488,8 @@ def main(argv=None) -> int:
             print(json.dumps(report, indent=2, sort_keys=True))
             if args.state_source == LEGACY_DIAGNOSTIC_STATE_SOURCE:
                 break
+            # A finished session returns at once until its authority ends.
+            stop.wait(2.0)
         return 0
     finally:
         pool.closeall()

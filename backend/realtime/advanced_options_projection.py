@@ -57,7 +57,7 @@ OPTIONS_PAGE_CONTRACTS = {
 }
 P8_DISPOSABLE_DATABASE_PREFIX = "test_realtime_v2_p8_"
 P8_DISPOSABLE_SCOPE_REFERENCE = "OWNED_DISPOSABLE_P8_CANARY"
-ADVANCED_OPTIONS_PAGE_FLOW_EVENT_LIMIT = 5_000
+ADVANCED_OPTIONS_PAGE_FLOW_EVENT_DETAIL_LIMIT = 250
 _OPTION_TICKER = re.compile(
     r"^O:(?P<underlyer>[A-Z0-9.-]+)"
     r"(?P<expiration>\d{6})(?P<call_put>[CP])"
@@ -265,8 +265,19 @@ def _flow_event_contract_rows(
             row["market_data_time"] = event_time.isoformat()
             row["model_mark"] = str(event["price"])
             row["display_mark"] = str(event["price"])
+        first_event_time = event.get("first_event_time")
+        if first_event_time is not None:
+            if not isinstance(first_event_time, datetime):
+                first_event_time = datetime.fromisoformat(
+                    str(first_event_time)
+                )
+            observed.setdefault(underlyer, []).append(
+                _utc(first_event_time, "first flow event time")
+            )
         observed.setdefault(underlyer, []).append(event_time)
-        event_counts[underlyer] += 1
+        event_counts[underlyer] += int(
+            event.get("event_count", 1)
+        )
     by_underlyer: dict[str, list[dict[str, object]]] = {}
     for (underlyer, _contract_id), row in grouped.items():
         open_interest = row["open_interest"]
@@ -386,6 +397,75 @@ def _eligible_chain_row(
     }
 
 
+def _admitted_chain_row(
+    contract,
+    *,
+    dataset_id: UUID,
+    cutoff: datetime,
+) -> dict[str, object]:
+    return {
+        "snapshot_id": str(uuid5(
+            NAMESPACE_URL,
+            (
+                "advanced-options-admitted-contract:"
+                f"{dataset_id}:{contract['contract_id']}"
+            ),
+        )),
+        "contract_id": int(contract["contract_id"]),
+        "contract_ticker": str(contract["contract_ticker"]),
+        "underlying": str(contract["underlyer"]),
+        "contract_type": (
+            "CALL" if contract["call_put"] == "C" else "PUT"
+        ),
+        "expiration_date": contract["expiration"].isoformat(),
+        "strike": str(contract["strike"]),
+        "calendar_dte": max(
+            0,
+            (contract["expiration"] - cutoff.date()).days,
+        ),
+        "spot": "0",
+        "model_mark": "0",
+        "mark": "0",
+        "absolute_delta": None,
+        "local_delta": None,
+        "local_iv": None,
+        "local_gamma": None,
+        "local_theta_per_day": None,
+        "local_vega_per_vol_point": None,
+        "local_rho_per_rate_point": None,
+        "bid": None,
+        "ask": None,
+        "mark_market_data_time": (
+            contract["observed_at"].isoformat()
+        ),
+        "day_volume": None,
+        "open_interest": None,
+        "volume_open_interest_ratio": None,
+        "otm_fraction": None,
+        "market_data_time": contract["observed_at"].isoformat(),
+        "first_observed_at": (
+            contract["observed_at"].isoformat()
+        ),
+        "mark_source": "ADMITTED_INVENTORY_UNEVALUATED",
+        "quality_flags": ["NOT_DETECTOR_EVALUATED"],
+        "asset_type": _asset_type(str(contract["underlyer"])),
+        "batch_id": str(dataset_id),
+        "matrix_id": str(dataset_id),
+        "display_mark": "0",
+        "time_to_expiration_years": None,
+        "risk_free_rate": None,
+        "dividend_yield": None,
+        "model_version": None,
+        "valuation_policy_version": None,
+        "valuation_policy_sha256": None,
+    }
+
+def _known_sum(rows, key):
+    values = [row[key] for row in rows]
+    if any(value is None for value in values):
+        return None
+    return sum(values)
+
 def _flow_response(
     *,
     underlyer: str,
@@ -393,6 +473,7 @@ def _flow_response(
     evaluations,
     dataset_id: UUID,
     flow_events: tuple[Mapping[str, object], ...],
+    flow_event_detail: tuple[Mapping[str, object], ...],
     cutoff: datetime,
     policy_sha256: str,
     configuration_sha256: str,
@@ -453,8 +534,8 @@ def _flow_response(
         )
         call_volume = sum(row["day_volume"] for row in call_rows)
         put_volume = sum(row["day_volume"] for row in put_rows)
-        call_oi = sum(row["open_interest"] or 0 for row in call_rows)
-        put_oi = sum(row["open_interest"] or 0 for row in put_rows)
+        call_oi = _known_sum(call_rows, "open_interest")
+        put_oi = _known_sum(put_rows, "open_interest")
         call_premium = sum(
             Decimal(row["premium_activity"] or "0")
             for row in call_rows
@@ -503,7 +584,11 @@ def _flow_response(
             "total_volume": call_volume + put_volume,
             "call_open_interest": call_oi,
             "put_open_interest": put_oi,
-            "total_open_interest": call_oi + put_oi,
+            "total_open_interest": (
+                None
+                if call_oi is None or put_oi is None
+                else call_oi + put_oi
+            ),
             "call_premium_activity": str(call_premium),
             "put_premium_activity": str(put_premium),
             "total_premium_activity": str(call_premium + put_premium),
@@ -514,7 +599,9 @@ def _flow_response(
                 None if call_volume == 0 else put_volume / call_volume
             ),
             "put_call_open_interest_ratio": (
-                None if call_oi == 0 else put_oi / call_oi
+                None
+                if call_oi in {None, 0} or put_oi is None
+                else put_oi / call_oi
             ),
             "open_interest_change": None,
         })
@@ -545,11 +632,13 @@ def _flow_response(
             "contract_count": len(rows),
             "call_volume": sum(row["day_volume"] for row in calls),
             "put_volume": sum(row["day_volume"] for row in puts),
-            "call_open_interest": sum(
-                row["open_interest"] or 0 for row in calls
+            "call_open_interest": _known_sum(
+                calls,
+                "open_interest",
             ),
-            "put_open_interest": sum(
-                row["open_interest"] or 0 for row in puts
+            "put_open_interest": _known_sum(
+                puts,
+                "open_interest",
             ),
             "call_premium_activity": str(sum(
                 Decimal(row["premium_activity"] or "0")
@@ -574,11 +663,13 @@ def _flow_response(
             "contract_count": len(rows),
             "call_volume": sum(row["day_volume"] for row in calls),
             "put_volume": sum(row["day_volume"] for row in puts),
-            "call_open_interest": sum(
-                row["open_interest"] or 0 for row in calls
+            "call_open_interest": _known_sum(
+                calls,
+                "open_interest",
             ),
-            "put_open_interest": sum(
-                row["open_interest"] or 0 for row in puts
+            "put_open_interest": _known_sum(
+                puts,
+                "open_interest",
             ),
         })
     selected_summary = next(
@@ -610,6 +701,41 @@ def _flow_response(
                     row["contract_id"],
                 ),
             )[:25],
+            "event_detail_page": {
+                "offset": 0,
+                "limit": ADVANCED_OPTIONS_PAGE_FLOW_EVENT_DETAIL_LIMIT,
+                "total": event_counts.get(underlyer, 0),
+                "has_more": (
+                    event_counts.get(underlyer, 0)
+                    > sum(
+                        str(row["underlyer"]) == underlyer
+                        for row in flow_event_detail
+                    )
+                ),
+                "rows": [
+                    {
+                        "event_id": str(row["event_id"]),
+                        "event_time": _utc(
+                            row["event_time"],
+                            "flow event detail time",
+                        ).isoformat(),
+                        "contract_ticker": str(
+                            row["contract_ticker"]
+                        ),
+                        "contract_id": int(row["contract_id"]),
+                        "price": str(row["price"]),
+                        "size": int(row["size"]),
+                        "premium": str(row["premium"]),
+                        "prior_open_interest": (
+                            None
+                            if row["prior_open_interest"] is None
+                            else int(row["prior_open_interest"])
+                        ),
+                    }
+                    for row in flow_event_detail
+                    if str(row["underlyer"]) == underlyer
+                ],
+            },
             "directional_flow_available": False,
             "quote_liquidity": "NOT_AVAILABLE",
             "trade_tape_scope": (
@@ -1058,6 +1184,7 @@ def _build_advanced_options_page_payloads(
         "provider_tier": control_plane.binding.provider_tier.value,
         "cycle_sha256": cycle.cycle_sha256,
         "dataset_id": str(cycle.dataset_id),
+        "session_date": control_plane.session_date.isoformat(),
         "published_at": published,
         "valid_until": valid_until,
     }
@@ -1078,6 +1205,10 @@ def _build_advanced_options_page_payloads(
         "artifact_kind": "FLOW",
         **common_identity,
         "scope_sha256": scope_sha256,
+        "aggregate_rows": [
+            _flow_aggregate_payload(row)
+            for row in page_source.flow_events
+        ],
         "responses": {
             underlyer: _flow_response(
                 underlyer=underlyer,
@@ -1085,6 +1216,7 @@ def _build_advanced_options_page_payloads(
                 evaluations=cycle.evaluations,
                 dataset_id=cycle.dataset_id,
                 flow_events=page_source.flow_events,
+                flow_event_detail=page_source.flow_event_detail,
                 cutoff=generated_at,
                 policy_sha256=policy_sha256,
                 configuration_sha256=configuration_sha256,
@@ -1094,27 +1226,42 @@ def _build_advanced_options_page_payloads(
         },
     }
     screener_rows = []
-    seen_snapshots = set()
     coverage = []
     for underlyer in underlyers:
-        members = []
         source_evaluations = tuple(
             row for row in cycle.evaluations
             if row.underlyer == underlyer
         )
+        evaluated = {}
         for evaluation in source_evaluations:
             for leg in _evaluation_legs(evaluation):
-                snapshot_id = str(leg["snapshot_id"])
-                if snapshot_id in seen_snapshots:
-                    continue
-                seen_snapshots.add(snapshot_id)
                 row = _eligible_chain_row(
                     evaluation,
                     leg,
                     generated_at,
                 )
-                screener_rows.append(row)
-                members.append(row)
+                evaluated.setdefault(row["contract_id"], row)
+        admitted = tuple(
+            row
+            for row in page_source.admitted_contracts
+            if str(row["underlyer"]) == underlyer
+        )
+        members = [
+            evaluated.get(int(contract["contract_id"]))
+            or _admitted_chain_row(
+                contract,
+                dataset_id=cycle.dataset_id,
+                cutoff=generated_at,
+            )
+            for contract in admitted
+        ]
+        screener_rows.extend(members)
+        evaluated_ids = set(evaluated)
+        observed_ids = {
+            int(row["contract_id"])
+            for row in page_source.flow_events
+            if str(row["underlyer"]) == underlyer
+        } | evaluated_ids
         coverage.append({
             "underlying": underlyer,
             "batch_id": str(cycle.dataset_id),
@@ -1137,9 +1284,21 @@ def _build_advanced_options_page_payloads(
                 if source_evaluations
                 else published
             ),
-            "received": len(members),
+            "admitted": len(admitted),
+            "observed": sum(
+                int(contract["contract_id"]) in observed_ids
+                for contract in admitted
+            ),
+            "received": len(admitted),
             "retained": len(members),
-            "eligible": len(members),
+            "eligible": sum(
+                contract["eligibility"] == "VALIDATED_ACTIVE"
+                for contract in admitted
+            ),
+            "evaluated": sum(
+                int(contract["contract_id"]) in evaluated_ids
+                for contract in admitted
+            ),
         })
     screener = {
         "contract": OPTIONS_PAGE_CONTRACTS["SCREENER"],
@@ -1223,7 +1382,7 @@ class AdvancedOptionsFlowPagePublication:
     def read(
         self,
         *,
-        underlyer: str,
+        underlyer: str | None,
         cohort_id: UUID,
         provider_tier: ProviderTier,
         scope_sha256: str,
@@ -1235,10 +1394,14 @@ class AdvancedOptionsFlowPagePublication:
             scope_sha256=scope_sha256,
         )
         responses = self._payload["responses"]
-        result = responses.get(underlyer)
+        result = (
+            next(iter(responses.values()), None)
+            if underlyer is None
+            else responses.get(underlyer)
+        )
         if result is None:
             raise AdvancedOptionsPageUnavailable(
-                "Requested Flow underlying is outside the Advanced release"
+                "Requested Flow scope is outside the Advanced release"
             )
         return deepcopy(result)
 
@@ -1625,6 +1788,7 @@ def _stored_page_row(row):
     names = (
         "release_id",
         "cutoff",
+        "session_date",
         "provider_tier",
         "manifest",
         "manifest_sha256",
@@ -1643,38 +1807,41 @@ def load_advanced_options_page_release_cursor(
     cohort_id: UUID,
     available_by: datetime,
     artifact_kind: str,
+    release_id: UUID,
+    release_cutoff: datetime,
 ):
     if artifact_kind not in OPTIONS_FULL_PAGE_ARTIFACT_KINDS:
         raise ValueError("Advanced Options page artifact kind is invalid")
     checked = _utc(available_by, "available_by")
+    exact_cutoff = _utc(release_cutoff, "release_cutoff")
     cursor.execute(
-        "SELECT release.release_id,release.cutoff,"
+        "SELECT release.release_id,release.cutoff,release.session_date,"
         "release.provider_tier,release.manifest,"
         "release.manifest_sha256,"
         "entry.value->>'snapshot_type' AS snapshot_type,"
         "catalog.snapshot_id,catalog.generated_at,"
         "catalog.payload_sha256,hot.payload "
-        "FROM rt.portal_release_current AS pointer "
-        "JOIN rt.portal_releases AS release "
-        "ON release.release_id=pointer.release_id "
-        "AND release.cutoff=pointer.cutoff "
+        "FROM rt.portal_releases AS release "
         "JOIN LATERAL jsonb_array_elements("
         "release.manifest->'snapshots') AS entry(value) "
         "ON entry.value->>'snapshot_type'=ANY(%s) "
         "AND entry.value->>'snapshot_key'='CURRENT' "
         "JOIN rt.snapshot_catalog AS catalog "
         "ON catalog.snapshot_id=(entry.value->>'snapshot_id')::uuid "
-        "AND catalog.cohort_id=pointer.cohort_id "
-        "AND catalog.provider_tier=pointer.provider_tier "
+        "AND catalog.cohort_id=release.cohort_id "
+        "AND catalog.provider_tier=release.provider_tier "
         "JOIN rt.portal_snapshot_hot AS hot "
         "ON hot.snapshot_id=catalog.snapshot_id "
         "AND hot.generated_at=catalog.generated_at "
-        "WHERE pointer.cohort_id=%s "
-        "AND pointer.provider_tier='MASSIVE_ADVANCED' "
-        "AND pointer.cutoff<=%s "
+        "WHERE release.release_id=%s AND release.cutoff=%s "
+        "AND release.cohort_id=%s "
+        "AND release.provider_tier='MASSIVE_ADVANCED' "
+        "AND release.cutoff<=%s "
         "ORDER BY entry.value->>'snapshot_type'",
         (
             list(OPTIONS_PAGE_SNAPSHOT_TYPES.values()),
+            str(release_id),
+            exact_cutoff,
             str(cohort_id),
             checked,
         ),
@@ -1710,24 +1877,35 @@ def load_advanced_options_page_release_cursor(
             "Advanced Options release is missing page or diagnostic evidence"
         )
     payloads = {}
+    valid_until_by_kind = {}
     for kind, snapshot_type in OPTIONS_PAGE_SNAPSHOT_TYPES.items():
         row = by_type[snapshot_type]
         payload = row["payload"]
+        try:
+            valid_until = _utc(
+                datetime.fromisoformat(str(payload["valid_until"])),
+                "Advanced Options page valid_until",
+            )
+        except (KeyError, TypeError, ValueError) as error:
+            raise AdvancedOptionsPageUnavailable(
+                "Advanced Options full page artifact identity drift"
+            ) from error
         if (
             canonical_sha256(payload) != row["payload_sha256"]
             or payload.get("contract") != OPTIONS_PAGE_CONTRACTS[kind]
             or payload.get("artifact_kind") != kind
             or payload.get("cohort_id") != str(cohort_id)
+            or payload.get("session_date") != first["session_date"].isoformat()
             or payload.get("provider_tier")
             != ProviderTier.MASSIVE_ADVANCED.value
             or payload.get("published_at")
             != row["generated_at"].astimezone(timezone.utc).isoformat()
-            or datetime.fromisoformat(payload["valid_until"]) < checked
         ):
             raise AdvancedOptionsPageUnavailable(
                 "Advanced Options full page artifact identity drift"
             )
         payloads[kind] = payload
+        valid_until_by_kind[kind] = valid_until
     scope_sha256s = {
         payload["scope_sha256"] for payload in payloads.values()
     }
@@ -1746,6 +1924,11 @@ def load_advanced_options_page_release_cursor(
             "Advanced Options full page artifacts changed release scope"
         )
     selected = by_type[OPTIONS_PAGE_SNAPSHOT_TYPES[artifact_kind]]
+    valid_until = valid_until_by_kind[artifact_kind]
+    staleness_seconds = max(
+        0,
+        int((checked - valid_until).total_seconds()),
+    )
     publication_types = {
         "FLOW": AdvancedOptionsFlowPagePublication,
         "SCREENER": AdvancedOptionsScreenerPagePublication,
@@ -1759,6 +1942,12 @@ def load_advanced_options_page_release_cursor(
             "manifest_sha256": first["manifest_sha256"],
             "scope_sha256": next(iter(scope_sha256s)),
             "snapshot_id": str(selected["snapshot_id"]),
+            "retained_session_date": first["session_date"].isoformat(),
+            "valid_until": valid_until.isoformat(),
+            "checked_at": checked.isoformat(),
+            "stale": staleness_seconds > 0,
+            "staleness_seconds": staleness_seconds,
+            "serving_latest_available": staleness_seconds > 0,
         },
     )
 
@@ -1776,13 +1965,17 @@ class AdvancedOptionsProjectionBatch:
 class AdvancedOptionsPageSource:
     flow_events: tuple[Mapping[str, object], ...] = ()
     current_marks: tuple[Mapping[str, object], ...] = ()
+    flow_event_detail: tuple[Mapping[str, object], ...] = ()
+    admitted_contracts: tuple[Mapping[str, object], ...] = ()
 
     @property
     def sha256(self) -> str:
         return canonical_sha256({
-            "contract": "advanced-options-page-source-v1",
+            "contract": "advanced-options-page-source-v2",
             "flow_events": self.flow_events,
             "current_marks": self.current_marks,
+            "flow_event_detail": self.flow_event_detail,
+            "admitted_contracts": self.admitted_contracts,
         })
 
 
@@ -1790,19 +1983,62 @@ def _flow_event_row(row):
     if isinstance(row, Mapping):
         return dict(row)
     names = (
-        "event_id",
-        "event_time",
-        "contract_ticker",
-        "contract_id",
-        "underlyer",
-        "price",
-        "size",
-        "multiplier",
-        "premium",
-        "prior_open_interest",
+        (
+            "event_id",
+            "event_time",
+            "first_event_time",
+            "contract_ticker",
+            "contract_id",
+            "underlyer",
+            "price",
+            "size",
+            "multiplier",
+            "premium",
+            "prior_open_interest",
+            "event_count",
+        )
+        if len(row) == 12
+        else (
+            "event_id",
+            "event_time",
+            "contract_ticker",
+            "contract_id",
+            "underlyer",
+            "price",
+            "size",
+            "multiplier",
+            "premium",
+            "prior_open_interest",
+        )
     )
     return dict(zip(names, row, strict=True))
 
+
+def _flow_aggregate_payload(row) -> dict[str, object]:
+    return {
+        "event_id": str(row["event_id"]),
+        "event_time": _utc(
+            row["event_time"],
+            "aggregate event time",
+        ).isoformat(),
+        "first_event_time": _utc(
+            row["first_event_time"],
+            "aggregate first event time",
+        ).isoformat(),
+        "contract_ticker": str(row["contract_ticker"]),
+        "contract_id": int(row["contract_id"]),
+        "underlyer": str(row["underlyer"]),
+        "price": str(row["price"]),
+        "size": int(row["size"]),
+        "multiplier": int(row["multiplier"]),
+        "premium": str(row["premium"]),
+        "prior_open_interest": (
+            None
+            if row["prior_open_interest"] is None
+            else int(row["prior_open_interest"])
+        ),
+        "event_count": int(row["event_count"]),
+    }
 
 def _current_mark_row(row):
     if isinstance(row, Mapping):
@@ -1825,6 +2061,23 @@ def _current_mark_row(row):
     }
 
 
+def _admitted_contract_row(row):
+    if isinstance(row, Mapping):
+        return dict(row)
+    names = (
+        "instrument_id",
+        "contract_id",
+        "contract_ticker",
+        "underlyer",
+        "call_put",
+        "expiration",
+        "strike",
+        "eligibility",
+        "observed_at",
+    )
+    return dict(zip(names, row, strict=True))
+
+
 def load_advanced_options_page_source_cursor(
     cursor,
     *,
@@ -1833,6 +2086,52 @@ def load_advanced_options_page_source_cursor(
     generated_at: datetime,
 ) -> AdvancedOptionsPageSource:
     generated = _utc(generated_at, "generated_at")
+    aggregate_query = (
+        "SELECT (array_agg(event.event_id ORDER BY "
+        "event.event_time,event.event_id))[1] AS event_id,"
+        "max(event.event_time) AS event_time,"
+        "min(event.event_time) AS first_event_time,"
+        "event.contract_ticker,"
+        "COALESCE(event.contract_id,contract.contract_id) AS contract_id,"
+        "event.underlyer,"
+        "(array_agg(event.price ORDER BY "
+        "event.event_time DESC,event.event_id DESC))[1] AS price,"
+        "sum(event.size) AS size,max(event.multiplier) AS multiplier,"
+        "sum(event.premium) AS premium,"
+        "(array_agg(event.prior_open_interest ORDER BY "
+        "event.event_time DESC,event.event_id DESC))[1] "
+        "AS prior_open_interest,count(*) AS event_count "
+        "FROM rt.option_flow_events AS event "
+        "LEFT JOIN ref.option_contracts AS contract "
+        "ON contract.contract_ticker=event.contract_ticker "
+        "WHERE event.cohort_id=%s "
+        "AND event.provider_tier='MASSIVE_ADVANCED' "
+        "AND event.session_date=%s AND event.event_time<=%s "
+        "GROUP BY event.contract_ticker,"
+        "COALESCE(event.contract_id,contract.contract_id),"
+        "event.underlyer "
+        "ORDER BY event.underlyer,event.contract_ticker"
+    )
+    cursor.execute(
+        aggregate_query,
+        (
+            str(control_plane.cohort_id),
+            control_plane.session_date,
+            generated,
+        ),
+    )
+    events = tuple(
+        _flow_event_row(row) for row in cursor.fetchall()
+    )
+    if any(
+        str(row["underlyer"]) not in control_plane.universe.option_underlyings
+        or row["event_time"] > generated
+        or row["contract_id"] is None
+        for row in events
+    ):
+        raise ValueError(
+            "Advanced Options page flow evidence changed cycle scope"
+        )
     cursor.execute(
         "SELECT event.event_id,event.event_time,"
         "event.contract_ticker,"
@@ -1845,27 +2144,66 @@ def load_advanced_options_page_source_cursor(
         "WHERE event.cohort_id=%s "
         "AND event.provider_tier='MASSIVE_ADVANCED' "
         "AND event.session_date=%s AND event.event_time<=%s "
-        "ORDER BY event.event_time,event.event_id LIMIT %s",
+        "ORDER BY event.event_time DESC,event.event_id DESC LIMIT %s",
         (
             str(control_plane.cohort_id),
             control_plane.session_date,
             generated,
-            ADVANCED_OPTIONS_PAGE_FLOW_EVENT_LIMIT + 1,
+            ADVANCED_OPTIONS_PAGE_FLOW_EVENT_DETAIL_LIMIT,
         ),
     )
-    events = tuple(_flow_event_row(row) for row in cursor.fetchall())
-    if len(events) > ADVANCED_OPTIONS_PAGE_FLOW_EVENT_LIMIT:
+    event_detail = tuple(
+        _flow_event_row(row) for row in cursor.fetchall()
+    )
+    instrument_ids = sorted({
+        member.instrument_id
+        for member in control_plane.slot_set.members
+    })
+    cursor.execute(
+        "SELECT DISTINCT ON (instrument.instrument_id) "
+        "instrument.instrument_id,contract.contract_id,"
+        "contract.contract_ticker,security.ticker AS underlyer,"
+        "version.call_put,version.expiration,version.strike,"
+        "version.eligibility,version.observed_at "
+        "FROM rt.instruments AS instrument "
+        "JOIN ref.option_contracts AS contract "
+        "ON contract.contract_id=instrument.contract_id "
+        "JOIN ref.option_contract_versions AS version "
+        "ON version.contract_id=contract.contract_id "
+        "JOIN LATERAL (SELECT revision.ticker "
+        "FROM ref.security_revisions AS revision "
+        "WHERE revision.security_id=contract.underlying_security_id "
+        "AND revision.effective_from<=%s "
+        "AND (revision.effective_to IS NULL "
+        "OR revision.effective_to>%s) "
+        "AND revision.observed_at<=%s "
+        "ORDER BY revision.effective_from DESC,"
+        "revision.observed_at DESC LIMIT 1) AS security ON true "
+        "WHERE instrument.instrument_id=ANY(%s) "
+        "AND version.effective_from<=%s "
+        "AND (version.effective_to IS NULL "
+        "OR version.effective_to>%s) "
+        "AND version.observed_at<=%s "
+        "ORDER BY instrument.instrument_id,"
+        "version.effective_from DESC,version.observed_at DESC",
+        (
+            generated,
+            generated,
+            generated,
+            instrument_ids,
+            generated,
+            generated,
+            generated,
+        ),
+    )
+    admitted_contracts = tuple(
+        _admitted_contract_row(row) for row in cursor.fetchall()
+    )
+    if {
+        int(row["instrument_id"]) for row in admitted_contracts
+    } != set(instrument_ids):
         raise ValueError(
-            "Advanced Options page flow evidence exceeds its sealed limit"
-        )
-    if any(
-        str(row["underlyer"]) not in control_plane.universe.option_underlyings
-        or row["event_time"] > generated
-        or row["contract_id"] is None
-        for row in events
-    ):
-        raise ValueError(
-            "Advanced Options page flow evidence changed cycle scope"
+            "Advanced Options admitted contract inventory is incomplete"
         )
     if cycle.input_gate.closure.cycle_input.cohort_id != (
         control_plane.cohort_id
@@ -1902,7 +2240,12 @@ def load_advanced_options_page_source_cursor(
             raise ValueError(
                 "Advanced Options page mark evidence is incomplete"
             )
-    return AdvancedOptionsPageSource(events, marks)
+    return AdvancedOptionsPageSource(
+        flow_events=events,
+        current_marks=marks,
+        flow_event_detail=event_detail,
+        admitted_contracts=admitted_contracts,
+    )
 
 
 @dataclass(frozen=True, slots=True)

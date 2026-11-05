@@ -41,6 +41,13 @@ function formatMarketTime(value: string | null): string {
   })
 }
 
+/** A daily, weekly or monthly bar only exists after the close, so during a session being behind on those is expected. */
+export function onlyLongBarsNotDue(status: Pick<MaterializationStatus, 'staleness_sessions' | 'stale_intervals'>): boolean {
+  return status.staleness_sessions === 0
+    && status.stale_intervals.length > 0
+    && status.stale_intervals.every(interval => ['1d', '1wk', '1mo'].includes(interval))
+}
+
 function describe(status: MaterializationStatus): string {
   const asOf = formatMarketTime(status.oldest_stale_market_time ?? status.last_market_time)
   const intervals = status.stale_intervals.join(', ')
@@ -149,7 +156,7 @@ export function StalenessBanner() {
       </div>
     )
   }
-  if (status.status === 'READY') return null
+  if (status.status === 'READY' || onlyLongBarsNotDue(status)) return null
 
   const updating = status.status === 'EXPIRED' && status.pipeline_active
   const active = status.active_intervals?.join(', ') || 'equity'

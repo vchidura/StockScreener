@@ -78,8 +78,38 @@ def test_database_state_not_report_files_controls_completion_and_retry():
             ADVANCED_WINDOW_BUILD_ID,
             "c" * 64,
         ),
+        known_by=NOW + timedelta(minutes=5),
     )
-    assert recovery.input_known_by == CUTOFF + timedelta(seconds=5)
+    assert recovery.input_known_by == NOW + timedelta(minutes=5)
+    assert recovery.input_gate_sha256 == "c" * 64
+
+
+def test_cross_build_receipt_keeps_its_exact_recovery_identity():
+    producer = "advanced-equity-window-v0"
+    recovery = _recovery(((
+        UUID(int=9),
+        "advanced-20261016T140000Z",
+        "FAILED",
+        None,
+        NOW - timedelta(minutes=6),
+        "INPUT_READY",
+        CUTOFF,
+        1,
+        "a" * 64,
+        "b" * 64,
+        bind_advanced_input_gate_build_id(producer, "c" * 64),
+        COHORT,
+        "a" * 64,
+        "stages_v3",
+        COHORT,
+        NOW + timedelta(minutes=5),
+        CUTOFF + timedelta(seconds=5),
+    ),))
+
+    assert recovery.input_receipt.build_id == (
+        bind_advanced_input_gate_build_id(producer, "c" * 64)
+    )
+    assert recovery.input_known_by == NOW + timedelta(minutes=5)
     assert recovery.input_gate_sha256 == "c" * 64
 
 
@@ -118,6 +148,7 @@ def test_retry_identity_derives_report_path_and_receipt_reuse():
         "a" * 64,
         "b" * 64,
         ADVANCED_WINDOW_BUILD_ID,
+        known_by=NOW,
     )
 
     retry = ensure_advanced_window_retry_cursor(

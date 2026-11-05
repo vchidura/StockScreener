@@ -211,11 +211,12 @@ def test_registry_invariants_and_role_separation():
         assert (API_ROLE in privileges["SELECT"]) == spec.api, name
         assert ("INSERT" in privileges and "UPDATE" in privileges) == (spec.writes != "NONE"), name
         assert ("DELETE" in privileges) == spec.delete, name
-    # app deletes only from the runtime tables that retention prunes row by row; catalogs and
-    # partitions are pruned by admin, which owns them.
+    # app deletes only for row-wise retention or exact rollback to prior absence;
+    # catalogs and partitions are pruned by admin, which owns them.
     assert {name for name, spec in RELATIONS.items() if spec.delete} == {
         "rt.worker_leases", "rt.provider_request_ledger", "rt.materialization_jobs", "rt.job_barriers",
-        "rt.job_barrier_members", "rt.option_volume_checkpoints"}
+        "rt.job_barrier_members", "rt.option_volume_checkpoints",
+        "rt.advanced_options_read_pins", "rt.portal_release_current"}
 
 
 def test_continuous_controller_can_create_authorizations_without_owner_privileges():

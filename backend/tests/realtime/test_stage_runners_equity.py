@@ -24,6 +24,7 @@ from realtime.ticker_repository import CycleRehydrationMismatch
 
 NOW = datetime(2026, 10, 12, 15, 0, tzinfo=timezone.utc)
 SESSION = date(2026, 10, 12)
+SEALED_KNOWN_BY = NOW + timedelta(minutes=1)
 
 
 def _inputs(cutoff=NOW):
@@ -102,13 +103,18 @@ def test_evidence_runner_blocks_without_a_ready_reference_generation(monkeypatch
 def test_evidence_runner_computes_hands_off_and_reports_an_equity_cycle_receipt(monkeypatch):
     seen = {}
     cycle = SimpleNamespace(inputs=_inputs())
+    known_by = NOW + timedelta(minutes=1)
 
     def compute(database, *, state, loader, **scope):
         seen.update(role=database.process_plan.role.value, state=state, loader=loader, scope=scope)
         return cycle
 
     monkeypatch.setattr(runners, "compute_realtime_ticker_cycle", compute)
-    database, environment = _Database([(3,)]), RunnerEnvironment(None, build_id="build-9")
+    database, environment = _Database([(3,)]), RunnerEnvironment(
+        None,
+        build_id="build-9",
+        input_known_by=known_by,
+    )
     context = _context("EQUITY_EVIDENCE", database=database)
     outcome = runners.equity_evidence_runner(environment)(context)
     assert outcome.state == "COMPLETE"
@@ -116,11 +122,13 @@ def test_evidence_runner_computes_hands_off_and_reports_an_equity_cycle_receipt(
     assert (receipt.receipt_kind, receipt.cutoff, receipt.reference_generation, receipt.build_id) == (
         "EQUITY_CYCLE", NOW, 3, "build-9")
     assert len(receipt.universe_sha256) == len(receipt.input_sha256) == 64
+    assert receipt.known_by == known_by
     assert seen["role"] == "COMPUTE" and seen["state"] is environment.ticker_state
     assert seen["loader"] is environment.screening_loader
     assert seen["scope"] == dict(cohort_id=context.plan.cohort_id, session=SESSION, cutoff=NOW,
-                                 known_by=context.window.deadline, source_generation=3)
-    assert seen["scope"]["known_by"] == NOW + timedelta(minutes=16, seconds=30) != seen["scope"]["cutoff"]
+                                 known_by=known_by, source_generation=3,
+                                 should_stop=context.is_cancelled)
+    assert seen["scope"]["known_by"] != context.window.deadline
     assert environment.handoff.peek(context.plan.cohort_id, NOW) is cycle
 
 
@@ -140,7 +148,10 @@ def test_v2_materialize_runner_emits_input_ready_without_loading_or_projecting(m
         lambda *args, **kwargs: pytest.fail("shared materialization must not load portal history or project"),
     )
     context = _context("EQUITY_MATERIALIZE")
-    outcome = runners.equity_materialize_runner(RunnerEnvironment(None))(context)
+    known_by = NOW + timedelta(minutes=1)
+    outcome = runners.equity_materialize_runner(
+        RunnerEnvironment(None, input_known_by=known_by)
+    )(context)
     assert outcome.state == "COMPLETE"
     assert (
         outcome.receipt.receipt_kind,
@@ -148,6 +159,58 @@ def test_v2_materialize_runner_emits_input_ready_without_loading_or_projecting(m
         outcome.receipt.universe_sha256,
         outcome.receipt.input_sha256,
     ) == (runners.INPUT_READY, 3, "b" * 64, "c" * 64)
+    assert outcome.receipt.known_by == known_by
+
+
+def test_first_window_seals_input_after_finalized_heads_are_visible(
+    monkeypatch,
+):
+    seen = {}
+    monkeypatch.setattr(
+        runners,
+        "finalize_five_minute_inputs",
+        lambda *args, **kwargs: ("COMPLETE", ()),
+    )
+    monkeypatch.setattr(
+        runners,
+        "finalize_higher_interval_inputs",
+        lambda *args, **kwargs: ("COMPLETE", ()),
+    )
+    monkeypatch.setattr(
+        runners,
+        "reference_generation",
+        lambda database, cutoff: 3,
+    )
+    monkeypatch.setattr(
+        runners,
+        "advanced_input_gate_identity",
+        lambda *args, **kwargs: "a" * 64,
+    )
+    monkeypatch.setattr(
+        runners,
+        "input_ready_identity",
+        lambda database, **scope: (
+            seen.update(scope) or ("b" * 64, "c" * 64)
+        ),
+    )
+    context = _advanced_context(NOW)
+    context = replace(
+        context,
+        plan=SimpleNamespace(
+            cohort_id=context.plan.cohort_id,
+            session_date=SESSION,
+            stage_catalog_version="stages_v3",
+        ),
+    )
+
+    known_by = NOW + timedelta(minutes=1)
+    outcome = runners.equity_materialize_runner(
+        RunnerEnvironment(None, input_known_by=known_by)
+    )(context)
+
+    assert outcome.state == "COMPLETE"
+    assert seen["known_by"] == known_by
+    assert outcome.receipt.known_by == known_by
 
 
 ADVANCED_CLOSE = datetime(2026, 10, 12, 20, 0, tzinfo=timezone.utc)
@@ -174,30 +237,47 @@ def _advanced_materialize(monkeypatch, context, *, visible):
     monkeypatch.setattr(runners, "input_ready_identity", lambda database, **scope: ("b" * 64, "c" * 64))
     gate = MagicMock(return_value=visible)
     monkeypatch.setattr(runners, "closing_daily_inputs_visible", gate)
-    return runners.equity_materialize_runner(RunnerEnvironment(None))(context), gate
+    known_by = context.window.cutoff + timedelta(minutes=1)
+    return (
+        runners.equity_materialize_runner(
+            RunnerEnvironment(None, input_known_by=known_by)
+        )(context),
+        gate,
+        known_by,
+    )
 
 
 def test_close_issues_no_input_ready_before_its_daily_bars_are_recorded(monkeypatch):
     # A receipt here would pin every retry to a known_by before the bars can exist.
     context = _advanced_context(ADVANCED_CLOSE)
 
-    outcome, gate = _advanced_materialize(monkeypatch, context, visible=False)
+    outcome, gate, known_by = _advanced_materialize(
+        monkeypatch,
+        context,
+        visible=False,
+    )
 
     assert outcome.state == "BLOCKED_POLICY"
     assert outcome.reason_codes == (runners.CLOSING_DAILY_INPUTS_PENDING,)
     assert outcome.receipt is None
-    assert gate.call_args.kwargs["known_by"] == context.window.release_at
+    assert gate.call_args.kwargs["known_by"] == known_by
+    assert known_by != context.window.deadline
 
 
 def test_close_issues_input_ready_once_its_daily_bars_are_recorded(monkeypatch):
-    outcome, _ = _advanced_materialize(monkeypatch, _advanced_context(ADVANCED_CLOSE), visible=True)
+    outcome, _, known_by = _advanced_materialize(
+        monkeypatch,
+        _advanced_context(ADVANCED_CLOSE),
+        visible=True,
+    )
 
     assert outcome.state == "COMPLETE"
     assert outcome.receipt.receipt_kind == runners.INPUT_READY
+    assert outcome.receipt.known_by == known_by
 
 
 def test_intraday_window_never_waits_for_daily_bars(monkeypatch):
-    outcome, gate = _advanced_materialize(
+    outcome, gate, _ = _advanced_materialize(
         monkeypatch, _advanced_context(ADVANCED_CLOSE - timedelta(minutes=5)), visible=False,
     )
 
@@ -440,6 +520,9 @@ def test_advanced_input_ready_binds_stream_checkpoint_gap_and_finalizer_heads():
     assert "rt.bar_current" not in bar_head_query
     assert "revision.created_at<=%s" in bar_head_query
     assert bar_head_parameters[-1] == NOW + timedelta(minutes=1)
+    checkpoint_query, checkpoint_parameters = raw.cursor.statements[4]
+    assert "committed_at" not in checkpoint_query
+    assert checkpoint_parameters == (str(cohort_id),)
 
     no_trade_raw = _advanced_input_identity_database(
         no_trade_instrument=12,
@@ -535,18 +618,24 @@ def test_advanced_input_ready_requires_the_gate_digest():
         )
 
 
-def test_runner_input_visibility_defaults_to_window_release():
+def test_runner_input_visibility_uses_the_exact_clock_not_the_deadline():
     release_at = NOW + timedelta(seconds=5)
-    environment = RunnerEnvironment(None)
+    deadline = NOW + timedelta(minutes=5)
+    known_by = NOW + timedelta(minutes=1)
+    environment = RunnerEnvironment(
+        None,
+        input_visibility_clock=lambda: known_by,
+    )
 
     assert environment.known_by(SimpleNamespace(
         cutoff=NOW,
         release_at=release_at,
-        deadline=NOW + timedelta(minutes=5),
-    )) == release_at
+        deadline=deadline,
+    )) == known_by
+    assert known_by != deadline
 
 
-def test_reused_advanced_input_ready_revalidates_the_exact_gate_digest(
+def test_reused_advanced_input_ready_uses_the_stored_same_build_identity(
     monkeypatch,
 ):
     from realtime.database_access import RealtimeDatabaseRole
@@ -576,34 +665,22 @@ def test_reused_advanced_input_ready_revalidates_the_exact_gate_digest(
         universe,
         input_sha256,
         runners.bind_advanced_input_gate_build_id(
-            "advanced-equity-window-v1",
+            "advanced-equity-window-v2",
             "a" * 64,
         ),
+        known_by=known_by,
     )
     environment = RunnerEnvironment(
         None,
-        build_id="advanced-equity-window-v1",
+        build_id="advanced-equity-window-v2",
     )
-
-    def context(gate_digest):
-        base = _context(
-            "EQUITY_MATERIALIZE",
-            database=_advanced_input_identity_database(),
-        )
-        return replace(
-            base,
-            plan=SimpleNamespace(
-                cohort_id=cohort_id,
-                session_date=SESSION,
-                stage_catalog_version="stages_v3",
-                gate_digest=gate_digest,
-            ),
-        )
 
     monkeypatch.setattr(
         runners,
         "advanced_input_gate_identity",
-        lambda _database, own_context: own_context.plan.gate_digest,
+        lambda *_args, **_kwargs: pytest.fail(
+            "retry must not recompute a moving input gate"
+        ),
     )
     runner = runners.reuse_advanced_input_ready_runner(
         environment,
@@ -612,9 +689,53 @@ def test_reused_advanced_input_ready_revalidates_the_exact_gate_digest(
         expected_gate_sha256="a" * 64,
     )
 
-    assert runner(context("a" * 64)).receipt == receipt
-    assert runner(context("b" * 64)).reason_codes == (
-        runners.ADVANCED_INPUT_GATE_DIGEST_CHANGED,
+    context = _context("EQUITY_MATERIALIZE")
+    context = replace(
+        context,
+        plan=SimpleNamespace(
+            cohort_id=cohort_id,
+            session_date=SESSION,
+            stage_catalog_version="stages_v3",
+        ),
+    )
+
+    assert runner(context).receipt == receipt
+
+
+def test_cross_build_input_retry_fails_with_recoverable_disposition(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        runners,
+        "input_ready_identity",
+        lambda *_args, **_kwargs: pytest.fail(
+            "cross-build retry must not recompute immutable evidence"
+        ),
+    )
+    receipt = CycleReceiptSpec(
+        runners.INPUT_READY,
+        NOW,
+        1,
+        "a" * 64,
+        "b" * 64,
+        runners.bind_advanced_input_gate_build_id(
+            "advanced-equity-window-v1",
+            "c" * 64,
+        ),
+        known_by=NOW + timedelta(minutes=5),
+    )
+    runner = runners.reuse_advanced_input_ready_runner(
+        RunnerEnvironment(
+            None,
+            build_id="advanced-equity-window-v2",
+        ),
+        receipt=receipt,
+        input_known_by=NOW + timedelta(minutes=5),
+        expected_gate_sha256="c" * 64,
+    )
+
+    assert runner(_context("EQUITY_MATERIALIZE")).reason_codes == (
+        runners.INPUT_READY_PRODUCER_UNAVAILABLE,
     )
 
 
@@ -676,6 +797,57 @@ def test_a_write_rejected_after_timeout_becomes_a_cancelled_failure_not_a_crash(
     database = _Database([(1,)])
     outcome = runners.equity_evidence_runner(RunnerEnvironment(None))(_context("EQUITY_EVIDENCE", database=database))
     assert outcome.state == "FAILED" and outcome.reason_codes == (runners.STAGE_CANCELLED,)
+
+
+def test_projection_cancellation_after_read_acquisition_stops_before_writes(
+    monkeypatch,
+):
+    cancelled = threading.Event()
+
+    def compute(database, *, should_stop, **scope):
+        assert database.process_plan.role.value == "COMPUTE"
+        cancelled.set()
+        assert should_stop()
+        raise runners.TickerProjectionCancelled("cancelled after read")
+
+    monkeypatch.setattr(runners, "compute_realtime_ticker_cycle", compute)
+    database = _Database([(1,)])
+    outcome = runners.equity_evidence_runner(
+        RunnerEnvironment(None)
+    )(_context(
+        "EQUITY_EVIDENCE",
+        database=database,
+        cancelled=cancelled,
+    ))
+
+    assert outcome.reason_codes == (runners.STAGE_CANCELLED,)
+
+
+def test_projection_result_abandoned_at_timeout_never_enters_handoff(
+    monkeypatch,
+):
+    cancelled = threading.Event()
+    cycle = SimpleNamespace(inputs=_inputs())
+
+    def compute(database, *, should_stop, **scope):
+        cancelled.set()
+        return cycle
+
+    monkeypatch.setattr(runners, "compute_realtime_ticker_cycle", compute)
+    environment = RunnerEnvironment(None)
+    context = _context(
+        "EQUITY_EVIDENCE",
+        database=_Database([(1,)]),
+        cancelled=cancelled,
+    )
+
+    outcome = runners.equity_evidence_runner(environment)(context)
+
+    assert outcome.reason_codes == (runners.STAGE_CANCELLED,)
+    assert environment.handoff.peek(
+        context.plan.cohort_id,
+        context.window.cutoff,
+    ) is None
 
 
 def test_the_bar_phase_runs_first_under_compute_with_a_lease_owner_derived_from_the_stage_run(monkeypatch):
@@ -746,7 +918,7 @@ def _receipt_row(context):
     return {"receipt_id": uuid4(), "cohort_id": context.plan.cohort_id, "cutoff": NOW,
             "universe_sha256": "b" * 64, "provider_tier": "MASSIVE_DEVELOPER",
             "reference_generation": 3, "input_sha256": "c" * 64,
-            "deadline": context.window.deadline}
+            "known_by": SEALED_KNOWN_BY}
 
 
 def test_publish_runner_needs_the_durable_receipt(monkeypatch):
@@ -781,8 +953,9 @@ def test_publish_runner_rehydrates_a_missing_handoff_from_the_receipt_and_publis
     # Read-only rebuild under the publication role, for exactly the window's scope, proven against the receipt.
     assert rebuilt == [("PUBLICATION", dict(
         input_sha256="c" * 64, universe_sha256="b" * 64, cohort_id=context.plan.cohort_id, session=SESSION,
-        cutoff=NOW, known_by=context.window.deadline, source_generation=3,
-        allow_late_identity_continuity=False))]
+        cutoff=NOW, known_by=SEALED_KNOWN_BY, source_generation=3,
+        allow_late_identity_continuity=False,
+        should_stop=context.is_cancelled))]
     assert rebuilt[0][1]["known_by"] != NOW
     assert published[0][0] == "the-rebuilt-cycle"
     assert published[0][1] is None
@@ -866,7 +1039,7 @@ def test_v2_portal_ready_proves_projection_but_publishes_into_the_input_ready_re
     assert runners.portal_publish_runner(environment)(context).state == "COMPLETE"
     assert published[0][0] == "dashboard"
     assert published[0][1].receipt_id == input_row["receipt_id"]
-    assert dashboards[0]["known_by"] == context.window.deadline
+    assert dashboards[0]["known_by"] == SEALED_KNOWN_BY
     assert dashboards[0]["allow_late_identity_continuity"] is False
 
 
@@ -916,7 +1089,7 @@ def test_publication_recovery_reads_both_receipts_from_the_explicit_source_windo
         str(source_window_id),
         str(source_window_id),
     ]
-    assert rebuilt[0]["known_by"] == context.window.deadline
+    assert rebuilt[0]["known_by"] == SEALED_KNOWN_BY
     assert rebuilt[0]["allow_late_identity_continuity"] is True
     assert dashboards[0]["allow_late_identity_continuity"] is True
 
@@ -974,8 +1147,9 @@ def test_rehydration_accepts_only_the_publication_role_and_a_cycle_whose_receipt
     projection = SimpleNamespace(snapshots=("snapshot",), screening_generation=None)
     seen = {}
 
-    def project(database, *, state, loader, scope):
+    def project(database, *, state, loader, scope, should_stop):
         seen.update(state=state, loader=loader, scope=scope)
+        assert should_stop is None
         return inputs, projection, "summary", "pattern"
 
     monkeypatch.setattr(repository, "_project_ticker_cycle", project)

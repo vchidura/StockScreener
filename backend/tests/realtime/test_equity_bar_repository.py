@@ -66,6 +66,28 @@ def _cursor(fact, *, catalog=True, body=True):
     return cursor
 
 
+def test_current_pointer_tie_goes_to_the_later_write():
+    # Nov 2: AAPL's 20:28 bar had two final revisions with one observed_at. A strict
+    # comparison left the head on the earlier one, while the 5m bar used the later one,
+    # and the chart failed its lineage check for the rest of the 5-session range.
+    fact = _fact()
+    cursor = _cursor(fact)
+    connection = MagicMock()
+    connection.cursor.return_value.__enter__.return_value = cursor
+
+    persist_realtime_equity_bars(
+        connection,
+        (fact,),
+        values_executor=_values_executor,
+        batch_executor=_batch_executor,
+    )
+
+    assert (
+        "rt.bar_current.observed_at <= EXCLUDED.observed_at"
+        in cursor.recorded_current_statement
+    )
+
+
 def test_bar_revision_and_current_pointer_commit_atomically_in_batches():
     fact = _fact()
     cursor = _cursor(fact)

@@ -160,6 +160,58 @@ def test_progress_check_due_prefers_retry_then_reconciliation_expiry():
     ) == now + timedelta(seconds=60)
 
 
+def test_retry_budget_stops_before_next_live_slot_and_drain():
+    now = datetime(2026, 11, 2, 17, 2, tzinfo=timezone.utc)
+    args = SimpleNamespace(completion_budget_seconds=300)
+    windows = (
+        SimpleNamespace(available_after=now - timedelta(minutes=2)),
+        SimpleNamespace(available_after=now + timedelta(minutes=3)),
+        SimpleNamespace(available_after=now + timedelta(minutes=8)),
+    )
+
+    budget, cap = script._retry_completion_budget(
+        args,
+        windows,
+        attempt=2,
+        now=now,
+        drain_deadline=now + timedelta(minutes=10),
+    )
+    assert (budget, cap) == (180, now + timedelta(minutes=3))
+
+    budget, cap = script._retry_completion_budget(
+        args,
+        windows,
+        attempt=2,
+        now=now,
+        drain_deadline=now + timedelta(seconds=75),
+    )
+    assert (budget, cap) == (75, now + timedelta(seconds=75))
+
+
+def test_current_window_keeps_its_budget_while_retry_is_deferred_at_slot():
+    now = datetime(2026, 11, 2, 17, 5, tzinfo=timezone.utc)
+    args = SimpleNamespace(completion_budget_seconds=300)
+    windows = (
+        SimpleNamespace(available_after=now),
+        SimpleNamespace(available_after=now + timedelta(minutes=5)),
+    )
+
+    assert script._retry_completion_budget(
+        args,
+        windows,
+        attempt=0,
+        now=now,
+        drain_deadline=now + timedelta(minutes=10),
+    )[0] == 300
+    assert script._retry_completion_budget(
+        args,
+        windows,
+        attempt=1,
+        now=now + timedelta(minutes=4, seconds=59, milliseconds=500),
+        drain_deadline=now + timedelta(minutes=10),
+    )[0] == 0
+
+
 @pytest.mark.parametrize(
     "completed_windows",
     (0, 30),
@@ -278,6 +330,11 @@ def test_continuous_progress_cache_waits_for_next_cutoff_availability(
         "audit_completed_session_coverage_cursor",
         lambda *_args, **_kwargs: {"status": "COMPLETE"},
     )
+    monkeypatch.setattr(
+        script,
+        "_recover_completed_session_window",
+        lambda *_args, **_kwargs: False,
+    )
 
     assert script.main([
         "--database",
@@ -379,3 +436,37 @@ def test_scheduler_drains_final_cutoff_after_provider_window_ends(tmp_path, monk
     assert calls[0][calls[0].index("--cutoff") + 1] == cutoff.isoformat()
     assert any(row["status"] == "DRAINING" for row in transitions)
     pool.closeall.assert_called_once()
+
+
+def test_a_past_session_that_cannot_be_read_does_not_stop_the_scheduler(monkeypatch, capsys):
+    now = datetime(2026, 11, 5, 11, 45, tzinfo=timezone.utc)
+    scope = dict(cohort_id=UUID(int=1), plan_id=UUID(int=2), runtime_profile_sha256="a" * 64)
+    calendar = SimpleNamespace(
+        session_open=lambda _session: datetime(2026, 11, 5, 14, 30, tzinfo=timezone.utc),
+        previous_session_date=lambda _session: datetime(2026, 11, 4).date(),
+    )
+    provider = SimpleNamespace(transaction=lambda *_args, **_kwargs: nullcontext(SimpleNamespace(cursor=MagicMock())))
+    monkeypatch.setattr(script, "load_continuous_advanced_scheduler_scope_cursor", lambda *_args, **_kwargs: scope)
+
+    def unreadable(*_args, **_kwargs):
+        raise ValueError("durable Advanced INPUT_READY lacks its visibility seal")
+
+    monkeypatch.setattr(script, "plan_session_windows", unreadable)
+    state = {}
+
+    recovered = script._recover_completed_session_window(
+        provider,
+        SimpleNamespace(),
+        SimpleNamespace(),
+        calendar,
+        lifecycle=SimpleNamespace(
+            phase=script.AdvancedEquityLifecyclePhase.BEFORE_OPEN,
+            target_session_date=datetime(2026, 11, 5).date(),
+        ),
+        now=now,
+        state=state,
+    )
+
+    assert recovered is False
+    assert state["finished"] == datetime(2026, 11, 4).date()
+    assert "visibility seal" in capsys.readouterr().err

@@ -33,9 +33,10 @@ def compute_features(packet: CanonicalInput, policy: BreakoutPolicy) -> FeatureS
         reasons.append("STALE_COMPLETED_BAR")
     if packet.context.market_trend is None:
         reasons.append("MISSING_MARKET_CONTEXT")
-    if packet.context.sector_trend is None:
+    optional = policy.optional_context_names
+    if packet.context.sector_trend is None and "sector_trend" not in optional:
         reasons.append("MISSING_SECTOR_CONTEXT")
-    if packet.context.event_risk is None:
+    if packet.context.event_risk is None and "event_risk" not in optional:
         reasons.append("MISSING_EVENT_CONTEXT")
     # Do not compute even partial values from late or incomplete observations.
     if not reasons:

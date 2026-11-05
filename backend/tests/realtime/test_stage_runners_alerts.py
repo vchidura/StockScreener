@@ -42,9 +42,14 @@ def _alert_environment():
 
 
 def _ready_context(generation=3, **options):
-    """A context whose database answers: the EQUITY_CYCLE receipt, then the READY seed count."""
+    """A context whose database answers with one visibility-sealed receipt."""
     context = _context("STOCK_ALERTS", **options)
-    database = _Database([_receipt_row(context), (generation,)])
+    receipt = {
+        **_receipt_row(context),
+        "reference_generation": generation,
+        "known_by": context.window.cutoff + timedelta(minutes=1),
+    }
+    database = _Database([receipt])
     return replace(context, database=database), database
 
 
@@ -83,13 +88,28 @@ def test_split_catalog_alerts_require_input_ready(
     )
 
 
-def test_alerts_runner_blocks_without_a_ready_reference_generation(monkeypatch):
-    monkeypatch.setattr(runners, "compute_realtime_stock_alerts", lambda *a, **k: pytest.fail("no generation"))
-    context, database = _ready_context(generation=0)
+def test_alerts_runner_uses_the_receipt_generation_without_requery(
+    monkeypatch,
+):
+    seen = {}
+    monkeypatch.setattr(
+        runners,
+        "compute_realtime_stock_alerts",
+        lambda *args, **kwargs: seen.update(kwargs) or SNAPSHOT,
+    )
+    monkeypatch.setattr(
+        runners,
+        "publish_realtime_stock_alerts",
+        lambda *args, **kwargs: None,
+    )
+    context, database = _ready_context(generation=7)
+
     outcome = runners.stock_alerts_runner(_alert_environment())(context)
-    assert outcome.state == "BLOCKED_POLICY" and outcome.reason_codes == (runners.REFERENCE_GENERATION_UNAVAILABLE,)
-    assert "rt.seed_manifests" in database.cursor.statements[1][0]
-    assert [role for role, _ in database.calls] == ["app", "app"]
+
+    assert outcome.state == "COMPLETE"
+    assert seen["source_generation"] == 7
+    assert seen["known_by"] == context.window.cutoff + timedelta(minutes=1)
+    assert len(database.cursor.statements) == 1
 
 
 def test_alerts_runner_blocks_without_the_retained_results_source(monkeypatch):
@@ -153,7 +173,7 @@ def test_alerts_runner_computes_read_only_then_publishes_under_the_publication_r
     role, scope = seen["compute"]
     assert role == "COMPUTE"
     assert scope == dict(cohort_id=context.plan.cohort_id, session=SESSION, cutoff=NOW,
-                         known_by=context.window.deadline, source_generation=3,
+                         known_by=NOW + timedelta(minutes=1), source_generation=3,
                          retained_projection=RETAINED_PROJECTION)
     role, snapshot, options = seen["publish"]
     assert (role, snapshot) == ("PUBLICATION", SNAPSHOT)
@@ -235,7 +255,14 @@ def test_the_final_window_of_a_session_publishes_the_kept_release(monkeypatch):
     monkeypatch.setattr(runners, "publish_realtime_stock_alerts",
                         lambda database, snapshot, **options: published.append(options))
     context = _context("STOCK_ALERTS", cutoff=close)
-    context = replace(context, database=_Database([dict(_receipt_row(context), cutoff=close), (3,)]))
+    context = replace(
+        context,
+        database=_Database([{
+            **_receipt_row(context),
+            "cutoff": close,
+            "known_by": close + timedelta(minutes=1),
+        }]),
+    )
     runners.stock_alerts_runner(_alert_environment())(context)
     assert published[0]["session_close"] is True
 
@@ -331,9 +358,12 @@ def test_strategy_runner_publishes_one_interval_at_a_time_under_both_roles(monke
     assert [options["intervals"] for _, _, options in calls] == [("1d",), ("1h",)]
     assert {(compute, publication) for compute, publication, _ in calls} == {("COMPUTE", "PUBLICATION")}
     for _, _, options in calls:
-        # Strategies read `available_by` as the time the data is known, so they run at the window deadline.
+        # Strategies reuse the exact input visibility seal.
         assert options["cohort_id"] == context.plan.cohort_id
-        assert options["available_by"] == context.window.deadline and "known_by" not in options
+        assert options["available_by"] == (
+            context.window.cutoff + timedelta(minutes=1)
+        )
+        assert "known_by" not in options
         assert options["receipt"].cohort_id == context.plan.cohort_id and options["receipt"].cutoff == NOW
     # A retained cutoff (ALREADY_STORED) is not a failure and does not degrade the stage.
     assert outcome.state == "COMPLETE" and outcome.reason_codes == ()

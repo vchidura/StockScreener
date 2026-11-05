@@ -259,11 +259,87 @@ class ResidentWindowTarget:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class ResidentConsumerHold:
+    equity_cutoff: datetime
+    target_window_id: UUID
+    cutoff: datetime
+    deadline: datetime
+    raw_offset: int
+    normalized_offset: int
+
+    def __post_init__(self) -> None:
+        equity = _utc(self.equity_cutoff, "equity_cutoff")
+        cutoff = _utc(self.cutoff, "cutoff")
+        deadline = _utc(self.deadline, "deadline")
+        if (
+            not isinstance(self.target_window_id, UUID)
+            or not self.target_window_id.int
+            or type(self.raw_offset) is not int
+            or self.raw_offset < 0
+            or type(self.normalized_offset) is not int
+            or self.normalized_offset < 0
+            or not equity <= cutoff <= deadline
+        ):
+            raise ValueError("resident consumer hold boundary is invalid")
+        object.__setattr__(self, "equity_cutoff", equity)
+        object.__setattr__(self, "cutoff", cutoff)
+        object.__setattr__(self, "deadline", deadline)
+
+
+_OPEN_WINDOW_STATES = frozenset({"PENDING", "RUNNING"})
+
+
+def resident_consumer_hold_cursor(
+    cursor,
+    *,
+    session_authorization_id: UUID,
+    reader,
+    checked_at: datetime,
+) -> ResidentConsumerHold | None:
+    """The barrier consumers stop at: that of the session's earliest cycle whose
+    window is open and within its deadline. With no such cycle there is no hold,
+    so a stuck or missing window can never keep consumers waiting."""
+    if (
+        not isinstance(session_authorization_id, UUID)
+        or not session_authorization_id.int
+        or not callable(getattr(reader, "offsets_at", None))
+    ):
+        raise ValueError("resident consumer hold scope is invalid")
+    checked = _utc(checked_at, "checked_at")
+    cursor.execute(
+        "SELECT cycle.equity_cutoff,cycle.target_window_id::text,"
+        "cycle.options_cutoff,window_run.deadline,window_run.state "
+        "FROM rt.advanced_options_window_cycle_authorizations AS cycle "
+        "JOIN rt.window_runs AS window_run "
+        "ON window_run.window_id=cycle.target_window_id "
+        "WHERE cycle.session_authorization_id=%s "
+        "ORDER BY cycle.options_cutoff,cycle.target_window_id",
+        (str(session_authorization_id),),
+    )
+    for row in cursor.fetchall():
+        deadline = _utc(row[3], "stored deadline")
+        if str(row[4]) not in _OPEN_WINDOW_STATES or checked >= deadline:
+            continue
+        cutoff = _utc(row[2], "stored options_cutoff")
+        raw_offset, normalized_offset = reader.offsets_at(cutoff)
+        return ResidentConsumerHold(
+            equity_cutoff=_utc(row[0], "stored equity_cutoff"),
+            target_window_id=UUID(str(row[1])),
+            cutoff=cutoff,
+            deadline=deadline,
+            raw_offset=raw_offset,
+            normalized_offset=normalized_offset,
+        )
+    return None
+
+
 def load_ready_resident_window_targets_cursor(
     cursor,
     *,
     session_authorization_id: UUID,
     member: ResidentCompletionMember,
+    checked_at: datetime,
 ) -> tuple[ResidentWindowTarget, ...]:
     if (
         not isinstance(session_authorization_id, UUID)
@@ -286,16 +362,25 @@ def load_ready_resident_window_targets_cursor(
         "AND done.member=%s "
         "WHERE cycle.session_authorization_id=%s "
         "AND done.target_window_id IS NULL "
+        # A window nothing will run again needs no evidence. Keeping it in this
+        # list made every loop rescan cutoffs with no events.
+        "AND window_run.state IN ('PENDING','RUNNING') "
+        "AND window_run.deadline>%s "
         "AND EXISTS ("
         "SELECT 1 FROM rt.stream_sessions AS stream "
         "WHERE stream.journal_generation=session.journal_generation "
-        # A stopped stream cannot add anything, so its journal already holds
-        # all it will ever hold at any later cutoff.
-        "AND (stream.event_time_watermark>=cycle.options_cutoff "
+        # An event past the cutoff fixes the barrier. A stopped stream cannot
+        # add anything, so its journal already holds all it will ever hold at
+        # any later cutoff.
+        "AND (stream.event_time_watermark>cycle.options_cutoff "
         "OR (stream.status='STOPPED' "
         "AND stream.ended_at<=cycle.options_cutoff))"
         ") ORDER BY cycle.options_cutoff,cycle.target_window_id",
-        (member.value, str(session_authorization_id)),
+        (
+            member.value,
+            str(session_authorization_id),
+            _utc(checked_at, "checked_at"),
+        ),
     )
     return tuple(
         ResidentWindowTarget(

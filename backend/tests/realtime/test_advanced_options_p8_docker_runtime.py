@@ -420,6 +420,181 @@ def test_acquisition_terminal_clock_accepts_stopped_socket():
     }) is None
 
 
+def test_window_accepts_complete_zero_flow_events():
+    from realtime.advanced_options_p8_window import (
+        _evidence_builder,
+        _flow_evidence,
+    )
+
+    class Cursor:
+        def execute(self, _statement, _parameters):
+            return None
+
+        def fetchall(self):
+            return ()
+
+    class Provider:
+        @contextmanager
+        def transaction(self, *_args, **_kwargs):
+            yield SimpleNamespace(cursor=Cursor())
+
+    provider = Provider()
+    events, observations = _flow_evidence(
+        provider,
+        UUID(int=1),
+        SimpleNamespace(committed_offset=0),
+        SimpleNamespace(committed_offset=0),
+    )
+
+    assert events == {}
+    assert observations == ()
+    assert callable(_evidence_builder(
+        provider,
+        object(),
+        SimpleNamespace(contract_volumes=(), committed_offset=0),
+        {},
+        object(),
+        START,
+        SimpleNamespace(cohort_id=UUID(int=1)),
+    ))
+
+
+def test_flow_volume_reconciler_uses_latest_authorized_snapshot(
+    monkeypatch,
+):
+    downstream = SimpleNamespace(
+        sequence=1,
+        production_binding={
+            "volume_baselines": [
+                {
+                    "contract_ticker": "O:SPY261120C00450000",
+                    "snapshot_volume": 123,
+                    "snapshot_at": START.isoformat(),
+                    "source_sha256": "a" * 64,
+                },
+            ],
+        },
+    )
+
+    class State:
+        def load_preopen_session_binding(self, _bundle):
+            return object()
+
+        def load_downstream_bindings(self, _session_binding):
+            return (downstream,)
+
+    monkeypatch.setattr(
+        roles_module,
+        "RawJournalReader",
+        lambda _path: SimpleNamespace(
+            offsets_at=lambda _cutoff: (5, 4)
+        ),
+    )
+    flushes = []
+    consumer = SimpleNamespace(
+        fed_offset=5,
+        volume_reconcile_required=lambda: True,
+        reconcile_snapshot=lambda *args: SimpleNamespace(
+            contract_ticker=args[0],
+            session_date=START.date(),
+            accepted=True,
+            reason=None,
+            cumulative_volume=args[1],
+            baseline_kind="SNAPSHOT_RECONCILED",
+        ),
+        mark_reconciled=lambda: True,
+        flush=lambda **kwargs: flushes.append(kwargs),
+    )
+    reconciler = roles_module._FlowVolumeBaselineReconciler(
+        session_state=State(),
+        bundle={},
+        source=SimpleNamespace(path=object()),
+        refresh_seconds=0,
+    )
+
+    results = reconciler.apply(consumer)
+
+    assert len(results) == 1
+    assert results[0].cumulative_volume == 123
+    assert flushes == [{
+        "reason": "SNAPSHOT_RECONCILE",
+        "full": True,
+    }]
+
+
+def test_flow_volume_reconciler_keeps_each_pending_contract_snapshot(
+    monkeypatch,
+):
+    def binding(sequence, ticker, snapshot_at):
+        return SimpleNamespace(
+            sequence=sequence,
+            production_binding={
+                "volume_baselines": [{
+                    "contract_ticker": ticker,
+                    "snapshot_volume": sequence * 100,
+                    "snapshot_at": snapshot_at.isoformat(),
+                    "source_sha256": f"{sequence:x}" * 64,
+                }],
+            },
+        )
+
+    first = binding(1, "O:SPY261120C00450000", START)
+    second = binding(
+        2,
+        "O:QQQ261120C00400000",
+        START + timedelta(minutes=5),
+    )
+
+    class State:
+        calls = 0
+
+        def load_preopen_session_binding(self, _bundle):
+            return object()
+
+        def load_downstream_bindings(self, _session_binding):
+            self.calls += 1
+            return (first,) if self.calls == 1 else (first, second)
+
+    monkeypatch.setattr(
+        roles_module,
+        "RawJournalReader",
+        lambda _path: SimpleNamespace(
+            offsets_at=lambda _cutoff: (5, 4)
+        ),
+    )
+    reconciled = []
+    flushes = []
+    consumer = SimpleNamespace(
+        fed_offset=0,
+        reconcile_snapshot=lambda *args: (
+            reconciled.append(args)
+            or SimpleNamespace(accepted=True)
+        ),
+        mark_reconciled=lambda: True,
+        flush=lambda **kwargs: flushes.append(kwargs),
+    )
+    reconciler = roles_module._FlowVolumeBaselineReconciler(
+        session_state=State(),
+        bundle={},
+        source=SimpleNamespace(path=object()),
+        refresh_seconds=0,
+    )
+
+    assert reconciler.apply(consumer) == ()
+    consumer.fed_offset = 5
+    results = reconciler.apply(consumer)
+
+    assert len(results) == 2
+    assert [row[0] for row in reconciled] == [
+        "O:SPY261120C00450000",
+        "O:QQQ261120C00400000",
+    ]
+    assert flushes == [{
+        "reason": "SNAPSHOT_RECONCILE",
+        "full": True,
+    }]
+
+
 def test_ingress_reconciles_session_without_pending_window(monkeypatch):
     binding = object()
     waited = []
@@ -1079,24 +1254,32 @@ def test_health_requires_fresh_lease_identity_and_zero_effects(tmp_path):
 
 
 class _LeaseCursor:
-    def execute(self, statement, _parameters=()):
-        assert statement.startswith(
-            "SELECT owner_id::text,owner_epoch,lease_until"
-        )
+    def __init__(self):
+        self._row = None
 
-    @staticmethod
-    def fetchone():
-        return (
-            str(uuid5(
-                NAMESPACE_URL,
-                (
-                    "stockscreener:advanced-options-p8-owner:"
-                    f"{_package()['package_nonce']}:FLOW"
-                ),
-            )),
-            1,
-            STOP,
+    def execute(self, statement, _parameters=()):
+        if statement.startswith(
+            "SELECT owner_id::text,owner_epoch,lease_until"
+        ):
+            self._row = (
+                str(uuid5(
+                    NAMESPACE_URL,
+                    (
+                        "stockscreener:advanced-options-p8-owner:"
+                        f"{_package()['package_nonce']}:FLOW"
+                    ),
+                )),
+                1,
+                STOP,
+            )
+            return
+        assert statement.startswith(
+            "UPDATE rt.worker_leases SET lease_until="
         )
+        self._row = (_parameters[0],)
+
+    def fetchone(self):
+        return self._row
 
 
 class _LeaseConnection:
@@ -1121,6 +1304,42 @@ class _LeaseConnection:
 
     def close(self):
         self.closed = True
+
+
+def test_docker_service_stops_cleanly_on_a_paused_role(tmp_path, monkeypatch):
+    package_path, bundle_path, _bundle = _write_bundle(tmp_path)
+    status = tmp_path / "status"
+    status.mkdir()
+
+    def role_runner(**kwargs):
+        time.sleep(0.05)
+        kwargs["stop_event"].set()
+        return {
+            "status": "PAUSED",
+            "kind": kwargs["kind"].value,
+            "effects": dict(P8_EFFECT_DENIALS),
+        }
+
+    monkeypatch.setattr(
+        runtime_module.psycopg2,
+        "connect",
+        lambda *_args, **_kwargs: _LeaseConnection(),
+    )
+
+    assert run_p8_docker_service(
+        AdvancedOptionsProcessKind.FLOW,
+        package_path,
+        bundle_path,
+        environment={
+            "REALTIME_V2_APP_DSN": "fixture",
+            "REALTIME_V2_P8_STATUS_DIR": str(status),
+        },
+        clock=lambda: START + timedelta(minutes=2),
+        role_runner=role_runner,
+    ) == 0
+    stored = json.loads((status / "flow.json").read_text(encoding="utf-8"))
+    assert stored["state"] == "STOPPED"
+    assert stored["role_evidence"]["status"] == "PAUSED"
 
 
 def test_docker_service_invokes_real_role_boundary(tmp_path, monkeypatch):
@@ -1649,6 +1868,113 @@ def test_v5_window_loop_isolates_four_successive_deterministic_windows(
     assert [offsets[value] for value in invocations] == [10, 20, 30, 40]
     assert len(alerts) == 4
     assert len(publications) == 4
+
+
+class _RecordingStop(threading.Event):
+    def __init__(self):
+        super().__init__()
+        self.waits = []
+
+    def wait(self, timeout=None):
+        self.waits.append(timeout)
+        return super().wait(0.001)
+
+
+@pytest.mark.parametrize(
+    "first_attempt",
+    ("ROLLING_BLOCKED", "INPUT_DEFERRED"),
+)
+def test_v5_window_retries_blocked_rolling_preflight(
+    monkeypatch,
+    first_attempt,
+):
+    package = _package()
+    package.update({
+        "equity_input_binding": {
+            "symbols": list(
+                EQUITY_VALIDATION_UNIVERSE.equity_tickers
+            ),
+        },
+        "cohort": {
+            **package["cohort"],
+            "underlyings": ["QQQ", "SPY"],
+        },
+        "v3_deployment": {
+            "profile": advanced_options_v3_profile_payload(),
+            "profile_sha256": ADVANCED_OPTIONS_V3_PROFILE_SHA256,
+            "state": ADVANCED_OPTIONS_V3_QUALIFICATION_STATE,
+            "window_role_authorized": True,
+            "qualification_verdict": "PASS",
+        },
+    })
+    package["orchestration"].update({
+        "catalog_version": STAGE_CATALOG_VERSION_V5,
+        "stage_order": list(OPTIONS_V3_STAGE_ORDER),
+    })
+    bundle = {
+        "package_sha256": package["package_sha256"],
+        "orchestration": dict(package["orchestration"]),
+        "production_binding": {
+            "control": {"option_underlyings": ["QQQ", "SPY"]},
+        },
+    }
+    binding = SimpleNamespace(
+        window_id=UUID("11111111-2222-3333-4444-555555555555")
+    )
+    dependencies = {
+        name: {"status": "COMPLETE"}
+        for name in ("INGRESS", "MARKET_STATE", "FLOW")
+    }
+    monkeypatch.setattr(
+        roles_module,
+        "_v3_resident_dependencies",
+        lambda *_args, **_kwargs: dependencies,
+    )
+
+    from realtime import advanced_options_p8_production as production
+
+    monkeypatch.setattr(
+        production,
+        "load_v3_pending_window_bindings",
+        lambda **_kwargs: (binding,),
+    )
+    attempts = []
+    stopped = _RecordingStop()
+
+    def serial(**_kwargs):
+        attempts.append(True)
+        if len(attempts) == 1:
+            if first_attempt == "INPUT_DEFERRED":
+                return {
+                    "status": "DEFERRED",
+                    "window_state": "PENDING",
+                    "reason_codes": ["MARKS_NOT_READY"],
+                }
+            raise roles_module.AdvancedOptionsRollingPreflightBlocked(
+                SimpleNamespace(reason_codes=("HEAD_NOT_READY",))
+            )
+        stopped.set()
+        return {
+            "status": "FINISHED",
+            "window_state": "COMPLETE",
+            "stage_order": list(OPTIONS_V3_STAGE_ORDER),
+        }
+
+    monkeypatch.setattr(production, "run_v3_serial_window", serial)
+
+    result = roles_module._run_window(
+        package=package,
+        bundle=bundle,
+        binding=binding,
+        provider=object(),
+        pool=object(),
+        environment={},
+        stop_event=stopped,
+    )
+
+    assert result["status"] == "COMPLETE"
+    assert len(attempts) == 2
+    assert stopped.waits[0] == roles_module._BLOCKED_WINDOW_RETRY_SECONDS
 
 
 def test_p8_options_gateway_subscriptions_remain_option_only():

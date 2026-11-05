@@ -60,6 +60,13 @@ def _gate(name: str, value: Decimal | bool | None, threshold: Decimal | bool | N
     return GateValue(name, value, threshold, status)
 
 
+def _optional_gate(name: str, value: Decimal | bool | None, threshold: Decimal | bool | None,
+                   passed: bool | None) -> GateValue:
+    if passed is None:
+        return GateValue(name, value, threshold, GateStatus.NOT_APPLICABLE)
+    return _gate(name, value, threshold, passed)
+
+
 def evaluate(packet: CanonicalInput, policy: BreakoutPolicy, *,
              feature_calculator: FeatureCalculator = compute_features) -> Decision:
     """Invalid contracts raise; deterministic calculation failures return ERROR.
@@ -86,9 +93,14 @@ def evaluate(packet: CanonicalInput, policy: BreakoutPolicy, *,
             sign = Decimal(direction.value) if direction else Decimal(0)
             volume = _number(features, "volume_multiple")
             market = sign * _number(features, "market_trend")
-            sector = sign * _number(features, "sector_trend")
+            optional = policy.optional_context_names
+            sector = (
+                None
+                if features.values["sector_trend"] is None and "sector_trend" in optional
+                else sign * _number(features, "sector_trend")
+            )
             event = features.values["event_risk"]
-            if type(event) is not bool:
+            if type(event) is not bool and not (event is None and "event_risk" in optional):
                 raise ValueError("ready event feature must be boolean")
             expiry = packet.bars[-1].clocks.market_end + timedelta(seconds=policy.validity_seconds)
             stop = low if direction is Direction.LONG else high
@@ -98,12 +110,12 @@ def evaluate(packet: CanonicalInput, policy: BreakoutPolicy, *,
                 _gate("breakout", close, high if direction is not Direction.SHORT else low, direction is not None),
                 _gate("volume", volume, policy.min_volume_multiple, volume >= policy.min_volume_multiple),
                 _gate("market", market, Decimal(0), market > 0),
-                _gate("sector", sector, Decimal(0), sector > 0),
-                _gate("event", event, False, event is False),
+                _optional_gate("sector", sector, Decimal(0), None if sector is None else sector > 0),
+                _optional_gate("event", event, False, None if event is None else event is False),
                 _gate("validity", Decimal(str((expiry - packet.decision_at).total_seconds())), Decimal(0), expiry > packet.decision_at),
                 _gate("geometry", geometry_ok, True, geometry_ok),
             )
-            matched = all(gate.status is GateStatus.PASS for gate in gates)
+            matched = all(gate.status in {GateStatus.PASS, GateStatus.NOT_APPLICABLE} for gate in gates)
             disposition = Disposition.MATCH if matched else Disposition.NO_MATCH
             trigger = canonical_sha256({"schema": "equity_trigger_v1", "state_key": state_key(packet, policy),
                                        "source": packet.bars[-1].source, "direction": direction}) if matched else None

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 import os
 import signal
@@ -48,8 +49,10 @@ from realtime.advanced_scheduler import (  # noqa: E402
     load_advanced_scheduler_progress_cursor,
 )
 from realtime.advanced_stream_gap_repair import (  # noqa: E402
+    close_covered_stream_gaps_cursor,
     first_missing_minute_range,
     load_stored_minutes_cursor,
+    load_stream_gap_repair_scope_cursor,
 )
 from realtime.advanced_realtime_desired_state_repository import (  # noqa: E402
     load_effective_desired_state_reconciliation_cursor,
@@ -115,6 +118,8 @@ UTC = timezone.utc
 # minute older than this is missing rather than merely in flight.
 REPAIR_STORAGE_GRACE_SECONDS = 180
 REPAIR_BLOCKED_RETRY_SECONDS = 300
+# One hole gets this many repairs beyond the first. The provider budget still applies to each.
+REPAIR_MAXIMUM_RETRIES = 5
 ACTIVE_EXTERNAL_INGRESS_STATUSES = frozenset({
     "CONNECTING",
     "AUTHENTICATING",
@@ -1016,6 +1021,37 @@ def _load_hybrid_progress_cursor(
     )
 
 
+def _resume_or_retry_identity_cursor(cursor, identity, retries=REPAIR_MAXIMUM_RETRIES):
+    """The identity to plan a hole with, or None when its retries are used up.
+
+    A repair's identity includes when it was planned, so planning the same hole again never
+    matched its stored window, and the controller crashed (found Nov 5). A repair still in
+    progress keeps its stored time, and one that ended gets a new identity to try again.
+    """
+    for retry in range(retries + 1):
+        candidate = identity
+        if retry:
+            repair_id = uuid5(
+                NAMESPACE_URL,
+                f"stockscreener:advanced-hybrid-repair-retry:{identity.repair_id}:{retry}",
+            )
+            candidate = dataclasses.replace(
+                identity,
+                repair_id=repair_id,
+                window_key=f"adv-hybrid-{repair_id.hex[:24]}",
+            )
+        cursor.execute(
+            "SELECT state,release_at FROM rt.window_runs WHERE window_id=%s",
+            (str(candidate.repair_id),),
+        )
+        row = cursor.fetchone()
+        if row is None:
+            return candidate
+        if row[0] in {"PENDING", "RUNNING"}:
+            return dataclasses.replace(candidate, release_at=row[1])
+    return None
+
+
 def _ensure_hybrid_window_cursor(
     cursor,
     *,
@@ -1317,7 +1353,42 @@ class _HybridRepairCoordinator:
                 journal_root=self.journal_root,
             )
 
+    def _close_covered_gaps(self):
+        """Close a stream gap once stored bars prove it lost nothing.
+
+        A drop inside one minute loses no bar: that minute's bar arrives after
+        the reconnect, so there is nothing for REST to fetch and no repair runs.
+        Repairs used to be the only thing closing a gap, so the gap stayed open
+        and the input gate failed every window overlapping it. The proof here is
+        the one a repair ends with, and a gap with a missing minute stays open.
+        """
+        with self.provider.transaction(APP_ROLE, read_only=True) as unit:
+            unit.cursor.execute(
+                "SELECT EXISTS (SELECT 1 FROM rt.stream_gaps "
+                "WHERE plan_id=%s AND instrument_id IS NULL "
+                "AND recovery_status='UNRESOLVED' "
+                "AND COALESCE(gap_end,reconnect_at) IS NOT NULL)",
+                (str(self.runtime_scope.plan_id),),
+            )
+            if unit.cursor.fetchone()[0] is not True:
+                return
+        with self.provider.transaction(APP_ROLE) as unit:
+            closed = close_covered_stream_gaps_cursor(
+                unit.cursor,
+                load_stream_gap_repair_scope_cursor(
+                    unit.cursor,
+                    self.runtime_scope.plan_id,
+                ),
+            )
+        for gap_id in closed:
+            print(
+                f"Advanced stream gap closed by stored coverage: {gap_id}",
+                file=sys.stderr,
+                flush=True,
+            )
+
     def _plan_next(self, now):
+        self._close_covered_gaps()
         if self.next_plan_at is not None and now < self.next_plan_at:
             return
         through = min(
@@ -1398,14 +1469,24 @@ class _HybridRepairCoordinator:
         if identity.release_at >= self.deadline:
             self._block_repair(now, "AUTHORIZATION_EXHAUSTED")
             return
-        with self.provider.transaction(APP_ROLE) as unit:
-            self.window = _ensure_hybrid_window_cursor(
-                unit.cursor,
-                runtime_scope=self.runtime_scope,
-                identity=identity,
-                deadline=self.deadline,
-                journal_root=self.journal_root,
-            )
+        try:
+            with self.provider.transaction(APP_ROLE) as unit:
+                planned = _resume_or_retry_identity_cursor(unit.cursor, identity)
+                if planned is None:
+                    self._block_repair(now, "REPAIR_RETRIES_USED")
+                    return
+                self.window = _ensure_hybrid_window_cursor(
+                    unit.cursor,
+                    runtime_scope=self.runtime_scope,
+                    identity=planned,
+                    deadline=self.deadline,
+                    journal_root=self.journal_root,
+                )
+        except ValueError as error:
+            # A repair must never end the session; see _block_repair.
+            print(f"Advanced hybrid repair could not be planned: {error}", file=sys.stderr, flush=True)
+            self._block_repair(now, "BLOCKED_GAP")
+            return
         self.instrument_ids = instrument_ids
 
     def _verify_completed(self, now):

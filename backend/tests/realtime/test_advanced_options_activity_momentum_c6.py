@@ -2303,3 +2303,51 @@ def test_120_730_dte_groups_add_zero_live_workload():
             "SILENT_ACCUMULATION_DISABLED",
         )
     }
+
+
+def _ranked(profile, candidate, *, volume, ask, delta, session_date=SESSION_DATE):
+    from dataclasses import replace
+
+    from realtime.advanced_options_activity_momentum_c6 import _criterion_candidate_rank
+
+    criterion = next(
+        row for row in profile.selection_criteria
+        if row.criterion_id == "SHORT_ACTIVITY"
+    )
+    return _criterion_candidate_rank(
+        replace(
+            candidate,
+            completed_session_volume=volume,
+            ask=Decimal(ask),
+            delta=delta,
+        ),
+        criterion,
+        session_date=session_date,
+    )
+
+
+def test_a_busy_contract_near_target_beats_a_tight_spread_deep_in_the_money():
+    # Nov 3: SPY's 8 picks traded 4,755 contracts against 533,230 for its busiest 8,
+    # because relative spread was sorted first and in-the-money contracts have tight spreads.
+    profile = load_activity_momentum_profile()
+    near_target = _candidate("SPY", 1, dte=2, side=OptionSide.CALL)
+    deep = _candidate("SPY", 2, dte=2, side=OptionSide.CALL)
+
+    assert _ranked(
+        profile, near_target, volume=60_000, ask="1.05", delta=Decimal("0.45"),
+    ) < _ranked(
+        profile, deep, volume=50, ask="1.001", delta=Decimal("0.86"),
+    )
+
+
+def test_a_contract_the_flow_policy_excludes_ranks_after_one_it_keeps():
+    # Nov 3: 3 of the 16 picks were 3 DTE, which the flow policy excludes.
+    profile = load_activity_momentum_profile()
+    excluded = _candidate("SPY", 1, dte=3, side=OptionSide.CALL)
+    kept = _candidate("SPY", 2, dte=1, side=OptionSide.CALL)
+
+    assert _ranked(
+        profile, kept, volume=10, ask="1.05", delta=Decimal("0.45"),
+    ) < _ranked(
+        profile, excluded, volume=90_000, ask="1.05", delta=Decimal("0.45"),
+    )

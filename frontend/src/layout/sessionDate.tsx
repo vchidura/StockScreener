@@ -62,7 +62,14 @@ export function SessionDateProvider({ children, enabled = true }: { children: Re
     enabled,
   })
 
-  const sessions = useMemo(() => data?.sessions ?? [], [data])
+  // Closing pages show closed sessions. Today is offered once its close is saved, so
+  // during a session they open on the last close instead of an error.
+  const sessions = useMemo(() => {
+    const listed = data?.sessions ?? []
+    return data?.current_is_session_close === false
+      ? listed.filter(session => session !== data.current_session)
+      : listed
+  }, [data])
 
   // Switching interval can strand the pinned session: today exists for 5m but not yet for 1d.
   useEffect(() => {
@@ -129,6 +136,11 @@ export function SessionDateProvider({ children, enabled = true }: { children: Re
   return <SessionDateContext.Provider value={value}>{children}</SessionDateContext.Provider>
 }
 
+/** The session store when one is mounted, for shared hooks that also run without it. */
+export function useOptionalSessionDate(): SessionDateStore | null {
+  return useContext(SessionDateContext)
+}
+
 export function useSessionDate(): SessionDateStore {
   const store = useContext(SessionDateContext)
   if (!store) throw new Error('useSessionDate must be used inside SessionDateProvider')
@@ -149,6 +161,8 @@ export function sessionLabel(date: string): string {
 
 /** Exchange-local stamp, e.g. "Sep 9, 2026, 11:45 AM EDT". */
 export function formatMarketTime(iso: string): string {
+  // A session date has no time; read as one, it shows as 7 PM the evening before.
+  if (/^\d{4}-\d{2}-\d{2}$/.test(iso)) return sessionLabel(iso)
   return new Intl.DateTimeFormat('en-US', {
     timeZone: 'America/New_York',
     month: 'short',

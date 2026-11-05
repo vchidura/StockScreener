@@ -138,6 +138,39 @@ def test_apply_grants_exactly_what_the_registry_says_and_nothing_to_admin_or_pub
     assert f'ALTER FUNCTION rt.fence_stage_run(uuid) OWNER TO "{ADMIN}"' in statements
 
 
+def test_exact_rollback_deletes_are_granted_only_to_app_and_audited():
+    rollback_relations = {
+        "rt.advanced_options_read_pins",
+        "rt.portal_release_current",
+    }
+    expected = grants()
+    assert {
+        relation
+        for relation in rollback_relations
+        if expected[relation].get("DELETE") == ("app",)
+    } == rollback_relations
+    connection = _Connection(_apply_answer())
+    apply_database_security_v2(connection, ROLES)
+    granted = _granted_tables(connection.statements)
+    assert rollback_relations <= granted[("DELETE", APP)]
+    assert ("DELETE", API) not in granted
+
+    missing = {
+        ("app", "DELETE", relation)
+        for relation in rollback_relations
+    }
+    results = dict(
+        audit_database_security_v2(
+            _Connection(_audit_answer(missing=missing)),
+            ROLES,
+        )
+    )
+    verdict = results["runtime_privileges_match_registry"]
+    assert verdict.startswith("FAIL")
+    for relation in rollback_relations:
+        assert f"app:DELETE:{relation}:missing" in verdict
+
+
 def test_live024_apply_uses_the_exact_historical_registry_not_a_domain_filter():
     connection = _Connection(_apply_answer())
 

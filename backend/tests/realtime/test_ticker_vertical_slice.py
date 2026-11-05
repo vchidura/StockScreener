@@ -1117,6 +1117,8 @@ class TickerStore(PortalV2Statements):
                                 payload_sha256=reference["payload_sha256"])]
         elif sql.startswith("SELECT EXISTS"):
             self.result = [dict(action_drift=self.action_drift)]
+        elif sql.startswith("SELECT alert_id::text AS alert_id,projection FROM rt.alert_current"):
+            self.result = []
         else:
             raise AssertionError(f"Unexpected SQL: {sql}")
 
@@ -1654,7 +1656,7 @@ def test_ticker_materialization_persists_evidence_before_portal(monkeypatch):
     )
     monkeypatch.setattr(
         ticker_repository, "produce_realtime_ticker_workspace_summary",
-        lambda inputs, snapshots, charts: summary,
+        lambda inputs, snapshots, charts, **options: summary,
     )
     monkeypatch.setattr(
         ticker_repository, "persist_realtime_equity_materialization_batch_cursor",

@@ -9,7 +9,7 @@ from .gap_repair_plan import plan_gap_repair_cursor
 from .orchestration_repository import CycleReceiptSpec
 
 
-ADVANCED_WINDOW_BUILD_ID = "advanced-equity-window-v1"
+ADVANCED_WINDOW_BUILD_ID = "advanced-equity-window-v2"
 
 
 def bind_advanced_input_gate_build_id(
@@ -31,16 +31,26 @@ def bind_advanced_input_gate_build_id(
     return bound
 
 
+def split_advanced_input_gate_build_id(
+    build_id: str,
+) -> tuple[str, str]:
+    producer_build_id, separator, gate_sha256 = build_id.rpartition(":")
+    if not separator:
+        raise ValueError("Advanced input receipt build identity is invalid")
+    bind_advanced_input_gate_build_id(producer_build_id, gate_sha256)
+    return producer_build_id, gate_sha256
+
+
 def advanced_input_gate_from_build_id(
     build_id: str,
     *,
     expected_build_id: str,
 ) -> str:
-    prefix = f"{expected_build_id}:"
-    if not build_id.startswith(prefix):
+    producer_build_id, gate_sha256 = (
+        split_advanced_input_gate_build_id(build_id)
+    )
+    if producer_build_id != expected_build_id:
         raise ValueError("Advanced input receipt build identity is invalid")
-    gate_sha256 = build_id[len(prefix):]
-    bind_advanced_input_gate_build_id(expected_build_id, gate_sha256)
     return gate_sha256
 
 
@@ -169,7 +179,7 @@ def discover_advanced_window_recovery_cursor(
         "receipt.reference_generation,receipt.universe_sha256,"
         "receipt.input_sha256,receipt.build_id,receipt.cohort_id,"
         "manifest.universe_sha256,service.stage_catalog_version,"
-        "service.cohort_id,run.deadline,run.release_at "
+        "service.cohort_id,receipt.known_by,run.release_at "
         "FROM rt.window_runs AS run "
         "JOIN rt.cohorts AS cohort ON cohort.cohort_id=run.cohort_id "
         "JOIN rt.subscription_manifests AS manifest USING(manifest_id) "
@@ -204,21 +214,19 @@ def discover_advanced_window_recovery_cursor(
             str(row[8]),
             str(row[9]),
             str(row[10]),
+            known_by=(
+                row[15]
+                if str(row[5]) == "INPUT_READY"
+                else None
+            ),
         )
         gate_digest = (
-            advanced_input_gate_from_build_id(
-                spec.build_id,
-                expected_build_id=ADVANCED_WINDOW_BUILD_ID,
-            )
+            split_advanced_input_gate_build_id(spec.build_id)[1]
             if spec.receipt_kind == "INPUT_READY"
             else None
         )
         if (
             spec.cutoff != cutoff_utc
-            or (
-                spec.receipt_kind != "INPUT_READY"
-                and spec.build_id != ADVANCED_WINDOW_BUILD_ID
-            )
             or str(row[11]) != str(cohort_id)
             or (
                 spec.receipt_kind == "INPUT_READY"
@@ -232,6 +240,10 @@ def discover_advanced_window_recovery_cursor(
             )
         receipts[spec.receipt_kind].add(spec)
         if spec.receipt_kind == "INPUT_READY":
+            if row[15] is None:
+                raise ValueError(
+                    "durable Advanced INPUT_READY lacks its visibility seal"
+                )
             marker = "-retry"
             suffix = (
                 str(row[1]).rsplit(marker, 1)[1]
@@ -239,7 +251,7 @@ def discover_advanced_window_recovery_cursor(
                 else "0"
             )
             attempt = int(suffix) if suffix.isdigit() else 0
-            input_scopes.append((attempt, row[16], gate_digest))
+            input_scopes.append((attempt, row[15], gate_digest))
     if any(len(values) > 1 for values in receipts.values()):
         raise ValueError("durable Advanced receipts disagree")
     if receipts["INPUT_READY"] and not input_scopes:

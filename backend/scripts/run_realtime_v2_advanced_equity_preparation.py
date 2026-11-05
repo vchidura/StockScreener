@@ -34,6 +34,13 @@ from realtime.advanced_equity_bootstrap import (  # noqa: E402
 from realtime.advanced_equity_rollover import (  # noqa: E402
     AdvancedEquityRolloverResident,
 )
+from realtime.earnings_calendar_refresh import (  # noqa: E402
+    run_earnings_calendar_refresh,
+)
+from realtime.fed_calendar_refresh import (  # noqa: E402
+    FED_CALENDAR_CHECK_INTERVAL,
+    run_fed_calendar_refresh,
+)
 from realtime.database_access_v2 import (  # noqa: E402
     APP_ROLE,
     V2AccessConfig,
@@ -444,6 +451,7 @@ def main(argv=None):
         clock=_now,
     )
     next_rollover_at = _now()
+    next_fed_calendar_at = _now()
     stop = threading.Event()
     signal.signal(signal.SIGINT, lambda *_args: stop.set())
     signal.signal(signal.SIGTERM, lambda *_args: stop.set())
@@ -474,6 +482,17 @@ def main(argv=None):
                 )
                 if progressed:
                     wait_seconds = COMPLETED_CHUNK_PAUSE_SECONDS
+            # The end-of-day maintenance slot. Idle only, so never during a session.
+            if result.status == "IDLE" and _now() >= next_fed_calendar_at:
+                print(json.dumps(
+                    run_fed_calendar_refresh(provider, clock=_now),
+                    sort_keys=True,
+                ), flush=True)
+                print(json.dumps(
+                    run_earnings_calendar_refresh(provider, clock=_now),
+                    sort_keys=True,
+                ), flush=True)
+                next_fed_calendar_at = _now() + FED_CALENDAR_CHECK_INTERVAL
             stop.wait(wait_seconds)
     finally:
         pool.closeall()

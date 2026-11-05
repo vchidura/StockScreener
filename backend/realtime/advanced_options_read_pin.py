@@ -107,6 +107,21 @@ class PostgresAdvancedOptionsStoredReadPort:
         self._package_sha256 = package_sha256
         self._clock = clock
 
+    def snapshot(
+        self,
+        *,
+        cohort_id: UUID,
+    ) -> Mapping[str, object] | None:
+        with self._provider.transaction(
+            APP_ROLE,
+            read_only=True,
+            isolation_level="REPEATABLE READ",
+        ) as unit:
+            return load_advanced_options_read_pin_cursor(
+                unit.cursor,
+                cohort_id=cohort_id,
+            )
+
     def enable(
         self,
         *,

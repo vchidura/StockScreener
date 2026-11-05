@@ -423,3 +423,31 @@ def test_receipt_reuse_requires_a_durable_retry_identity():
             "--retry-release-now",
             "--reuse-portal-receipt",
         ])
+
+
+def test_retry_execution_deadline_is_explicit_and_timezone_aware():
+    deadline = "2026-10-16T16:34:30+00:00"
+    args = script.parse_args([
+        *BASE,
+        "--window-key-suffix=-retry1",
+        "--retry-release-now",
+        "--execution-deadline",
+        deadline,
+    ])
+
+    assert args.execution_deadline.isoformat() == deadline
+
+    with pytest.raises(SystemExit):
+        script.parse_args([
+            *BASE,
+            "--execution-deadline",
+            deadline,
+        ])
+    with pytest.raises(SystemExit):
+        script.parse_args([
+            *BASE,
+            "--window-key-suffix=-retry1",
+            "--retry-release-now",
+            "--execution-deadline",
+            "2026-10-16T16:34:30",
+        ])

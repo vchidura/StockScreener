@@ -11,6 +11,8 @@ test('original Options Alerts page shows exact unavailable scope without validat
   assert.match(page, /optionAlertsUnavailableReason\(inventory\.data\?\.reason/)
   assert.match(page, /optionAlertsUnavailableReason\(review\.data\?\.reason\)/)
   assert.doesNotMatch(page, /realtime\/option-alerts/)
+  assert.match(page, /optionsDataTierLabel\(tier\.data\?\.data_tier\)/)
+  assert.doesNotMatch(page, /value: '15-minute delayed'/)
   for (const name of ['Latest Run', 'Day History', 'EOD Review']) assert.ok(page.includes(name))
 })
 
@@ -39,15 +41,29 @@ test('all original Options Alerts requests preserve the realtime cohort', async 
   }).outputText
   const source = read('../src/services/api.ts')
     .replace("import axios from 'axios'", 'const axios = { create: () => globalThis.__optionsAlertsApi }')
+    .replace(
+      "import { realtimeCohortId, realtimeOptionsCohortId, realtimeOptionsReadsEnabled } from './portalIdentity'",
+      `const realtimeCohortId = () => globalThis.__optionsAlertsIdentity?.equity?.cohort_id
+       const realtimeOptionsCohortId = sessionDate => sessionDate
+         ? globalThis.__optionsAlertsIdentity?.options_session_cohorts?.[sessionDate]
+         : globalThis.__optionsAlertsIdentity?.options?.cohort_id
+       const realtimeOptionsReadsEnabled = () => globalThis.__optionsAlertsIdentity?.options_reads_enabled === true`,
+    )
     .replaceAll('import.meta.env', 'globalThis.__optionsAlertsEnvironment')
   const candidate = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
   const cohort = { cohort_id: 'exact-cohort' }
-  const evaluation = { dataset_id: 'frozen-v1', detector: 'O1' }
-  const detector = { dataset_id: 'frozen-v1', scope: 'LATEST' }
+  const evaluation = { dataset_id: 'frozen-v1', detector: 'O1', session_date: '2026-10-06' }
+  const detector = { dataset_id: 'frozen-v1', scope: 'HISTORY', session_date: '2026-10-06' }
+  const historical = { cohort_id: 'historical-options-cohort' }
   try {
-    globalThis.__optionsAlertsEnvironment = {
-      VITE_REALTIME_ONLY: 'true', VITE_REALTIME_OPTIONS_V2: 'true',
-      VITE_REALTIME_COHORT_ID: ' exact-cohort ',
+    globalThis.__optionsAlertsEnvironment = { VITE_REALTIME_ONLY: 'true' }
+    globalThis.__optionsAlertsIdentity = {
+      equity: { cohort_id: 'equity-cohort' },
+      options: { cohort_id: 'exact-cohort' },
+      options_reads_enabled: true,
+      options_session_cohorts: {
+        '2026-10-06': 'historical-options-cohort',
+      },
     }
     const api = await import(`data:text/javascript;base64,${Buffer.from(compile(source)).toString('base64')}`)
     await api.getOptionDetectorDatasets()
@@ -60,16 +76,15 @@ test('all original Options Alerts requests preserve the realtime cohort', async 
     assert.deepEqual(calls, [
       ['get', '/options/alerts/datasets', { params: cohort }],
       ['get', '/options/alerts/schedule', { params: cohort }],
-      ['get', '/options/alerts/evaluations', { params: { ...evaluation, ...cohort } }],
-      ['get', '/options/alerts/detector-runs', { params: { ...detector, ...cohort } }],
+      ['get', '/options/alerts/evaluations', { params: { ...evaluation, ...historical } }],
+      ['get', '/options/alerts/detector-runs', { params: { ...detector, ...historical } }],
       ['get', `/options/candidates/${candidate}`, { params: cohort }],
       ['get', '/options/quotes/current', { params: { contract_id: [11, 12], ...cohort } }],
       ['post', `/options/alerts/preview/${candidate}`, {}, { params: cohort }],
     ])
     calls.length = 0
-    globalThis.__optionsAlertsEnvironment = {
-      VITE_REALTIME_ONLY: 'true', VITE_REALTIME_OPTIONS_V2: 'true',
-    }
+    globalThis.__optionsAlertsIdentity.options = null
+    globalThis.__optionsAlertsIdentity.options_session_cohorts = {}
     for (const readRequest of [
       () => api.getOptionDetectorDatasets(),
       () => api.getOptionAlertSchedule(),
@@ -78,21 +93,18 @@ test('all original Options Alerts requests preserve the realtime cohort', async 
       () => api.getOptionCandidate(candidate),
       () => api.getOptionCurrentAdvancedQuotes([11]),
       () => api.previewOptionAlert(candidate, {}),
-    ]) await assert.rejects(readRequest(), /requires VITE_REALTIME_COHORT_ID/)
+    ]) await assert.rejects(readRequest(), /No Options publication/)
     assert.equal(calls.length, 0)
-    globalThis.__optionsAlertsEnvironment = {
-      VITE_REALTIME_ONLY: 'true',
-      VITE_REALTIME_OPTIONS_V2: 'false',
-      VITE_REALTIME_COHORT_ID: 'exact-cohort',
-    }
+    globalThis.__optionsAlertsIdentity.options_reads_enabled = false
     await assert.rejects(
       api.getOptionDetectorDatasets(),
-      /require VITE_REALTIME_OPTIONS_V2=true/,
+      /stored reads are disabled/,
     )
     assert.equal(calls.length, 0)
   } finally {
     delete globalThis.__optionsAlertsApi
     delete globalThis.__optionsAlertsEnvironment
+    delete globalThis.__optionsAlertsIdentity
   }
 })
 
@@ -118,12 +130,22 @@ test('Advanced Options V2 selects only the flagged cohort-local stored release s
   }).outputText
   const source = read('../src/services/api.ts')
     .replace("import axios from 'axios'", 'const axios = { create: () => globalThis.__optionsAlertsApi }')
+    .replace(
+      "import { realtimeCohortId, realtimeOptionsCohortId, realtimeOptionsReadsEnabled } from './portalIdentity'",
+      `const realtimeCohortId = () => globalThis.__optionsAlertsIdentity?.equity?.cohort_id
+       const realtimeOptionsCohortId = sessionDate => sessionDate
+         ? globalThis.__optionsAlertsIdentity?.options_session_cohorts?.[sessionDate]
+         : globalThis.__optionsAlertsIdentity?.options?.cohort_id
+       const realtimeOptionsReadsEnabled = () => globalThis.__optionsAlertsIdentity?.options_reads_enabled === true`,
+    )
     .replaceAll('import.meta.env', 'globalThis.__optionsAlertsEnvironment')
   try {
-    globalThis.__optionsAlertsEnvironment = {
-      VITE_REALTIME_ONLY: 'true',
-      VITE_REALTIME_OPTIONS_V2: 'true',
-      VITE_REALTIME_COHORT_ID: ' disposable-cohort ',
+    globalThis.__optionsAlertsEnvironment = { VITE_REALTIME_ONLY: 'true' }
+    globalThis.__optionsAlertsIdentity = {
+      equity: { cohort_id: 'equity-cohort' },
+      options: { cohort_id: 'disposable-cohort' },
+      options_reads_enabled: true,
+      options_session_cohorts: {},
     }
     const api = await import(`data:text/javascript;base64,${Buffer.from(compile(source)).toString('base64')}#advanced-v2`)
     const status = await api.getAdvancedOptionsV2Status()
@@ -135,7 +157,7 @@ test('Advanced Options V2 selects only the flagged cohort-local stored release s
       ['/realtime/options-v2/projections/OPTIONS_ALERTS', { params: { cohort_id: 'disposable-cohort' } }],
     ])
     calls.length = 0
-    globalThis.__optionsAlertsEnvironment.VITE_REALTIME_OPTIONS_V2 = 'false'
+    globalThis.__optionsAlertsIdentity.options_reads_enabled = false
     assert.equal((await api.getAdvancedOptionsV2Status()).enabled, false)
     await assert.rejects(
       api.getAdvancedOptionsV2Projection('OPTIONS_ALERTS'),
@@ -145,5 +167,6 @@ test('Advanced Options V2 selects only the flagged cohort-local stored release s
   } finally {
     delete globalThis.__optionsAlertsApi
     delete globalThis.__optionsAlertsEnvironment
+    delete globalThis.__optionsAlertsIdentity
   }
 })

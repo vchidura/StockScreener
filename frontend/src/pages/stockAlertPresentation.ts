@@ -1,7 +1,7 @@
 import type { ColumnSpec } from '../layout/PageChrome'
 import type { AlertPlanRow } from '../services/stockDiscovery'
 
-const requiredLatestColumns = new Set(['triggered_at', 'stop', 'target', 'reward_risk', 'success_probability', 'risk_assessment'])
+const requiredLatestColumns = new Set(['triggered_at', 'stop', 'target', 'reward_risk'])
 const requiredHistoryColumns = new Set(['triggered_at', 'latest_price', 'price_return'])
 
 export const unavailableAlertProbability = {

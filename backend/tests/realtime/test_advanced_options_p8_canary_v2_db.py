@@ -72,6 +72,12 @@ from realtime.advanced_options_p8_canary_authorization import (
     PAGE_RELEASE_OBSERVATION_SCHEMA,
     validate_p8_page_release_observation,
 )
+from realtime.advanced_options_p8_canary_executor import (
+    AdvancedOptionsP8LifecyclePort,
+)
+from realtime.advanced_options_p8_production import (
+    load_p8_production_publication_batch,
+)
 from realtime.advanced_options_package_evidence import (
     AdvancedOptionsThresholdEvidence,
     build_cluster_observation,
@@ -103,6 +109,9 @@ from realtime.advanced_options_provider_contract import (
 from realtime.advanced_options_reference_producer import (
     PostgresAdvancedOptionsReferenceProducer,
     build_advanced_options_reference_producer_plan,
+)
+from realtime.advanced_options_read_pin import (
+    PostgresAdvancedOptionsStoredReadPort,
 )
 from realtime.advanced_options_rolling_producer import (
     PostgresAdvancedOptionsRollingProducer,
@@ -160,6 +169,10 @@ from realtime.option_flow.volume import BaselineKind
 from realtime.option_portal_adapter import (
     materialize_realtime_option_package_mark,
 )
+from realtime.option_portal_repository import (
+    RealtimeOptionPortalMarkRepository,
+    persist_realtime_option_package_mark_cursor,
+)
 from realtime.option_source_flow import (
     build_option_source_flow_identity,
     persist_option_contract_scope_cursor,
@@ -188,6 +201,7 @@ from realtime.portal_projection import (
 )
 from realtime.portal_projection_repository import (
     PortalReleaseReceipt,
+    load_portal_release_pointer_cursor,
     persist_screening_generation_cursor,
 )
 from realtime.portal_publisher import (
@@ -907,7 +921,24 @@ def _package_mark(package, mark, valuation_policy, cutoff):
         policy=valuation_policy,
     )
     assert result.mark is not None, result.reason_codes
-    return result.mark
+    evidence_batch_id = uuid5(
+        NAMESPACE_URL,
+        "realtime-option-quote-batch:"
+        f"{package.candidate_id}:{mark.evidence_id}",
+    )
+    return replace(
+        result,
+        mark=replace(
+            result.mark,
+            outcome=replace(
+                result.mark.outcome,
+                source_snapshot_ids=(mark.evidence_id,),
+                source_batch_id=evidence_batch_id,
+            ),
+            evidence_batch_id=evidence_batch_id,
+            mark_evidence=(mark,),
+        ),
+    )
 
 
 def _shape_alert(
@@ -1267,8 +1298,9 @@ def test_p8_provider_free_ingestion_to_canary_alert_publication(
 
             frames = _frames(
                 selected.contract_ticker,
-                cutoff - timedelta(milliseconds=200),
+                cutoff - timedelta(milliseconds=199),
             )
+            source_known_at = cutoff
             journal_path = journal_root / "options.sqlite"
             (
                 gateway_result,
@@ -1347,13 +1379,13 @@ def test_p8_provider_free_ingestion_to_canary_alert_publication(
                     raw_offset=journal_progress.last_raw_offset,
                     event_offset=journal_progress.last_event_offset,
                     started_at=cutoff - timedelta(minutes=1),
-                    ended_at=cutoff - timedelta(seconds=1),
+                    ended_at=source_known_at,
                 )
                 _seed_equity_market_state(
                     database_cursor,
                     enrollment,
                     source_flow,
-                    known_at=cutoff,
+                    known_at=source_known_at,
                 )
                 (
                     equity_receipt_id,
@@ -1494,7 +1526,7 @@ def test_p8_provider_free_ingestion_to_canary_alert_publication(
                 flow_shard_ids=(0,),
                 market_state_shard_map_sha256=market_map.sha256,
                 flow_shard_map_sha256=shard_map_sha256(1),
-                known_at=cutoff,
+                known_at=source_known_at,
                 valid_until=expires,
             )
             rolling = PostgresAdvancedOptionsRollingProducer(
@@ -1624,12 +1656,18 @@ def test_p8_provider_free_ingestion_to_canary_alert_publication(
                 producer_build_id=BUILD_ID,
                 producer_build_sha256=_digest("input-ready-build"),
             )
-            package_mark = _package_mark(
+            package_mark_result = _package_mark(
                 package,
                 marks[0],
                 valuation_policy,
                 cutoff,
             )
+            package_mark = package_mark_result.mark
+            with provider.transaction(APP_ROLE) as unit:
+                persist_realtime_option_package_mark_cursor(
+                    unit.cursor,
+                    package_mark_result,
+                )
             threshold = _threshold(flow_cluster, flow_events, rolling)
 
             def evidence_builder(cycle):
@@ -1896,7 +1934,14 @@ def test_p8_provider_free_ingestion_to_canary_alert_publication(
             with provider.transaction(APP_ROLE) as unit:
                 for probe, probe_cutoff in (
                     ("stale", cutoff - timedelta(minutes=2)),
-                    ("rollback", cutoff + timedelta(minutes=2)),
+                    (
+                        "first_rollback",
+                        cutoff + timedelta(minutes=2),
+                    ),
+                    (
+                        "existing_rollback",
+                        cutoff + timedelta(minutes=3),
+                    ),
                 ):
                     probe_window_id = uuid4()
                     unit.cursor.execute(
@@ -1941,6 +1986,98 @@ def test_p8_provider_free_ingestion_to_canary_alert_publication(
                 owner_epoch=1,
                 dispatch_authorized=False,
             )
+            read_port = PostgresAdvancedOptionsStoredReadPort(
+                provider,
+                package_sha256=_digest("read-pin-package"),
+                clock=lambda: cutoff + timedelta(minutes=4),
+            )
+            rollback_binding = SimpleNamespace(enrollment=enrollment)
+
+            def current_pointer():
+                with provider.transaction(
+                    APP_ROLE,
+                    read_only=True,
+                ) as unit:
+                    return load_portal_release_pointer_cursor(
+                        unit.cursor,
+                        cohort_id=control.cohort_id,
+                        provider_tier=ProviderTier.MASSIVE_ADVANCED,
+                    )
+
+            def publish_then_fail(batch):
+                lifecycle = AdvancedOptionsP8LifecyclePort(
+                    capture=object(),
+                    enrollment_connection=object(),
+                    resident_launcher=object(),
+                    orchestrator=object(),
+                    publisher_database=publisher_database,
+                    publication_config=publisher_config,
+                    publication_batch=lambda *_args: batch,
+                    publication_observation=lambda *_args: {},
+                    stored_reads=read_port,
+                )
+                lifecycle._previous_pointer = current_pointer()
+                _publish(
+                    publisher_database,
+                    publisher_config,
+                    batch,
+                    checked_at=cutoff + timedelta(minutes=4),
+                )
+                lifecycle._published_pointer = current_pointer()
+                publication = {
+                    "release_id": str(
+                        lifecycle._published_pointer.release_id
+                    ),
+                }
+                lifecycle.enable_stored_reads(
+                    rollback_binding,
+                    publication,
+                )
+                try:
+                    raise RuntimeError(
+                        "P8_INJECTED_POST_PUBLICATION_FAILURE"
+                    )
+                except RuntimeError:
+                    lifecycle.rollback(
+                        rollback_binding,
+                        publication,
+                    )
+                    raise
+
+            first_rollback_snapshot = build_portal_snapshot(
+                cohort_id=control.cohort_id,
+                provider_tier=ProviderTier.MASSIVE_ADVANCED,
+                snapshot_type="OPTIONS_MARKS",
+                snapshot_key="FIRST_ROLLBACK_PROBE",
+                source_generation=99,
+                source_manifest={
+                    "lane": "OPTIONS",
+                    "first_rollback": True,
+                },
+                payload={"first_rollback": True},
+                generated_at=cutoff + timedelta(minutes=2),
+            )
+            first_rollback_receipt = PortalReleaseReceipt(
+                probe_receipts["first_rollback"],
+                control.cohort_id,
+                ProviderTier.MASSIVE_ADVANCED,
+                cutoff + timedelta(minutes=2),
+                control.universe.sha256,
+            )
+            with pytest.raises(
+                RuntimeError,
+                match="P8_INJECTED_POST_PUBLICATION_FAILURE",
+            ):
+                publish_then_fail(
+                    PortalPublicationBatch(
+                        (first_rollback_snapshot,),
+                        receipt=first_rollback_receipt,
+                    )
+                )
+            assert current_pointer() is None
+            assert read_port.snapshot(
+                cohort_id=control.cohort_id,
+            ) is None
             stock_alert_snapshot = build_portal_snapshot(
                 cohort_id=control.cohort_id,
                 provider_tier=ProviderTier.MASSIVE_ADVANCED,
@@ -2021,9 +2158,36 @@ def test_p8_provider_free_ingestion_to_canary_alert_publication(
             assert canary_handoff.release_authorized
             assert canary_handoff.pointer_authorized
             assert not canary_handoff.dispatch_authorized
-            canary_batch = PortalPublicationBatch(
-                canary_handoff.snapshots,
-                receipt=canary_handoff.receipt,
+            canary_batch = load_p8_production_publication_batch(
+                provider,
+                cohort_id=control.cohort_id,
+                window_id=window_id,
+            )
+            assert {
+                row.snapshot_type: (
+                    row.snapshot_id,
+                    row.source_manifest_sha256,
+                    row.payload_sha256,
+                )
+                for row in canary_batch.snapshots
+            } == {
+                row.snapshot_type: (
+                    row.snapshot_id,
+                    row.source_manifest_sha256,
+                    row.payload_sha256,
+                )
+                for row in canary_handoff.snapshots
+            }
+            assert (
+                canary_batch.receipt.receipt_id,
+                canary_batch.receipt.cohort_id,
+                canary_batch.receipt.cutoff,
+                canary_batch.receipt.universe_sha256,
+            ) == (
+                canary_handoff.receipt.receipt_id,
+                canary_handoff.receipt.cohort_id,
+                canary_handoff.receipt.cutoff,
+                canary_handoff.receipt.universe_sha256,
             )
             canary_status = _publish(
                 publisher_database,
@@ -2081,6 +2245,11 @@ def test_p8_provider_free_ingestion_to_canary_alert_publication(
                 "WHERE cohort_id=%s",
                 (str(control.cohort_id),),
             )[0][0] == release_count
+            read_port.advance(
+                cohort_id=control.cohort_id,
+                release_id=UUID(release_id),
+                previous=None,
+            )
 
             stale_snapshot = build_portal_snapshot(
                 cohort_id=control.cohort_id,
@@ -2113,6 +2282,14 @@ def test_p8_provider_free_ingestion_to_canary_alert_publication(
                 control.cohort_id,
             )[0] == release_id
 
+            prior_pointer = current_pointer()
+            read_port.disable(
+                cohort_id=control.cohort_id,
+                release_id=UUID(release_id),
+            )
+            prior_pin = read_port.snapshot(
+                cohort_id=control.cohort_id,
+            )
             rollback_snapshot = build_portal_snapshot(
                 cohort_id=control.cohort_id,
                 provider_tier=ProviderTier.MASSIVE_ADVANCED,
@@ -2121,44 +2298,40 @@ def test_p8_provider_free_ingestion_to_canary_alert_publication(
                 source_generation=100,
                 source_manifest={"lane": "OPTIONS", "rollback": True},
                 payload={"rollback": True},
-                generated_at=cutoff + timedelta(minutes=2),
+                generated_at=cutoff + timedelta(minutes=3),
             )
             rollback_receipt = PortalReleaseReceipt(
-                probe_receipts["rollback"],
+                probe_receipts["existing_rollback"],
                 control.cohort_id,
                 ProviderTier.MASSIVE_ADVANCED,
-                cutoff + timedelta(minutes=2),
+                cutoff + timedelta(minutes=3),
                 control.universe.sha256,
             )
-
-            def fail_release(*_args, **_options):
-                raise RuntimeError("P8_FORCED_RELEASE_ROLLBACK")
-
             with pytest.raises(
                 RuntimeError,
-                match="PORTAL_PUBLICATION_RUNTIMEERROR",
-            ) as publication_failure:
-                _publish(
-                    publisher_database,
-                    publisher_config,
+                match="P8_INJECTED_POST_PUBLICATION_FAILURE",
+            ):
+                publish_then_fail(
                     PortalPublicationBatch(
                         (rollback_snapshot,),
                         receipt=rollback_receipt,
-                    ),
-                    checked_at=cutoff + timedelta(minutes=3),
-                    release_repository=fail_release,
+                    )
                 )
-            assert str(publication_failure.value.__cause__) == "P8_FORCED_RELEASE_ROLLBACK"
             assert _query(
                 database_pool,
                 "SELECT count(*) FROM rt.snapshot_catalog "
                 "WHERE snapshot_id=%s",
                 (str(rollback_snapshot.snapshot_id),),
             )[0][0] == 1
-            assert _pointer(
-                database_pool,
-                control.cohort_id,
-            )[0] == release_id
+            assert current_pointer() == prior_pointer
+            assert read_port.snapshot(
+                cohort_id=control.cohort_id,
+            ) == prior_pin
+            read_port.advance(
+                cohort_id=control.cohort_id,
+                release_id=UUID(release_id),
+                previous=prior_pin,
+            )
 
             @contextmanager
             def stored_cursor():
@@ -2177,8 +2350,27 @@ def test_p8_provider_free_ingestion_to_canary_alert_publication(
             )
 
             advanced_repository = (
-                AdvancedOptionsStoredProjectionRepository(stored_cursor)
+                AdvancedOptionsStoredProjectionRepository(
+                    stored_cursor,
+                    require_read_pin=True,
+                )
             )
+            mark_repository = RealtimeOptionPortalMarkRepository(
+                stored_cursor,
+                transaction_configured=True,
+            )
+            retained_marks = mark_repository.retained_plan_marks(
+                (package.candidate_id,),
+                available_by=cutoff + timedelta(minutes=4),
+                valuation_policy_sha256=(
+                    control.pins.valuation_policy_sha256
+                ),
+                cohort_id=control.cohort_id,
+                provider_tier=ProviderTier.MASSIVE_ADVANCED,
+            )
+            assert set(retained_marks["rows"]) == {
+                str(package.candidate_id)
+            }
             option_flow_repository = RealtimeOptionFlowRepository(
                 stored_cursor,
                 transaction_configured=True,
@@ -2459,26 +2651,34 @@ def test_p8_provider_free_ingestion_to_canary_alert_publication(
                 equity_cutoff=equity_cutoff,
                 history_source_cohort_id=history_cohort_id,
             )
-            assert all(
-                row["status"] in {"AVAILABLE", "COMPLETE_ZERO"}
-                for row in categories.values()
-            ), categories
+            unavailable = {
+                name: row
+                for name, row in categories.items()
+                if row["status"] not in {
+                    "AVAILABLE",
+                    "COMPLETE_ZERO",
+                }
+            }
+            assert not unavailable, unavailable
 
-            frontend_result = subprocess.run(
-                [
-                    "node",
-                    "--test",
-                    "frontend\\tests\\optionsAlertsRealtime.test.mjs",
-                ],
-                cwd=Path(__file__).parents[3],
-                check=False,
-                capture_output=True,
-                text=True,
-                timeout=60,
-            )
-            assert frontend_result.returncode == 0, (
-                frontend_result.stdout + frontend_result.stderr
-            )
+            backend_only = os.getenv("STOCKS_P8_BACKEND_ONLY") == "1"
+            frontend_result = SimpleNamespace(returncode=None)
+            if not backend_only:
+                frontend_result = subprocess.run(
+                    [
+                        "node",
+                        "--test",
+                        "frontend\\tests\\optionsAlertsRealtime.test.mjs",
+                    ],
+                    cwd=Path(__file__).parents[3],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=60,
+                )
+                assert frontend_result.returncode == 0, (
+                    frontend_result.stdout + frontend_result.stderr
+                )
             shutil.rmtree(journal_root)
             assert not journal_root.exists()
             report = {
@@ -2613,6 +2813,7 @@ def test_p8_provider_free_ingestion_to_canary_alert_publication(
                     "frontend_test_exit_code": (
                         frontend_result.returncode
                     ),
+                    "frontend_test_skipped_backend_only": backend_only,
                 },
                 "combined_page_gate": page_gate,
                 "alerts": {

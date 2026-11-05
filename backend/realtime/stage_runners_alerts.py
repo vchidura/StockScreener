@@ -27,11 +27,9 @@ from .stage_runners_equity import (
     EQUITY_CYCLE_RECEIPT_MISSING,
     INPUT_READY,
     INPUT_READY_RECEIPT_MISSING,
-    REFERENCE_GENERATION_UNAVAILABLE,
     STAGE_CANCELLED,
     _is_session_close,
     _window_cycle_receipt,
-    reference_generation,
 )
 from .stock_alert_repository import (
     RetainedForwardState,
@@ -114,9 +112,6 @@ def stock_alerts_runner(environment: RunnerEnvironment) -> StageRunner:
                         else str(resumed.work_id)
                     ),
                 )
-            generation = reference_generation(compute, window.cutoff)
-            if generation < 1:
-                return StageOutcome.blocked(REFERENCE_GENERATION_UNAVAILABLE)
             if context.is_cancelled():
                 return StageOutcome.failed(STAGE_CANCELLED)
             if environment.stock_alert_projection_loader is None:
@@ -131,7 +126,7 @@ def stock_alerts_runner(environment: RunnerEnvironment) -> StageRunner:
                         input_receipt_id=receipt.release.receipt_id,
                         cutoff=window.cutoff,
                         input_sha256=receipt.input_sha256,
-                        known_by=environment.known_by(window),
+                        known_by=receipt.known_by,
                     )
                 )
             except CanonicalStockAlertBatchUnavailable:
@@ -141,7 +136,8 @@ def stock_alerts_runner(environment: RunnerEnvironment) -> StageRunner:
             try:
                 snapshot = compute_realtime_stock_alerts(
                     compute, cohort_id=plan.cohort_id, session=plan.session_date, cutoff=window.cutoff,
-                    known_by=environment.known_by(window), source_generation=generation,
+                    known_by=receipt.known_by,
+                    source_generation=receipt.reference_generation,
                     retained_projection=retained_projection,
                 )
             except RetainedForwardState:
@@ -188,7 +184,7 @@ def strategy_publish_runner(environment: RunnerEnvironment) -> StageRunner:
                     # Strategies subtract the provider delay from this sealed input visibility clock.
                     outcomes = materialize_due_realtime_strategies(
                         compute, publication, cohort_id=plan.cohort_id,
-                        available_by=environment.known_by(window),
+                        available_by=receipt.known_by,
                         intervals=(interval,), receipt=receipt.release,
                     )
                 except (StageCancelled, WriteFenceRejected):

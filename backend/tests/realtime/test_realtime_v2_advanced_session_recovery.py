@@ -119,6 +119,20 @@ def test_closing_window_runs_once_its_inputs_exist(monkeypatch, tmp_path):
     assert "--retry-release-now" in arguments
     assert "--continuous-publication" in arguments
     assert state["next_check_at"] is None
+    assert state["finished"] == SESSION
+
+    ran_again = scheduler._recover_completed_session_window(
+        _provider(),
+        _args(tmp_path),
+        _catalog(),
+        CALENDAR,
+        lifecycle=_lifecycle(),
+        now=LATE_EVENING + timedelta(minutes=1),
+        state=state,
+        window_runner=runner,
+    )
+    assert ran_again is False
+    runner.assert_called_once()
 
 
 def test_waiting_window_does_not_spend_an_attempt(monkeypatch, tmp_path):
@@ -138,6 +152,43 @@ def test_attempts_stay_bounded(monkeypatch, tmp_path):
         monkeypatch,
         tmp_path,
         [_row(datetime(2026, 11, 2, 21, 0, tzinfo=UTC), attempt=6)],
+    )
+
+    assert ran is False
+    runner.assert_not_called()
+
+
+def test_recovery_waits_until_ordinary_retries_are_exhausted(
+    monkeypatch,
+    tmp_path,
+):
+    ran, runner, _state = _recover(
+        monkeypatch,
+        tmp_path,
+        [_row(
+            datetime(2026, 11, 2, 21, 0, tzinfo=UTC),
+            attempt=3,
+        )],
+    )
+
+    assert ran is False
+    runner.assert_not_called()
+
+
+def test_only_the_completed_sessions_final_window_is_recovered(
+    monkeypatch,
+    tmp_path,
+):
+    ran, runner, _state = _recover(
+        monkeypatch,
+        tmp_path,
+        [
+            _row(datetime(2026, 11, 2, 20, 55, tzinfo=UTC)),
+            _row(
+                datetime(2026, 11, 2, 21, 0, tzinfo=UTC),
+                ready=False,
+            ),
+        ],
     )
 
     assert ran is False

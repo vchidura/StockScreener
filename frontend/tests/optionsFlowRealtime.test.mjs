@@ -11,7 +11,7 @@ test('Options Activity and Flow keep the original pages and explicit unavailable
   assert.equal(app.match(/path="\/options\/flow" element=\{<OptionsFlowPage \/>\}/g)?.length, 2)
   const activity = read('../src/pages/OptionsActivityPage.tsx')
   const flow = read('../src/pages/OptionsFlowPage.tsx')
-  assert.match(activity, /optionFlowUnavailableReason\(activity\.data\?\.reason\)/)
+  assert.match(activity, /optionFlowUnavailableReason\(activity\.data\?\.reason, activity\.error\)/)
   assert.match(activity, /new URLSearchParams\(searchParams\)/)
   assert.match(flow, /EQUITY_ONLY_COHORT/)
   assert.match(flow, /No complete analyzed option matrices were retained/)
@@ -22,6 +22,8 @@ test('Options Activity and Flow keep the original pages and explicit unavailable
   assert.match(flow, /className="flow-summary"/)
   assert.match(flow, /<ExpiryProfile rows=\{data\.expirations\}/)
   assert.match(flow, /<StrikeProfile rows=\{strikeRows\}/)
+  assert.match(activity + flow, /optionsDataTierLabel/)
+  assert.doesNotMatch(flow, /Delayed options activity/)
 })
 
 test('Options Flow requests preserve realtime cohort identity without canonical fallback', async () => {
@@ -37,36 +39,57 @@ test('Options Flow requests preserve realtime cohort identity without canonical 
   }).outputText
   const source = read('../src/services/api.ts')
     .replace("import axios from 'axios'", 'const axios = { create: () => globalThis.__optionFlowApi }')
+    .replace(
+      "import { realtimeCohortId, realtimeOptionsCohortId, realtimeOptionsReadsEnabled } from './portalIdentity'",
+      `const realtimeCohortId = () => globalThis.__optionFlowIdentity?.equity?.cohort_id
+       const realtimeOptionsCohortId = sessionDate => sessionDate
+         ? globalThis.__optionFlowIdentity?.options_session_cohorts?.[sessionDate]
+         : globalThis.__optionFlowIdentity?.options?.cohort_id
+       const realtimeOptionsReadsEnabled = () => globalThis.__optionFlowIdentity?.options_reads_enabled === true`,
+    )
     .replaceAll('import.meta.env', 'globalThis.__optionFlowEnvironment')
   try {
-    globalThis.__optionFlowEnvironment = {
-      VITE_REALTIME_ONLY: 'true', VITE_REALTIME_OPTIONS_V2: 'true',
-      VITE_REALTIME_COHORT_ID: ' exact-cohort ',
+    globalThis.__optionFlowEnvironment = { VITE_REALTIME_ONLY: 'true' }
+    globalThis.__optionFlowIdentity = {
+      equity: { cohort_id: 'equity-cohort' },
+      options: { cohort_id: 'exact-cohort' },
+      options_reads_enabled: true,
+      options_session_cohorts: {
+        '2026-10-06': 'historical-options-cohort',
+      },
     }
     const api = await import(`data:text/javascript;base64,${Buffer.from(compile(source)).toString('base64')}`)
     await api.getOptionFlow('AAPL', '2026-10-06')
     assert.deepEqual(calls, [[
       '/options/flow',
-      { params: { underlyer: 'AAPL', session_date: '2026-10-06', cohort_id: 'exact-cohort' } },
+      {
+        params: {
+          underlyer: 'AAPL',
+          session_date: '2026-10-06',
+          read_mode: 'retained',
+          cohort_id: 'historical-options-cohort',
+        },
+      },
     ]])
     calls.length = 0
-    globalThis.__optionFlowEnvironment = {
-      VITE_REALTIME_ONLY: 'true', VITE_REALTIME_OPTIONS_V2: 'true',
-    }
-    await assert.rejects(api.getOptionFlow('AAPL'), /requires VITE_REALTIME_COHORT_ID/)
+    await api.getOptionFlow('AAPL')
+    assert.equal(calls[0][1].params.cohort_id, 'exact-cohort')
+    calls.length = 0
+    globalThis.__optionFlowIdentity.options_session_cohorts = {}
+    await assert.rejects(
+      api.getOptionFlow('AAPL', '2026-10-06'),
+      /selected session/,
+    )
     assert.equal(calls.length, 0)
-    globalThis.__optionFlowEnvironment = {
-      VITE_REALTIME_ONLY: 'true',
-      VITE_REALTIME_OPTIONS_V2: 'false',
-      VITE_REALTIME_COHORT_ID: 'exact-cohort',
-    }
+    globalThis.__optionFlowIdentity.options_reads_enabled = false
     await assert.rejects(
       api.getOptionFlow('AAPL'),
-      /require VITE_REALTIME_OPTIONS_V2=true/,
+      /stored reads are disabled/,
     )
     assert.equal(calls.length, 0)
   } finally {
     delete globalThis.__optionFlowApi
     delete globalThis.__optionFlowEnvironment
+    delete globalThis.__optionFlowIdentity
   }
 })

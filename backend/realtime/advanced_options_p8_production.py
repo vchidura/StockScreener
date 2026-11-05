@@ -1,6 +1,7 @@
 """Production dependency composition for the Advanced Options P8 factory."""
 from __future__ import annotations
 
+import logging
 import os
 import time
 from collections.abc import Mapping
@@ -9,7 +10,7 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
-from uuid import NAMESPACE_URL, UUID, uuid5
+from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 from options.data.polygon_http import RequestsPolygonHttpTransport
 from psycopg2.pool import ThreadedConnectionPool
@@ -126,6 +127,8 @@ from .worker_database import RealtimeProcessDatabase
 
 
 UTC = timezone.utc
+_LOGGER = logging.getLogger(__name__)
+_FAILED_ATTEMPT_LEASE_SECONDS = 60
 BUILD_ID = "advanced-options-p8-live-canary-v1"
 P8_PRODUCTION_BINDING_SCHEMA = "advanced-options-p8-production-binding-v3"
 
@@ -671,6 +674,38 @@ def publisher_advancing_read_pin(
     return publish_and_pin
 
 
+def fail_v3_window_attempt(
+    *,
+    provider,
+    window_id: UUID,
+    reason: str,
+    checked_at: datetime,
+) -> dict[str, object]:
+    """End a window whose retry cannot reproduce what an earlier attempt made
+    durable, as any failed attempt ends, so the hold lifts and the next cycle runs."""
+    repository = PostgresOrchestrationRepository(provider)
+    claim = repository.claim_window(
+        window_id,
+        uuid4(),
+        checked_at,
+        _FAILED_ATTEMPT_LEASE_SECONDS,
+    )
+    if claim is None:
+        return {"status": "NOT_CLAIMED", "persisted": False}
+    repository.recover_orphans(claim, checked_at)
+    repository.finish_window(claim, "FAILED", checked_at)
+    _LOGGER.warning(
+        "advanced_options_window_retry_failed window_id=%s reason=%s",
+        window_id,
+        reason,
+    )
+    return {
+        "status": "FINISHED",
+        "window_state": "FAILED",
+        "reason_codes": ["WINDOW_RETRY_DIVERGED"],
+    }
+
+
 def load_v3_pending_window_bindings(
     *,
     provider,
@@ -694,12 +729,18 @@ def load_v3_pending_window_bindings(
             "WHERE cycle.session_authorization_id=%s "
             "AND cycle.target_cohort_id=%s "
             "AND window_run.state IN ('PENDING','RUNNING') "
+            # This loop is the only runner, so a live lease is an earlier attempt
+            # that died. Its window is retried once that lease ends.
+            "AND (window_run.state='PENDING' "
+            "OR window_run.lease_until IS NULL "
+            "OR window_run.lease_until<=%s) "
             "AND window_run.release_at<=%s "
             "AND window_run.deadline>%s "
             "ORDER BY cycle.options_cutoff,cycle.target_window_id",
             (
                 str(session.authorization_id),
                 str(binding.enrollment.control_plane.cohort_id),
+                checked,
                 checked,
                 checked,
             ),
@@ -783,6 +824,7 @@ def _production_binding_payload(
     reference,
     receipt_inputs,
     selection,
+    selection_capture,
 ):
     value = {
         "schema": P8_PRODUCTION_BINDING_SCHEMA,
@@ -948,6 +990,18 @@ def _production_binding_payload(
             "authorized_plan_id": str(control.plan_id),
         },
         "selection": option_activity_selection_payload(selection),
+        "volume_baselines": [
+            {
+                "contract_ticker": row.contract_ticker,
+                "snapshot_volume": row.day_volume,
+                "snapshot_at": row.market_data_time.isoformat(),
+                "source_sha256": row.source_sha256,
+            }
+            for row in sorted(
+                selection_capture.selection.selected,
+                key=lambda candidate: candidate.contract_ticker,
+            )
+        ],
         "history_binding": advanced_options_history_binding_payload(
             binding.history
         ),
@@ -1933,6 +1987,7 @@ class _P8ProductionCapture:
             reference=reference,
             receipt_inputs=receipt,
             selection=selection,
+            selection_capture=capture,
         )
         self.cycle_cutoff = cycle_cutoff
         rebuilt = p8_production_binding_from_payload(
@@ -2398,6 +2453,99 @@ class _EnrollmentConnection:
         self._connection.commit()
 
 
+def load_p8_production_publication_batch(
+    provider: V2ConnectionProvider,
+    *,
+    cohort_id: UUID,
+    window_id: UUID,
+) -> PortalPublicationBatch:
+    with provider.transaction(
+        APP_ROLE,
+        read_only=True,
+        dict_cursor=True,
+    ) as unit:
+        unit.cursor.execute(
+            "SELECT receipt_id::text,cutoff,"
+            "reference_generation,universe_sha256,input_sha256,"
+            "build_id FROM rt.cycle_receipts "
+            "WHERE window_id=%s "
+            "AND receipt_kind='OPTIONS_PORTAL_READY'",
+            (str(window_id),),
+        )
+        row = unit.cursor.fetchone()
+        if row is None:
+            raise RuntimeError(
+                "P8 publication receipt is unavailable"
+            )
+        unit.cursor.execute(
+            "SELECT catalog.snapshot_id::text,catalog.cohort_id::text,"
+            "catalog.provider_tier,catalog.snapshot_type,"
+            "catalog.snapshot_key,catalog.source_generation,"
+            "catalog.manifest_sha256 AS source_manifest_sha256,"
+            "hot.source_manifest,catalog.payload_sha256,hot.payload,"
+            "catalog.generated_at,catalog.valid_until "
+            "FROM rt.snapshot_catalog AS catalog "
+            "JOIN rt.portal_snapshot_hot AS hot "
+            "ON hot.snapshot_id=catalog.snapshot_id "
+            "AND hot.generated_at=catalog.generated_at "
+            "WHERE catalog.cohort_id=%s "
+            "AND catalog.provider_tier='MASSIVE_ADVANCED' "
+            "AND catalog.snapshot_type=ANY(%s) "
+            "AND catalog.snapshot_key='CURRENT' "
+            "AND catalog.generated_at=%s "
+            "ORDER BY catalog.snapshot_type",
+            (
+                str(cohort_id),
+                list(OPTIONS_PROJECTION_TYPES)
+                + list(OPTIONS_PAGE_SNAPSHOT_TYPES.values()),
+                row["cutoff"],
+            ),
+        )
+        snapshot_rows = tuple(unit.cursor.fetchall())
+    expected_types = set(OPTIONS_PROJECTION_TYPES) | set(
+        OPTIONS_PAGE_SNAPSHOT_TYPES.values()
+    )
+    if {
+        str(value["snapshot_type"]) for value in snapshot_rows
+    } != expected_types:
+        raise RuntimeError(
+            "P8 canonical projection snapshots are incomplete"
+        )
+    from .portal_projection import RealtimePortalSnapshot
+    from .portal_projection_repository import PortalReleaseReceipt
+
+    snapshots = tuple(
+        RealtimePortalSnapshot(
+            snapshot_id=UUID(value["snapshot_id"]),
+            cohort_id=UUID(value["cohort_id"]),
+            provider_tier=ProviderTier(value["provider_tier"]),
+            snapshot_type=str(value["snapshot_type"]),
+            snapshot_key=str(value["snapshot_key"]),
+            source_generation=int(value["source_generation"]),
+            source_manifest_sha256=str(
+                value["source_manifest_sha256"]
+            ),
+            source_manifest=value["source_manifest"],
+            payload_sha256=str(value["payload_sha256"]),
+            payload=value["payload"],
+            generated_at=value["generated_at"],
+            valid_until=value["valid_until"],
+        )
+        for value in snapshot_rows
+    )
+    receipt = PortalReleaseReceipt(
+        UUID(row["receipt_id"]),
+        cohort_id,
+        ProviderTier.MASSIVE_ADVANCED,
+        row["cutoff"],
+        str(row["universe_sha256"]),
+    )
+    return PortalPublicationBatch(
+        snapshots,
+        receipt=receipt,
+    )
+
+
 def build_advanced_options_p8_production_components(
     *,
     package: Mapping[str, object],
@@ -2480,92 +2628,13 @@ def build_advanced_options_p8_production_components(
                 raise RuntimeError(
                     "P8 publication requires completed serial stages"
                 )
-            with provider.transaction(
-                APP_ROLE,
-                read_only=True,
-                dict_cursor=True,
-            ) as unit:
-                unit.cursor.execute(
-                    "SELECT receipt_id::text,cutoff,"
-                    "reference_generation,universe_sha256,input_sha256,"
-                    "build_id FROM rt.cycle_receipts "
-                    "WHERE window_id=%s "
-                    "AND receipt_kind='OPTIONS_PORTAL_READY'",
-                    (str(binding.window_id),),
-                )
-                row = unit.cursor.fetchone()
-                if row is None:
-                    raise RuntimeError(
-                        "P8 publication receipt is unavailable"
-                    )
-                unit.cursor.execute(
-                    "SELECT catalog.snapshot_id::text,catalog.cohort_id::text,"
-                    "catalog.provider_tier,catalog.snapshot_type,"
-                    "catalog.snapshot_key,catalog.source_generation,"
-                    "catalog.source_manifest_sha256,hot.source_manifest,"
-                    "catalog.payload_sha256,hot.payload,"
-                    "catalog.generated_at,catalog.valid_until "
-                    "FROM rt.snapshot_catalog AS catalog "
-                    "JOIN rt.portal_snapshot_hot AS hot "
-                    "ON hot.snapshot_id=catalog.snapshot_id "
-                    "AND hot.generated_at=catalog.generated_at "
-                    "WHERE catalog.cohort_id=%s "
-                    "AND catalog.provider_tier='MASSIVE_ADVANCED' "
-                    "AND catalog.snapshot_type=ANY(%s) "
-                    "AND catalog.snapshot_key='CURRENT' "
-                    "AND catalog.generated_at=%s "
-                    "ORDER BY catalog.snapshot_type",
-                    (
-                        str(binding.enrollment.control_plane.cohort_id),
-                        list(OPTIONS_PROJECTION_TYPES)
-                        + list(OPTIONS_PAGE_SNAPSHOT_TYPES.values()),
-                        row["cutoff"],
-                    ),
-                )
-                snapshot_rows = tuple(unit.cursor.fetchall())
-            expected_types = set(OPTIONS_PROJECTION_TYPES) | set(
-                OPTIONS_PAGE_SNAPSHOT_TYPES.values()
+            batch = load_p8_production_publication_batch(
+                provider,
+                cohort_id=binding.enrollment.control_plane.cohort_id,
+                window_id=binding.window_id,
             )
-            if {
-                str(value["snapshot_type"]) for value in snapshot_rows
-            } != expected_types:
-                raise RuntimeError(
-                    "P8 canonical projection snapshots are incomplete"
-                )
-            from .portal_projection import RealtimePortalSnapshot
-            from .portal_projection_repository import PortalReleaseReceipt
-
-            snapshots = tuple(
-                RealtimePortalSnapshot(
-                    snapshot_id=UUID(value["snapshot_id"]),
-                    cohort_id=UUID(value["cohort_id"]),
-                    provider_tier=ProviderTier(value["provider_tier"]),
-                    snapshot_type=str(value["snapshot_type"]),
-                    snapshot_key=str(value["snapshot_key"]),
-                    source_generation=int(value["source_generation"]),
-                    source_manifest_sha256=str(
-                        value["source_manifest_sha256"]
-                    ),
-                    source_manifest=value["source_manifest"],
-                    payload_sha256=str(value["payload_sha256"]),
-                    payload=value["payload"],
-                    generated_at=value["generated_at"],
-                    valid_until=value["valid_until"],
-                )
-                for value in snapshot_rows
-            )
-            receipt = PortalReleaseReceipt(
-                UUID(row["receipt_id"]),
-                binding.enrollment.control_plane.cohort_id,
-                ProviderTier.MASSIVE_ADVANCED,
-                row["cutoff"],
-                str(row["universe_sha256"]),
-            )
-            publication_state["snapshots"] = snapshots
-            return PortalPublicationBatch(
-                snapshots,
-                receipt=receipt,
-            )
+            publication_state["snapshots"] = batch.snapshots
+            return batch
 
         def publication_observation(binding, pointer, checked_at):
             snapshots = publication_state.get("snapshots")

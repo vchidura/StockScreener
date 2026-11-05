@@ -224,7 +224,12 @@ class AdvancedOptionsCanonicalLoaders:
         _context: StageContext,
     ) -> OptionsReferenceStageResult:
         result = self._port.produce_reference_state()
-        state = getattr(result, "state", None)
+        # The Postgres producer returns the persisted state itself.
+        state = (
+            result
+            if hasattr(result, "state_id")
+            else getattr(result, "state", None)
+        )
         if state is None:
             reasons = tuple(getattr(result, "reason_codes", ()))
             raise ValueError(

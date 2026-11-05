@@ -338,7 +338,7 @@ def test_deferred_state_is_durable_in_owned_postgres(database):
     ].attempt == 2
 
 
-def test_options_exception_never_blocks_equity_and_its_message_is_not_persisted(harness):
+def test_options_exception_keeps_bounded_sanitized_detail_and_isolates_equity(harness):
     harness.mark_reference_ready()
     window = harness.window()
 
@@ -351,7 +351,11 @@ def test_options_exception_never_blocks_equity_and_its_message_is_not_persisted(
     assert states["OPTIONS_ADMISSION"] == "BLOCKED_PREREQ" and states["OPTIONS_CYCLE"] == "BLOCKED_PREREQ"
     assert {states[name] for name in EQUITY - {"REFERENCE"}} == {"COMPLETE"}
     persisted = repr(harness.query_runs(window.window_id)) + repr(harness.repository.readiness(harness.plan.cohort_id))
-    assert "SECRET-VALUE" not in persisted and "STAGE_EXCEPTION:RuntimeError" in persisted
+    assert "SECRET-VALUE" not in persisted
+    assert (
+        "STAGE_EXCEPTION:RuntimeError:provider said token=<redacted>"
+        in persisted
+    )
     assert report.window_state == "FAILED"
 
 
@@ -617,7 +621,9 @@ def test_resident_stage_failure_is_isolated_and_reported_through_readiness(harne
     })
     orchestrator.start(harness.plan.plan_id)
     outcome = orchestrator.tick_resident(harness.plan.plan_id, "OPTIONS_FLOW")
-    assert outcome.reason_codes == ("STAGE_EXCEPTION:ConnectionError",)
+    assert outcome.reason_codes == (
+        "STAGE_EXCEPTION:ConnectionError:feed down",
+    )
     readiness = harness.repository.readiness(harness.plan.cohort_id)
     assert readiness["OPTIONS_FLOW"] == "BLOCKED" and readiness["REFERENCE"] == "READY"
     window = harness.window()
@@ -813,8 +819,12 @@ def test_the_equity_runners_run_through_the_orchestrator_on_the_real_schema(data
     published = []
     monkeypatch.setattr(equity_runners, "compute_realtime_ticker_cycle",
                         lambda database, **scope: SimpleNamespace(inputs=inputs, scope=scope))
-    monkeypatch.setattr(equity_runners, "publish_realtime_ticker_cycle",
-                        lambda database, cycle, **options: published.append((cycle, options)))
+    monkeypatch.setattr(
+        equity_runners,
+        "publish_realtime_portal_cycle_atomic",
+        lambda database, cycle, dashboard, **options:
+        published.append((cycle, options)),
+    )
     environment = RunnerEnvironment(harness.database, build_id="build-test")
     window = harness.window()
     report = harness.orchestrator({

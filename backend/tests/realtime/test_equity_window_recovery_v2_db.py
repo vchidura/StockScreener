@@ -54,12 +54,13 @@ def test_recovery_uses_matching_durable_receipt_not_window_status_alone(
             )
             cursor.execute(
                 "INSERT INTO rt.cycle_receipts (receipt_id,window_id,cohort_id,receipt_kind,"
-                "cutoff,reference_generation,universe_sha256,input_sha256,build_id) "
-                "VALUES (%s,%s,%s,'INPUT_READY',%s,1,%s,%s,%s)",
+                "cutoff,reference_generation,universe_sha256,input_sha256,build_id,known_by) "
+                "VALUES (%s,%s,%s,'INPUT_READY',%s,1,%s,%s,%s,%s)",
                 (
                     str(uuid4()), str(window), str(cohort), CUTOFF,
                     "0" * 64 if wrong_universe else universe, "b" * 64,
                     EQUITY_WINDOW_BUILD_ID,
+                    CUTOFF + timedelta(minutes=17),
                 ),
             )
             if wrong_universe:
@@ -69,7 +70,8 @@ def test_recovery_uses_matching_durable_receipt_not_window_status_alone(
                 result = equity_window_recovery_cursor(cursor, cohort, CUTOFF)
                 assert result["has_input_receipt"]
                 assert result["input_receipt"].input_sha256 == "b" * 64
-                assert result["input_known_by"] == CUTOFF + timedelta(minutes=20)
+                assert result["input_known_by"] == CUTOFF + timedelta(minutes=17)
+                assert result["input_receipt"].known_by == result["input_known_by"]
                 assert result["complete"] == (state == "COMPLETE")
                 if state == "FAILED":
                     assert result["retry_not_before"] == CUTOFF + timedelta(minutes=21)

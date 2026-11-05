@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import nullcontext
+from decimal import Decimal
 from uuid import NAMESPACE_URL, UUID, uuid5
 
 from options.domain import ContractType
@@ -404,7 +405,7 @@ def _persist_realtime_option_package_mark(
                     outcome.estimated_cost,
                     outcome.net_pnl,
                     outcome.capital_at_risk,
-                    outcome.net_return,
+                    outcome.net_return.quantize(Decimal("0.000000000001")),
                     outcome.availability_flag,
                     list(outcome.quality_flags),
                     str(mark.evidence_batch_id),
@@ -437,7 +438,7 @@ def _persist_realtime_option_package_mark(
                 outcome.estimated_cost,
                 outcome.net_pnl,
                 outcome.capital_at_risk,
-                outcome.net_return,
+                outcome.net_return.quantize(Decimal("0.000000000001")),
                 outcome.availability_flag,
                 list(outcome.quality_flags),
                 str(mark.evidence_batch_id),
@@ -683,7 +684,8 @@ class RealtimeOptionPortalMarkRepository:
                 "revision.evidence_batch_id AS source_batch_id "
                 "FROM rt.option_package_mark_current AS current "
                 "JOIN rt.option_package_mark_revisions AS revision USING (mark_id) "
-                "JOIN rt.option_packages AS package USING (candidate_id) "
+                "JOIN rt.option_packages AS package "
+                "ON package.candidate_id=current.candidate_id "
                 "JOIN rt.option_package_mark_inputs AS input USING (mark_id) "
                 "JOIN rt.option_package_legs AS leg ON leg.candidate_id=package.candidate_id "
                 "AND leg.leg_index=input.leg_index "

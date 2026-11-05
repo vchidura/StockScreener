@@ -134,7 +134,9 @@ class AdvancedOptionsFlowObservation:
                 self.quote_seq,
             )
         )
-        if classified != quote_complete:
+        # A side needs a full quote. The reverse does not hold: QUOTE_STALE keeps the
+        # quote it judged too old, which crashed the Options window (found Nov 5).
+        if classified and not quote_complete:
             raise ValueError("aggression evidence is incomplete")
         if (self.side_class == "INSIDE_SPREAD") != (
             self.spread_position is not None
@@ -217,12 +219,15 @@ def build_flow_observation(
     )
     if (
         volume is None
-        or volume.checkpoint.cumulative_volume < event.cumulative_volume_after
         or event.session_date != reference_state.session_date
         or event.session_date != rolling_state.session_date
     ):
         raise ValueError("flow event does not match reference/rolling state")
     reasons = tuple(event.reasons)
+    # Reconciling to a provider snapshot can lower the checkpoint below a total this
+    # event already saw. That dates the event's total, and the event stays valid.
+    if volume.checkpoint.cumulative_volume < event.cumulative_volume_after:
+        reasons = (*reasons, "VOLUME_ABOVE_RECONCILED_CHECKPOINT")
     if BaselineKind(event.volume_baseline_kind) not in COMPLETE_BASELINES:
         reasons = (*reasons, "VOLUME_BASELINE_INCOMPLETE")
     identity = {

@@ -3,7 +3,7 @@ import { useNavigate, useSearchParams } from 'react-router-dom'
 import { AlertTriangle, Database } from 'lucide-react'
 import { usePublishPageContext } from '../layout/pageContext'
 import { useSessionDate } from '../layout/sessionDate'
-import { getOptionFlow } from '../services/api'
+import { getOptionFlow, optionsDataTierLabel } from '../services/api'
 import { optionFlowUnavailableReason, TickerBoard } from './OptionsFlowPage'
 import './OptionsFlowPage.css'
 
@@ -22,11 +22,12 @@ export default function OptionsActivityPage() {
     eyebrow: 'Cross-sectional options activity',
     title: 'Option Activity',
     detail: 'Compare call and put participation, estimated premium activity, and settled positioning change across the tracked universe.',
-    session: '1d',
+    status: [{ label: 'Data', value: optionsDataTierLabel(activity.data?.data_tier) }],
+    session: '5m',
   })
 
   if (activity.isLoading) return <div className="flow-state"><Database size={20} /><div><strong>Loading option activity</strong><span>Reading the latest complete matrices in the selected exchange session.</span></div></div>
-  if (activity.isError || !data || activity.data?.available === false) return <div className="flow-state flow-state--warning"><AlertTriangle size={20} /><div><strong>Option activity unavailable</strong><span>{optionFlowUnavailableReason(activity.data?.reason)}</span></div></div>
+  if (activity.isError || !data || activity.data?.available === false) return <div className="flow-state flow-state--warning"><AlertTriangle size={20} /><div><strong>Option activity unavailable</strong><span>{optionFlowUnavailableReason(activity.data?.reason, activity.error)}</span></div></div>
 
   return <div className="options-flow-page">
     <TickerBoard rows={data.underlyers} selected="" onSelect={underlyer => {

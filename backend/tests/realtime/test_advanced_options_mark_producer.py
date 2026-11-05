@@ -1,7 +1,10 @@
 from contextlib import contextmanager
 from dataclasses import replace
+from datetime import timedelta
+from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
+from uuid import uuid4
 
 from psycopg2 import Error as PsycopgError
 
@@ -13,6 +16,7 @@ from realtime.advanced_options_mark_producer import (
     AdvancedOptionsMarkStatus,
     PostgresAdvancedOptionsMarkProducer,
     advanced_options_mark_producer_plan_payload,
+    assemble_advanced_options_marks_cursor,
     build_advanced_options_mark_producer_plan,
     freeze_advanced_options_mark_producer_plan,
 )
@@ -109,6 +113,89 @@ def _preflight(plan):
         marks=(),
         evidence=(),
     )
+
+
+class _QuoteCursor:
+    def __init__(self, rows):
+        self.rows = rows
+
+    def execute(self, _statement, _parameters):
+        return None
+
+    def fetchall(self):
+        return self.rows
+
+
+def _quote_rows(plan, *, event_at, received_at):
+    control = plan.control_plane
+    return tuple(
+        {
+            "instrument_id": row.instrument_id,
+            "catalog_version_id": row.catalog_version_id,
+            "contract_id": row.contract_id,
+            "contract_ticker": row.contract_ticker,
+            "underlying_security_id": str(uuid4()),
+            "expiration": control.session_date,
+            "source_session": control.session_date,
+            "source_sequence": 1,
+            "event_time_raw": int(event_at.timestamp() * 1000),
+            "event_time_unit": "ms",
+            "event_at": event_at,
+            "received_at": received_at,
+            "bid": Decimal("1"),
+            "ask": Decimal("1.1"),
+            "bid_size": 10,
+            "ask_size": 12,
+            "bid_exchange": 301,
+            "ask_exchange": 302,
+            "quality": "GOOD",
+            "reason_codes": [],
+            "session_id": str(plan.source_flow.stream_session_ids[0]),
+            "journal_generation": str(plan.source_flow.journal_generation),
+            "shard_id": 0,
+            "source_offset": 1,
+            "payload_sha256": "9" * 64,
+        }
+        for row in plan.enrollment.activity_selection.contracts
+    )
+
+
+def _noncausal_rows(result):
+    return [
+        row
+        for row in result.evidence
+        if "OPTION_NBBO_STALE_OR_NONCAUSAL" in row.reason_codes
+    ]
+
+
+def test_quote_from_before_the_cutoff_may_arrive_just_after_it():
+    plan = _plan()
+
+    result = assemble_advanced_options_marks_cursor(
+        _QuoteCursor(_quote_rows(
+            plan,
+            event_at=NOW - timedelta(milliseconds=2),
+            received_at=NOW + timedelta(milliseconds=40),
+        )),
+        plan,
+    )
+
+    assert _noncausal_rows(result) == []
+
+
+def test_quote_from_after_the_cutoff_stays_out_of_the_window():
+    plan = _plan()
+
+    result = assemble_advanced_options_marks_cursor(
+        _QuoteCursor(_quote_rows(
+            plan,
+            event_at=NOW + timedelta(milliseconds=1),
+            received_at=NOW + timedelta(milliseconds=40),
+        )),
+        plan,
+    )
+
+    assert _noncausal_rows(result)
 
 
 def test_mark_plan_freezes_exact_scope_policy_and_zero_authority():

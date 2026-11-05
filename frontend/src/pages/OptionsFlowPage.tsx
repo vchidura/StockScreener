@@ -13,6 +13,7 @@ import { usePublishPageContext } from '../layout/pageContext'
 import { useSessionDate } from '../layout/sessionDate'
 import {
   getOptionFlow,
+  optionsDataTierLabel,
   type OptionFlowExpiration,
   type OptionFlowStrike,
   type OptionFlowSummary,
@@ -49,7 +50,8 @@ const formatDateTime = (value: string | null | undefined) => value
     }).format(new Date(value))
   : 'Unavailable'
 
-export function optionFlowUnavailableReason(reason: string | null | undefined) {
+export function optionFlowUnavailableReason(reason: string | null | undefined, error?: unknown) {
+  if (error instanceof Error && error.message.startsWith('No Options publication')) return error.message
   if (reason === 'EQUITY_ONLY_COHORT') return 'The selected realtime cohort contains no option underlyings.'
   if (reason === 'NO_COMPLETE_MATRIX') return 'No complete analyzed option matrices were retained for this cohort.'
   if (reason === 'ACTIVE_COHORT_UNAVAILABLE') return 'The selected realtime cohort is unavailable.'
@@ -198,14 +200,15 @@ export default function OptionsFlowPage() {
   useEffect(() => setStrikeExpiration('ALL'), [data?.selected, data?.session_date])
 
   usePublishPageContext({
-    eyebrow: 'Delayed options activity',
+    eyebrow: `${optionsDataTierLabel(flow.data?.data_tier)} options activity`,
     title: 'Options Flow',
     detail: 'Call and put activity, positioning change, and contract concentration for one selected underlying.',
-    session: '1d',
+    status: [{ label: 'Data', value: optionsDataTierLabel(flow.data?.data_tier) }],
+    session: '5m',
   })
 
   if (flow.isLoading) return <div className="flow-state"><Database size={20} /><div><strong>Loading options activity</strong><span>Reading the latest complete option matrices.</span></div></div>
-  if (flow.isError || !data || flow.data?.available === false) return <div className="flow-state flow-state--warning"><AlertTriangle size={20} /><div><strong>Options activity unavailable</strong><span>{optionFlowUnavailableReason(flow.data?.reason)}</span></div></div>
+  if (flow.isError || !data || flow.data?.available === false) return <div className="flow-state flow-state--warning"><AlertTriangle size={20} /><div><strong>Options activity unavailable</strong><span>{optionFlowUnavailableReason(flow.data?.reason, flow.error)}</span></div></div>
 
   const oiChange = selected?.open_interest_change
   const strikeRows = strikeExpiration === 'ALL'

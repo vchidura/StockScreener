@@ -7,7 +7,9 @@ import pytest
 
 from realtime.portal_compatibility_repository import (
     BoundedCache,
+    ReleaseView,
     RealtimeOptionAlertRepository,
+    RealtimeOptionFlowRepository,
     RealtimeStockAlertRepository,
     RealtimeTickerScreenerRepository,
     load_release,
@@ -41,6 +43,60 @@ def _release(snapshot_type, snapshot_key):
              "snapshot_type": snapshot_type, "snapshot_key": snapshot_key,
              "source_generation": 7, "generated_at": NOW.isoformat()}
     return release_rows(UUID(int=77), COHORT, [entry], cutoff=NOW, session_date=NOW.date())
+
+
+def test_advanced_options_page_honors_disabled_and_selected_release(
+    monkeypatch,
+):
+    cursor = MagicMock()
+    disabled = RealtimeOptionFlowRepository(
+        _factory(cursor),
+        reads_enabled=False,
+    )
+    assert disabled._advanced_options_page(
+        cursor,
+        cohort_id=COHORT,
+        available_by=NOW,
+        artifact_kind="FLOW",
+    ) is None
+
+    release = ReleaseView(
+        release_id=UUID(int=77),
+        cohort_id=COHORT,
+        provider_tier="MASSIVE_ADVANCED",
+        release_class="PORTAL",
+        session_date=NOW.date(),
+        cutoff=NOW,
+        entries={},
+    )
+    repository = RealtimeOptionFlowRepository(_factory(cursor))
+    monkeypatch.setattr(
+        type(repository),
+        "_release",
+        lambda _self, _cursor, _cohort_id: release,
+    )
+    observed = {}
+
+    def load(_cursor, **kwargs):
+        observed.update(kwargs)
+        return "selected"
+
+    from realtime import advanced_options_projection
+
+    monkeypatch.setattr(
+        advanced_options_projection,
+        "load_advanced_options_page_release_cursor",
+        load,
+    )
+
+    assert repository._advanced_options_page(
+        cursor,
+        cohort_id=COHORT,
+        available_by=NOW,
+        artifact_kind="FLOW",
+    ) == "selected"
+    assert observed["release_id"] == release.release_id
+    assert observed["release_cutoff"] == release.cutoff
 
 
 def test_ticker_page_reads_only_the_current_release_snapshot_without_provider_fetch():

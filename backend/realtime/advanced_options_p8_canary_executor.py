@@ -220,19 +220,27 @@ class P8BindingCapturePort(Protocol):
 
 
 class P8StoredReadPort(Protocol):
-    def enable(
+    def snapshot(
+        self,
+        *,
+        cohort_id: UUID,
+    ) -> Mapping[str, object] | None: ...
+
+    def advance(
         self,
         *,
         cohort_id: UUID,
         release_id: UUID,
+        previous: Mapping[str, object] | None,
     ) -> Mapping[str, object]: ...
 
-    def disable(
+    def restore(
         self,
         *,
         cohort_id: UUID,
-        release_id: UUID,
-    ) -> None: ...
+        expected_release_id: UUID,
+        previous: Mapping[str, object] | None,
+    ) -> Mapping[str, object] | None: ...
 
 
 class P8CanaryLifecyclePort(Protocol):
@@ -491,6 +499,7 @@ class AdvancedOptionsP8LifecyclePort:
         self._clock = clock
         self._previous_pointer: PortalReleasePointer | None = None
         self._published_pointer: PortalReleasePointer | None = None
+        self._previous_read_pin: Mapping[str, object] | None = None
         self._stored_reads_enabled = False
         self._resident_starts = 0
         self._resident_stops = 0
@@ -607,10 +616,15 @@ class AdvancedOptionsP8LifecyclePort:
         if self._stored_reads is None:
             raise RuntimeError("P8 stored-read port is unavailable")
         release_id = UUID(str(publication["release_id"]))
-        result = self._stored_reads.enable(
+        self._previous_read_pin = self._stored_reads.snapshot(
+            cohort_id=binding.enrollment.control_plane.cohort_id,
+        )
+        result = self._stored_reads.advance(
             cohort_id=binding.enrollment.control_plane.cohort_id,
             release_id=release_id,
+            previous=self._previous_read_pin,
         )
+        self._stored_reads_enabled = True
         if (
             result.get("cohort_id")
             != str(binding.enrollment.control_plane.cohort_id)
@@ -620,7 +634,6 @@ class AdvancedOptionsP8LifecyclePort:
             raise RuntimeError(
                 "P8 stored reads did not verify the exact cohort release"
             )
-        self._stored_reads_enabled = True
         return result
 
     def rollback(
@@ -629,9 +642,14 @@ class AdvancedOptionsP8LifecyclePort:
         publication: Mapping[str, object] | None,
     ) -> None:
         if self._stored_reads_enabled and self._stored_reads is not None:
-            self._stored_reads.disable(
+            if publication is None:
+                raise RuntimeError(
+                    "P8 stored-read rollback lacks its publication"
+                )
+            self._stored_reads.restore(
                 cohort_id=binding.enrollment.control_plane.cohort_id,
-                release_id=UUID(str(publication["release_id"])),
+                expected_release_id=UUID(str(publication["release_id"])),
+                previous=self._previous_read_pin,
             )
             self._stored_reads_enabled = False
         if publication is None or self._published_pointer is None:

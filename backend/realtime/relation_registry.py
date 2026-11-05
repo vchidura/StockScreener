@@ -233,7 +233,7 @@ RELATIONS: dict[str, Relation] = {
     ),
     "rt.worker_leases": _r("control", "BOUNDED", mutable=True, delete=True),
     "rt.advanced_options_read_pins": _r(
-        "control", "BOUNDED", mutable=True, api=True
+        "control", "BOUNDED", mutable=True, delete=True, api=True
     ),
     "rt.readiness_current": _r("control", "BOUNDED", mutable=True, api=True),
     "rt.readiness_transitions": _r("control", "BOUNDED", append=True, api=True),
@@ -389,7 +389,9 @@ RELATIONS: dict[str, Relation] = {
     "rt.portal_snapshot_hot": _r("equity", "HOT_TTL", append=True, partitioned=True, api=True),
     "rt.portal_snapshot_kept": _r("equity", "SESSION_WINDOW", append=True, partitioned=True, api=True),
     "rt.portal_releases": _r("equity", "KEPT_3M", append=True, partitioned=True, api=True),
-    "rt.portal_release_current": _r("equity", "BOUNDED", mutable=True, api=True),
+    "rt.portal_release_current": _r(
+        "equity", "BOUNDED", mutable=True, delete=True, api=True
+    ),
     # Archive
     "rt.session_archives": _r("shared", "BOUNDED", append=True),
 }

@@ -248,6 +248,7 @@ def load_advanced_options_equity_context_cursor(
     requirements: tuple[AdvancedOptionsEquityContextRequirement, ...],
     underlyings: tuple[str, ...],
     allow_shared_history_source: bool = False,
+    equity_receipt_id: UUID | None = None,
 ) -> tuple[AdvancedOptionsLaneEquityContext, ...]:
     if not isinstance(equity_plan, AdvancedEquityControlPlanePlan):
         raise TypeError("Options Equity dependency plan is invalid")
@@ -272,6 +273,20 @@ def load_advanced_options_equity_context_cursor(
     ):
         raise ValueError("Options Equity dependency identities are incomplete")
 
+    # A bar ending at the cutoff is always stored after it, so "observed by the cutoff"
+    # could never hold for the bar this check requires, and O3, OS1 and OS2 could never
+    # run (found Nov 5: 0 of 176 bars). The Equity window's own receipt fixes what it
+    # accepted, which is also stable across retries.
+    live_known_by = equity_cutoff
+    if equity_receipt_id is not None:
+        cursor.execute(
+            "SELECT known_by FROM rt.cycle_receipts "
+            "WHERE receipt_id=%s AND receipt_kind='INPUT_READY'",
+            (str(equity_receipt_id),),
+        )
+        receipt = cursor.fetchone()
+        if receipt is not None and receipt["known_by"] is not None:
+            live_known_by = max(equity_cutoff, receipt["known_by"])
     contexts = []
     calendar = OptionExchangeCalendar("XNYS")
     requirements_by_lane: dict[
@@ -387,7 +402,12 @@ def load_advanced_options_equity_context_cursor(
                         requirement.current_session,
                         equity_cutoff.date(),
                         equity_cutoff,
-                        equity_cutoff,
+                        (
+                            live_known_by
+                            if requirement.source
+                            is AdvancedOptionsEquityContextSource.LIVE_EQUITY
+                            else equity_cutoff
+                        ),
                         requirement.session_count,
                     ),
                 )
@@ -484,6 +504,7 @@ def validate_advanced_options_equity_dependencies_cursor(
         requirements=selected,
         underlyings=underlyings,
         allow_shared_history_source=allow_shared_history_source,
+        equity_receipt_id=equity_input.equity_receipt_id,
     )
     lane_context = {
         row.lane.value: {

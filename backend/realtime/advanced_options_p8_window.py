@@ -1,6 +1,9 @@
 """Post-E late-canary stages_v4 assembly for the P8 WINDOW Docker role."""
 from __future__ import annotations
 
+import json
+import sys
+import logging
 from collections.abc import Mapping
 from datetime import datetime, timedelta, timezone
 from dataclasses import replace
@@ -39,6 +42,7 @@ from .advanced_options_package_evidence import (
     build_flow_package_evidence_batch,
 )
 from .advanced_options_native_loader import (
+    AdvancedOptionsNativePreflightBlocked,
     NativeInputPlanStatus,
     PostgresAdvancedOptionsNativeInputLoader,
     build_advanced_options_native_input_plan,
@@ -86,6 +90,7 @@ from .stage_orchestrator import StageOrchestrator
 from .stage_runners_options import (
     OptionsAcquireResult,
     OptionsAdmissionResult,
+    _engine_config,
 )
 from .stage_runners_v2 import (
     build_advanced_options_non_serving_runners,
@@ -93,6 +98,7 @@ from .stage_runners_v2 import (
 
 
 UTC = timezone.utc
+_LOGGER = logging.getLogger(__name__)
 
 
 def _resident_owner_epoch(flow: Mapping[str, object]) -> int:
@@ -309,29 +315,67 @@ def _flow_evidence(provider, cohort_id, reference, rolling):
             "FROM rt.option_flow_event_profiles AS own "
             "WHERE own.event_id=event.event_id "
             "ORDER BY own.profile LIMIT 1) AS profile ON true "
-            "WHERE event.cohort_id=%s "
-            "ORDER BY event.event_time,event.event_id LIMIT 10000",
-            (str(cohort_id),),
+            # Consumers can pass this window's barrier once it ends, so read only up
+            # to the flow checkpoint it holds. Newest first: at the limit, the
+            # oldest prints are the ones to lose.
+            "WHERE event.cohort_id=%s AND event.source_offset<=%s "
+            "ORDER BY event.event_time DESC,event.event_id DESC LIMIT 10000",
+            (str(cohort_id), rolling.committed_offset),
         )
-        rows = tuple(unit.cursor.fetchall())
-    if not rows:
-        raise RuntimeError("P8 canonical flow evidence is empty")
-    events = {
-        UUID(str(row["event_id"])): _flow_event(
-            row,
-            str(row["profile"]),
+        rows = tuple(reversed(unit.cursor.fetchall()))
+    # One event the evidence contract refuses must not stop the whole Options window.
+    events = {}
+    flow_observations = []
+    rejected = {}
+    for row in rows:
+        try:
+            event = _flow_event(row, str(row["profile"]))
+            observation = build_flow_observation(
+                event,
+                reference_state=reference,
+                rolling_state=rolling,
+            )
+        except ValueError as error:
+            reason = str(error).splitlines()[-1][:120] if str(error) else type(error).__name__
+            rejected[reason] = rejected.get(reason, 0) + 1
+            continue
+        events[UUID(str(row["event_id"]))] = event
+        flow_observations.append(observation)
+    if rejected:
+        print(
+            json.dumps({"event": "advanced_options_flow_events_rejected", "reasons": rejected}),
+            file=sys.stderr,
+            flush=True,
         )
-        for row in rows
-    }
-    flow_observations = tuple(
-        build_flow_observation(
-            event,
-            reference_state=reference,
-            rolling_state=rolling,
+    return events, tuple(flow_observations)
+
+
+def _flow_runtime_policy_sha256(
+    provider,
+    flow_environment,
+    control,
+    source_flow,
+):
+    """A session with no qualifying print yet has no event to read the policy
+    from. That is a normal window, and the engine's own policy is the same value."""
+    with provider.transaction(APP_ROLE, read_only=True) as unit:
+        unit.cursor.execute(
+            "SELECT runtime_policy_sha256 "
+            "FROM rt.option_flow_events WHERE cohort_id=%s "
+            "AND source_flow_id=%s "
+            "ORDER BY event_time DESC,event_id DESC LIMIT 1",
+            (str(control.cohort_id), str(source_flow.source_flow_id)),
         )
-        for event in events.values()
-    )
-    return events, flow_observations
+        stored = unit.cursor.fetchone()
+    if stored is not None:
+        return str(stored[0])
+    return _engine_config(
+        flow_environment,
+        flow_environment.options_flow_settings,
+        control.cohort_id,
+        source_flow.journal_generation,
+        source_flow=source_flow,
+    ).policy_sha256()
 
 
 def _package_mark(package, marks, valuation_policy, cutoff):
@@ -351,7 +395,8 @@ def _package_mark(package, marks, valuation_policy, cutoff):
             source_timestamp=int(mark.market_time.timestamp() * 1000),
             source_timestamp_unit="ms",
             event_at=mark.market_time,
-            received_at=mark.observed_time,
+            # A quote from before the cutoff can arrive just after it.
+            received_at=min(mark.observed_time, cutoff),
             bid=mark.bid,
             ask=mark.ask,
             bid_size=mark.bid_size,
@@ -392,7 +437,11 @@ def _evidence_builder(
         reference,
         rolling,
     )
-    observed = max(events.values(), key=lambda row: row.event_time)
+    observed = (
+        None
+        if not events
+        else max(events.values(), key=lambda row: row.event_time)
+    )
     volume = max(
         (
             row.checkpoint.cumulative_volume
@@ -409,13 +458,29 @@ def _evidence_builder(
         minimum_cumulative_volume=1,
         observed_cumulative_volume=volume,
         minimum_volume_oi_ratio=Decimal("0"),
-        observed_volume_oi_ratio=Decimal("1"),
+        observed_volume_oi_ratio=(
+            None if observed is None else Decimal("1")
+        ),
         minimum_premium=Decimal("1"),
-        observed_premium=observed.premium,
-        accepted_side_classes=(observed.side_class,),
-        accepted_confidences=(observed.side_confidence,),
-        observed_side_class=observed.side_class,
-        observed_confidence=observed.side_confidence,
+        observed_premium=(
+            Decimal("0") if observed is None else observed.premium
+        ),
+        accepted_side_classes=(
+            () if observed is None else (observed.side_class,)
+        ),
+        accepted_confidences=(
+            () if observed is None else (observed.side_confidence,)
+        ),
+        observed_side_class=(
+            "NO_QUALIFYING_FLOW_EVENT"
+            if observed is None
+            else observed.side_class
+        ),
+        observed_confidence=(
+            "NO_QUALIFYING_FLOW_EVENT"
+            if observed is None
+            else observed.side_confidence
+        ),
         minimum_cluster_prints=0,
         observed_cluster_prints=0,
         minimum_distinct_exchanges=0,
@@ -432,7 +497,11 @@ def _evidence_builder(
         maximum_freshness_ms=1000,
         observed_freshness_ms=0,
         completeness=completeness,
-        passed=volume >= 1 and completeness in COMPLETE_BASELINES,
+        passed=(
+            observed is not None
+            and volume >= 1
+            and completeness in COMPLETE_BASELINES
+        ),
     )
 
     def build(cycle):
@@ -475,7 +544,10 @@ def _evidence_builder(
                     if package_mark is None
                     else control.pins.valuation_policy_sha256
                 ),
-                degraded_reason_codes=rolling.iv_surface.reason_codes,
+                degraded_reason_codes=(
+                    *rolling.iv_surface.reason_codes,
+                    *rolling.degraded_reason_codes,
+                ),
             ))
         return build_flow_package_evidence_batch(cycle, tuple(values))
 
@@ -610,6 +682,7 @@ def build_and_run_p8_serial_window(
             (BUILD_ID, "mark")
         ),
         valuation_policy=valuation_policy,
+        market_state_committed_offset=int(market["normalized_end_offset"]),
     )
     mark_preflight = PostgresAdvancedOptionsMarkProducer(
         provider,
@@ -623,6 +696,21 @@ def build_and_run_p8_serial_window(
         provider,
         mark_plan,
     ).produce()
+    marked = {row.instrument_id for row in marks}
+    unmarked_instrument_ids = tuple(sorted(
+        row.instrument_id
+        for row in binding.enrollment.activity_selection.contracts
+        if row.instrument_id not in marked
+    ))
+    if rolling.degraded_reason_codes:
+        _LOGGER.warning(
+            "advanced_options_window_degraded window_id=%s reasons=%s "
+            "excluded_contracts=%d first_excluded=%s",
+            binding.window_id,
+            ",".join(rolling.degraded_reason_codes),
+            len(rolling.excluded_contracts),
+            ",".join(row[0] for row in rolling.excluded_contracts[:20]),
+        )
     producer_plan = build_advanced_options_producer_plan(
         control_plane=control,
         discovery_scope=RealtimeOptionDiscoveryScope(
@@ -669,16 +757,14 @@ def build_and_run_p8_serial_window(
         equity_context_requirements=(
             initial_advanced_options_equity_context_requirements()
         ),
+        unmarked_instrument_ids=unmarked_instrument_ids,
     )
     native_preflight = PostgresAdvancedOptionsNativeInputLoader(
         provider,
         native_candidate,
     ).preflight()
     if native_preflight.status is not NativeInputPlanStatus.READY:
-        raise RuntimeError(
-            "P8 native input preflight blocked: "
-            + ",".join(native_preflight.reason_codes)
-        )
+        raise AdvancedOptionsNativePreflightBlocked(native_preflight)
     native_plan = freeze_advanced_options_native_input_plan(
         native_candidate,
         native_preflight,
@@ -701,24 +787,18 @@ def build_and_run_p8_serial_window(
             (BUILD_ID, "input-ready")
         ),
     )
-    with provider.transaction(APP_ROLE, read_only=True) as unit:
-        unit.cursor.execute(
-            "SELECT runtime_policy_sha256 "
-            "FROM rt.option_flow_events WHERE cohort_id=%s "
-            "AND source_flow_id=%s "
-            "ORDER BY event_time DESC,event_id DESC LIMIT 1",
-            (str(control.cohort_id), str(source_flow.source_flow_id)),
-        )
-        runtime_policy = unit.cursor.fetchone()
-    if runtime_policy is None:
-        raise RuntimeError("P8 canonical flow runtime policy is unavailable")
     flow_identity = AdvancedOptionsDatasetFlowIdentity(
         source_flow,
         flow_environment.options_flow_advanced_policy.sha256,
         contract_scope.sha256,
         control.manifest_sha256,
         control.slot_set_sha256,
-        str(runtime_policy[0]),
+        _flow_runtime_policy_sha256(
+            provider,
+            flow_environment,
+            control,
+            source_flow,
+        ),
     )
     scope = AdvancedOptionsPostgresRuntimeScope(
         control_plane=control,
@@ -835,6 +915,17 @@ def build_and_run_p8_serial_window(
             catalog_version=STAGE_CATALOG_VERSION_V4,
             parallel_lanes=False,
         )
+    # OPTIONS_ACQUIRE needs REFERENCE ready for this cohort, and no resident role
+    # reports it. This attempt has just built and verified its reference state.
+    repository.upsert_readiness(
+        control.cohort_id,
+        "REFERENCE",
+        catalog_version,
+        "READY",
+        (),
+        f"advanced-options-reference-state:{reference.state_id}",
+        datetime.now(UTC),
+    )
     started = orchestrator.start(control.plan_id)
     report = orchestrator.run_window(binding.window_id)
     if started.enabled != frozenset(runners):
@@ -843,4 +934,6 @@ def build_and_run_p8_serial_window(
         "status": report.status,
         "window_state": report.window_state,
         "stage_order": list(runners),
+        "executed": [list(row) for row in report.executed],
+        "lane_errors": dict(report.lane_errors),
     }

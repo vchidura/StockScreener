@@ -42,7 +42,7 @@ def equity_window_recovery_cursor(cursor, cohort_id: UUID, cutoff: datetime) -> 
         "receipt.receipt_id, receipt.cohort_id, receipt.cutoff, receipt.universe_sha256, "
         "receipt.input_sha256, receipt.build_id, receipt.reference_generation, "
         "manifest.universe_sha256, plan.stage_catalog_version, plan.cohort_id, "
-        "window_run.deadline "
+        "receipt.known_by "
         "FROM rt.window_runs AS window_run "
         "JOIN rt.cohorts AS cohort ON cohort.cohort_id=window_run.cohort_id "
         "JOIN rt.subscription_manifests AS manifest USING (manifest_id) "
@@ -80,6 +80,7 @@ def equity_window_recovery_cursor(cursor, cohort_id: UUID, cutoff: datetime) -> 
             row[7],
             row[8],
             row[9],
+            known_by=row[14],
         ))
         if "-receipt-retry" not in row[0]:
             input_known_bys.add(row[14])
@@ -190,6 +191,7 @@ class CycleReceiptSpec:
     input_sha256: str
     build_id: str
     advance_release: bool = False
+    known_by: datetime | None = None
 
 
 WindowStageEffectAuthorizer = Callable[
@@ -223,10 +225,24 @@ def persist_cycle_receipt_cursor(
             raise ValueError(f"cycle receipt {name} must be a SHA-256 digest")
     if not spec.receipt_kind.strip() or not spec.build_id.strip():
         raise ValueError("cycle receipt kind and build ID cannot be blank")
+    if spec.known_by is not None and (
+        spec.known_by.tzinfo is None
+        or spec.known_by.utcoffset() is None
+        or spec.known_by < spec.cutoff
+    ):
+        raise ValueError(
+            "cycle receipt visibility seal must be timezone-aware "
+            "and not precede the cutoff"
+        )
+    if spec.receipt_kind == "INPUT_READY" and spec.known_by is None:
+        raise ValueError(
+            "INPUT_READY requires an exact persisted visibility seal"
+        )
     cursor.execute(
         "INSERT INTO rt.cycle_receipts (receipt_id, window_id, cohort_id, "
         "receipt_kind, cutoff, reference_generation, universe_sha256, "
-        "input_sha256, build_id) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) "
+        "input_sha256, build_id, known_by) VALUES "
+        "(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
         "ON CONFLICT (window_id, receipt_kind) DO NOTHING",
         (
             str(uuid4()),
@@ -238,11 +254,13 @@ def persist_cycle_receipt_cursor(
             spec.universe_sha256,
             spec.input_sha256,
             spec.build_id,
+            spec.known_by,
         ),
     )
     cursor.execute(
         "SELECT receipt_id, window_id, cohort_id, receipt_kind, cutoff, "
-        "reference_generation, universe_sha256, input_sha256, build_id "
+        "reference_generation, universe_sha256, input_sha256, build_id,"
+        "known_by "
         "FROM rt.cycle_receipts WHERE window_id=%s AND receipt_kind=%s",
         (str(window_id), spec.receipt_kind),
     )
@@ -259,6 +277,7 @@ def persist_cycle_receipt_cursor(
         spec.universe_sha256,
         spec.input_sha256,
         spec.build_id,
+        spec.known_by,
     ):
         raise ValueError(
             f"receipt {spec.receipt_kind} already recorded with different inputs"

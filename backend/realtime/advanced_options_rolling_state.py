@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
+from decimal import Decimal
 from enum import Enum
 from typing import TYPE_CHECKING, Callable
 from uuid import NAMESPACE_URL, UUID, uuid5
@@ -26,6 +27,24 @@ ROLLING_STATE_VERSION = "advanced-options-rolling-state-v1"
 CANONICAL_ORDER_WINDOWS_SECONDS = (1, 5, 60, 180, 900)
 O2_MODEL_NOT_ACCEPTED = "O2_MODEL_NOT_ACCEPTED"
 DARK_POOL_OWNER_NOT_ACCEPTED = "DARK_POOL_OWNER_NOT_ACCEPTED"
+# A window can publish with these. Each is carried in the rolling state and in
+# the flow package evidence, so what it left out stays visible.
+TOLERATED_STREAM_GAPS = "TOLERATED_STREAM_GAPS"
+OPTION_CONTRACTS_EXCLUDED = "OPTION_CONTRACTS_EXCLUDED"
+# Above this share of an underlying's contracts, the data itself is broken and the
+# window blocks, rather than a few quotes being left out. Half, because an underlying
+# has about 8 contracts, so anything lower blocks every name on two ordinary one-sided quotes.
+MAXIMUM_EXCLUDED_CONTRACT_SHARE = Decimal("0.5")
+OPTION_CONTRACTS_EXCLUDED_ABOVE_LIMIT = "OPTION_CONTRACTS_EXCLUDED_ABOVE_LIMIT"
+
+
+def excluded_contract_share_exceeded(excluded: int, total: int) -> bool:
+    return excluded > MAXIMUM_EXCLUDED_CONTRACT_SHARE * total
+
+
+class AdvancedOptionsWindowRetryDiverged(ValueError):
+    """A retry cannot reproduce what an earlier attempt of its window made durable.
+    The window ends as a failed attempt so that the next cycle runs."""
 
 
 class RollingAvailability(str, Enum):
@@ -477,6 +496,8 @@ class AdvancedOptionsRollingState:
     iv_surface: AdvancedOptionsOptionalRollingLane
     dark_pool: AdvancedOptionsOptionalRollingLane
     producer_binding: AdvancedOptionsRollingProducerBinding | None = None
+    degraded_reason_codes: tuple[str, ...] = ()
+    excluded_contracts: tuple[tuple[str, tuple[str, ...]], ...] = ()
 
     def __post_init__(self) -> None:
         from .advanced_options_underlying_snapshot import (
@@ -587,7 +608,30 @@ class AdvancedOptionsRollingState:
                 if self.producer_binding is None
                 else {"producer_binding": self.producer_binding}
             ),
+            **_degraded_identity(
+                self.degraded_reason_codes,
+                self.excluded_contracts,
+            ),
         }
+
+
+def _degraded_identity(
+    degraded_reason_codes: tuple[str, ...],
+    excluded_contracts: tuple[tuple[str, tuple[str, ...]], ...],
+) -> dict[str, object]:
+    """Absent from a state that left nothing out, so stored states keep their IDs."""
+    return {
+        **(
+            {"degraded_reason_codes": degraded_reason_codes}
+            if degraded_reason_codes
+            else {}
+        ),
+        **(
+            {"excluded_contracts": excluded_contracts}
+            if excluded_contracts
+            else {}
+        ),
+    }
 
 
 def build_advanced_options_rolling_state(
@@ -609,6 +653,8 @@ def build_advanced_options_rolling_state(
     iv_surface: AdvancedOptionsOptionalRollingLane | None = None,
     dark_pool: AdvancedOptionsOptionalRollingLane | None = None,
     producer_binding: AdvancedOptionsRollingProducerBinding | None = None,
+    degraded_reason_codes: tuple[str, ...] = (),
+    excluded_contracts: tuple[tuple[str, tuple[str, ...]], ...] = (),
 ) -> AdvancedOptionsRollingState:
     if (
         iv_surface is not None
@@ -658,6 +704,7 @@ def build_advanced_options_rolling_state(
             if producer_binding is None
             else {"producer_binding": producer_binding}
         ),
+        **_degraded_identity(degraded_reason_codes, excluded_contracts),
     }
     digest = canonical_sha256(identity)
     return AdvancedOptionsRollingState(
@@ -681,6 +728,8 @@ def build_advanced_options_rolling_state(
         iv_surface=iv,
         dark_pool=dark,
         producer_binding=producer_binding,
+        degraded_reason_codes=degraded_reason_codes,
+        excluded_contracts=excluded_contracts,
     )
 
 
