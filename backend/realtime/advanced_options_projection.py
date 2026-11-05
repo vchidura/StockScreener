@@ -1223,7 +1223,7 @@ class AdvancedOptionsFlowPagePublication:
     def read(
         self,
         *,
-        underlyer: str,
+        underlyer: str | None,
         cohort_id: UUID,
         provider_tier: ProviderTier,
         scope_sha256: str,
@@ -1235,10 +1235,14 @@ class AdvancedOptionsFlowPagePublication:
             scope_sha256=scope_sha256,
         )
         responses = self._payload["responses"]
-        result = responses.get(underlyer)
+        result = (
+            next(iter(responses.values()), None)
+            if underlyer is None
+            else responses.get(underlyer)
+        )
         if result is None:
             raise AdvancedOptionsPageUnavailable(
-                "Requested Flow underlying is outside the Advanced release"
+                "Requested Flow scope is outside the Advanced release"
             )
         return deepcopy(result)
 
@@ -1625,6 +1629,7 @@ def _stored_page_row(row):
     names = (
         "release_id",
         "cutoff",
+        "session_date",
         "provider_tier",
         "manifest",
         "manifest_sha256",
@@ -1643,38 +1648,41 @@ def load_advanced_options_page_release_cursor(
     cohort_id: UUID,
     available_by: datetime,
     artifact_kind: str,
+    release_id: UUID,
+    release_cutoff: datetime,
 ):
     if artifact_kind not in OPTIONS_FULL_PAGE_ARTIFACT_KINDS:
         raise ValueError("Advanced Options page artifact kind is invalid")
     checked = _utc(available_by, "available_by")
+    exact_cutoff = _utc(release_cutoff, "release_cutoff")
     cursor.execute(
-        "SELECT release.release_id,release.cutoff,"
+        "SELECT release.release_id,release.cutoff,release.session_date,"
         "release.provider_tier,release.manifest,"
         "release.manifest_sha256,"
         "entry.value->>'snapshot_type' AS snapshot_type,"
         "catalog.snapshot_id,catalog.generated_at,"
         "catalog.payload_sha256,hot.payload "
-        "FROM rt.portal_release_current AS pointer "
-        "JOIN rt.portal_releases AS release "
-        "ON release.release_id=pointer.release_id "
-        "AND release.cutoff=pointer.cutoff "
+        "FROM rt.portal_releases AS release "
         "JOIN LATERAL jsonb_array_elements("
         "release.manifest->'snapshots') AS entry(value) "
         "ON entry.value->>'snapshot_type'=ANY(%s) "
         "AND entry.value->>'snapshot_key'='CURRENT' "
         "JOIN rt.snapshot_catalog AS catalog "
         "ON catalog.snapshot_id=(entry.value->>'snapshot_id')::uuid "
-        "AND catalog.cohort_id=pointer.cohort_id "
-        "AND catalog.provider_tier=pointer.provider_tier "
+        "AND catalog.cohort_id=release.cohort_id "
+        "AND catalog.provider_tier=release.provider_tier "
         "JOIN rt.portal_snapshot_hot AS hot "
         "ON hot.snapshot_id=catalog.snapshot_id "
         "AND hot.generated_at=catalog.generated_at "
-        "WHERE pointer.cohort_id=%s "
-        "AND pointer.provider_tier='MASSIVE_ADVANCED' "
-        "AND pointer.cutoff<=%s "
+        "WHERE release.release_id=%s AND release.cutoff=%s "
+        "AND release.cohort_id=%s "
+        "AND release.provider_tier='MASSIVE_ADVANCED' "
+        "AND release.cutoff<=%s "
         "ORDER BY entry.value->>'snapshot_type'",
         (
             list(OPTIONS_PAGE_SNAPSHOT_TYPES.values()),
+            str(release_id),
+            exact_cutoff,
             str(cohort_id),
             checked,
         ),
@@ -1710,24 +1718,35 @@ def load_advanced_options_page_release_cursor(
             "Advanced Options release is missing page or diagnostic evidence"
         )
     payloads = {}
+    valid_until_by_kind = {}
     for kind, snapshot_type in OPTIONS_PAGE_SNAPSHOT_TYPES.items():
         row = by_type[snapshot_type]
         payload = row["payload"]
+        try:
+            valid_until = _utc(
+                datetime.fromisoformat(str(payload["valid_until"])),
+                "Advanced Options page valid_until",
+            )
+        except (KeyError, TypeError, ValueError) as error:
+            raise AdvancedOptionsPageUnavailable(
+                "Advanced Options full page artifact identity drift"
+            ) from error
         if (
             canonical_sha256(payload) != row["payload_sha256"]
             or payload.get("contract") != OPTIONS_PAGE_CONTRACTS[kind]
             or payload.get("artifact_kind") != kind
             or payload.get("cohort_id") != str(cohort_id)
+            or payload.get("session_date") != first["session_date"].isoformat()
             or payload.get("provider_tier")
             != ProviderTier.MASSIVE_ADVANCED.value
             or payload.get("published_at")
             != row["generated_at"].astimezone(timezone.utc).isoformat()
-            or datetime.fromisoformat(payload["valid_until"]) < checked
         ):
             raise AdvancedOptionsPageUnavailable(
                 "Advanced Options full page artifact identity drift"
             )
         payloads[kind] = payload
+        valid_until_by_kind[kind] = valid_until
     scope_sha256s = {
         payload["scope_sha256"] for payload in payloads.values()
     }
@@ -1746,6 +1765,11 @@ def load_advanced_options_page_release_cursor(
             "Advanced Options full page artifacts changed release scope"
         )
     selected = by_type[OPTIONS_PAGE_SNAPSHOT_TYPES[artifact_kind]]
+    valid_until = valid_until_by_kind[artifact_kind]
+    staleness_seconds = max(
+        0,
+        int((checked - valid_until).total_seconds()),
+    )
     publication_types = {
         "FLOW": AdvancedOptionsFlowPagePublication,
         "SCREENER": AdvancedOptionsScreenerPagePublication,
@@ -1759,6 +1783,12 @@ def load_advanced_options_page_release_cursor(
             "manifest_sha256": first["manifest_sha256"],
             "scope_sha256": next(iter(scope_sha256s)),
             "snapshot_id": str(selected["snapshot_id"]),
+            "retained_session_date": first["session_date"].isoformat(),
+            "valid_until": valid_until.isoformat(),
+            "checked_at": checked.isoformat(),
+            "stale": staleness_seconds > 0,
+            "staleness_seconds": staleness_seconds,
+            "serving_latest_available": staleness_seconds > 0,
         },
     )
 

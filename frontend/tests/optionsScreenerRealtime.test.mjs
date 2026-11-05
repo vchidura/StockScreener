@@ -19,6 +19,8 @@ test('Options Screener keeps its original catalog and explicit unavailable chain
   assert.doesNotMatch(workspace + library, /AdvancedOptionsV2|getAdvancedOptionsV2Projection/)
   assert.match(workspace, /<OptionsChainResults catalog=\{catalog\}/)
   assert.match(library, /publicationPath\(`\/ticker\//)
+  assert.match(library, /optionsDataTierLabel\(query\.data\?\.data_tier\)/)
+  assert.doesNotMatch(library, /delayed model marks/)
 })
 
 test('Options Screener GET and POST requests preserve the realtime cohort', async () => {
@@ -38,12 +40,25 @@ test('Options Screener GET and POST requests preserve the realtime cohort', asyn
   }).outputText
   const source = read('../src/services/api.ts')
     .replace("import axios from 'axios'", 'const axios = { create: () => globalThis.__optionScreenerApi }')
+    .replace(
+      "import { realtimeCohortId, realtimeOptionsCohortId, realtimeOptionsReadsEnabled } from './portalIdentity'",
+      `const realtimeCohortId = () => globalThis.__optionScreenerIdentity?.equity?.cohort_id
+       const realtimeOptionsCohortId = sessionDate => sessionDate
+         ? globalThis.__optionScreenerIdentity?.options_session_cohorts?.[sessionDate]
+         : globalThis.__optionScreenerIdentity?.options?.cohort_id
+       const realtimeOptionsReadsEnabled = () => globalThis.__optionScreenerIdentity?.options_reads_enabled === true`,
+    )
     .replaceAll('import.meta.env', 'globalThis.__optionScreenerEnvironment')
   const request = { filters: [], sort: 'day_volume', descending: true, limit: 100, offset: 0 }
   try {
-    globalThis.__optionScreenerEnvironment = {
-      VITE_REALTIME_ONLY: 'true', VITE_REALTIME_OPTIONS_V2: 'true',
-      VITE_REALTIME_COHORT_ID: ' exact-cohort ',
+    globalThis.__optionScreenerEnvironment = { VITE_REALTIME_ONLY: 'true' }
+    globalThis.__optionScreenerIdentity = {
+      equity: { cohort_id: 'equity-cohort' },
+      options: { cohort_id: 'exact-cohort' },
+      options_reads_enabled: true,
+      options_session_cohorts: {
+        '2026-10-06': 'historical-options-cohort',
+      },
     }
     const api = await import(`data:text/javascript;base64,${Buffer.from(compile(source)).toString('base64')}`)
     await api.getOptionDiscoveryCatalog()
@@ -53,24 +68,28 @@ test('Options Screener GET and POST requests preserve the realtime cohort', asyn
       ['post', '/options/eligible-chain/query', request, { params: { cohort_id: 'exact-cohort' } }],
     ])
     calls.length = 0
-    globalThis.__optionScreenerEnvironment = {
-      VITE_REALTIME_ONLY: 'true', VITE_REALTIME_OPTIONS_V2: 'true',
-    }
-    await assert.rejects(api.getOptionDiscoveryCatalog(), /requires VITE_REALTIME_COHORT_ID/)
-    await assert.rejects(api.queryEligibleChain(request), /requires VITE_REALTIME_COHORT_ID/)
+    const historical = { ...request, session_date: '2026-10-06' }
+    await api.queryEligibleChain(historical)
+    assert.deepEqual(calls, [[
+      'post',
+      '/options/eligible-chain/query',
+      historical,
+      { params: { session_date: '2026-10-06', cohort_id: 'historical-options-cohort' } },
+    ]])
+    calls.length = 0
+    globalThis.__optionScreenerIdentity.options = null
+    await assert.rejects(api.getOptionDiscoveryCatalog(), /No Options publication/)
+    await assert.rejects(api.queryEligibleChain(request), /No Options publication/)
     assert.equal(calls.length, 0)
-    globalThis.__optionScreenerEnvironment = {
-      VITE_REALTIME_ONLY: 'true',
-      VITE_REALTIME_OPTIONS_V2: 'false',
-      VITE_REALTIME_COHORT_ID: 'exact-cohort',
-    }
+    globalThis.__optionScreenerIdentity.options_reads_enabled = false
     await assert.rejects(
       api.getOptionDiscoveryCatalog(),
-      /require VITE_REALTIME_OPTIONS_V2=true/,
+      /stored reads are disabled/,
     )
     assert.equal(calls.length, 0)
   } finally {
     delete globalThis.__optionScreenerApi
     delete globalThis.__optionScreenerEnvironment
+    delete globalThis.__optionScreenerIdentity
   }
 })

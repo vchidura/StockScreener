@@ -267,6 +267,23 @@ def _unavailable_options_data_tier(active: dict[str, object] | None) -> str:
     )
 
 
+def _retained_options_envelope(
+    result: Mapping[str, object],
+    release: Mapping[str, object],
+) -> dict[str, object]:
+    return {
+        **result,
+        "release_id": release["release_id"],
+        "release_cutoff": release["cutoff"].isoformat(),
+        "retained_session_date": release["retained_session_date"],
+        "valid_until": release["valid_until"],
+        "checked_at": release["checked_at"],
+        "stale": release["stale"],
+        "staleness_seconds": release["staleness_seconds"],
+        "serving_latest_available": release["serving_latest_available"],
+    }
+
+
 class _RealtimeCompatibilityRepository:
     def __init__(
         self,
@@ -305,13 +322,91 @@ class _RealtimeCompatibilityRepository:
             if release_pin is None:
                 return None
             release_id, release_cutoff = release_pin
-            return load_release(
+            release = load_release(
                 cursor,
                 release_id,
                 release_cutoff,
                 cache=self._release_cache,
             )
-        return load_current_release(cursor, cohort_id, self._release_cache)
+        else:
+            release = load_current_release(
+                cursor,
+                cohort_id,
+                self._release_cache,
+            )
+        if (
+            release is not None
+            and release.cohort_id != UUID(str(cohort_id))
+        ):
+            raise ValueError("Portal release cohort identity mismatch")
+        return release
+
+    def _options_read_context(
+        self,
+        cursor,
+        *,
+        cohort_id: UUID,
+        cutoff: datetime,
+        session_date: date | None = None,
+    ) -> tuple[
+        dict[str, object] | None,
+        ReleaseView | None,
+        str | None,
+    ]:
+        if not self._reads_enabled:
+            return None, None, "ADVANCED_OPTIONS_V2_DISABLED"
+        if self._require_read_pin:
+            release = self._release(cursor, cohort_id)
+            if release is None:
+                return (
+                    None,
+                    None,
+                    "ADVANCED_OPTIONS_READ_PIN_UNAVAILABLE",
+                )
+            if (
+                release.provider_tier != "MASSIVE_ADVANCED"
+                or release.cutoff > cutoff
+            ):
+                raise ValueError(
+                    "Advanced Options read pin release identity mismatch"
+                )
+            if (
+                session_date is not None
+                and release.session_date != session_date
+            ):
+                return (
+                    {
+                        "cohort_id": cohort_id,
+                        "provider_tier": release.provider_tier,
+                        "effective_at": release.cutoff,
+                    },
+                    release,
+                    "OPTIONS_SESSION_RELEASE_UNAVAILABLE",
+                )
+            return (
+                {
+                    "cohort_id": cohort_id,
+                    "provider_tier": release.provider_tier,
+                    "effective_at": release.cutoff,
+                },
+                release,
+                None,
+            )
+        active = _active_cohort(cursor, cutoff, cohort_id)
+        if active is None:
+            return None, None, "ACTIVE_COHORT_UNAVAILABLE"
+        release = (
+            self._release(cursor, cohort_id)
+            if active["provider_tier"] == "MASSIVE_ADVANCED"
+            else None
+        )
+        if (
+            session_date is not None
+            and release is not None
+            and release.session_date != session_date
+        ):
+            return active, release, "OPTIONS_SESSION_RELEASE_UNAVAILABLE"
+        return active, release, None
 
     def _latest_release_entries(
         self,
@@ -387,15 +482,18 @@ class RealtimeOptionFlowRepository(_RealtimeCompatibilityRepository):
         cutoff = _utc(available_by, "available_by")
         if cohort_id is None:
             raise ValueError("Options Flow requires an explicit realtime cohort")
-        symbol = underlyer.strip().upper() if underlyer else "SPY"
-        if not _TICKER_PATTERN.fullmatch(symbol):
+        symbol = underlyer.strip().upper() if underlyer else None
+        if symbol is not None and not _TICKER_PATTERN.fullmatch(symbol):
             raise ValueError("Invalid Options Flow underlying")
         with self._cursor() as cursor:
             self._begin(cursor)
-            active = _active_cohort(cursor, cutoff, cohort_id)
-            if active is None:
-                reason = "ACTIVE_COHORT_UNAVAILABLE"
-            else:
+            active, resolved_release, reason = self._options_read_context(
+                cursor,
+                cohort_id=cohort_id,
+                cutoff=cutoff,
+                session_date=session_date,
+            )
+            if active is not None and reason is None:
                 cursor.execute(
                     "SELECT manifest.option_underlying_count "
                     "FROM rt.cohorts AS cohort "
@@ -418,19 +516,28 @@ class RealtimeOptionFlowRepository(_RealtimeCompatibilityRepository):
                             load_advanced_options_page_release_cursor,
                         )
 
-                        retained = load_advanced_options_page_release_cursor(
-                            cursor,
-                            cohort_id=cohort_id,
-                            available_by=cutoff,
-                            artifact_kind="FLOW",
+                        retained = (
+                            None
+                            if resolved_release is None
+                            else load_advanced_options_page_release_cursor(
+                                cursor,
+                                cohort_id=cohort_id,
+                                available_by=cutoff,
+                                artifact_kind="FLOW",
+                                release_id=resolved_release.release_id,
+                                release_cutoff=resolved_release.cutoff,
+                            )
                         )
                         if retained is not None:
                             publication, release = retained
-                            return publication.read(
+                            return _retained_options_envelope(
+                                publication.read(
                                 underlyer=symbol,
                                 cohort_id=cohort_id,
                                 provider_tier=publication.provider_tier,
                                 scope_sha256=release["scope_sha256"],
+                                ),
+                                release,
                             )
                     else:
                         from .forward_reader import (
@@ -445,13 +552,24 @@ class RealtimeOptionFlowRepository(_RealtimeCompatibilityRepository):
                         )
                     if retained is not None:
                         publication, release = retained
-                        publication = publication.get(symbol) if isinstance(publication, dict) else publication
+                        publication = (
+                            (
+                                next(iter(publication.values()), None)
+                                if symbol is None
+                                else publication.get(symbol)
+                            )
+                            if isinstance(publication, dict)
+                            else publication
+                        )
                         if publication is None:
                             from .forward_reader import ForwardPublicationUnavailable
                             raise ForwardPublicationUnavailable("Requested Flow underlying is outside the approved release")
                         result = publication.read(cohort_id=cohort_id, provider_tier=publication.provider_tier,
                             scope_sha256=release["scope_sha256"])
-                        if symbol != result["data"]["selected"]:
+                        if (
+                            symbol is not None
+                            and symbol != result["data"]["selected"]
+                        ):
                             from .forward_reader import ForwardPublicationUnavailable
                             raise ForwardPublicationUnavailable("Requested underlying Flow profile is not retained in this release")
                         return result
@@ -485,10 +603,13 @@ class RealtimeOptionScreenerRepository(_RealtimeCompatibilityRepository):
             raise ValueError("Options Screener requires an explicit realtime cohort")
         with self._cursor() as cursor:
             self._begin(cursor)
-            active = _active_cohort(cursor, cutoff, cohort_id)
-            if active is None:
-                reason = "ACTIVE_COHORT_UNAVAILABLE"
-            else:
+            active, resolved_release, reason = self._options_read_context(
+                cursor,
+                cohort_id=cohort_id,
+                cutoff=cutoff,
+                session_date=request.session_date,
+            )
+            if active is not None and reason is None:
                 cursor.execute(
                     "SELECT manifest.option_underlying_count "
                     "FROM rt.cohorts AS cohort "
@@ -511,11 +632,17 @@ class RealtimeOptionScreenerRepository(_RealtimeCompatibilityRepository):
                             load_advanced_options_page_release_cursor,
                         )
 
-                        retained = load_advanced_options_page_release_cursor(
-                            cursor,
-                            cohort_id=cohort_id,
-                            available_by=cutoff,
-                            artifact_kind="SCREENER",
+                        retained = (
+                            None
+                            if resolved_release is None
+                            else load_advanced_options_page_release_cursor(
+                                cursor,
+                                cohort_id=cohort_id,
+                                available_by=cutoff,
+                                artifact_kind="SCREENER",
+                                release_id=resolved_release.release_id,
+                                release_cutoff=resolved_release.cutoff,
+                            )
                         )
                     else:
                         from .forward_reader import (
@@ -530,8 +657,18 @@ class RealtimeOptionScreenerRepository(_RealtimeCompatibilityRepository):
                         )
                     if retained is not None:
                         publication, release = retained
-                        return publication.query(request, cohort_id=cohort_id, provider_tier=publication.provider_tier,
-                            scope_sha256=release["scope_sha256"])
+                        result = publication.query(
+                            request,
+                            cohort_id=cohort_id,
+                            provider_tier=publication.provider_tier,
+                            scope_sha256=release["scope_sha256"],
+                        )
+                        return (
+                            _retained_options_envelope(result, release)
+                            if active["provider_tier"]
+                            == "MASSIVE_ADVANCED"
+                            else result
+                        )
         requested = [request.underlyer] if request.underlyer else []
         return {
             "available": False,
@@ -629,12 +766,16 @@ class RealtimeOptionsAlertsPageRepository(_RealtimeCompatibilityRepository):
         cutoff = _utc(available_by, "available_by")
         if cohort_id is None:
             raise ValueError("Options Alerts requires an explicit realtime cohort")
+        requested_session = (query or {}).get("session_date")
         with self._cursor() as cursor:
             self._begin(cursor)
-            active = _active_cohort(cursor, cutoff, cohort_id)
-            if active is None:
-                reason = "ACTIVE_COHORT_UNAVAILABLE"
-            else:
+            active, resolved_release, reason = self._options_read_context(
+                cursor,
+                cohort_id=cohort_id,
+                cutoff=cutoff,
+                session_date=requested_session,
+            )
+            if active is not None and reason is None:
                 cursor.execute(
                     "SELECT manifest.option_underlying_count "
                     "FROM rt.cohorts AS cohort "
@@ -660,11 +801,17 @@ class RealtimeOptionsAlertsPageRepository(_RealtimeCompatibilityRepository):
                             load_advanced_options_page_release_cursor,
                         )
 
-                        retained = load_advanced_options_page_release_cursor(
-                            cursor,
-                            cohort_id=cohort_id,
-                            available_by=cutoff,
-                            artifact_kind="ALERTS",
+                        retained = (
+                            None
+                            if resolved_release is None
+                            else load_advanced_options_page_release_cursor(
+                                cursor,
+                                cohort_id=cohort_id,
+                                available_by=cutoff,
+                                artifact_kind="ALERTS",
+                                release_id=resolved_release.release_id,
+                                release_cutoff=resolved_release.cutoff,
+                            )
                         )
                     else:
                         from .forward_reader import (
@@ -681,17 +828,41 @@ class RealtimeOptionsAlertsPageRepository(_RealtimeCompatibilityRepository):
                         publication, release = retained
                         identity = dict(cohort_id=cohort_id, provider_tier=publication.provider_tier, scope_sha256=release["scope_sha256"])
                         if contract == "datasets":
-                            return publication.datasets(**identity)
+                            result = publication.datasets(**identity)
+                            return (
+                                _retained_options_envelope(result, release)
+                                if advanced
+                                else result
+                            )
                         if contract == "schedule":
-                            return publication.schedule(checked_at=cutoff, **identity)
+                            result = publication.schedule(
+                                checked_at=cutoff,
+                                **identity,
+                            )
+                            return (
+                                _retained_options_envelope(result, release)
+                                if advanced
+                                else result
+                            )
                         if contract == "evaluations":
                             from .option_alert_projection import DetectorEvaluationQuery
-                            return publication.evaluations(DetectorEvaluationQuery(**(query or {})), **identity)
+                            result = publication.evaluations(
+                                DetectorEvaluationQuery(**(query or {})),
+                                **identity,
+                            )
+                            return (
+                                _retained_options_envelope(result, release)
+                                if advanced
+                                else result
+                            )
                         if contract == "detector_runs":
                             from .option_alert_projection import DetectorRunQuery
                             envelope = publication.detector_runs(DetectorRunQuery(**(query or {})), **identity)
                             return (
-                                envelope
+                                _retained_options_envelope(
+                                    envelope,
+                                    release,
+                                )
                                 if advanced
                                 else self._retained_marks(
                                     cursor,
@@ -704,12 +875,39 @@ class RealtimeOptionsAlertsPageRepository(_RealtimeCompatibilityRepository):
                         if contract == "candidate":
                             if candidate_id is None:
                                 raise ValueError("Candidate identity is required")
-                            return publication.candidate(candidate_id, **identity)
+                            result = publication.candidate(
+                                candidate_id,
+                                **identity,
+                            )
+                            return (
+                                _retained_options_envelope(result, release)
+                                if advanced
+                                else result
+                            )
                         if contract == "preview":
                             if candidate_id is None or preview_request is None:
                                 raise ValueError("Preview requires exact candidate identity and request")
-                            return publication.preview(candidate_id, assessed_at=cutoff, request=preview_request, **identity)
-                        return publication.unavailable(contract, requested_contract_ids=requested_contract_ids, **identity)
+                            result = publication.preview(
+                                candidate_id,
+                                assessed_at=cutoff,
+                                request=preview_request,
+                                **identity,
+                            )
+                            return (
+                                _retained_options_envelope(result, release)
+                                if advanced
+                                else result
+                            )
+                        result = publication.unavailable(
+                            contract,
+                            requested_contract_ids=requested_contract_ids,
+                            **identity,
+                        )
+                        return (
+                            _retained_options_envelope(result, release)
+                            if advanced
+                            else result
+                        )
         if contract == "datasets":
             data = {
                 "storage_ready": False, "datasets": [], "dataset_sessions": {},
@@ -730,7 +928,7 @@ class RealtimeOptionsAlertsPageRepository(_RealtimeCompatibilityRepository):
             data = {}
         return {
             "available": False, "reason": reason,
-            "data_tier": "15-MINUTE DELAYED RESEARCH DATA",
+            "data_tier": _unavailable_options_data_tier(active),
             "generated_at": cutoff, "as_of": None, "observed_at": None,
             "policy_sha256": None, "model_version": None, "data": data,
         }

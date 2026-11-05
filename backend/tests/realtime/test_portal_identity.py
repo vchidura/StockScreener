@@ -30,13 +30,17 @@ TODAY_COHORT = UUID("11111111-1111-5111-8111-111111111111")
 PRIOR_COHORT = UUID("22222222-2222-5222-8222-222222222222")
 OPTIONS_COHORT = UUID("33333333-3333-5333-8333-333333333333")
 RELEASE = UUID("44444444-4444-5444-8444-444444444444")
+PRIOR_OPTIONS_COHORT = UUID("66666666-6666-5666-8666-666666666666")
 TODAY = date(2026, 11, 3)
 PRIOR = date(2026, 11, 2)
 
 
 class _Cursor:
     def __init__(self, equity=(), pin=None):
-        self.results = iter((list(equity), pin))
+        pins = [] if pin is None else (
+            list(pin) if isinstance(pin, (list, tuple)) else [pin]
+        )
+        self.results = iter((list(equity), pins))
         self.current = None
         self.statements = []
 
@@ -123,6 +127,9 @@ def test_only_an_enabled_pin_identifies_options():
     identity = load_portal_identity_cursor(cursor, available_by=NOW)
 
     assert identity.options.cohort_id == OPTIONS_COHORT
+    assert identity.options_session_cohorts == {
+        TODAY.isoformat(): OPTIONS_COHORT,
+    }
     assert "pin.enabled" in cursor.statements[1]
 
 
@@ -150,6 +157,10 @@ def _identity(*, options=True):
             else None
         ),
         {TODAY.isoformat(): TODAY_COHORT, PRIOR.isoformat(): PRIOR_COHORT},
+        {
+            TODAY.isoformat(): OPTIONS_COHORT,
+            PRIOR.isoformat(): PRIOR_OPTIONS_COHORT,
+        },
     )
 
 
@@ -206,8 +217,7 @@ def _client(identity, *, options_reads_enabled=False):
             option_alerts=None,
             ticker_workspace=tickers,
             option_flow=SimpleNamespace(
-                read=lambda **values: values,
-                option_flow=lambda **values: {
+                flow=lambda **values: {
                     "cohort_id": str(values["cohort_id"]),
                 },
             ),
@@ -301,6 +311,24 @@ def test_options_never_receive_the_equity_cohort():
     response = client.get("/api/options/flow")
 
     assert response.headers["X-Realtime-Cohort-Id"] == str(OPTIONS_COHORT)
+
+
+def test_historical_options_session_uses_its_own_pinned_cohort():
+    client, _tickers, _resolver = _client(
+        _identity(),
+        options_reads_enabled=True,
+    )
+
+    response = client.get(
+        "/api/options/flow",
+        params={"session_date": PRIOR.isoformat()},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["cohort_id"] == str(PRIOR_OPTIONS_COHORT)
+    assert response.headers["X-Realtime-Cohort-Id"] == str(
+        PRIOR_OPTIONS_COHORT
+    )
 
 
 def test_options_stay_unresolved_while_their_reads_are_off():

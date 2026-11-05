@@ -36,8 +36,11 @@ export const tickerParams = (params?: Record<string, ApiQueryValue>, snapshotId?
 // Options has its own per-session cohort, so an Equity identity must never reach these reads.
 const optionParams = (params?: Record<string, ApiQueryValue>) => {
   if (import.meta.env.VITE_REALTIME_ONLY !== 'true') return params
-  const cohort_id = realtimeOptionsCohortId()
-  if (!cohort_id) throw new Error('No Options publication is available yet')
+  const sessionDate = typeof params?.session_date === 'string' ? params.session_date : undefined
+  const cohort_id = realtimeOptionsCohortId(sessionDate)
+  if (!cohort_id) throw new Error(sessionDate
+    ? 'No Options publication is available for the selected session'
+    : 'No Options publication is available yet')
   return { ...params, cohort_id }
 }
 
@@ -308,12 +311,12 @@ export const fetchOptionsMaterializationStatus = async (
       max_serveable_stale_sessions: 5,
       staleness_sessions: 0,
       last_market_time: marketTime,
-      oldest_stale_market_time: marketTime,
+      oldest_stale_market_time: envelope.valid_until || marketTime,
       stale_intervals: ['options'],
       pipeline_active: false,
       active_intervals: [],
       source: 'OPTIONS_RETAINED_RELEASE',
-      serving_latest_available: true,
+      serving_latest_available: envelope.serving_latest_available ?? true,
       retained_setup_generated_at: generatedAt,
     }
   }
@@ -327,10 +330,11 @@ export const fetchOptionsMaterializationStatus = async (
     sessionParts.find(part => part.type === type)?.value ?? ''
   const sourceSession = `${sessionPart('year')}-${sessionPart('month')}-${sessionPart('day')}`
   const age = checked - Date.parse(marketTime)
-  const sessionsBehind = sourceSession < expectedSession ? 1 : 0
+  const retainedSession = envelope.retained_session_date || sourceSession
+  const sessionsBehind = retainedSession < expectedSession ? 1 : 0
   const status: MaterializationStatus['status'] = sessionsBehind
     ? 'EXPIRED'
-    : age > 5 * 60 * 1000
+    : envelope.stale === true || age > 5 * 60 * 1000
       ? 'STALE'
       : 'READY'
   return {
@@ -339,12 +343,14 @@ export const fetchOptionsMaterializationStatus = async (
     max_serveable_stale_sessions: 5,
     staleness_sessions: sessionsBehind,
     last_market_time: marketTime,
-    oldest_stale_market_time: status === 'READY' ? null : marketTime,
+    oldest_stale_market_time: status === 'READY'
+      ? null
+      : envelope.valid_until || marketTime,
     stale_intervals: status === 'READY' ? [] : ['options'],
     pipeline_active: false,
     active_intervals: [],
     source: 'OPTIONS_RETAINED_RELEASE',
-    serving_latest_available: true,
+    serving_latest_available: envelope.serving_latest_available ?? status !== 'READY',
     retained_setup_generated_at: generatedAt,
   }
 }
@@ -2265,6 +2271,20 @@ export interface OptionsEnvelope<T> {
   policy_sha256: string | null
   model_version: string | null
   data: T
+  release_id?: string
+  release_cutoff?: string
+  retained_session_date?: string
+  valid_until?: string
+  checked_at?: string
+  stale?: boolean
+  staleness_seconds?: number
+  serving_latest_available?: boolean
+}
+
+export const optionsDataTierLabel = (dataTier?: string): string => {
+  if (dataTier === 'REAL-TIME ADVANCED RESEARCH DATA') return 'Real-time Advanced'
+  if (dataTier === '15-MINUTE DELAYED RESEARCH DATA') return '15-minute delayed'
+  return dataTier || 'Stored research data'
 }
 
 export type OptionEventWindowState = 'BLOCKED' | 'CLEAR' | 'UNAVAILABLE' | 'NOT_APPLICABLE'
@@ -2529,7 +2549,7 @@ export interface AdvancedOptionsV2Status {
 
 export const getAdvancedOptionsV2Status = async (): Promise<AdvancedOptionsV2Status> => {
   if (realtimeOptionsReadsEnabled()) {
-    return (await api.get<AdvancedOptionsV2Status>('/realtime/options-v2/status', { params: tickerParams() })).data
+    return (await api.get<AdvancedOptionsV2Status>('/realtime/options-v2/status', { params: optionParams() })).data
   }
   const envelope = (await api.get<OptionsEnvelope<AdvancedOptionsV2Status>>('/options/advanced-v2/status')).data
   return envelope.data
@@ -3232,7 +3252,11 @@ export const getOptionDiscoveryCatalog = async (): Promise<OptionDiscoveryCatalo
 
 export const queryEligibleChain = async (request: EligibleChainRequest): Promise<OptionsEnvelope<EligibleChainData>> => {
   requireRealtimeOptionsReads()
-  const response = await api.post('/options/eligible-chain/query', request, { params: optionParams() })
+  const response = await api.post('/options/eligible-chain/query', request, {
+    params: optionParams(request.session_date
+      ? { session_date: request.session_date }
+      : undefined),
+  })
   return response.data
 }
 
@@ -3248,7 +3272,7 @@ export const getOptionCurrentAdvancedQuotes = async (
   contractIds: number[],
 ): Promise<OptionsEnvelope<OptionCurrentAdvancedQuotesData>> => {
   requireRealtimeOptionsReads()
-  const response = await api.get('/options/quotes/current', { params: tickerParams({ contract_id: contractIds }) })
+  const response = await api.get('/options/quotes/current', { params: optionParams({ contract_id: contractIds }) })
   return response.data
 }
 

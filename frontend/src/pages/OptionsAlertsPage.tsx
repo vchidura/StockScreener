@@ -6,6 +6,7 @@ import { usePublishPageContext, type PageContextValue } from '../layout/pageCont
 import { ColumnPicker, useColumnPreferences, type ColumnSpec } from '../layout/PageChrome'
 import {
   getOptionCandidate, getOptionCurrentAdvancedQuotes, getOptionDetectorEvaluations, getOptionDetectorAlerts, getOptionDetectorDatasets, getOptionAlertSchedule, previewOptionAlert,
+  optionsDataTierLabel,
   type OptionCurrentMark, type OptionAlertPreviewRequest, type OptionCandidateDetailData, type OptionCandidateLeg,
   type OptionCandidateResearchEvidence, type OptionStockBehaviorGateEvidence,
   type OptionDetectorEvaluationReview, type OptionDetectorAlertReview, type OptionDetectorSort, type OptionDetectorDatasets, type OptionDetectorRunSummary, type OptionLocalSurfaceObservation, type OptionO3CreditObservation,
@@ -379,7 +380,7 @@ function CreditObservationDetails({ observation }: { observation: OptionO3Credit
   </table></div><p className="oa-permission">Selected indicative research alert / Original retained model marks</p></>
 }
 
-function DetectorAlertSidecar({ row, asOf, close, openCandidate }: { row: DetectorAlertRow; asOf?: string | null; close: () => void; openCandidate: () => void }) {
+function DetectorAlertSidecar({ row, asOf, dataTier, close, openCandidate }: { row: DetectorAlertRow; asOf?: string | null; dataTier?: string; close: () => void; openCandidate: () => void }) {
   const original = row.original_package
   const legs = original.status === 'AVAILABLE' ? original.legs : []
   const credit = detectorCreditObservation(row)
@@ -403,7 +404,7 @@ function DetectorAlertSidecar({ row, asOf, close, openCandidate }: { row: Detect
     <div className="oa-detail oa-alert-sidecar">
       <div className="oa-detail-heading"><div><h3>{row.underlyer} <span>{credit ? label(credit.structure_type) : surface ? 'IV observation' : label(original.structure_type || row.strategy_name || 'alert')}</span></h3>
         <p>{detectorNames[row.detector_id]} / {label(row.origin)}</p></div><Status value={surface ? 'OBSERVATION' : 'SELECTED'} /></div>
-      <p className="oa-alert-sidecar-notice">{credit ? 'Selected indicative credit / Model marks' : 'Retained alert evidence / Delayed marks'} / Not a fill or execution permission</p>
+      <p className="oa-alert-sidecar-notice">{credit ? 'Selected indicative credit / Model marks' : `Retained alert evidence / ${optionsDataTierLabel(dataTier)} marks`} / Not a fill or execution permission</p>
       <AlertSidecarFacts title="Alert selection" values={[
         ['Triggered (ET)', time(row.triggered_at)], ['First selected (ET)', time(row.first_selected_at)],
         ['Run (ET)', time(row.scheduled_cycle)], ['Direction', row.direction === 1 ? <span className="sd-positive">Bullish</span> : <span className="sd-negative">Bearish</span>],
@@ -670,7 +671,7 @@ function DetectorAlertsPanel({ view, params, update, offset, onSessionContext, t
       <label>Preset name<input aria-label="Alert preset name" value={presetName} maxLength={60} onChange={event => setPresetName(event.target.value)} required /></label>
       {presetError && <Notice>{presetError}</Notice>}<div className="oa-form-actions"><button className="oa-command" type="submit"><Save size={15} />Save preset</button></div>
     </form></Modal>}
-    {planDetail && <DetectorAlertSidecar row={planDetail} asOf={data?.as_of} close={() => setPlanDetail(null)} openCandidate={() => {
+    {planDetail && <DetectorAlertSidecar row={planDetail} asOf={data?.as_of} dataTier={review.data?.data_tier} close={() => setPlanDetail(null)} openCandidate={() => {
       update({ candidate: planDetail.candidate_id, offset: String(offset) }); setPlanDetail(null)
     }} />}
   </section>
@@ -793,6 +794,7 @@ function DetectorEvaluationPanel({ params, update, offset, onSessionContext }: {
 export default function OptionsAlertsPage() {
   const [params, setParams] = useSearchParams()
   const [sessionContext, setSessionContext] = useState<NonNullable<PageContextValue['alertSessions']>>({ dates: [], selected: '', source: 'OPTIONS_DETECTIONS', emptyLabel: 'No completed runs' })
+  const tier = useQuery({ queryKey: ['option-detector-datasets'], queryFn: getOptionDetectorDatasets, retry: false, refetchInterval: 30_000 })
   const activeView: OptionAlertView = params.get('view') === 'daily' ? 'daily' : params.get('view') === 'day_history' ? 'day_history' : 'behavior'
   const offsetValue = Number(params.get('offset') || 0)
   const offset = Number.isSafeInteger(offsetValue) && offsetValue >= 0 ? offsetValue : 0
@@ -815,7 +817,7 @@ export default function OptionsAlertsPage() {
     switchTab(views[nextIndex])
     buttons?.[nextIndex]?.focus()
   }
-  usePublishPageContext({ eyebrow: 'Options', title: 'Options Alerts', status: [{ label: 'Mode', value: 'Read-only / Indicative' }, { label: 'Data', value: '15-minute delayed' }],
+  usePublishPageContext({ eyebrow: 'Options', title: 'Options Alerts', status: [{ label: 'Mode', value: 'Read-only / Indicative' }, { label: 'Data', value: optionsDataTierLabel(tier.data?.data_tier) }],
     alertSessions: { ...sessionContext, selected: params.get('session_date') || sessionContext.dates[sessionContext.dates.length - 1] || '', historicalView: 'day_history' } })
   const tabs = <div className="sd-presets" role="tablist" aria-label="Options alert views">
       <button type="button" role="tab" aria-selected={activeView === 'behavior'} tabIndex={activeView === 'behavior' ? 0 : -1} onKeyDown={tabKey} className={activeView === 'behavior' ? 'active' : ''} onClick={() => switchTab('behavior')}><ListFilter size={14} />Latest Run</button>

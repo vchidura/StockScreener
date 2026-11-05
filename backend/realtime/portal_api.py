@@ -106,10 +106,12 @@ def _current_cohort(
     from the cohort that holds it. Options stays unresolved while its reads are off,
     because its page readers follow the release pointer directly."""
     if _is_options_read(path):
+        if not options_reads_enabled:
+            return None
+        if session_date is not None:
+            return identity.options_session_cohorts.get(session_date)
         return (
-            None
-            if identity.options is None or not options_reads_enabled
-            else identity.options.cohort_id
+            None if identity.options is None else identity.options.cohort_id
         )
     if session_date in identity.session_cohorts:
         return identity.session_cohorts[session_date]
@@ -409,7 +411,7 @@ def create_realtime_portal_app(
     @app.middleware("http")
     async def serve_current_publication(request: Request, call_next):
         """A reader naming no cohort gets the current publication. An explicit
-        cohort is always honored exactly, and is never substituted."""
+        cohort is never substituted; repositories still enforce authorization."""
         cohort_id = None
         if (
             repositories.portal_identity is not None
@@ -847,9 +849,21 @@ def create_realtime_portal_app(
         return {**build_discovery_catalog(), "contract_filters": CONTRACT_FILTERS}
 
     @app.post("/api/options/eligible-chain/query")
-    def option_eligible_chain(request: EligibleChainQuery, cohort_id: UUID | None = None):
+    def option_eligible_chain(
+        request: EligibleChainQuery,
+        cohort_id: UUID | None = None,
+        session_date: date | None = None,
+    ):
         if repositories.option_screener is None:
             raise HTTPException(503, "Realtime Options Screener repository is unavailable")
+        if (
+            session_date is not None
+            and request.session_date != session_date
+        ):
+            raise HTTPException(
+                422,
+                "Options Screener session identity mismatch",
+            )
         try:
             return repositories.option_screener.eligible_chain(
                 request, available_by=cutoff(), cohort_id=cohort_id,

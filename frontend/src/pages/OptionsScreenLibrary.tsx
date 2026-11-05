@@ -3,7 +3,7 @@ import { Link, type SetURLSearchParams } from 'react-router-dom'
 import { useQuery } from '@tanstack/react-query'
 import { Copy, Download, Eye, FolderOpen, Pencil, Plus, Save, Search, Trash2, Upload, RotateCcw, Check, ChevronDown, X } from 'lucide-react'
 import { ColumnPicker } from '../layout/PageChrome'
-import { queryEligibleChain, type EligibleChainRow, type EligibleChainRequest, type OptionDiscoveryCatalog } from '../services/api'
+import { optionsDataTierLabel, queryEligibleChain, type EligibleChainRow, type EligibleChainRequest, type OptionDiscoveryCatalog } from '../services/api'
 import { Modal } from './ScreenLibrary'
 import { chainFilterRanges, columnsForView, independentScreenQuery, makeOptionsScreen, optionColumnPresets, optionContractDetailSections, optionRuleLabels, optionTemplates, OPTIONS_LIBRARY_KEY, readOptionsLibrary, screenQuery, visibleOptionsColumns, writeOptionsLibrary, type OptionsLibrary, type OptionsScreen, type OptionsView } from './optionsScreenLibrary'
 import { optionAlertMoney, optionAlertPercent, optionAlertTime } from './optionsAlertPresentation'
@@ -241,7 +241,7 @@ export function OptionsScreenLibrary({ catalog, params, setParams, filterControl
   </>
 }
 
-function OptionContractDetail({ row, close }: { row: EligibleChainRow; close: () => void }) {
+function OptionContractDetail({ row, close, dataTier }: { row: EligibleChainRow; close: () => void; dataTier?: string }) {
   const detailTone = (key: string, value: unknown) => {
     if (key === 'contract_type') return value === 'CALL' ? 'os-positive' : value === 'PUT' ? 'os-negative' : ''
     if (['model_mark', 'display_mark'].includes(key)) return 'os-option-price'
@@ -263,7 +263,7 @@ function OptionContractDetail({ row, close }: { row: EligibleChainRow; close: ()
   }
   return <Modal title="Option contract details" close={close}><div className="os-contract-detail">
     <div className="os-contract-heading"><h3>{row.underlying} / <span className={row.contract_type === 'CALL' ? 'os-positive' : 'os-negative'}>{row.contract_type}</span> {optionAlertMoney(row.strike)}</h3><p>{row.contract_ticker}</p></div>
-    <p className="os-contract-notice">Retained contract snapshot / Delayed marks / Not a fill or an alert package</p>
+    <p className="os-contract-notice">Retained contract snapshot / {optionsDataTierLabel(dataTier)} marks / Not a fill or an alert package</p>
     {optionContractDetailSections(row).map(section => <section key={section.title} aria-label={section.title}>
       <h3>{section.title}</h3><dl className="os-contract-facts">{section.fields.map(field => <div key={field.key}>
         <dt>{field.label}</dt><dd className={detailTone(field.key, field.value)} title={typeof field.value === 'string' ? field.value : undefined}>{fieldValue(field)}</dd>
@@ -345,8 +345,8 @@ export function OptionsChainResults({ catalog, params, setParams, sessionDate, r
         {rows.map(row => <tr key={row.snapshot_id}><td className="os-contract-view"><button type="button" className="sw-icon" title="View retained contract details" aria-label={`View ${row.contract_ticker} details`} onClick={event => { contractTrigger.current = event.currentTarget; setSelectedContract(structuredClone(row)) }}><Eye size={16} /></button></td>{columns.map(column => <td key={column.key}>{cell(row, column.key)}</td>)}</tr>)}
         {!query.isLoading && rows.length === 0 && <tr><td colSpan={columns.length + 1}>{invalid || (query.isError || query.data?.available === false ? 'Data unavailable' : 'No eligible contracts on this page.')}</td></tr>}
       </tbody></table></div>
-      <footer><span>Retained policy-filtered chain / delayed model marks</span><div><button type="button" disabled={offset === 0} onClick={() => update('offset', String(Math.max(0, offset - 100)))}>Previous</button><button type="button" disabled={offset + 100 >= (data?.total || 0)} onClick={() => update('offset', String(offset + 100))}>Next</button></div></footer>
+      <footer><span>Retained policy-filtered chain / {optionsDataTierLabel(query.data?.data_tier)} model marks</span><div><button type="button" disabled={offset === 0} onClick={() => update('offset', String(Math.max(0, offset - 100)))}>Previous</button><button type="button" disabled={offset + 100 >= (data?.total || 0)} onClick={() => update('offset', String(offset + 100))}>Next</button></div></footer>
     </section>
-    {selectedContract && <OptionContractDetail row={selectedContract} close={() => setSelectedContract(null)} />}
+    {selectedContract && <OptionContractDetail row={selectedContract} dataTier={query.data?.data_tier} close={() => setSelectedContract(null)} />}
   </>
 }

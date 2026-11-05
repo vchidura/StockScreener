@@ -8,7 +8,7 @@ release exists, so a new session never blanks the prior session's publication.
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from uuid import UUID
 
@@ -53,6 +53,9 @@ class PortalIdentity:
     equity: PortalPublicationIdentity | None
     options: PortalPublicationIdentity | None
     session_cohorts: Mapping[str, UUID]
+    options_session_cohorts: Mapping[str, UUID] = field(
+        default_factory=dict,
+    )
 
     def payload(
         self,
@@ -74,6 +77,16 @@ class PortalIdentity:
                 session: str(cohort)
                 for session, cohort in sorted(self.session_cohorts.items())
             },
+            "options_session_cohorts": (
+                {}
+                if not options_reads_enabled
+                else {
+                    session: str(cohort)
+                    for session, cohort in sorted(
+                        self.options_session_cohorts.items()
+                    )
+                }
+            ),
             "provider_fetch_performed": False,
         }
 
@@ -162,13 +175,22 @@ def load_portal_identity_cursor(
         "ON release.release_id=pin.release_id "
         "AND release.cutoff=pin.release_cutoff "
         "WHERE pin.enabled AND pin.release_cutoff<=%s "
-        "ORDER BY pin.release_cutoff DESC,pin.cohort_id LIMIT 1",
-        (available,),
+        "ORDER BY pin.release_cutoff DESC,pin.cohort_id LIMIT %s",
+        (available, PORTAL_IDENTITY_SESSION_LIMIT),
     )
-    pinned = cursor.fetchone()
+    pinned = tuple(
+        _row(row, _OPTIONS_NAMES)
+        for row in cursor.fetchall()
+    )
+    options_session_cohorts: dict[str, UUID] = {}
+    for row in pinned:
+        options_session_cohorts.setdefault(
+            row["session_date"].isoformat(),
+            UUID(str(row["cohort_id"])),
+        )
     options = None
-    if pinned is not None:
-        row = _row(pinned, _OPTIONS_NAMES)
+    if pinned:
+        row = pinned[0]
         options = PortalPublicationIdentity(
             cohort_id=UUID(str(row["cohort_id"])),
             session_date=row["session_date"],
@@ -177,7 +199,12 @@ def load_portal_identity_cursor(
             release_id=UUID(str(row["release_id"])),
             cutoff=_utc(row["cutoff"], "Options release cutoff"),
         )
-    return PortalIdentity(equity, options, session_cohorts)
+    return PortalIdentity(
+        equity,
+        options,
+        session_cohorts,
+        options_session_cohorts,
+    )
 
 
 class PortalIdentityRepository:

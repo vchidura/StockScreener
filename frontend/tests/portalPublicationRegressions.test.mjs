@@ -18,7 +18,21 @@ function compile(file, overrides = {}) {
   const module = new Module(filename)
   module.filename = filename
   module.paths = Module._nodeModulePaths(path.dirname(filename))
-  module.require = specifier => Object.hasOwn(overrides, specifier) ? overrides[specifier] : require(specifier)
+  module.require = specifier => {
+    if (Object.hasOwn(overrides, specifier)) return overrides[specifier]
+    if (specifier === '../services/portalIdentity' || specifier === './portalIdentity') {
+      const identity = () => globalThis.__regressionPortalIdentity ?? null
+      return {
+        realtimeCohortId: () => identity()?.equity?.cohort_id,
+        realtimeOptionsCohortId: sessionDate => sessionDate
+          ? identity()?.options_session_cohorts?.[sessionDate]
+          : identity()?.options?.cohort_id,
+        realtimeOptionsReadsEnabled: () => identity()?.options_reads_enabled === true,
+        usePortalIdentity: identity,
+      }
+    }
+    return require(specifier)
+  }
   module._compile(ts.transpileModule(read(file).replaceAll('import.meta.env', 'globalThis.__regressionEnvironment'), {
     compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022, jsx: ts.JsxEmit.ReactJSX },
   }).outputText, filename)
@@ -213,6 +227,11 @@ test('market-hours banner skips freshness validation on weekends, holidays and o
             return { status: 'STALE', last_market_time: '2026-10-08T20:00:00Z',
               stale_intervals: ['1d', '30m'], staleness_sessions: 1 }
           },
+          fetchScreeningMaterializationStatus: async () => {
+            freshnessReads++
+            return { status: 'STALE', last_market_time: '2026-10-08T20:00:00Z',
+              stale_intervals: ['1d', '30m'], staleness_sessions: 1 }
+          },
         },
       })
       assert.equal(StalenessBanner(), null)
@@ -273,7 +292,7 @@ test('market-hours banner suppresses unknown calendars and late responses, but r
       await new Promise(setImmediate)
       assert.equal(freshnessReads, calendarFails ? 0 : 1)
       if (calendarFails) assert.equal(StalenessBanner(), null)
-      else assert.match(renderToStaticMarkup(StalenessBanner()), /Market data status unavailable/)
+      else assert.match(renderToStaticMarkup(StalenessBanner()), /DATA STATUS UNAVAILABLE/)
       assert.equal(marketNotificationsEnabled(market, 5 * 60 * 60 * 1000), false)
       cleanup()
     }
@@ -415,6 +434,8 @@ test('enabled Options freshness preserves the retained release and reports its a
               available: true, reason: null, data_tier: 'REAL-TIME ADVANCED RESEARCH DATA',
               generated_at: '2026-10-09T14:46:00Z', as_of: '2026-10-09T14:45:00Z',
               observed_at: '2026-10-09T14:46:00Z', policy_sha256: 'a'.repeat(64),
+              retained_session_date: '2026-10-09', valid_until: '2026-10-09T14:50:00Z',
+              stale: true, staleness_seconds: 600, serving_latest_available: true,
               model_version: 'v1', data: { underlyers: [], selected: 'SPY' },
             } }
           },
@@ -432,7 +453,7 @@ test('enabled Options freshness preserves the retained release and reports its a
     )
     assert.equal(status.status, 'STALE')
     assert.equal(status.serving_latest_available, true)
-    assert.equal(status.oldest_stale_market_time, '2026-10-09T14:45:00Z')
+    assert.equal(status.oldest_stale_market_time, '2026-10-09T14:50:00Z')
     assert.equal(status.retained_setup_generated_at, '2026-10-09T14:46:00Z')
     assert.deepEqual(calls, [['/options/flow', { underlyer: undefined, session_date: undefined, cohort_id: 'options-cohort' }]])
   } finally {
@@ -519,7 +540,8 @@ test('brand navigation preserves explicit realtime identities and canonical home
   visit(ast)
   assert.ok(destination)
   const home = new Function('realtimeOnly', 'pinnedPath', `return ${destination}`)
-  globalThis.__regressionEnvironment = { VITE_REALTIME_ONLY: 'true', VITE_REALTIME_COHORT_ID: 'exact-cohort' }
+  globalThis.__regressionEnvironment = { VITE_REALTIME_ONLY: 'true' }
+  globalThis.__regressionPortalIdentity = { equity: { cohort_id: 'exact-cohort' } }
   try {
     const { publicationPath } = compile('pages/publicationNavigation.ts')
     assert.equal(home(true, route => publicationPath(route, 'old', 'exact-cohort')),
@@ -535,7 +557,8 @@ test('brand navigation preserves explicit realtime identities and canonical home
 })
 
 test('navigation clears incompatible ticker and summary pins without dropping the cohort', () => {
-  globalThis.__regressionEnvironment = { VITE_REALTIME_ONLY: 'true', VITE_REALTIME_COHORT_ID: 'exact-cohort' }
+  globalThis.__regressionEnvironment = { VITE_REALTIME_ONLY: 'true' }
+  globalThis.__regressionPortalIdentity = { equity: { cohort_id: 'exact-cohort' } }
   try {
     const { navigationPublicationPath } = compile('pages/publicationNavigation.ts')
     const path = (target, source, pin = 'selected-release', cohort = 'exact-cohort') =>
@@ -567,8 +590,8 @@ test('navigation clears incompatible ticker and summary pins without dropping th
 test('ticker page ignores a stale release pin and loads the current view', () => {
   const source = read('pages/publicationNavigation.ts')
   assert.match(source, /const internalWorkspace = isTickerWorkspaceQuery\(name\) \|\| name === 'all-tickers'/)
-  assert.match(source, /const pin = internalWorkspace \? undefined : params\.get\('snapshot_id'\) \?\? undefined/)
-  assert.match(source, /!internalWorkspace && params\.has\('snapshot_id'\) && !pin/)
+  assert.match(source, /const pin = internalWorkspace \|\| \(earlierSession && !requireIdentity\) \? undefined : params\.get\('snapshot_id'\) \?\? undefined/)
+  assert.match(source, /!internalWorkspace && !earlierSession && params\.has\('snapshot_id'\) && !pin/)
   assert.match(source, /!isTickerPath\(path\)\) params\.set\('snapshot_id', snapshotId\)/)
 })
 
@@ -642,7 +665,8 @@ test('Dashboard still fails closed without retained publication and preserves ca
 })
 
 test('retrying a ticker publication ignores a stale pin and reloads the current view', async () => {
-  globalThis.__regressionEnvironment = { VITE_REALTIME_ONLY: 'true', VITE_REALTIME_COHORT_ID: 'exact-cohort' }
+  globalThis.__regressionEnvironment = { VITE_REALTIME_ONLY: 'true' }
+  globalThis.__regressionPortalIdentity = { equity: { cohort_id: 'exact-cohort' } }
   const calls = []
   try {
     const { usePublicationQuery } = compile('pages/publicationNavigation.ts', {
@@ -661,7 +685,8 @@ test('retrying a ticker publication ignores a stale pin and reloads the current 
 })
 
 test('ordinary ticker, strategy and Persistence browsing keeps snapshot identities internal', async () => {
-  globalThis.__regressionEnvironment = { VITE_REALTIME_ONLY: 'true', VITE_REALTIME_COHORT_ID: 'exact-cohort' }
+  globalThis.__regressionEnvironment = { VITE_REALTIME_ONLY: 'true' }
+  globalThis.__regressionPortalIdentity = { equity: { cohort_id: 'exact-cohort' } }
   try {
     const scenarios = [['ticker-workspace:NVDA', '1d'], ['all-tickers', '1d'], ['daily-gaps', '1d'], ['daily-persistence', '1d'],
       ['daily-gaps', '1h'], ['daily-persistence', '1h']]

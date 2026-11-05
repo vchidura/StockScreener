@@ -13,6 +13,7 @@ import { usePublishPageContext } from '../layout/pageContext'
 import { useSessionDate } from '../layout/sessionDate'
 import {
   getOptionFlow,
+  optionsDataTierLabel,
   type OptionFlowExpiration,
   type OptionFlowStrike,
   type OptionFlowSummary,
@@ -198,9 +199,10 @@ export default function OptionsFlowPage() {
   useEffect(() => setStrikeExpiration('ALL'), [data?.selected, data?.session_date])
 
   usePublishPageContext({
-    eyebrow: 'Delayed options activity',
+    eyebrow: `${optionsDataTierLabel(flow.data?.data_tier)} options activity`,
     title: 'Options Flow',
     detail: 'Call and put activity, positioning change, and contract concentration for one selected underlying.',
+    status: [{ label: 'Data', value: optionsDataTierLabel(flow.data?.data_tier) }],
     session: '1d',
   })
 

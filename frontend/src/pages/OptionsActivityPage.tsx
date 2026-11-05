@@ -3,7 +3,7 @@ import { useNavigate, useSearchParams } from 'react-router-dom'
 import { AlertTriangle, Database } from 'lucide-react'
 import { usePublishPageContext } from '../layout/pageContext'
 import { useSessionDate } from '../layout/sessionDate'
-import { getOptionFlow } from '../services/api'
+import { getOptionFlow, optionsDataTierLabel } from '../services/api'
 import { optionFlowUnavailableReason, TickerBoard } from './OptionsFlowPage'
 import './OptionsFlowPage.css'
 
@@ -22,6 +22,7 @@ export default function OptionsActivityPage() {
     eyebrow: 'Cross-sectional options activity',
     title: 'Option Activity',
     detail: 'Compare call and put participation, estimated premium activity, and settled positioning change across the tracked universe.',
+    status: [{ label: 'Data', value: optionsDataTierLabel(activity.data?.data_tier) }],
     session: '1d',
   })
 
