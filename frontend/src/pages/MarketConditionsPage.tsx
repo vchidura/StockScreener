@@ -1,10 +1,11 @@
-import { useDeferredValue, useId, useLayoutEffect, useRef, useState } from 'react'
+import { useDeferredValue, useId, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { useQuery } from '@tanstack/react-query'
 import { Link } from 'react-router-dom'
 import { ArrowDownWideNarrow, ArrowUpWideNarrow, ChevronRight, Info, RefreshCw, Search, X } from 'lucide-react'
 import { getMarketConditions, type RotationFact, type RotationPrices, type SectorRotationRow } from '../services/api'
 import { usePublishPageContext } from '../layout/pageContext'
+import { formatLiveTime, useLivePrices, useRunningSession, withLiveFact } from '../services/livePrices'
 import { compareStockDivergence, stockDivergenceColumns, type StockDivergenceSort } from './stockDivergence'
 import './MarketConditionsPage.css'
 
@@ -125,7 +126,18 @@ export default function MarketConditionsPage() {
   const [stockSort, setStockSort] = useState<StockDivergenceSort>('relative5')
   const [stockDescending, setStockDescending] = useState(true)
   const [comparisonSample, setComparisonSample] = useState<'rolling' | 'nonoverlapping' | 'first_half' | 'second_half'>('rolling')
-  const data = query.data
+  const stored = query.data
+  const runningSession = useRunningSession()
+  const liveTickers = useMemo(() => (stored
+    ? [...new Set([...Object.keys(stored.benchmarks), ...stored.sectors.map(row => row.ticker), ...stored.stocks.map(row => row.ticker)])]
+    : []), [stored])
+  const live = useLivePrices(liveTickers, runningSession)
+  const data = useMemo(() => (stored && live.asOf ? {
+    ...stored,
+    benchmarks: Object.fromEntries(Object.entries(stored.benchmarks).map(([ticker, fact]) => [ticker, withLiveFact(fact, live.prices.get(ticker))])),
+    sectors: stored.sectors.map(row => ({ ...row, context: withLiveFact(row.context, live.prices.get(row.ticker)) })),
+    stocks: stored.stocks.map(row => ({ ...row, context: withLiveFact(row.context, live.prices.get(row.ticker)) })),
+  } : stored), [stored, live.asOf, live.prices])
   const comparison = data?.bond_comparison
   const sectors = data?.sectors ?? []
   const componentSources = (name: string) => name === 'momentum' ? ['SPY', 'QQQ'].map(ticker => data?.benchmarks[ticker])
@@ -156,7 +168,9 @@ export default function MarketConditionsPage() {
     <header className="mc-capture">
       <span>Daily close <strong>{data.session}</strong></span>
       <span>Captured {data.as_of ? new Date(data.as_of).toLocaleString('en-US', { timeZone: 'America/New_York', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }) : 'Unavailable'} ET</span>
-      <span className={data.stale ? 'mc-negative' : 'mc-muted'}>{data.stale ? `Stale: expected ${data.expected_session}` : 'Stored capture'}</span>
+      {live.asOf
+        ? <span className="mc-muted">Prices and day change as of {formatLiveTime(live.asOf)}; averages and rotation from the last close</span>
+        : <span className={data.stale ? 'mc-negative' : 'mc-muted'}>{data.stale ? `Stale: expected ${data.expected_session}` : 'Stored capture'}</span>}
       <button className="mc-icon" type="button" title="Reload stored snapshot" aria-label="Reload stored snapshot" disabled={query.isFetching} onClick={() => void query.refetch()}><RefreshCw size={16} /></button>
     </header>
 

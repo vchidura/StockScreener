@@ -21,6 +21,16 @@ function compile(file, overrides = {}) {
   module.require = specifier => {
     if (Object.hasOwn(overrides, specifier)) return overrides[specifier]
     if (specifier === '../layout/sessionDate') return { useOptionalSessionDate: () => null }
+    if (specifier === '../services/livePrices') {
+      return {
+        formatLiveTime: () => '',
+        useLivePrices: () => ({ prices: new Map(), asOf: null }),
+        useRunningSession: () => null,
+        withLiveFact: fact => fact,
+        withLiveOverview: row => row,
+        withLiveScreeningRow: row => row,
+      }
+    }
     if (specifier === '../services/portalIdentity' || specifier === './portalIdentity') {
       const identity = () => globalThis.__regressionPortalIdentity ?? null
       return {
@@ -683,6 +693,83 @@ test('retrying a ticker publication ignores a stale pin and reloads the current 
   } finally {
     delete globalThis.__regressionEnvironment
   }
+})
+
+test('the ticker page follows a running session, and All Tickers stays on the last close', async () => {
+  globalThis.__regressionEnvironment = { VITE_REALTIME_ONLY: 'true' }
+  globalThis.__regressionPortalIdentity = { equity: { cohort_id: 'today' } }
+  const open = (name, search, store, load) => {
+    let options
+    const { usePublicationQuery } = compile('pages/publicationNavigation.ts', {
+      react: { ...React, useState: initial => [initial, () => {}], useRef: initial => ({ current: initial }), useEffect: () => {} },
+      'react-router-dom': { useSearchParams: () => [new URLSearchParams(search), () => {}] },
+      '../layout/sessionDate': { useOptionalSessionDate: () => store },
+      '@tanstack/react-query': { useQueryClient: () => ({ setQueryData: () => {} }), useQuery: value => {
+        options = value
+        return { refetch: () => value.queryFn(), isFetching: false, error: null }
+      } },
+    })
+    return { view: usePublicationQuery(name, load), options: () => options }
+  }
+  const running = { loading: false, date: '2026-11-05', sessions: ['2026-11-03', '2026-11-04', '2026-11-05'], runningSession: '2026-11-05' }
+  const answer = session => ({ publication: { cohort_id: 'today', snapshot_id: 'latest', session } })
+  try {
+    for (const search of ['', 'session_date=2026-11-05']) {
+      const calls = []
+      const page = open('ticker-workspace:AAPL', search, running, async (pin, session) => { calls.push(session); return answer(session) })
+      await page.view.retry()
+      assert.deepEqual(calls, [undefined], 'today reads the latest published window, not a close')
+      assert.equal(page.options().refetchInterval, 30_000)
+    }
+
+    const beforeFirstWindow = []
+    const early = open('ticker-workspace:AAPL', '', running, async (pin, session) => {
+      beforeFirstWindow.push(session)
+      if (session === undefined) throw new Error('Saved sessions have no retained publication for this cohort')
+      return answer(session)
+    })
+    assert.equal((await early.view.retry()).publication.session, '2026-11-04')
+    assert.deepEqual(beforeFirstWindow, [undefined, '2026-11-04'], 'nothing published yet falls back to the last close')
+
+    const past = []
+    const history = open('ticker-workspace:AAPL', 'session_date=2026-11-03', running, async (pin, session) => { past.push(session); return answer(session) })
+    await history.view.retry()
+    assert.deepEqual(past, ['2026-11-03'], 'a chosen past date stays on that close')
+    assert.equal(history.options().refetchInterval, false)
+
+    const closed = []
+    const overnight = open('ticker-workspace:AAPL', '', { ...running, runningSession: null }, async (pin, session) => { closed.push(session); return answer(session) })
+    await overnight.view.retry()
+    assert.deepEqual(closed, ['2026-11-05'], 'once the close is saved the page reads it')
+    assert.equal(overnight.options().refetchInterval, false)
+
+    const others = []
+    const allTickers = open('all-tickers', '', running, async (pin, session) => { others.push(session); return answer(session) })
+    await allTickers.view.retry()
+    assert.deepEqual(others, ['2026-11-04'], 'All Tickers reads the last close and adds today\'s prices itself')
+    assert.equal(allTickers.options().refetchInterval, false)
+
+    const failing = open('ticker-workspace:AAPL', 'session_date=2026-11-03', running, async () => { throw new Error('Unavailable') })
+    await assert.rejects(failing.view.retry(), /Unavailable/, 'a past date never substitutes another session')
+  } finally {
+    delete globalThis.__regressionEnvironment
+  }
+})
+
+test('the session list offers the running session only to pages that show today\'s prices', () => {
+  const { listedSessions } = compile('layout/sessionDate.tsx', {
+    '@tanstack/react-query': { useQuery: () => ({}) },
+    'react-router-dom': {},
+    '../services/api': {},
+    '../pages/publicationNavigation': {},
+    './navigation': {},
+  })
+  const data = { sessions: ['2026-11-04', '2026-11-05'], current_session: '2026-11-05', current_is_session_close: false }
+  assert.deepEqual(listedSessions(data, true), ['2026-11-04', '2026-11-05'])
+  assert.deepEqual(listedSessions(data, false), ['2026-11-04'])
+  assert.deepEqual(listedSessions({ ...data, sessions: ['2026-11-04'] }, true), ['2026-11-04', '2026-11-05'], 'today has no daily bar yet')
+  assert.deepEqual(listedSessions({ ...data, current_is_session_close: true }, false), ['2026-11-04', '2026-11-05'])
+  assert.deepEqual(listedSessions(undefined, true), [])
 })
 
 test('ordinary ticker, strategy and Persistence browsing keeps snapshot identities internal', async () => {

@@ -2422,6 +2422,7 @@ export interface OptionFlowContract {
   local_iv: number | null
   local_delta: number | null
   volume_open_interest_ratio: number | null
+  volume_baseline?: string
   premium_activity: string | null
   moneyness_fraction: string
 }

@@ -1,10 +1,11 @@
-import { useDeferredValue, useEffect, useEffectEvent, useRef, useState, type ReactNode } from 'react'
+import { useDeferredValue, useEffect, useEffectEvent, useMemo, useRef, useState, type ReactNode } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { Link, useSearchParams } from 'react-router-dom'
 import { AlertTriangle, ArrowDown, ArrowLeft, ArrowRight, ArrowUp, Bell, Clock, Download, Eye, History, RefreshCw, ShieldAlert, X } from 'lucide-react'
 import { ColumnPicker, useColumnPreferences, type ColumnSpec } from '../layout/PageChrome'
 import { usePublishPageContext } from '../layout/pageContext'
 import { getAlertView, type AlertPlanRow } from '../services/stockDiscovery'
+import { useLivePrices, useRunningSession, withLiveAlert } from '../services/livePrices'
 import { alertCombinedResults, alertSort, alertSourceParams, alertTabParams, alertTradeFilters, resolveAlertRoute, tradeAlertModels, tradeAlertStatuses, type AlertView } from './stockAlertNavigation'
 import { alertColumnLayout, alertPlanTiming, alertPublicationFacts, alertRiskAssessment, earliestAlertWindow, unavailableAlertProbability } from './stockAlertPresentation'
 import StockEodReviewPanel from './StockEodReviewPanel'
@@ -167,7 +168,14 @@ export default function StockAlertsPage() {
   const data = view === 'eod' ? undefined : query.data
   const source = data?.source || requestedSource
   const sourceLabel = source === 'REPLAY' ? 'Backtested history' : data?.combined ? 'Intraday + swing shadow' : data?.source_id === 'stock_ideas_forward_swing_v1' ? 'Swing shadow' : 'Forward shadow'
-  const rows = data?.rows || []
+  const storedRows = useMemo(() => data?.rows || [], [data?.rows])
+  const runningSession = useRunningSession()
+  const liveSession = source !== 'REPLAY' && data?.session === runningSession ? runningSession : null
+  const liveTickers = useMemo(() => [...new Set(storedRows.map(row => row.ticker))], [storedRows])
+  const live = useLivePrices(liveTickers, liveSession)
+  const rows = useMemo(() => (
+    liveSession ? storedRows.map(row => withLiveAlert(row, live.prices.get(row.ticker))) : storedRows
+  ), [storedRows, liveSession, live.prices])
   const selectedAlert = rows.find(row => row.alert_id === selectedAlertId) || null
   const displayedRuns = view === 'history' ? data?.runs || [] : view === 'open' ? [] : data?.latest_runs || (data?.run ? [data.run] : [])
   const incompleteCoverage = displayedRuns.some(run => (run.missing ?? 0) > 0 || run.status === 'MISSED_PUBLICATION')

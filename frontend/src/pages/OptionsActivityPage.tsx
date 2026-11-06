@@ -4,7 +4,7 @@ import { AlertTriangle, Database } from 'lucide-react'
 import { usePublishPageContext } from '../layout/pageContext'
 import { useSessionDate } from '../layout/sessionDate'
 import { getOptionFlow, optionsDataTierLabel } from '../services/api'
-import { optionFlowUnavailableReason, TickerBoard } from './OptionsFlowPage'
+import { OptionSessionNotice, optionFlowUnavailableReason, TickerBoard } from './OptionsFlowPage'
 import './OptionsFlowPage.css'
 
 export default function OptionsActivityPage() {
@@ -30,6 +30,7 @@ export default function OptionsActivityPage() {
   if (activity.isError || !data || activity.data?.available === false) return <div className="flow-state flow-state--warning"><AlertTriangle size={20} /><div><strong>Option activity unavailable</strong><span>{optionFlowUnavailableReason(activity.data?.reason, activity.error)}</span></div></div>
 
   return <div className="options-flow-page">
+    <OptionSessionNotice session={data.session_date} />
     <TickerBoard rows={data.underlyers} selected="" onSelect={underlyer => {
       const next = new URLSearchParams(searchParams)
       next.set('underlyer', underlyer)

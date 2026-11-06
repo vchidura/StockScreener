@@ -183,6 +183,23 @@ function StrikeProfile({ rows, metric }: { rows: OptionFlowStrike[]; metric: Pro
   )
 }
 
+const VOLUME_INCOMPLETE_NOTE = 'Volume may be slightly off: a trade correction could not be matched to its original trade.'
+
+/** Known holes in a session's Options data, so a short total says so. */
+const OPTION_SESSION_NOTICES: Record<string, string> = {
+  '2026-11-05': 'Options trades were not captured from 10:18:12 to 10:33:53 AM ET, or for under a minute each at about 10:42, 10:48 and 10:53 AM ET, so estimated premium activity and flow events are short by those periods. No Options updates were published for 9:55 to 10:45 AM ET.',
+}
+
+export function optionSessionNotice(session: string | null | undefined): string | null {
+  return session ? OPTION_SESSION_NOTICES[session] ?? null : null
+}
+
+export function OptionSessionNotice({ session }: { session: string | null | undefined }) {
+  const notice = optionSessionNotice(session)
+  if (!notice) return null
+  return <div className="flow-state flow-state--warning" role="status"><AlertTriangle size={20} /><div><strong>Incomplete session</strong><span>{notice}</span></div></div>
+}
+
 export default function OptionsFlowPage() {
   const [searchParams, setSearchParams] = useSearchParams()
   const ticker = (searchParams.get('underlyer') || 'SPY').toUpperCase()
@@ -217,6 +234,7 @@ export default function OptionsFlowPage() {
   const selectedExpiration = data.expirations.find(row => row.expiration_date === strikeExpiration)
   return (
     <div className="options-flow-page">
+      <OptionSessionNotice session={data.session_date} />
       <section className="flow-command" aria-label="Options flow filters">
         <label>Underlying<select value={data.selected} onChange={event => setSearchParams(current => {
           const next = new URLSearchParams(current)
@@ -255,16 +273,17 @@ export default function OptionsFlowPage() {
               <tbody>{data.top_contracts.map(contract => <tr key={contract.contract_id}>
                 <td><strong className={contract.contract_type === 'CALL' ? 'flow-call' : 'flow-put'}>{Number(contract.strike).toLocaleString('en-US', { maximumFractionDigits: 2 })} {contract.contract_type}</strong><small title={contract.contract_ticker}>{contract.contract_ticker}</small></td>
                 <td>{formatDate(contract.expiration_date)}<small>{contract.calendar_dte} DTE</small></td>
-                <td>{formatInteger(contract.day_volume)}</td>
+                <td title={contract.volume_baseline === 'INCOMPLETE' ? VOLUME_INCOMPLETE_NOTE : undefined}>{formatInteger(contract.day_volume)}{contract.volume_baseline === 'INCOMPLETE' ? ' *' : ''}</td>
                 <td>{contract.open_interest == null ? 'N/A' : formatInteger(contract.open_interest)}</td>
                 <td>{formatRatio(contract.volume_open_interest_ratio)}</td>
                 <td>{contract.model_mark ? `$${Number(contract.model_mark).toFixed(2)}` : 'N/A'}</td>
-                <td>{formatCurrency(contract.premium_activity)}</td>
+                <td>{contract.premium_activity == null ? 'N/A' : formatCurrency(contract.premium_activity)}</td>
                 <td>{contract.local_delta == null ? 'N/A' : contract.local_delta.toFixed(3)}</td>
-                <td>{formatPercent(Number(contract.moneyness_fraction))}</td>
+                <td>{(Number(contract.moneyness_fraction) * 100).toFixed(2)}%</td>
               </tr>)}</tbody>
             </table>
           </div>
+          {data.top_contracts.some(contract => contract.volume_baseline === 'INCOMPLETE') && <small role="note">* {VOLUME_INCOMPLETE_NOTE}</small>}
         </section>
       </>}
     </div>

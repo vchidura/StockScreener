@@ -3,6 +3,7 @@ import { Link } from 'react-router-dom'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { Settings } from 'lucide-react'
 import { usePublishPageContext } from '../layout/pageContext'
+import { formatLiveTime, useLivePrices, withLiveOverview } from '../services/livePrices'
 import { useSessionDate } from '../layout/sessionDate'
 import '../layout/pageChrome.css'
 import { publicationPath, usePublicationQuery } from './publicationNavigation'
@@ -52,7 +53,7 @@ function TickersOverview() {
   const [maThreshold, setMaThreshold] = useState(3)
   const [presetFilter, setPresetFilter] = useState('')
   const [presetPct, setPresetPct] = useState(5)
-  const { pinned: scanDate } = useSessionDate()
+  const { pinned: scanDate, runningSession } = useSessionDate()
   const [hiddenCols, setHiddenCols] = useState<Set<string>>(() => new Set(DEFAULT_HIDDEN_COLUMNS))
   const [showColPicker, setShowColPicker] = useState(false)
 
@@ -63,7 +64,13 @@ function TickersOverview() {
     queryFn: () => getTickersOverview(scanDate || undefined),
     enabled: !realtimeOnly,
   })
-  const data = (realtimeOnly ? realtimeQuery.data?.overview : overviewQuery.data) ?? []
+  const storedRows = realtimeOnly ? realtimeQuery.data?.overview : overviewQuery.data
+  const liveSession = realtimeOnly && (!scanDate || scanDate === runningSession) ? runningSession ?? null : null
+  const liveTickers = useMemo(() => (storedRows ?? []).map(row => row.ticker), [storedRows])
+  const live = useLivePrices(liveTickers, liveSession)
+  const data = useMemo(() => (storedRows ?? []).map(row => (
+    liveSession ? withLiveOverview(row, live.prices.get(row.ticker), liveSession) : row
+  )), [storedRows, liveSession, live.prices])
   const weekly200Available = data.some(row => row.wsma_200 != null)
   const loading = realtimeOnly ? realtimeQuery.loading : overviewQuery.isFetching
   const error = realtimeOnly ? realtimeQuery.error : overviewQuery.error?.message
@@ -345,9 +352,12 @@ function TickersOverview() {
     eyebrow: realtimeOnly ? 'Market · selected realtime cohort' : 'Market · full universe',
     title: 'All Tickers',
     detail: realtimeOnly
-      ? 'Price, momentum, key moving averages, and published daily setups for the exact retained cohort.'
+      ? live.asOf
+        ? 'Price and volume from today\'s latest window. Moving averages, momentum and setups from the last close.'
+        : 'Price, momentum, key moving averages, and published daily setups for the exact retained cohort.'
       : 'Price, momentum, key moving averages, and published trade-setup state for every tracked ticker.',
     session: SETUP_INTERVAL,
+    status: live.asOf ? [{ label: 'Prices', value: formatLiveTime(live.asOf) }] : undefined,
   })
 
   const toneFor = (value: string | null | undefined) => {
@@ -758,9 +768,10 @@ function TickersOverview() {
                       }}>
                         {col.key === 'ticker' ? <Link
                           className="ticker-publication-link"
-                          to={realtimeOnly && publication
+                          to={realtimeOnly && publication && !liveSession
                             ? publicationPath(`/ticker/${row.ticker}`, undefined, publication.cohort_id, undefined, publication.session)
                             : `/ticker/${row.ticker}`}
+                          // Today's row opens today's ticker page. Only a chosen past session pins its cohort and date.
                           aria-label={`Open ${row.ticker} ticker workspace`}
                           title={evidenceRefs?.[row.ticker] ? `Daily evidence ${evidenceRefs[row.ticker].evidence_id}` : undefined}
                         >{content}</Link> : content}

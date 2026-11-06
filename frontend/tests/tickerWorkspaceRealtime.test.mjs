@@ -36,7 +36,8 @@ test('both deployment modes route every ticker view to the original workspace', 
     assert.ok(workspace.includes(`value: '${view}'`))
   }
   assert.doesNotMatch(workspace, /availableViews/)
-  assert.match(workspace, /usePublicationQuery\(`ticker-workspace:/)
+  assert.match(workspace, /usePublicationQuery\(\s*`ticker-workspace:/)
+  assert.match(workspace, /getTickerWorkspacePublication\(\s*symbol,\s*pin,\s*session,\s*session !== undefined,/)
   assert.match(workspace, /queryScope = realtimeOnly \? \[publication\?\.cohort_id, snapshotId, \.\.\.\(closingView \? \['session_close'\] : \[\]\)\] : \[\]/)
   assert.doesNotMatch(workspace, /view === 'financials'/)
   assert.match(workspace, /active === 'financials' && <FinancialsView/)

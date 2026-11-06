@@ -57,6 +57,9 @@ export function useStrategyInterval(searchState?: { current: { pending: URLSearc
   return { interval, setInterval }
 }
 
+/** A window publishes every 5 minutes; this finds it soon after, and each new one reloads the page's reads. */
+const LIVE_PUBLICATION_POLL_MS = 30_000
+
 export function usePublicationQuery<T extends { publication: Pick<DashboardPublication, 'cohort_id' | 'snapshot_id'> & { session?: string } }>(
   name: string, load: (snapshotId?: string, sessionDate?: string) => Promise<T>,
   requireIdentity = false,
@@ -79,7 +82,15 @@ export function usePublicationQuery<T extends { publication: Pick<DashboardPubli
   const sessionStore = useOptionalSessionDate()
   const sessionsLoading = sessionStore?.loading ?? false
   const defaultSession = realtimeOnly && internalWorkspace ? sessionStore?.date || undefined : undefined
-  const sessionDate = name.startsWith('daily-') || internalWorkspace ? params.get('session_date') ?? defaultSession : undefined
+  const chosenSession = params.get('session_date')
+  // The ticker page follows a running session: it reads the latest published window and keeps up with new ones.
+  // All Tickers is built on daily results, so it stays on the last close and adds today's prices itself.
+  const tickerWorkspace = isTickerWorkspaceQuery(name)
+  const runningSession = realtimeOnly && internalWorkspace ? sessionStore?.runningSession ?? null : null
+  const readingLive = runningSession !== null && (chosenSession === null || chosenSession === runningSession)
+  const lastClose = readingLive ? sessionStore?.sessions.filter(session => session !== runningSession).pop() : undefined
+  const sessionDate = readingLive ? (tickerWorkspace ? undefined : lastClose)
+    : name.startsWith('daily-') || internalWorkspace ? chosenSession ?? defaultSession : undefined
   const scopeError = name.startsWith('daily-') && !['1d', '1h'].includes(interval)
     ? 'Unsupported strategy interval; no substitution was made.' : requireIdentity && earlierSession
     ? 'This research link belongs to another session; no substitution was made.'
@@ -89,13 +100,18 @@ export function usePublicationQuery<T extends { publication: Pick<DashboardPubli
   const queryKey = (snapshotId?: string) => [name, cohort, snapshotId, ...(interval === '1h' ? ['1h'] : []),
     ...(sessionDate !== undefined ? [sessionDate] : [])]
   const key = queryKey(pin)
-  const read = async (snapshotId?: string) => {
-    const result = await load(snapshotId, sessionDate)
-    if (sessionDate !== undefined && result.publication.session !== sessionDate) {
+  const readSession = async (snapshotId: string | undefined, session: string | undefined) => {
+    const result = await load(snapshotId, session)
+    if (session !== undefined && result.publication.session !== session) {
       throw new Error('Stored publication does not match the selected trading session; no substitution was made.')
     }
     return result
   }
+  const read = (snapshotId?: string) => readSession(snapshotId, sessionDate).catch(error => {
+    // Before the day's first window publishes, the last close is the newest thing to show.
+    if (sessionDate !== undefined || lastClose === undefined) throw error
+    return readSession(snapshotId, lastClose)
+  })
   const [refreshError, setRefreshError] = useState<string | null>(null)
   const [refreshing, setRefreshing] = useState(false)
   const generation = useRef(0)
@@ -118,6 +134,7 @@ export function usePublicationQuery<T extends { publication: Pick<DashboardPubli
     staleTime: Infinity,
     refetchOnMount: internalSelection ? 'always' : undefined,
     refetchOnWindowFocus: false,
+    refetchInterval: readingLive && tickerWorkspace ? LIVE_PUBLICATION_POLL_MS : false,
   })
   const commit = (result: T) => {
     const snapshot = result.publication.snapshot_id

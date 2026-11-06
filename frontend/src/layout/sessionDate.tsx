@@ -29,6 +29,22 @@ type SessionDateStore = {
   /** Newest stored bar across all intervals, ISO. */
   dataAsOf: string | null
   dataInterval: string | null
+  /** Today while its session runs, on pages that read live windows. Null otherwise. */
+  runningSession: string | null
+}
+
+/**
+ * Closing pages list closed sessions, so during a session they open on the last close.
+ * The ticker page and All Tickers show today's prices, so they also list the running session, as the newest.
+ */
+export function listedSessions(
+  data: { sessions?: string[]; current_session?: string | null; current_is_session_close?: boolean } | undefined,
+  listsRunningSession: boolean,
+): string[] {
+  const listed = data?.sessions ?? []
+  if (data?.current_is_session_close !== false || !data.current_session) return listed
+  const closed = listed.filter(session => session !== data.current_session)
+  return listsRunningSession ? [...closed, data.current_session] : closed
 }
 
 const SessionDateContext = createContext<SessionDateStore | null>(null)
@@ -62,14 +78,9 @@ export function SessionDateProvider({ children, enabled = true }: { children: Re
     enabled,
   })
 
-  // Closing pages show closed sessions. Today is offered once its close is saved, so
-  // during a session they open on the last close instead of an error.
-  const sessions = useMemo(() => {
-    const listed = data?.sessions ?? []
-    return data?.current_is_session_close === false
-      ? listed.filter(session => session !== data.current_session)
-      : listed
-  }, [data])
+  const followsRunningSession = isTicker || isAllTickers
+  const sessions = useMemo(() => listedSessions(data, followsRunningSession), [data, followsRunningSession])
+  const runningSession = followsRunningSession && data?.current_is_session_close === false ? data.current_session ?? null : null
 
   // Switching interval can strand the pinned session: today exists for 5m but not yet for 1d.
   useEffect(() => {
@@ -131,7 +142,8 @@ export function SessionDateProvider({ children, enabled = true }: { children: Re
     requestInterval,
     dataAsOf: data?.data_as_of ?? null,
     dataInterval: data?.data_interval ?? null,
-  }), [pinned, date, sessions, index, step, reset, choose, isStrategy, isTicker, isPattern, isAllTickers, persistedSelection, error, isFetching, selectedInterval, requestInterval, data])
+    runningSession,
+  }), [pinned, date, sessions, index, step, reset, choose, isStrategy, isTicker, isPattern, isAllTickers, persistedSelection, error, isFetching, selectedInterval, requestInterval, data, runningSession])
 
   return <SessionDateContext.Provider value={value}>{children}</SessionDateContext.Provider>
 }

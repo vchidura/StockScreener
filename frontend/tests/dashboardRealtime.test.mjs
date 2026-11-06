@@ -6,6 +6,22 @@ import ts from 'typescript'
 const read = path => readFileSync(new URL(path, import.meta.url), 'utf8')
 const dashboard = read('../src/pages/Dashboard.tsx')
 
+test('during a session the Dashboard shows today\'s prices, and labels what stays on the last close', () => {
+  assert.match(dashboard, /const liveSession = realtimeOnly && publication\?\.session === runningSession \? runningSession : null/)
+  assert.match(dashboard, /withLiveOverview\(row, live\.prices\.get\(row\.ticker\), liveSession\)/)
+  assert.match(dashboard, /label: 'Prices', value: formatLiveTime\(live\.asOf\)/)
+  // A part-day volume has no relative volume, so this panel keeps yesterday's rows and says so.
+  assert.match(dashboard, /\[\.\.\.storedOverview\]\.filter\(r => \(r\.rel_vol \?\? 0\) >= 2/)
+  assert.match(dashboard, /RelVol ≥ 2x\{liveSession \? ' · last close' : ''\}/)
+  assert.match(dashboard, /Market: \{marketRegime\.regime\}\{liveSession \? ' \(last close\)' : ''\}/)
+})
+
+test('the Gaps page opens on a tab with rows, once, and leaves a later choice alone', () => {
+  const gaps = read('../src/pages/GapScreener.tsx')
+  assert.match(gaps, /if \(openedOnRows\.current \|\| !data\?\.results\) return\s+openedOnRows\.current = true/)
+  assert.match(gaps, /TABS\.find\(tab => tab\.key !== 'fvg' && allTickerAssignments\[tab\.key\]\.length > 0\)/)
+})
+
 test('both modes retain the original Dashboard, with explicit unavailable navigation and cohort scope', () => {
   const app = read('../src/App.tsx')
   assert.equal(app.match(/path="\/" element=\{<Dashboard \/>\}/g)?.length, 2)

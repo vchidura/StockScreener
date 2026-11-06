@@ -46,7 +46,7 @@ export default function OptionsScreeningWorkspace() {
     if (filtersOpen && !drawer.current.open) drawer.current.showModal()
     if (!filtersOpen && drawer.current.open) drawer.current.close()
   }, [mobile, filtersOpen])
-  usePublishPageContext({ eyebrow: 'Options', title: 'Options Screener', status: [{ label: 'Session', value: sessionDate || 'Latest stored' }] })
+  usePublishPageContext({ session: '5m', eyebrow: 'Options', title: 'Options Screener', status: [{ label: 'Session', value: sessionDate || 'Latest stored' }] })
   function edit(key: string, value: string) { setDraft(previous => { const next = { ...previous }; if (value === '') delete next[key]; else next[key] = value; return next }) }
   function update(key: string, value: string) { const next = new URLSearchParams(window.location.search); if (value) next.set(key, value); else next.delete(key); next.delete('offset'); setParams(next) }
   function remove(field: string) {

@@ -1,4 +1,4 @@
-import { Fragment, useEffect, useEffectEvent, useRef, useState } from 'react'
+import { Fragment, useEffect, useEffectEvent, useMemo, useRef, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { Link } from 'react-router-dom'
 import { AlertTriangle, ArrowDown, ArrowLeft, ArrowRight, ArrowUp, Check, CircleHelp, Download, Eye as ChevronDown, Eye as ChevronRight, RefreshCw, RotateCcw, Save, SlidersHorizontal, X } from 'lucide-react'
@@ -10,6 +10,7 @@ import { useScreenLibrary } from './useScreenLibrary'
 import { dailyCoverageNotice } from './screeningModel'
 import ScreenLibrary, { Modal } from './ScreenLibrary'
 import PatternWatchLink from './PatternWatchLink'
+import { formatLiveTime, useLivePrices, useRunningSession, withLiveScreeningRow } from '../services/livePrices'
 import './StockScreeningPage.css'
 
 export default function StockScreeningPage() {
@@ -32,7 +33,13 @@ export default function StockScreeningPage() {
   const library = useScreenLibrary({ catalog, draft, request, columns: selectedColumns, setDraft, setRequest, setColumns })
   const dailyRequest = { ...request, generation: null }
   const query = useQuery({ queryKey: ['screening-query', dailyRequest], queryFn: ({ signal }) => queryScreening(dailyRequest, signal), enabled: !!catalog?.publications.length && library.ready, staleTime: 60_000, gcTime: 60_000, refetchInterval: 60_000, refetchOnWindowFocus: false })
-  const result = query.data
+  const storedResult = query.data
+  const runningSession = useRunningSession()
+  const liveTickers = useMemo(() => storedResult?.rows.map(row => row.ticker) ?? [], [storedResult])
+  const live = useLivePrices(liveTickers, runningSession)
+  const result = useMemo(() => (storedResult && live.asOf
+    ? { ...storedResult, rows: storedResult.rows.map(row => withLiveScreeningRow(row, live.prices.get(row.ticker))) }
+    : storedResult), [storedResult, live.asOf, live.prices])
   const coverageNotice = dailyCoverageNotice(result?.generation)
   const expandedRow = result?.rows.find(row => row.security_id === expanded)
   const gapQuery = useQuery({ queryKey: ['screening-gap-details', result?.generation.generation, expandedRow?.security_id, request.predicate.gap || null],
@@ -61,7 +68,7 @@ export default function StockScreeningPage() {
   const activeGroupCounts = Object.fromEntries(groups.map(group => [group, Object.entries(draft.fields).filter(([field, input]) => catalog?.fields[field]?.group === group && hasDraftFilter(input)).length]))
   const filterPanelKey = `${library.workspace.active_tab || 'all'}:${filtersOpen}`
   const units = (unit: string) => unit === 'fraction' ? '%' : unit === 'category' ? '' : unit
-  usePublishPageContext({ eyebrow: 'Daily screening', title: 'Stock Screener', status: [{ label: 'Session', value: result?.generation.session || 'Awaiting publication' }] })
+  usePublishPageContext({ eyebrow: 'Daily screening', title: 'Stock Screener', status: [{ label: 'Session', value: result?.generation.session || 'Awaiting publication' }, ...(live.asOf ? [{ label: 'Prices', value: formatLiveTime(live.asOf) }] : [])] })
 
   useEffect(() => {
     const media = matchMedia('(max-width: 760px)')
@@ -197,7 +204,8 @@ export default function StockScreeningPage() {
           {!request.predicate.filters.length && !request.predicate.patterns.length && !request.predicate.gap && !request.predicate.hourly && <small>All eligible instruments</small>}
         </>}{draftChanged && <small className="sw-draft-status">Unapplied changes</small>}</div>
         {hourlySource && (columns.includes('hourly') || request.predicate.hourly) && <div className="sw-hourly-status" role="status">{hourlyContextTiming(result?.generation.market_time, hourlySource)}{result?.hourly_stale || hourlySource.status !== 'READY' ? ' / Stale or unavailable' : ''}{request.predicate.hourly && ' / New comparison unavailable for hourly rules'}</div>}
-        {result?.stale && <div className="sw-warning" role="status"><AlertTriangle size={16} />Stale screening publication: {result.generation.session}</div>}
+        {live.asOf && <div className="sw-hourly-status" role="status">Close, session change and volume are from today's latest window, as of {formatLiveTime(live.asOf)}. Screen criteria and other columns use the last close.</div>}
+        {result?.stale && !live.asOf && <div className="sw-warning" role="status"><AlertTriangle size={16} />Stale screening publication: {result.generation.session}</div>}
         {coverageNotice && <div className="sw-warning" role="status" aria-label="Daily source coverage"><AlertTriangle size={16} /><span>{coverageNotice}</span></div>}
         {(catalogQuery.isError || query.isError) && <div role="alert" className="sw-warning"><AlertTriangle size={16} />Screening publication unavailable. <button type="button" onClick={() => { void catalogQuery.refetch(); void query.refetch() }}>Retry</button></div>}
         {catalog?.status === 'AWAITING_FIRST_PUBLICATION' ? <div className="sw-empty">Awaiting first daily screening publication</div> : query.isFetching && !result ? <div className="sw-empty" role="status">Loading published screening facts...</div> : result && <>

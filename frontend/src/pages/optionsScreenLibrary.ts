@@ -57,7 +57,7 @@ export function visibleOptionsColumns(view: OptionsView, selected: string | null
 type ContractDetailFormat = 'text' | 'money' | 'percent' | 'number' | 'time' | 'boolean' | 'flags'
 const contractDetailGroups: Array<{ title: string; fields: Array<[keyof EligibleChainRow, string, ContractDetailFormat?]> }> = [
   { title: 'Contract terms', fields: [
-    ['underlying', 'Underlying'], ['contract_ticker', 'Contract'], ['contract_id', 'Contract ID'],
+    ['underlying', 'Underlying'], ['contract_ticker', 'Contract'],
     ['contract_type', 'Type'], ['asset_type', 'Underlying asset type'], ['expiration_date', 'Expiration'],
     ['expiration_cutoff', 'Expiration cutoff (ET)', 'time'], ['calendar_dte', 'DTE at source', 'number'],
     ['strike', 'Strike / share', 'money'], ['shares_per_contract', 'Contract multiplier', 'number'],

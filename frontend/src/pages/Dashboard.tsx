@@ -13,6 +13,7 @@ import { MomentumRanks } from './EquityContextPanels'
 import { usePublishPageContext } from '../layout/pageContext'
 import { CommandBar, CommandSpacer } from '../layout/PageChrome'
 import { publicationPath, usePublicationQuery } from './publicationNavigation'
+import { formatLiveTime, useLivePrices, useRunningSession, withLiveOverview } from '../services/livePrices'
 
 // Muted strategy palette
 const STRAT = [
@@ -185,7 +186,18 @@ function Dashboard() {
   const latest = realtimeOnly ? (publication ? { latest_date: publication.session, publication } : undefined) : canonicalLatestQuery.data
   const latestDate = latest?.latest_date ?? ''
   const latestError = realtimeOnly ? (realtimeQuery.error ? new Error(realtimeQuery.error) : null) : canonicalLatestQuery.error
-  const overview = realtimeOnly ? realtimeQuery.data?.overview ?? [] : canonicalOverviewQuery.data ?? []
+  const storedOverview = realtimeOnly ? realtimeQuery.data?.overview ?? [] : canonicalOverviewQuery.data ?? []
+  // Daily rows hold the last close until today's close is saved. Prices and movers read today's
+  // published window, and scanner results, regime and relative volume stay on the last close.
+  const runningSession = useRunningSession()
+  const liveSession = realtimeOnly && publication?.session === runningSession ? runningSession : null
+  const liveTickers = useMemo(() => storedOverview.map(row => row.ticker), [storedOverview])
+  const live = useLivePrices(liveTickers, liveSession)
+  const overview = useMemo(() => (
+    liveSession
+      ? storedOverview.map(row => withLiveOverview(row, live.prices.get(row.ticker), liveSession))
+      : storedOverview
+  ), [storedOverview, liveSession, live.prices])
   const overviewLoading = realtimeOnly ? realtimeQuery.loading && !realtimeQuery.data : canonicalOverviewQuery.isFetching
   const loading = realtimeOnly ? realtimeQuery.loading : canonicalLoading
   const overviewError = realtimeOnly ? latestError : canonicalOverviewQuery.error
@@ -272,10 +284,10 @@ function Dashboard() {
   })
 
   const highVolMovers = useMemo(() =>
-    [...overview].filter(r => (r.rel_vol ?? 0) >= 2 && r.chg_pct != null)
+    [...storedOverview].filter(r => (r.rel_vol ?? 0) >= 2 && r.chg_pct != null)
       .sort((a, b) => (b.rel_vol ?? 0) - (a.rel_vol ?? 0))
       .slice(0, 20),
-    [overview]
+    [storedOverview]
   )
 
   const filteredOverview = useMemo(() =>
@@ -399,6 +411,7 @@ function Dashboard() {
     detail: 'Separates validated ranking from descriptive scanner context.',
     status: [
       { label: 'Session', value: latestDate || '—' },
+      ...(live.asOf ? [{ label: 'Prices', value: formatLiveTime(live.asOf) }] : []),
     ],
   })
 
@@ -437,7 +450,7 @@ function Dashboard() {
     <div style={{ padding: '4px' }}>
       <CommandBar>
         <span className="tm-commandbar__note">
-          {overview.length} tickers tracked{marketRegime && marketRegime.regime !== 'Unknown' ? ` · market ${marketRegime.regime}` : ''}
+          {overview.length} tickers tracked{marketRegime && marketRegime.regime !== 'Unknown' ? ` · market ${marketRegime.regime}${liveSession ? ' (last close)' : ''}` : ''}
         </span>
         <CommandSpacer />
         <button type="button" className="tm-commandbar__action" onClick={() => runScan(true)} disabled={loading}>
@@ -525,7 +538,7 @@ function Dashboard() {
               <div style={{ flex: '0 1 auto', minWidth: '200px' }}>
                 <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '6px', flexWrap: 'wrap' }}>
                   <span style={{ fontSize: '1.3rem' }}>{rs.icon}</span>
-                  <span style={{ fontSize: '1rem', fontWeight: 800, color: rs.color }}>Market: {marketRegime.regime}</span>
+                  <span style={{ fontSize: '1rem', fontWeight: 800, color: rs.color }}>Market: {marketRegime.regime}{liveSession ? ' (last close)' : ''}</span>
                 </div>
                 <div style={{ fontSize: '0.8rem', color: rs.color, fontWeight: 500, lineHeight: 1.4, marginBottom: '6px' }}>{marketRegime.description}</div>
                 {(marketRegime.caution_buy || marketRegime.caution_sell) && (
@@ -613,7 +626,7 @@ function Dashboard() {
 
         {/* Unusual Volume */}
         <div style={CARD}>
-          <h3 style={SECTION_TITLE}>🔥 Unusual Volume <span style={SUBTITLE}>RelVol ≥ 2x</span></h3>
+          <h3 style={SECTION_TITLE}>🔥 Unusual Volume <span style={SUBTITLE}>RelVol ≥ 2x{liveSession ? ' · last close' : ''}</span></h3>
           {overviewLoading ? <div style={{ color: 'var(--tm-faint)', fontSize: '0.84rem' }}>Loading...</div>
             : overviewUnavailable ? emptySlate('Volume publication unavailable')
             : highVolMovers.length === 0 ? <div style={{ color: 'var(--tm-faint)', fontSize: '0.84rem', padding: '20px 0', textAlign: 'center' }}>No unusual volume detected</div>

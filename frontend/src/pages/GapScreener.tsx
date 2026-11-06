@@ -1,6 +1,6 @@
 import { sortHeaderProps } from './strategyShared'
 import './strategyPages.css'
-import { useState, useEffect, useMemo, useCallback } from 'react'
+import { useState, useEffect, useMemo, useCallback, useRef } from 'react'
 import { StrategyTickerButton } from './StrategyTickerButton'
 import { useQuery, useQueryClient, keepPreviousData } from '@tanstack/react-query'
 import { usePublishPageContext } from '../layout/pageContext'
@@ -227,6 +227,17 @@ function GapScreener() {
 
     return assigned
   }, [data])
+
+  // Open on a tab that has rows, the first time data arrives, so the page never opens empty
+  // beside tabs with gaps in them. A reader's later choice stands, even an empty tab.
+  const openedOnRows = useRef(false)
+  useEffect(() => {
+    if (openedOnRows.current || !data?.results) return
+    openedOnRows.current = true
+    if (allTickerAssignments[activeTab]?.length) return
+    const first = TABS.find(tab => tab.key !== 'fvg' && allTickerAssignments[tab.key].length > 0)
+    if (first) setActiveTab(first.key)
+  }, [data, allTickerAssignments, activeTab])
 
   const getTabTickerCount = (tab: typeof TABS[number]): number => {
     if (tab.key === 'fvg') return fvgTickerGroups.length

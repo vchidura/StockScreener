@@ -25,7 +25,15 @@ export default function TickerWorkspace() {
   const [analysisInterval, setAnalysisInterval] = useState<SetupTimeframe>('1d')
   const [analysisSetup, setAnalysisSetup] = useState<{ snapshotId?: string; setup: TradeSetup | null } | null>(null)
   const realtimeOnly = import.meta.env.VITE_REALTIME_ONLY === 'true'
-  const release = usePublicationQuery(`ticker-workspace:${symbol}`, (pin, session) => getTickerWorkspacePublication(symbol, pin, session, true))
+  const release = usePublicationQuery(
+    `ticker-workspace:${symbol}`,
+    (pin, session) => getTickerWorkspacePublication(
+      symbol,
+      pin,
+      session,
+      session !== undefined,
+    ),
+  )
   const publication = release.data?.publication
   const snapshotId = publication?.snapshot_id
   const onAnalysisSetupChange = useCallback((setup: TradeSetup | null) => {
