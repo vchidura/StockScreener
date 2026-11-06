@@ -1444,7 +1444,8 @@ def test_independent_strategy_source_guards_preserve_research_input_integrity(fa
     elif fault == "scale":
         row = next(row for row in bars if row["interval"] == "1d" and row["adjustment_basis"] == "ADJUSTED"
                    and row["session_date"] == inputs.session)
-        row["close"] *= 1.01
+        # A 3:2 split's scale error (G82: a 1% closing-auction move is now accepted at the endpoint).
+        row["close"] *= 1.5
         row["high"] = max(row["high"], row["close"])
     elif fault == "membership":
         inputs = replace(inputs, members=inputs.members[:-1])
@@ -1454,6 +1455,24 @@ def test_independent_strategy_source_guards_preserve_research_input_integrity(fa
         bars.remove(row)
     with pytest.raises(ValueError):
         project_realtime_daily_strategies(replace(inputs, bars=tuple(bars)))
+
+
+@pytest.mark.parametrize("factor,accepted", [(1 / 1.00119, True), (1.011, False)])
+def test_strategy_endpoint_scale_check_accepts_a_closing_auction_move(factor, accepted):
+    """G82: Nov 5 AMZN's official close was 0.119% off its stream-derived raw close."""
+    from realtime.strategy_projection import project_realtime_daily_strategies
+    inputs = daily_scanner_fixture()
+    bars = [dict(row) for row in inputs.bars]
+    row = next(row for row in bars if row["interval"] == "1d" and row["adjustment_basis"] == "ADJUSTED"
+               and row["session_date"] == inputs.session)
+    row["close"] *= factor
+    row["high"], row["low"] = max(row["high"], row["close"]), min(row["low"], row["close"])
+    scaled = replace(inputs, bars=tuple(bars))
+    if accepted:
+        assert project_realtime_daily_strategies(scaled) is not None
+    else:
+        with pytest.raises(ValueError, match="Strategy current adjusted/raw scale drift"):
+            project_realtime_daily_strategies(scaled)
 
 
 @pytest.mark.parametrize("query_data,status", [

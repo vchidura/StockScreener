@@ -451,3 +451,96 @@ def test_retry_execution_deadline_is_explicit_and_timezone_aware():
             "--execution-deadline",
             "2026-10-16T16:34:30",
         ])
+
+
+# G85: the incremental loader and projection state stay warm between windows of one cohort.
+COHORT_A = UUID("11111111-1111-1111-1111-111111111111")
+COHORT_B = UUID("22222222-2222-2222-2222-222222222222")
+
+
+def _at(minute):
+    from datetime import datetime, timezone
+    return datetime(2026, 10, 16, 16, minute, tzinfo=timezone.utc)
+
+
+def test_warm_pair_serves_only_newer_cutoffs_of_the_same_cohort():
+    warm = script._WarmProjection()
+    state, loader, used = warm.take(COHORT_A, _at(30))
+    assert used is False
+    warm.settle(COHORT_A, _at(30), state, loader, warm=False, complete=True)
+
+    again = warm.take(COHORT_A, _at(35))
+    assert again == (state, loader, True)
+    warm.settle(COHORT_A, _at(35), state, loader, warm=True, complete=True)
+    assert warm.cutoff == _at(35)
+
+    # A retry or recovery of an equal or older cutoff gets a fresh pair and leaves the warm one alone.
+    for cutoff in (_at(35), _at(30)):
+        retry_state, retry_loader, used = warm.take(COHORT_A, cutoff)
+        assert used is False and retry_state is not state and retry_loader is not loader
+        warm.settle(COHORT_A, cutoff, retry_state, retry_loader, warm=False, complete=True)
+        assert (warm.state, warm.loader, warm.cutoff) == (state, loader, _at(35))
+
+
+def test_a_window_that_does_not_complete_drops_the_warm_pair():
+    warm = script._WarmProjection()
+    state, loader, _ = warm.take(COHORT_A, _at(30))
+    warm.settle(COHORT_A, _at(30), state, loader, warm=False, complete=True)
+    state, loader, used = warm.take(COHORT_A, _at(35))
+    assert used is True
+    warm.settle(COHORT_A, _at(35), state, loader, warm=True, complete=False)
+    assert warm.state is None and warm.loader is None
+    assert warm.take(COHORT_A, _at(40))[2] is False
+
+
+def test_a_new_cohort_starts_cold_and_becomes_the_warm_one():
+    warm = script._WarmProjection()
+    state, loader, _ = warm.take(COHORT_A, _at(30))
+    warm.settle(COHORT_A, _at(30), state, loader, warm=False, complete=True)
+    other_state, other_loader, used = warm.take(COHORT_B, _at(35))
+    assert used is False and other_state is not state
+    warm.settle(COHORT_B, _at(35), other_state, other_loader, warm=False, complete=True)
+    assert (warm.cohort_id, warm.state) == (COHORT_B, other_state)
+
+
+@pytest.mark.parametrize("outcome", [0, 2, RuntimeError("stage blew up")])
+def test_main_passes_the_warm_pair_into_the_window_and_settles_it(monkeypatch, outcome):
+    warm = script._WarmProjection()
+    monkeypatch.setattr(script, "_WARM", warm)
+    seen = []
+
+    def fake_main(args, *, ticker_state, screening_loader, dashboard_due):
+        seen.append((args.cutoff, ticker_state, screening_loader, dashboard_due))
+        if len(seen) == 1:
+            return 0
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    monkeypatch.setattr(script, "_main", fake_main)
+    assert script.main(list(BASE)) == 0
+    warm_state, warm_loader = seen[0][1], seen[0][2]
+    later = [*BASE[:9], "2026-10-16T16:35:00+00:00", *BASE[10:]]
+    if isinstance(outcome, Exception):
+        with pytest.raises(RuntimeError):
+            script.main(later)
+    else:
+        assert script.main(later) == outcome
+    assert seen[1][1] is warm_state and seen[1][2] is warm_loader
+    # The first window of the process builds the Dashboard; 16:35 is an hourly :35 window.
+    assert seen[0][3] is True and seen[1][3] is True
+    if outcome == 0:
+        assert warm.state is warm_state
+    else:
+        assert warm.state is None
+
+
+@pytest.mark.parametrize("minute,warm,due", [
+    (35, False, True),   # first window of a process or cohort
+    (40, False, True),   # retry or restart with a fresh pair
+    (40, True, False),   # warm, between hourly rebuilds: the previous Dashboard carries forward
+    (35, True, True),    # hourly rebuild
+    (0, True, False),
+])
+def test_dashboard_is_rebuilt_on_fresh_pairs_and_hourly(minute, warm, due):
+    assert script.dashboard_due(_at(minute), warm=warm) is due

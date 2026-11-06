@@ -4,13 +4,20 @@ from __future__ import annotations
 from collections import Counter
 from copy import deepcopy
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
+from datetime import date, datetime, time as clock_time, timezone
 from decimal import Decimal
 from enum import Enum
+import json
+import math
 import re
 from typing import Mapping
 from uuid import NAMESPACE_URL, UUID, uuid5
+from zoneinfo import ZoneInfo
 
+from options.analytics.greeks import OptionValuationInput, solve_local_greeks
+from options.domain import ContractType
+
+from .acquisition_ledger import load_raw_payload_cursor
 from .advanced_options_control_plane import (
     CANONICAL_PUBLISHER_OWNER,
     AdvancedOptionsControlPlanePlan,
@@ -58,6 +65,7 @@ OPTIONS_PAGE_CONTRACTS = {
 P8_DISPOSABLE_DATABASE_PREFIX = "test_realtime_v2_p8_"
 P8_DISPOSABLE_SCOPE_REFERENCE = "OWNED_DISPOSABLE_P8_CANARY"
 ADVANCED_OPTIONS_PAGE_FLOW_EVENT_DETAIL_LIMIT = 250
+_EXCHANGE_TIME_ZONE = ZoneInfo("America/New_York")
 _OPTION_TICKER = re.compile(
     r"^O:(?P<underlyer>[A-Z0-9.-]+)"
     r"(?P<expiration>\d{6})(?P<call_put>[CP])"
@@ -302,6 +310,318 @@ def _flow_event_contract_rows(
     )
 
 
+def _time_to_expiration_years(expiration: date, cutoff: datetime) -> float | None:
+    """Whole days, as the production valuation counts them. A contract expiring today has
+    no whole day left, so it counts the time to that day's close instead."""
+    days = (expiration - cutoff.date()).days
+    if days > 0:
+        return days / 365.0
+    if days < 0:
+        return None
+    close = datetime.combine(expiration, clock_time(16), _EXCHANGE_TIME_ZONE)
+    remaining = (close - cutoff).total_seconds()
+    return remaining / (365.0 * 86400.0) if remaining > 0 else None
+
+
+def _with_contract_greeks(
+    facts: list[dict[str, object]],
+    valuation_inputs,
+    cutoff: datetime,
+) -> None:
+    """Local IV and Greeks from each contract's quote, using the stored valuation inputs.
+    These describe the quote for display. A row the solver cannot identify says why."""
+    valuations = {
+        (str(row["ticker"]), str(row["expiration_date"])): row
+        for row in valuation_inputs or ()
+    }
+    requests = []
+    for fact in facts:
+        match = _OPTION_TICKER.fullmatch(str(fact["contract_ticker"]))
+        expiration = datetime.strptime(match.group("expiration"), "%y%m%d").date()
+        valuation = valuations.get((str(fact["underlyer"]), expiration.isoformat()))
+        years = _time_to_expiration_years(expiration, cutoff)
+        if valuation is None or years is None or not fact.get("spot") or not fact.get("mark"):
+            fact["greeks_reason"] = "VALUATION_INPUT_UNAVAILABLE"
+            continue
+        requests.append((fact, valuation, years, OptionValuationInput(
+            contract_type=(
+                ContractType.CALL
+                if match.group("call_put") == "C"
+                else ContractType.PUT
+            ),
+            spot=Decimal(str(fact["spot"])),
+            strike=Decimal(match.group("strike")) / Decimal("1000"),
+            model_mark=Decimal(str(fact["mark"])),
+            time_to_expiration_years=years,
+            risk_free_rate=float(valuation["risk_free_rate"]),
+            dividend_yield=float(valuation["dividend_yield"]),
+        )))
+    results = solve_local_greeks(tuple(item[3] for item in requests))
+    for (fact, valuation, years, _input), result in zip(requests, results):
+        fact.update({
+            "local_iv": result.local_iv,
+            "local_delta": result.local_delta,
+            "local_gamma": result.local_gamma,
+            "local_theta_per_day": result.local_theta_per_day,
+            "local_vega_per_vol_point": result.local_vega_per_vol_point,
+            "local_rho_per_rate_point": result.local_rho_per_rate_point,
+            "time_to_expiration_years": years,
+            "risk_free_rate": str(valuation["risk_free_rate"]),
+            "dividend_yield": str(valuation["dividend_yield"]),
+            "model_version": str(valuation.get("model_version") or ""),
+            "greeks_reason": (
+                None
+                if result.failure_reason is None
+                else result.failure_reason.value
+            ),
+            "iv_converged": bool(result.converged),
+            "iv_solver": None if result.solver is None else result.solver.value,
+            "iv_iteration_count": int(result.iteration_count),
+            "iv_price_error": (
+                None if result.price_error is None else float(result.price_error)
+            ),
+            "iv_failure_reason": (
+                None
+                if result.failure_reason is None
+                else result.failure_reason.value
+            ),
+        })
+
+
+def _contract_facts(
+    contract_volumes,
+    underlying_ticks,
+    open_interest,
+    admitted_contracts: tuple[Mapping[str, object], ...],
+    quotes=(),
+    *,
+    spot_closes=(),
+    valuation_inputs=(),
+    cutoff: datetime | None = None,
+    contract_terms=(),
+    provider_greeks=None,
+) -> tuple[dict[str, object], ...]:
+    """What the window's stored state knows about every subscribed contract.
+
+    Flow events are only the prints that pass the flow filter, so their sizes are not a
+    contract's volume: on Nov 5 a contract with 74,878 traded showed 1,000 (G71).
+    """
+    contract_ids = {
+        str(row["contract_ticker"]): int(row["contract_id"])
+        for row in admitted_contracts
+    }
+    spots = {}
+    for tick in underlying_ticks or ():
+        evidence = tick.get("evidence")
+        if isinstance(evidence, Mapping) and evidence.get("price"):
+            spots[str(evidence["ticker"])] = str(evidence["price"])
+    # The stock's own close at the cutoff when it is stored. The tick above can be minutes old.
+    spot_times = {}
+    for stock_close in spot_closes:
+        spots[str(stock_close[0])] = format(
+            Decimal(str(stock_close[1])).normalize(),
+            "f",
+        )
+        if len(stock_close) > 2:
+            spot_times[str(stock_close[0])] = _json_value(stock_close[2])
+    terms = {
+        int(contract_id): (exercise_style, multiplier)
+        for contract_id, exercise_style, multiplier in contract_terms
+    }
+    interest = {
+        str(row["contract_ticker"]): int(row["open_interest"])
+        for row in open_interest or ()
+        if row.get("availability") == "AVAILABLE"
+        and row.get("open_interest") is not None
+    }
+    tickers_by_instrument = {
+        int(row["instrument_id"]): str(row["contract_ticker"])
+        for row in admitted_contracts
+        if row.get("instrument_id") is not None
+    }
+    quotes_by_ticker = {
+        tickers_by_instrument[int(instrument_id)]: (bid, ask, quoted_at)
+        for instrument_id, bid, ask, quoted_at in quotes
+        if int(instrument_id) in tickers_by_instrument
+    }
+    facts = []
+    for state in contract_volumes or ():
+        checkpoint = state["checkpoint"]
+        ticker = str(checkpoint["contract_ticker"])
+        match = _OPTION_TICKER.fullmatch(ticker)
+        if match is None or ticker not in contract_ids:
+            raise ValueError(
+                "Advanced Options contract facts changed cycle scope"
+            )
+        bid, ask, quoted_at = quotes_by_ticker.get(ticker, (None, None, None))
+        exercise_style, multiplier = terms.get(contract_ids[ticker], (None, None))
+        facts.append({
+            "exercise_style": None if exercise_style is None else str(exercise_style),
+            "shares_per_contract": None if multiplier is None else int(multiplier),
+            "spot_market_data_time": spot_times.get(match.group("underlyer")),
+            "contract_ticker": ticker,
+            "contract_id": contract_ids[ticker],
+            "underlyer": match.group("underlyer"),
+            "day_volume": int(checkpoint["cumulative_volume"]),
+            "baseline_kind": str(checkpoint["baseline_kind"]),
+            "last_event_time": checkpoint.get("last_event_time"),
+            "open_interest": interest.get(ticker),
+            "spot": spots.get(match.group("underlyer")),
+            "bid": None if bid is None else str(bid),
+            "ask": None if ask is None else str(ask),
+            "mark": (
+                None
+                if bid is None or ask is None
+                else str((Decimal(str(bid)) + Decimal(str(ask))) / 2)
+            ),
+            "quoted_at": None if quoted_at is None else _json_value(quoted_at),
+        })
+    if cutoff is not None:
+        _with_contract_greeks(facts, valuation_inputs, cutoff)
+    for fact in facts:
+        fact.update((provider_greeks or {}).get(fact["contract_ticker"], {}))
+    return tuple(sorted(facts, key=lambda row: row["contract_ticker"]))
+
+
+_PROVIDER_SNAPSHOT_READ_LIMIT = 8
+
+
+def _provider_number(value) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value) if math.isfinite(value) else None
+
+
+def _provider_greeks_cursor(
+    cursor,
+    *,
+    session_date: date,
+    cutoff: datetime,
+    tickers,
+) -> dict[str, dict[str, float]]:
+    """The provider's own IV and gamma, from the newest snapshots stored by the cutoff.
+
+    Display only, beside the values we solve. No detector reads them, so a snapshot that
+    cannot be read leaves them empty instead of stopping the window. The provider omits
+    Greeks for some contracts, and those stay empty too."""
+    wanted = set(tickers)
+    found: dict[str, dict[str, float]] = {}
+    seen: set[str] = set()
+    cursor.execute(
+        "SELECT payload_id FROM rt.provider_request_ledger "
+        "WHERE endpoint_class='OPTIONS_UNIFIED_SNAPSHOT' AND outcome='OK' "
+        "AND payload_id IS NOT NULL AND reserved_at>=%s AND requested_to<=%s "
+        "ORDER BY requested_to DESC LIMIT %s",
+        (
+            datetime.combine(session_date, clock_time.min, tzinfo=timezone.utc),
+            cutoff,
+            _PROVIDER_SNAPSHOT_READ_LIMIT,
+        ),
+    )
+    for payload in tuple(cursor.fetchall()):
+        try:
+            document = json.loads(load_raw_payload_cursor(cursor, payload[0]))
+        except ValueError:
+            continue
+        results = document.get("results") if isinstance(document, dict) else None
+        for row in results if isinstance(results, list) else ():
+            if not isinstance(row, dict):
+                continue
+            details = row.get("details")
+            ticker = str(
+                (details if isinstance(details, dict) else {}).get(
+                    "ticker",
+                    row.get("ticker", ""),
+                )
+            ).strip().upper()
+            if ticker not in wanted or ticker in seen:
+                continue
+            seen.add(ticker)
+            greeks = row.get("greeks")
+            values = {
+                "provider_iv": _provider_number(row.get("implied_volatility")),
+                "provider_gamma": _provider_number(
+                    (greeks if isinstance(greeks, dict) else {}).get("gamma")
+                ),
+            }
+            found[ticker] = {
+                key: value for key, value in values.items() if value is not None
+            }
+        if wanted <= seen:
+            break
+    return found
+
+
+def _apply_contract_facts(
+    rows_by_underlyer: dict[str, list[dict[str, object]]],
+    contract_facts: tuple[Mapping[str, object], ...],
+    cutoff: datetime,
+) -> None:
+    """Every subscribed contract gets a row with its true volume. Premium and mark stay
+    what flow events support, so a contract with none says so rather than showing zero."""
+    for fact in contract_facts:
+        rows = rows_by_underlyer.get(str(fact["underlyer"]))
+        if rows is None:
+            continue
+        ticker = str(fact["contract_ticker"])
+        row = next(
+            (item for item in rows if item["contract_ticker"] == ticker),
+            None,
+        )
+        if row is None:
+            match = _OPTION_TICKER.fullmatch(ticker)
+            expiration = datetime.strptime(
+                match.group("expiration"),
+                "%y%m%d",
+            ).date()
+            row = {
+                "contract_id": int(fact["contract_id"]),
+                "contract_ticker": ticker,
+                "contract_type": (
+                    "CALL" if match.group("call_put") == "C" else "PUT"
+                ),
+                "expiration_date": expiration.isoformat(),
+                "calendar_dte": max(0, (expiration - cutoff.date()).days),
+                "strike": str(Decimal(match.group("strike")) / Decimal("1000")),
+                "spot": "0",
+                "day_volume": 0,
+                "open_interest": None,
+                "model_mark": fact.get("mark"),
+                "display_mark": fact.get("mark"),
+                "local_iv": None,
+                "local_delta": None,
+                "volume_open_interest_ratio": None,
+                "premium_activity": None,
+                "moneyness_fraction": "0",
+                "market_data_time": str(
+                    fact.get("last_event_time") or cutoff.isoformat()
+                ),
+            }
+            rows.append(row)
+        row["day_volume"] = int(fact["day_volume"])
+        row["volume_baseline"] = str(fact["baseline_kind"])
+        # The quote at this cutoff, so a contract reads the same on every page. A flow
+        # event's price can be far older, and is kept only when no quote exists.
+        if fact.get("mark") is not None:
+            row["model_mark"] = fact["mark"]
+            row["display_mark"] = fact["mark"]
+        if fact.get("local_iv") is not None:
+            row["local_iv"] = fact["local_iv"]
+            row["local_delta"] = fact["local_delta"]
+        if fact.get("open_interest") is not None:
+            row["open_interest"] = int(fact["open_interest"])
+        if fact.get("spot"):
+            spot = Decimal(str(fact["spot"]))
+            row["spot"] = str(spot)
+            row["moneyness_fraction"] = str(
+                Decimal(str(row["strike"])) / spot - 1
+            )
+        open_interest = row["open_interest"]
+        row["volume_open_interest_ratio"] = (
+            None if not open_interest else row["day_volume"] / open_interest
+        )
+
+
 def _eligible_chain_row(
     evaluation,
     leg: Mapping[str, object],
@@ -402,8 +722,9 @@ def _admitted_chain_row(
     *,
     dataset_id: UUID,
     cutoff: datetime,
+    fact: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
-    return {
+    row = {
         "snapshot_id": str(uuid5(
             NAMESPACE_URL,
             (
@@ -459,6 +780,80 @@ def _admitted_chain_row(
         "valuation_policy_version": None,
         "valuation_policy_sha256": None,
     }
+    if fact is None:
+        return row
+    # A contract no detector evaluated still has stored facts. Placeholders read as a $0
+    # price, and the reference row's own time read as a stale source (G71).
+    strike = Decimal(str(contract["strike"]))
+    volume = int(fact["day_volume"])
+    open_interest = fact.get("open_interest")
+    row.update({
+        "strike": format(strike.normalize(), "f"),
+        "model_mark": fact.get("mark"),
+        "mark": fact.get("mark"),
+        "display_mark": fact.get("mark"),
+        "bid": fact.get("bid"),
+        "ask": fact.get("ask"),
+        "mark_market_data_time": fact.get("quoted_at") or cutoff.isoformat(),
+        "mark_source": (
+            "QUOTE_MIDPOINT" if fact.get("mark") is not None else "UNAVAILABLE"
+        ),
+        "day_volume": volume,
+        "open_interest": open_interest,
+        "volume_open_interest_ratio": (
+            None if not open_interest else volume / int(open_interest)
+        ),
+        "market_data_time": cutoff.isoformat(),
+        "first_observed_at": cutoff.isoformat(),
+        "volume_baseline": str(fact["baseline_kind"]),
+    })
+    if fact["baseline_kind"] == "INCOMPLETE":
+        row["quality_flags"] = [*row["quality_flags"], "VOLUME_INCOMPLETE"]
+    if fact.get("greeks_reason"):
+        row["quality_flags"] = [*row["quality_flags"], f"GREEKS_{fact['greeks_reason']}"]
+    for key in (
+        "local_iv",
+        "local_delta",
+        "local_gamma",
+        "local_theta_per_day",
+        "local_vega_per_vol_point",
+        "local_rho_per_rate_point",
+        "time_to_expiration_years",
+        "risk_free_rate",
+        "dividend_yield",
+        "model_version",
+        "iv_converged",
+        "iv_solver",
+        "iv_iteration_count",
+        "iv_price_error",
+        "iv_failure_reason",
+        "exercise_style",
+        "shares_per_contract",
+        "spot_market_data_time",
+    ):
+        if fact.get(key) is not None:
+            row[key] = fact[key]
+    if fact.get("local_delta") is not None:
+        row["absolute_delta"] = abs(fact["local_delta"])
+    mark = None if fact.get("mark") is None else Decimal(str(fact["mark"]))
+    if mark is not None:
+        row["midpoint"] = str(mark)
+        row["single_contract_breakeven"] = str(
+            strike + mark if row["contract_type"] == "CALL" else strike - mark
+        )
+    if fact.get("spot"):
+        spot = Decimal(str(fact["spot"]))
+        is_call = row["contract_type"] == "CALL"
+        row["spot"] = str(spot)
+        row["otm_fraction"] = str(
+            (strike - spot) / spot if is_call else (spot - strike) / spot
+        )
+        intrinsic = max(spot - strike if is_call else strike - spot, Decimal(0))
+        row["intrinsic_value"] = str(intrinsic)
+        if mark is not None:
+            row["extrinsic_value"] = str(mark - intrinsic)
+    return row
+
 
 def _known_sum(rows, key):
     values = [row[key] for row in rows]
@@ -478,6 +873,7 @@ def _flow_response(
     policy_sha256: str,
     configuration_sha256: str,
     session_date: date,
+    contract_facts: tuple[Mapping[str, object], ...] = (),
 ) -> dict[str, object]:
     event_rows, event_times, event_counts = _flow_event_contract_rows(
         flow_events,
@@ -519,6 +915,7 @@ def _flow_response(
                         and not value
                     )
                 })
+    _apply_contract_facts(rows_by_underlyer, contract_facts, cutoff)
     summaries = []
     for symbol in underlyers:
         contracts = {
@@ -1221,12 +1618,17 @@ def _build_advanced_options_page_payloads(
                 policy_sha256=policy_sha256,
                 configuration_sha256=configuration_sha256,
                 session_date=control_plane.session_date,
+                contract_facts=page_source.contract_facts,
             )
             for underlyer in underlyers
         },
     }
     screener_rows = []
     coverage = []
+    facts_by_contract = {
+        int(fact["contract_id"]): fact
+        for fact in page_source.contract_facts
+    }
     for underlyer in underlyers:
         source_evaluations = tuple(
             row for row in cycle.evaluations
@@ -1252,9 +1654,16 @@ def _build_advanced_options_page_payloads(
                 contract,
                 dataset_id=cycle.dataset_id,
                 cutoff=generated_at,
+                fact=facts_by_contract.get(int(contract["contract_id"])),
             )
             for contract in admitted
         ]
+        # Beside our own values on evaluated contracts too, not only the admitted ones.
+        for member in members:
+            fact = facts_by_contract.get(int(member["contract_id"])) or {}
+            for key in ("provider_iv", "provider_gamma"):
+                if fact.get(key) is not None:
+                    member[key] = fact[key]
         screener_rows.extend(members)
         evaluated_ids = set(evaluated)
         observed_ids = {
@@ -1967,6 +2376,7 @@ class AdvancedOptionsPageSource:
     current_marks: tuple[Mapping[str, object], ...] = ()
     flow_event_detail: tuple[Mapping[str, object], ...] = ()
     admitted_contracts: tuple[Mapping[str, object], ...] = ()
+    contract_facts: tuple[Mapping[str, object], ...] = ()
 
     @property
     def sha256(self) -> str:
@@ -1976,6 +2386,11 @@ class AdvancedOptionsPageSource:
             "current_marks": self.current_marks,
             "flow_event_detail": self.flow_event_detail,
             "admitted_contracts": self.admitted_contracts,
+            **(
+                {"contract_facts": self.contract_facts}
+                if self.contract_facts
+                else {}
+            ),
         })
 
 
@@ -2240,11 +2655,86 @@ def load_advanced_options_page_source_cursor(
             raise ValueError(
                 "Advanced Options page mark evidence is incomplete"
             )
+    # This window's own stored state, so every value is as of the same cutoff.
+    cursor.execute(
+        "SELECT state_document->'contract_volumes',"
+        "state_document->'underlying_ticks' "
+        "FROM rt.advanced_options_rolling_checkpoints "
+        "WHERE cohort_id=%s AND session_date=%s AND committed_at=%s "
+        "ORDER BY created_at DESC LIMIT 1",
+        (
+            str(control_plane.cohort_id),
+            control_plane.session_date,
+            generated,
+        ),
+    )
+    rolling = cursor.fetchone()
+    cursor.execute(
+        "SELECT state_document->'open_interest',"
+        "state_document->'valuation_inputs' "
+        "FROM rt.advanced_options_reference_states "
+        "WHERE session_date=%s AND known_at=%s "
+        "ORDER BY created_at DESC LIMIT 1",
+        (control_plane.session_date, generated),
+    )
+    reference = cursor.fetchone()
+    contract_facts = ()
+    if isinstance(rolling, (tuple, list)) and isinstance(rolling[0], list):
+        # The market-state role holds at this cutoff while the window runs. A quote past
+        # it is not used: that contract reads as unavailable rather than from the future.
+        cursor.execute(
+            "SELECT instrument_id,bid,ask,event_at FROM rt.quote_current "
+            "WHERE instrument_id=ANY(%s) AND event_at<=%s",
+            (instrument_ids, generated),
+        )
+        quotes = tuple(cursor.fetchall())
+        cursor.execute(
+            "SELECT DISTINCT ON (ticker) ticker,close_price,bar_end "
+            "FROM rt.bar_revisions "
+            "WHERE ticker=ANY(%s) AND interval='1m' "
+            "AND source_kind='REALTIME_STREAM' "
+            "AND session_date=%s AND bar_end<=%s "
+            "ORDER BY ticker,bar_end DESC",
+            (
+                list(control_plane.universe.option_underlyings),
+                control_plane.session_date,
+                generated,
+            ),
+        )
+        spot_closes = tuple(cursor.fetchall())
+        cursor.execute(
+            "SELECT contract_id,exercise_style,multiplier "
+            "FROM ref.option_contract_versions "
+            "WHERE contract_id=ANY(%s) AND effective_to IS NULL",
+            ([int(row["contract_id"]) for row in admitted_contracts],),
+        )
+        contract_facts = _contract_facts(
+            rolling[0],
+            rolling[1],
+            reference[0] if isinstance(reference, (tuple, list)) else (),
+            admitted_contracts,
+            quotes,
+            spot_closes=spot_closes,
+            valuation_inputs=(
+                reference[1] if isinstance(reference, (tuple, list)) else ()
+            ),
+            cutoff=generated,
+            contract_terms=tuple(cursor.fetchall()),
+            provider_greeks=_provider_greeks_cursor(
+                cursor,
+                session_date=control_plane.session_date,
+                cutoff=generated,
+                tickers=tuple(
+                    str(row["contract_ticker"]) for row in admitted_contracts
+                ),
+            ),
+        )
     return AdvancedOptionsPageSource(
         flow_events=events,
         current_marks=marks,
         flow_event_detail=event_detail,
         admitted_contracts=admitted_contracts,
+        contract_facts=contract_facts,
     )
 
 

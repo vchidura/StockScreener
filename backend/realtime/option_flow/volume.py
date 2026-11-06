@@ -110,6 +110,24 @@ class ReconcileOutcome(NamedTuple):
     previous_cumulative: int
 
 
+_SEQUENCE_SPACE = 2**32
+
+
+def _extended_sequence(highest: int, seq: int) -> int:
+    """The provider's sequence is a 32-bit counter that wraps during a busy session. Within
+    a contract's book it keeps climbing past the wrap, so every comparison here, and the
+    stored checkpoint, stays monotonic. Without this each print after a wrap looked older
+    than the retained history and was not counted (G73)."""
+    if highest < 0:
+        return seq
+    epoch, low = divmod(highest, _SEQUENCE_SPACE)
+    if seq < low - _SEQUENCE_SPACE // 2:
+        epoch += 1
+    elif seq > low + _SEQUENCE_SPACE // 2 and epoch > 0:
+        epoch -= 1
+    return epoch * _SEQUENCE_SPACE + seq
+
+
 class VolumeBook:
     """Cumulative eligible volume per (session, contract).
 
@@ -162,6 +180,7 @@ class VolumeBook:
     def add_print(self, contract: str, session_date: date, seq: int, time_ms: int,
                   exchange: int | None, price: float, size: int) -> PrintOutcome:
         cv = self._contract(contract, session_date)
+        seq = _extended_sequence(cv.max_seq, seq)
         key = (seq, time_ms, False)
         existing = cv.history.get(key)
         if existing is not None:
@@ -195,6 +214,7 @@ class VolumeBook:
         """Apply a cancel. It echoes the cancelled print's exchange, price and size (to be
         confirmed against a capture) and is matched to the newest live print that agrees."""
         cv = self._contract(contract, session_date)
+        seq = _extended_sequence(cv.max_seq, seq)
         key = (seq, time_ms, True)
         if key in cv.history:
             return CancelOutcome(True, None, cv.cumulative, cv.cumulative, cv.baseline, None)

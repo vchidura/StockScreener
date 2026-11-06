@@ -1064,6 +1064,7 @@ def portal_publish_runner(
             dashboard = (
                 compute_realtime_dashboard(
                     V2StageDatabase(context, RealtimeDatabaseRole.COMPUTE),
+                    loader=environment.screening_loader,
                     cohort_id=plan.cohort_id,
                     session=plan.session_date,
                     cutoff=window.cutoff,
@@ -1073,7 +1074,7 @@ def portal_publish_runner(
                         environment.allow_late_identity_continuity
                     ),
                 )
-                if is_split_graph else None
+                if is_split_graph and (environment.dashboard_due or session_close) else None
             )
             if context.is_cancelled():
                 return StageOutcome.failed(STAGE_CANCELLED)

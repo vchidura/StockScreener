@@ -237,14 +237,27 @@ def _capture(provider, *, state, receipt, budget, api_key, clock, transport_fact
                 return combine_exact_contract_captures(
                     tuple(captures), contract_tickers=acquisition.contract_tickers,
                 )
-    raise RuntimeError("Options snapshot interval retry budget exhausted")
+    raise OptionsSnapshotStale("Options snapshot interval retry budget exhausted")
+
+
+class OptionsSnapshotStale(RuntimeError):
+    """G74: every attempt for this Equity window failed, or returned a snapshot already past its validity (a quiet
+    contract). The request ids are fixed per window, so retrying (or restarting) replays the same recorded answers: the
+    outcome cannot change until the next Equity window. The cycle reports a labelled skip instead of crashing."""
+
+
+STALE_SNAPSHOT_SKIPPED = "SNAPSHOT_STALE_SKIPPED"
+WAITING_AFTER_STALE_SNAPSHOT = "WAITING_AFTER_STALE_SNAPSHOT"
 
 
 def run_continuous_options_schedule_cycle(
     provider, *, session_date, api_key,
     clock=lambda: datetime.now(UTC),
     transport_factory=SingleAttemptPolygonHttpTransport,
+    skipped_receipts=frozenset(),
 ):
+    """`skipped_receipts`: Equity INPUT_READY receipt ids this process already skipped as stale (G74); the cycle
+    waits for the next Equity window instead of replaying them."""
     with provider.transaction(APP_ROLE) as unit:
         unit.cursor.execute(
             "SELECT pg_try_advisory_xact_lock(hashtextextended(%s,0))",
@@ -255,11 +268,19 @@ def run_continuous_options_schedule_cycle(
         return _run_schedule_cycle(
             provider, session_date=session_date, api_key=api_key,
             clock=clock, transport_factory=transport_factory,
+            skipped_receipts=frozenset(skipped_receipts),
         )
 
 
+def _stale_skip(receipt, reason):
+    return {
+        "status": STALE_SNAPSHOT_SKIPPED, "equity_receipt_id": receipt[0],
+        "equity_cutoff": receipt[1].isoformat(), "reason": reason,
+    }
+
+
 def _run_schedule_cycle(
-    provider, *, session_date, api_key, clock, transport_factory,
+    provider, *, session_date, api_key, clock, transport_factory, skipped_receipts=frozenset(),
 ):
     from scripts.run_advanced_options_v3_production import _authorize_window
 
@@ -298,6 +319,8 @@ def _run_schedule_cycle(
         return {"status": "ALREADY_ATTACHED", "equity_cutoff": receipt[1].isoformat()}
     if bindings and bindings[-1].finalized_cutoff > receipt[1]:
         raise ValueError("Options scheduler cannot regress its Equity cutoff")
+    if receipt[0] in skipped_receipts:
+        return {"status": WAITING_AFTER_STALE_SNAPSHOT, "equity_cutoff": receipt[1].isoformat()}
     acquisition = state.load_acquisition_binding()
     deadline = min(
         receipt[1] + timedelta(seconds=300), acquisition.authority.acquisition_stop,
@@ -312,10 +335,13 @@ def _run_schedule_cycle(
     if authorized_cutoffs:
         deadline = min(deadline, *authorized_cutoffs)
     budget = _scheduler_budget(acquisition, package["authorization_reference"])
-    capture = _capture(
-        provider, state=state, receipt=receipt, budget=budget, api_key=api_key,
-        clock=clock, transport_factory=transport_factory, deadline=deadline,
-    )
+    try:
+        capture = _capture(
+            provider, state=state, receipt=receipt, budget=budget, api_key=api_key,
+            clock=clock, transport_factory=transport_factory, deadline=deadline,
+        )
+    except OptionsSnapshotStale:
+        return _stale_skip(receipt, "OPTIONS_SNAPSHOT_RETRY_BUDGET_EXHAUSTED")
     observed = capture.selection.reviewed_at
     options_cutoff = min(
         p8_options_cycle_cutoff_from_capture(
@@ -324,7 +350,8 @@ def _run_schedule_cycle(
         receipt[1] + timedelta(seconds=300),
     )
     if options_cutoff <= clock():
-        raise ValueError("Options snapshot missed its E/O deadline")
+        # Deterministic for this Equity window as well: the next one gets a fresh capture.
+        return _stale_skip(receipt, "OPTIONS_E_O_DEADLINE_MISSED")
     reference = f"{package['authorization_reference']}:E:{receipt[1].isoformat()}"
     authorized = _authorize_window(
         SimpleNamespace(

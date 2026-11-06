@@ -118,8 +118,13 @@ class GatewayConfiguration:
     compression: str | None = None
     allow_insecure_loopback: bool = False
     silence_close_seconds: int = OPTIONS_SILENCE_CLOSE_SECONDS
+    # How long a burst may wait for room in the handoff before it counts as overload.
+    # While it waits the data stays in the socket. Zero disconnects at once.
+    handoff_wait_seconds: float = 0.0
 
     def __post_init__(self) -> None:
+        if self.handoff_wait_seconds < 0:
+            raise ValueError("Advanced gateway handoff wait must not be negative")
         parsed = urlsplit(self.endpoint)
         secure = parsed.scheme == "wss" and bool(parsed.hostname)
         loopback = (
@@ -795,6 +800,13 @@ class AdvancedGateway:
             received_monotonic_ns=self._monotonic_ns(),
             payload=payload,
         )
+        # A burst can outrun the journal while it flushes (G69).
+        wait_until = time.monotonic() + self.configuration.handoff_wait_seconds
+        while (
+            not self.buffer.has_room(envelope.byte_length)
+            and time.monotonic() < wait_until
+        ):
+            await asyncio.sleep(0.005)
         try:
             self.buffer.put_nowait(envelope)
         except BufferFull as error:

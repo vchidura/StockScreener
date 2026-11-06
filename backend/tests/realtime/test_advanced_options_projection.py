@@ -534,3 +534,370 @@ def test_projection_rejects_cycle_clock_drift():
             generated_at=NOW.replace(minute=31),
             build_id="p4-build",
         )
+
+
+def _stored_contract_facts():
+    from realtime.advanced_options_projection import _contract_facts
+
+    volumes = [
+        {"checkpoint": {
+            "contract_ticker": "O:SPY261105C00764000", "cumulative_volume": 74878,
+            "baseline_kind": "SNAPSHOT_RECONCILED", "last_event_time": "2026-11-05T16:24:47Z",
+        }},
+        {"checkpoint": {
+            "contract_ticker": "O:SPY261105C00765000", "cumulative_volume": 91960,
+            "baseline_kind": "SNAPSHOT_RECONCILED", "last_event_time": "2026-11-05T16:24:44Z",
+        }},
+    ]
+    ticks = [{"evidence": {"ticker": "SPY", "price": "744.82"}}]
+    interest = [
+        {"contract_ticker": "O:SPY261105C00764000", "availability": "AVAILABLE", "open_interest": 1308},
+        {"contract_ticker": "O:SPY261105C00765000", "availability": "UNAVAILABLE", "open_interest": None},
+    ]
+    admitted = (
+        {"contract_ticker": "O:SPY261105C00764000", "contract_id": 1},
+        {"contract_ticker": "O:SPY261105C00765000", "contract_id": 2},
+    )
+    return _contract_facts(volumes, ticks, interest, admitted)
+
+
+def test_flow_page_shows_each_contracts_true_volume_not_its_filtered_events():
+    """G71: a contract with 74,878 traded showed 1,000, and one with 91,960 was absent."""
+    from datetime import datetime, timezone
+
+    from realtime.advanced_options_projection import _apply_contract_facts
+
+    cutoff = datetime(2026, 11, 5, 16, 25, tzinfo=timezone.utc)
+    filtered = {
+        "contract_id": 1, "contract_ticker": "O:SPY261105C00764000", "contract_type": "CALL",
+        "expiration_date": "2026-11-05", "calendar_dte": 0, "strike": "764", "spot": "0",
+        "day_volume": 1000, "open_interest": 900, "model_mark": "0.04", "display_mark": "0.04",
+        "local_iv": None, "local_delta": None, "volume_open_interest_ratio": 1.11,
+        "premium_activity": "4000", "moneyness_fraction": "0", "market_data_time": cutoff.isoformat(),
+    }
+    rows = {"SPY": [filtered], "QQQ": []}
+
+    _apply_contract_facts(rows, _stored_contract_facts(), cutoff)
+
+    by_ticker = {row["contract_ticker"]: row for row in rows["SPY"]}
+    traded = by_ticker["O:SPY261105C00764000"]
+    assert traded["day_volume"] == 74878
+    assert traded["open_interest"] == 1308
+    assert traded["volume_open_interest_ratio"] == 74878 / 1308
+    assert traded["premium_activity"] == "4000", "premium stays what flow events support"
+    assert traded["display_mark"] == "0.04"
+    assert traded["spot"] == "744.82"
+    assert float(traded["moneyness_fraction"]) == pytest.approx(764 / 744.82 - 1)
+    quiet = by_ticker["O:SPY261105C00765000"]
+    assert quiet["day_volume"] == 91960
+    assert quiet["contract_type"] == "CALL"
+    assert quiet["strike"] == "765"
+    assert quiet["premium_activity"] is None, "no flow event means unknown, never zero"
+    assert quiet["display_mark"] is None
+    assert quiet["open_interest"] is None
+    assert quiet["volume_open_interest_ratio"] is None
+    assert rows["QQQ"] == []
+
+
+def test_contract_facts_refuse_a_contract_outside_the_window():
+    from realtime.advanced_options_projection import _contract_facts
+
+    volumes = [{"checkpoint": {
+        "contract_ticker": "O:SPY261105C00999000", "cumulative_volume": 1, "baseline_kind": "SESSION_COMPLETE",
+    }}]
+    with pytest.raises(ValueError, match="changed cycle scope"):
+        _contract_facts(volumes, [], [], ())
+
+
+def test_screener_rows_carry_stored_facts_not_placeholders():
+    """G71: the Screener showed $0.00 and Unavailable for all 16 contracts with quotes stored."""
+    from datetime import date as _date, datetime as _datetime, timezone as _timezone
+    from uuid import UUID as _UUID
+
+    from realtime.advanced_options_projection import _admitted_chain_row, _contract_facts
+
+    cutoff = _datetime(2026, 11, 5, 16, 25, tzinfo=_timezone.utc)
+    contract = {
+        "instrument_id": 7, "contract_id": 1, "contract_ticker": "O:SPY261120P00766000", "underlyer": "SPY",
+        "call_put": "P", "expiration": _date(2026, 11, 20), "strike": Decimal("766.00000000"),
+        "eligibility": "ELIGIBLE", "observed_at": _datetime(2026, 11, 3, 2, 47, tzinfo=_timezone.utc),
+    }
+    facts = _contract_facts(
+        [{"checkpoint": {"contract_ticker": contract["contract_ticker"], "cumulative_volume": 2976, "baseline_kind": "SNAPSHOT_RECONCILED"}}],
+        [{"evidence": {"ticker": "SPY", "price": "744.82"}}],
+        [{"contract_ticker": contract["contract_ticker"], "availability": "AVAILABLE", "open_interest": 5872}],
+        (contract,),
+        ((7, Decimal("23.92"), Decimal("24.48"), cutoff),),
+    )
+    row = _admitted_chain_row(contract, dataset_id=_UUID(int=1), cutoff=cutoff, fact=facts[0])
+
+    assert row["strike"] == "766"
+    assert row["spot"] == "744.82"
+    assert row["mark"] == row["model_mark"] == row["display_mark"] == "24.20"
+    assert (row["bid"], row["ask"]) == ("23.92", "24.48")
+    assert row["mark_source"] == "QUOTE_MIDPOINT"
+    assert row["day_volume"] == 2976
+    assert row["open_interest"] == 5872
+    assert row["volume_open_interest_ratio"] == 2976 / 5872
+    assert float(row["otm_fraction"]) == pytest.approx((744.82 - 766) / 744.82)
+    assert row["market_data_time"] == cutoff.isoformat()
+
+    no_quote = _contract_facts(
+        [{"checkpoint": {"contract_ticker": contract["contract_ticker"], "cumulative_volume": 1, "baseline_kind": "SESSION_COMPLETE"}}],
+        [], [], (contract,),
+    )
+    unknown = _admitted_chain_row(contract, dataset_id=_UUID(int=1), cutoff=cutoff, fact=no_quote[0])
+    assert unknown["mark"] is None, "an unknown price is never shown as zero"
+    assert unknown["mark_source"] == "UNAVAILABLE"
+
+    old_session = _admitted_chain_row(contract, dataset_id=_UUID(int=1), cutoff=cutoff)
+    assert old_session["mark_source"] == "ADMITTED_INVENTORY_UNEVALUATED", "no facts leaves the row as it was"
+
+
+def test_a_contract_reads_the_same_mark_and_volume_status_on_every_page():
+    """G71: SPY 766 PUT read $22.29 on Flow, an old print, and $25.32 on the Screener."""
+    from datetime import datetime, timezone
+
+    from realtime.advanced_options_projection import _apply_contract_facts
+
+    cutoff = datetime(2026, 11, 5, 16, 45, tzinfo=timezone.utc)
+    row = {
+        "contract_id": 1, "contract_ticker": "O:SPY261120P00766000", "strike": "766", "open_interest": None,
+        "day_volume": 2879, "model_mark": "22.29", "display_mark": "22.29", "premium_activity": "7900000",
+        "spot": "0", "moneyness_fraction": "0", "volume_open_interest_ratio": None,
+    }
+    fact = {
+        "contract_ticker": "O:SPY261120P00766000", "contract_id": 1, "underlyer": "SPY", "day_volume": 2997,
+        "baseline_kind": "INCOMPLETE", "open_interest": 5872, "spot": "743.93", "mark": "25.32",
+    }
+    rows = {"SPY": [row]}
+
+    _apply_contract_facts(rows, (fact,), cutoff)
+
+    assert row["display_mark"] == row["model_mark"] == "25.32"
+    assert row["premium_activity"] == "7900000"
+    assert row["volume_baseline"] == "INCOMPLETE"
+
+
+def _greeks_case(call_put="P", strike=766, expiry="261120", bid="23.92", ask="24.48", **extra):
+    from datetime import date, datetime, timezone
+
+    from realtime.advanced_options_projection import _contract_facts
+
+    cutoff = datetime(2026, 11, 5, 16, 45, tzinfo=timezone.utc)
+    ticker = f"O:SPY{expiry}{call_put}{strike * 1000:08d}"
+    expiration = date(2000 + int(expiry[:2]), int(expiry[2:4]), int(expiry[4:]))
+    contract = {"instrument_id": 7, "contract_id": 1, "contract_ticker": ticker}
+    return cutoff, _contract_facts(
+        [{"checkpoint": {"contract_ticker": ticker, "cumulative_volume": 10, "baseline_kind": "SESSION_COMPLETE"}}],
+        [{"evidence": {"ticker": "SPY", "price": "700"}}],
+        [],
+        (contract,),
+        ((7, Decimal(bid), Decimal(ask), cutoff),),
+        spot_closes=(("SPY", Decimal("743.93000000")),),
+        valuation_inputs=extra.get("valuation", [{
+            "ticker": "SPY", "expiration_date": expiration.isoformat(), "risk_free_rate": "0.0401",
+            "dividend_yield": "0.0", "model_version": "black-scholes-merton-v1",
+        }]),
+        cutoff=cutoff,
+    )
+
+
+def test_greeks_come_from_the_stored_quote_and_reproduce_it():
+    """A price from the solved volatility must give back the quote it was solved from."""
+    from options.analytics.greeks import price_and_greeks
+    from options.domain import ContractType
+    from realtime.advanced_options_projection import AdvancedOptionsPageSource
+
+    _cutoff, facts = _greeks_case()
+    fact = facts[0]
+
+    assert fact["spot"] == "743.93", "the stock's close at the cutoff, not the older tick"
+    assert fact["greeks_reason"] is None
+    assert 0 < fact["local_iv"] < 5
+    assert -1 < fact["local_delta"] < 0, "a put's delta is negative"
+    price, delta, gamma, theta, vega, rho = price_and_greeks(
+        ContractType.PUT, spot=743.93, strike=766.0, maturity=fact["time_to_expiration_years"], rate=0.0401, dividend=0.0, volatility=fact["local_iv"],
+    )
+    assert float(price) == pytest.approx(24.20, abs=0.001)
+    assert fact["local_delta"] == pytest.approx(float(delta))
+    assert fact["local_gamma"] == pytest.approx(float(gamma))
+    assert fact["local_theta_per_day"] == pytest.approx(float(theta))
+    assert fact["local_vega_per_vol_point"] == pytest.approx(float(vega))
+    assert fact["local_rho_per_rate_point"] == pytest.approx(float(rho))
+    assert fact["time_to_expiration_years"] == pytest.approx(15 / 365)
+    assert isinstance(AdvancedOptionsPageSource(contract_facts=facts).sha256, str)
+
+
+def test_a_contract_expiring_today_counts_the_time_to_the_close():
+    _cutoff, facts = _greeks_case(call_put="C", strike=744, expiry="261105", bid="4.10", ask="4.30")
+    # 11:45 AM ET to 4:00 PM ET is 4.25 hours.
+    assert facts[0]["time_to_expiration_years"] == pytest.approx(4.25 / (365 * 24))
+    assert facts[0]["local_delta"] > 0
+
+
+def test_greeks_say_why_when_they_cannot_be_solved():
+    _cutoff, facts = _greeks_case(valuation=[])
+    assert facts[0]["greeks_reason"] == "VALUATION_INPUT_UNAVAILABLE"
+    assert facts[0].get("local_iv") is None
+    # Below intrinsic value no volatility fits, and the solver must not invent one.
+    _cutoff, facts = _greeks_case(bid="1.00", ask="1.10")
+    assert facts[0]["local_iv"] is None
+    assert facts[0]["greeks_reason"] == "BELOW_NO_ARBITRAGE_BOUND"
+
+
+def test_the_screener_detail_panel_gets_every_derivable_field():
+    from datetime import date, datetime, timezone
+    from uuid import UUID as _UUID
+
+    from realtime.advanced_options_projection import _admitted_chain_row, _contract_facts
+
+    cutoff = datetime(2026, 11, 5, 17, 10, tzinfo=timezone.utc)
+    bar_end = datetime(2026, 11, 5, 17, 10, tzinfo=timezone.utc)
+    contract = {
+        "instrument_id": 7, "contract_id": 1, "contract_ticker": "O:SPY261120P00766000", "underlyer": "SPY",
+        "call_put": "P", "expiration": date(2026, 11, 20), "strike": Decimal("766.00000000"),
+        "eligibility": "VALIDATED_ACTIVE", "observed_at": cutoff,
+    }
+    fact = _contract_facts(
+        [{"checkpoint": {"contract_ticker": contract["contract_ticker"], "cumulative_volume": 5, "baseline_kind": "SESSION_COMPLETE"}}],
+        [], [], (contract,),
+        ((7, Decimal("30.00"), Decimal("31.00"), cutoff),),
+        spot_closes=(("SPY", Decimal("740.00"), bar_end),),
+        valuation_inputs=[{"ticker": "SPY", "expiration_date": "2026-11-20", "risk_free_rate": "0.04", "dividend_yield": "0.0", "model_version": "m"}],
+        cutoff=cutoff,
+        contract_terms=((1, "AMERICAN", Decimal("100.00000000")),),
+    )[0]
+    row = _admitted_chain_row(contract, dataset_id=_UUID(int=1), cutoff=cutoff, fact=fact)
+
+    assert row["exercise_style"] == "AMERICAN"
+    assert row["shares_per_contract"] == 100
+    assert row["midpoint"] == "30.50"
+    assert Decimal(row["intrinsic_value"]) == 26, "a put's intrinsic value is strike less spot"
+    assert Decimal(row["extrinsic_value"]) == Decimal("4.50")
+    assert Decimal(row["single_contract_breakeven"]) == Decimal("735.50")
+    assert row["spot_market_data_time"] == bar_end.isoformat()
+    assert row["iv_converged"] is True
+    assert row["iv_iteration_count"] >= 1
+    assert row["iv_failure_reason"] is None if "iv_failure_reason" in row else True
+
+
+class _SnapshotCursor:
+    """Answers only what _provider_greeks_cursor and load_raw_payload_cursor ask."""
+
+    def __init__(self, payloads):
+        self.payloads = payloads
+        self.rows = []
+        self.parameters = []
+
+    def execute(self, query, parameters=None):
+        import hashlib
+
+        self.parameters.append((query, parameters))
+        if "provider_request_ledger" in query:
+            self.rows = [(payload_id,) for payload_id in self.payloads]
+        elif "rt.raw_payloads" in query:
+            self.current = self.payloads[parameters[0]]
+            self.rows = [(
+                "arrived",
+                hashlib.sha256(self.current).hexdigest(),
+                len(self.current),
+                1,
+            )]
+        elif "rt.raw_payload_chunks" in query:
+            self.rows = [(0, self.current)]
+        else:
+            raise AssertionError(query)
+
+    def fetchone(self):
+        return self.rows[0] if self.rows else None
+
+    def fetchall(self):
+        return list(self.rows)
+
+
+def _snapshot(*rows):
+    import json as _json
+
+    return _json.dumps({"results": list(rows)}).encode("utf-8")
+
+
+def test_provider_iv_and_gamma_come_from_the_stored_snapshot():
+    from datetime import date, datetime, timezone
+
+    from realtime.advanced_options_projection import _provider_greeks_cursor
+
+    quoted = "O:SPY261120P00766000"
+    bare = "O:SPY261110P00764000"
+    cursor = _SnapshotCursor({
+        "11111111-1111-1111-1111-111111111111": _snapshot(
+            {"details": {"ticker": quoted}, "implied_volatility": 0.21, "greeks": {"gamma": 0.013}},
+            {"details": {"ticker": bare}, "greeks": {}},
+            {"details": {"ticker": "O:SPY261120C00999000"}, "implied_volatility": 9.0},
+        ),
+    })
+
+    found = _provider_greeks_cursor(
+        cursor,
+        session_date=date(2026, 11, 5),
+        cutoff=datetime(2026, 11, 5, 17, 10, tzinfo=timezone.utc),
+        tickers=(quoted, bare),
+    )
+
+    assert found == {quoted: {"provider_iv": 0.21, "provider_gamma": 0.013}, bare: {}}
+    query, parameters = cursor.parameters[0]
+    assert "requested_to<=%s" in query, "a snapshot after the cutoff is not used"
+    assert parameters[1] == datetime(2026, 11, 5, 17, 10, tzinfo=timezone.utc)
+
+
+def test_the_newest_readable_snapshot_wins():
+    from datetime import date, datetime, timezone
+
+    from realtime.advanced_options_projection import _provider_greeks_cursor
+
+    ticker = "O:SPY261120P00766000"
+    cursor = _SnapshotCursor({
+        "11111111-1111-1111-1111-111111111111": b"not json",
+        "22222222-2222-2222-2222-222222222222": _snapshot(
+            {"details": {"ticker": ticker}, "implied_volatility": 0.30},
+        ),
+        "33333333-3333-3333-3333-333333333333": _snapshot(
+            {"details": {"ticker": ticker}, "implied_volatility": 0.99},
+        ),
+    })
+
+    found = _provider_greeks_cursor(
+        cursor,
+        session_date=date(2026, 11, 5),
+        cutoff=datetime(2026, 11, 5, 17, 10, tzinfo=timezone.utc),
+        tickers=(ticker,),
+    )
+
+    assert found == {ticker: {"provider_iv": 0.30}}
+
+
+def test_provider_values_reach_the_contract_fact_and_never_replace_ours():
+    from datetime import date, datetime, timezone
+
+    from realtime.advanced_options_projection import _contract_facts
+
+    cutoff = datetime(2026, 11, 5, 17, 10, tzinfo=timezone.utc)
+    ticker = "O:SPY261120P00766000"
+    contract = {
+        "instrument_id": 7, "contract_id": 1, "contract_ticker": ticker, "underlyer": "SPY",
+        "call_put": "P", "expiration": date(2026, 11, 20), "strike": Decimal("766.00000000"),
+        "eligibility": "VALIDATED_ACTIVE", "observed_at": cutoff,
+    }
+    fact = _contract_facts(
+        [{"checkpoint": {"contract_ticker": ticker, "cumulative_volume": 5, "baseline_kind": "SESSION_COMPLETE"}}],
+        [], [], (contract,),
+        ((7, Decimal("30.00"), Decimal("31.00"), cutoff),),
+        spot_closes=(("SPY", Decimal("740.00"), cutoff),),
+        valuation_inputs=[{"ticker": "SPY", "expiration_date": "2026-11-20", "risk_free_rate": "0.04", "dividend_yield": "0.01", "model_version": "m"}],
+        cutoff=cutoff,
+        provider_greeks={ticker: {"provider_iv": 0.5, "provider_gamma": 0.01}},
+    )[0]
+
+    assert fact["provider_iv"] == 0.5
+    assert fact["provider_gamma"] == 0.01
+    assert fact["local_iv"] != 0.5, "the value we solve stays ours"

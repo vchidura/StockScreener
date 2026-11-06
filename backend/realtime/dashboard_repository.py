@@ -60,11 +60,14 @@ def materialize_realtime_dashboard(database: RealtimeProcessDatabase,
     return snapshot
 
 
-def compute_realtime_dashboard(database: RealtimeProcessDatabase, **scope):
+def compute_realtime_dashboard(database: RealtimeProcessDatabase, *, loader=None, **scope):
+    """`loader` is the runner's long-lived `ScreeningInputLoader` (G85): the projection stage has just loaded
+    the same bars, so this reads only what changed. Its result equals the full load; None re-reads every bar."""
     if not isinstance(database, RealtimeProcessDatabase) or database.process_plan.role is not RealtimeDatabaseRole.COMPUTE:
         raise ValueError("Realtime Dashboard production requires the target-local COMPUTE role")
+    load_inputs = loader.load if loader is not None else load_realtime_screening_input
     with database.transaction(dict_cursor=True, read_only=True, isolation_level="REPEATABLE READ") as cursor:
-        inputs = load_realtime_screening_input(
+        inputs = load_inputs(
             cursor,
             include_portal_history=True,
             include_strategy_action_details=True,

@@ -359,6 +359,22 @@ def _quote_from_record(record: NormalizedJournalRecord) -> MaterializedQuote:
     )
 
 
+_SEQUENCE_SPACE = 2**32
+
+
+def _sequence_is_newer(candidate: int, current: int) -> bool:
+    """The provider's sequence is a 32-bit counter that wraps during a busy session: on
+    Nov 5 2026 it went from 4,294,966,650 to about 15 million. A plain comparison then
+    rejects every later quote, freezing the contract (G73). A fall of more than half the
+    counter's range is a wrap, and a rise of more than half is a late pre-wrap message."""
+    difference = candidate - current
+    if difference < -_SEQUENCE_SPACE // 2:
+        return True
+    if difference > _SEQUENCE_SPACE // 2:
+        return False
+    return difference > 0
+
+
 def _replace_quote(current: MaterializedQuote, candidate: MaterializedQuote) -> bool:
     if candidate.source_session != current.source_session:
         return candidate.source_session > current.source_session
@@ -367,7 +383,7 @@ def _replace_quote(current: MaterializedQuote, candidate: MaterializedQuote) -> 
         and current.source_sequence is not None
         and candidate.source_sequence != current.source_sequence
     ):
-        return candidate.source_sequence > current.source_sequence
+        return _sequence_is_newer(candidate.source_sequence, current.source_sequence)
     if candidate.source_timestamp_unit != current.source_timestamp_unit:
         raise ValueError("quote source timestamp unit drifted within a session")
     if candidate.source_timestamp != current.source_timestamp:
@@ -433,7 +449,7 @@ def _replace_trade(current: MaterializedTrade, candidate: MaterializedTrade) -> 
         and current.source_sequence is not None
         and candidate.source_sequence != current.source_sequence
     ):
-        return candidate.source_sequence > current.source_sequence
+        return _sequence_is_newer(candidate.source_sequence, current.source_sequence)
     if candidate.source_timestamp_unit != current.source_timestamp_unit:
         raise ValueError("trade source timestamp unit drifted within a session")
     if candidate.source_timestamp != current.source_timestamp:

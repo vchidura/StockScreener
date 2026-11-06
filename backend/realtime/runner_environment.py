@@ -161,6 +161,9 @@ class RunnerEnvironment:
     # moved out of the cyclic collector's view (gc.freeze), so later gen-2 collections skip the retained bars.
     freeze_heap: bool = False
     heap_frozen: bool = False
+    # Whether PORTAL_PUBLISH rebuilds the Dashboard in this window (G85). The session close always does. A window
+    # that skips it leaves the previous Dashboard in place: a release carries forward entries it does not republish.
+    dashboard_due: bool = True
 
     def known_by(self, window) -> datetime:
         value = (

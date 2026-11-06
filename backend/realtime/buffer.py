@@ -68,6 +68,17 @@ class RawMessageBuffer:
         self._maximum_oldest_age_ns = 0
         self._lock = threading.Lock()
 
+    def has_room(self, byte_length: int) -> bool:
+        """Whether a message this size would fit now. Asking is not a rejection."""
+        with self._lock:
+            admitted_events = len(self._queued) + (
+                len(self._claim.messages) if self._claim is not None else 0
+            )
+            return (
+                admitted_events < self.limits.maximum_events
+                and self._payload_bytes + byte_length <= self.limits.maximum_bytes
+            )
+
     def put_nowait(self, message: RawMessageEnvelope) -> None:
         now = self._monotonic_ns()
         with self._lock:

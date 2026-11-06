@@ -2007,11 +2007,15 @@ class AdvancedEquityPreparationResident:
                 if self.bootstrap_history is not None
                 else max(fact.revision.bar_end for fact in sources)
             )
+            # A new member's first reference revision is from its REFERENCE stage (today), so months of history have
+            # no reference in effect at their bar time; like bootstrap, preparation then uses the reference known now.
+            # The identity check below still requires the same security and ticker.
             security = load_derivation_security_cursor(
                 unit.cursor,
                 instrument_id=claim.instrument_id,
                 window_end=identity_clock,
                 as_of=request.checked_at,
+                allow_late_reference=True,
             )
             if (
                 not security.active

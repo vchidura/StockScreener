@@ -8,6 +8,7 @@ import os
 import signal
 import sys
 import threading
+from collections import deque
 from pathlib import Path
 
 from dotenv import dotenv_values
@@ -24,6 +25,7 @@ from realtime.advanced_realtime_v3_runtime import (  # noqa: E402
     ADVANCED_REALTIME_V3_FINALITY_DELAY_SECONDS,
 )
 from realtime.advanced_options_continuous_scheduler import (  # noqa: E402
+    STALE_SNAPSHOT_SKIPPED,
     run_continuous_options_schedule_cycle,
 )
 from realtime.migrations import validate_target_database_v2  # noqa: E402
@@ -60,6 +62,8 @@ def main(argv=None):
     signal.signal(signal.SIGINT, lambda *_: stop.set())
     signal.signal(signal.SIGTERM, lambda *_: stop.set())
     planner = AdvancedEquityLifecyclePlanner()
+    # G74: Equity windows whose Options snapshot was stale; never retried in this process (bounded, newest kept).
+    skipped = deque(maxlen=256)
     try:
         while not stop.is_set():
             lifecycle = planner.plan(
@@ -69,8 +73,10 @@ def main(argv=None):
             )
             result = run_continuous_options_schedule_cycle(
                 provider, session_date=lifecycle.processing_session_date,
-                api_key=api_key,
+                api_key=api_key, skipped_receipts=frozenset(skipped),
             )
+            if result.get("status") == STALE_SNAPSHOT_SKIPPED:
+                skipped.append(result["equity_receipt_id"])
             print(json.dumps(result, sort_keys=True), flush=True)
             stop.wait(args.poll_seconds)
     finally:

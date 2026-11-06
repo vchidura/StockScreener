@@ -32,6 +32,7 @@ from realtime.advanced_options_rolling_producer import (
     RollingProducerStatus,
     _gaps,
     _market_state,
+    advanced_options_gap_blocks,
     advanced_options_unresolved_gaps_sha256,
 )
 from realtime.advanced_options_rolling_repository import (
@@ -134,6 +135,49 @@ def test_gap_still_blocks(changes):
     assert _gaps(_RowsCursor(rows), plan, evidence) is None
     assert evidence[-1].availability is RollingAvailability.UNAVAILABLE
     assert evidence[-1].reason_codes == ("UNRESOLVED_OR_WARMING_STREAM_GAPS",)
+
+
+def _accepted_gap(**changes):
+    return {
+        "gap_start": datetime(2026, 11, 5, 15, 18, 12, 825000, tzinfo=UTC),
+        "gap_end": datetime(2026, 11, 5, 15, 33, 53, 400000, tzinfo=UTC),
+        "reason": "GATEWAY_SESSION_CHANGED",
+        "recovery_status": "UNRESOLVED",
+        **changes,
+    }
+
+
+def test_the_accepted_nov_5_gap_stops_blocking_once_it_is_over():
+    assert not advanced_options_gap_blocks(
+        _accepted_gap(), datetime(2026, 11, 5, 15, 35, tzinfo=UTC)
+    )
+    assert advanced_options_gap_blocks(
+        _accepted_gap(), datetime(2026, 11, 5, 15, 30, tzinfo=UTC)
+    )
+
+
+@pytest.mark.parametrize(
+    "changes",
+    (
+        {
+            "gap_start": datetime(2026, 11, 5, 16, 0, tzinfo=UTC),
+            "gap_end": datetime(2026, 11, 5, 16, 10, tzinfo=UTC),
+        },
+        {
+            "gap_start": datetime(2026, 11, 6, 15, 18, 12, 825000, tzinfo=UTC),
+            "gap_end": datetime(2026, 11, 6, 15, 33, 53, 400000, tzinfo=UTC),
+        },
+        {"gap_end": datetime(2026, 11, 5, 15, 34, tzinfo=UTC)},
+        {"reason": "OTHER"},
+        {"recovery_status": "WARMING"},
+        {"gap_end": None},
+    ),
+    ids=("later-that-day", "next-day", "runs-longer", "other-reason", "warming", "open"),
+)
+def test_no_other_long_gap_is_accepted(changes):
+    assert advanced_options_gap_blocks(
+        _accepted_gap(**changes), datetime(2026, 11, 7, tzinfo=UTC)
+    )
 
 
 def test_gap_of_exactly_the_limit_is_tolerated():

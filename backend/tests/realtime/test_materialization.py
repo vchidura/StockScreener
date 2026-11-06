@@ -460,3 +460,14 @@ def test_one_read_fanout_partitions_once_and_advances_every_logical_shard(monkey
     assert [state.scanned_offset for state in advanced] == [1, 1]
     assert len(advanced[0].quotes) == 1
     assert advanced[1].quotes == ()
+
+def test_quotes_keep_updating_after_the_provider_sequence_wraps():
+    """G73: 4,294,966,650 then 15,288,498. A plain comparison froze the quote from then on."""
+    from realtime.materialization import _sequence_is_newer
+
+    assert _sequence_is_newer(15_288_498, 4_294_966_650) is True, "after the wrap"
+    assert _sequence_is_newer(4_294_966_650, 15_288_498) is False, "a late message from before it"
+    assert _sequence_is_newer(1_510_040_608, 4_294_789_484) is True, "an hour later"
+    assert _sequence_is_newer(101, 100) is True
+    assert _sequence_is_newer(100, 101) is False
+    assert _sequence_is_newer(100, 100) is False

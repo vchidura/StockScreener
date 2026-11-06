@@ -272,3 +272,69 @@ def test_state_digest_is_identical_for_identical_inputs_and_differs_otherwise():
 def test_initial_baseline_is_restricted():
     with pytest.raises(ValueError):
         VolumeConfig(initial_baseline=BaselineKind.INCOMPLETE)
+
+
+def test_a_wrapped_provider_sequence_keeps_counting_nov_5():
+    """G73: the 32-bit sequence wrapped, and every later print went uncounted."""
+    from datetime import date as _date
+    from uuid import uuid4 as _uuid4
+
+    from realtime.option_flow.volume import BaselineKind as Kind, PrintStatus as Status, VolumeBook, VolumeConfig
+
+    session = _date(2026, 11, 5)
+    book = VolumeBook(_uuid4(), VolumeConfig(history_per_contract=1, initial_baseline=Kind.SESSION_COMPLETE))
+    contract = "O:QQQ261105C00680000"
+
+    assert book.add_print(contract, session, 4_294_000_000, 1_000, 1, 0.15, 10).status is Status.COUNTED
+    assert book.add_print(contract, session, 4_294_789_484, 2_000, 1, 0.15, 20).status is Status.COUNTED
+    wrapped = book.add_print(contract, session, 15_288_498, 3_000, 1, 0.15, 30)
+
+    assert wrapped.status is Status.COUNTED
+    assert wrapped.late is False
+    state = book.get(contract, session)
+    assert state.cumulative == 60
+    assert state.baseline is Kind.SESSION_COMPLETE, "a wrap is not a gap"
+    assert state.max_seq == 2**32 + 15_288_498, "the stored checkpoint keeps climbing"
+    assert book.add_print(contract, session, 15_288_498, 3_000, 1, 0.15, 30).status is Status.DUPLICATE
+    assert book.add_print(contract, session, 1_510_040_608, 4_000, 1, 0.15, 5).status is Status.COUNTED
+    assert state.cumulative == 65
+
+
+def test_a_late_print_from_before_the_wrap_is_not_read_as_after_it():
+    from datetime import date as _date
+    from uuid import uuid4 as _uuid4
+
+    from realtime.option_flow.volume import VolumeBook, _extended_sequence
+
+    assert _extended_sequence(-1, 5) == 5
+    assert _extended_sequence(100, 200) == 200
+    assert _extended_sequence(2**32 + 15_000_000, 4_294_900_000) == 4_294_900_000
+    assert _extended_sequence(2**32 + 15_000_000, 16_000_000) == 2**32 + 16_000_000
+    book = VolumeBook(_uuid4())
+    contract = "O:QQQ261105C00680000"
+    session = _date(2026, 11, 5)
+    book.add_print(contract, session, 4_294_900_000, 1_000, 1, 0.15, 1)
+    book.add_print(contract, session, 15_000_000, 3_000, 1, 0.15, 1)
+    late = book.add_print(contract, session, 4_294_950_000, 2_000, 1, 0.15, 1)
+    assert late.late is True
+
+
+def test_a_reconcile_still_works_after_the_wrap():
+    from datetime import date as _date
+    from uuid import uuid4 as _uuid4
+
+    from realtime.option_flow.volume import BaselineKind as Kind, VolumeBook
+
+    book = VolumeBook(_uuid4())
+    contract = "O:QQQ261105C00680000"
+    session = _date(2026, 11, 5)
+    book.add_print(contract, session, 4_294_900_000, 1_000, 1, 0.15, 10)
+    book.add_print(contract, session, 15_000_000, 2_000, 1, 0.15, 20)
+    book.add_print(contract, session, 16_000_000, 3_000, 1, 0.15, 5)
+    watermark = book.watermark_at(contract, session, 2_500)
+
+    outcome = book.reconcile(contract, session, 1_000, watermark, 2_500)
+
+    assert outcome.accepted is True
+    assert book.get(contract, session).cumulative == 1_005, "the snapshot plus the print after it"
+    assert book.get(contract, session).baseline is Kind.SNAPSHOT_RECONCILED

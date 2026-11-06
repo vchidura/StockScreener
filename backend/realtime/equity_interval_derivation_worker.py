@@ -128,12 +128,17 @@ def load_derivation_security_cursor(
     instrument_id: int,
     window_end: datetime,
     as_of: datetime,
+    allow_late_reference: bool = False,
 ):
+    """`allow_late_reference`: when no reference revision was in effect at `window_end`, use the one in effect at
+    `as_of` (the finalizer's late-reference rule). New-member preparation needs it: it rebuilds months of history
+    for a security whose first reference revision is from today."""
     return _load_finalizer_security_cursor(
         cursor,
         instrument_id=instrument_id,
         window_end=window_end,
         as_of=as_of,
+        allow_late_reference=allow_late_reference,
     )
 
 

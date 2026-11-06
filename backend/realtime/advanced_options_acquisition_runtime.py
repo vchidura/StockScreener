@@ -63,7 +63,10 @@ ACQUISITION_OWNER_NAME = "advanced-options-v3-session-acquisition-v1"
 CONTROL_MESSAGES_PER_ATTEMPT = 8
 ACQUISITION_GIL_SWITCH_SECONDS = 0.0005
 ACQUISITION_PING_TIMEOUT_SECONDS = 60
+# Under the buffer's 30 s age limit, so a journal that truly stopped still fails.
+ACQUISITION_HANDOFF_WAIT_SECONDS = 20.0
 STATUS_MESSAGE_RESERVATION_QUANTUM = 1024
+STATUS_MESSAGE_RESERVATION_LOW_WATER = 256
 STATUS_BYTE_RESERVATION_MESSAGES = 2
 ZERO_FORBIDDEN_EFFECTS = {
     "detector": 0,
@@ -388,6 +391,25 @@ def acquisition_binding_from_payload(
     if acquisition_binding_payload(binding) != dict(value):
         raise ValueError("Options acquisition binding payload changed")
     return binding
+
+
+def _message_reservation_runs_low(
+    current_messages: int,
+    reserved_messages: int,
+    ceiling: int,
+) -> bool:
+    """Whether to reserve more decoded messages, which flushes the status file.
+
+    This runs on the socket thread for every message. Testing against the full
+    quantum, the size each extension grants, was true again on the very next
+    message, so every message waited on a disk flush: 62 per second on Nov 5,
+    which held the real feed at about 0.7 times real time (G63).
+    """
+    return (
+        current_messages + STATUS_MESSAGE_RESERVATION_LOW_WATER
+        > reserved_messages
+        and reserved_messages < ceiling
+    )
 
 
 def _write_json(path: Path, value: object) -> None:
@@ -815,6 +837,7 @@ def run_acquisition(
         ping_timeout_seconds=ACQUISITION_PING_TIMEOUT_SECONDS,
         maximum_message_bytes=binding.maximum_message_bytes,
         library_max_queue=binding.library_max_queue,
+        handoff_wait_seconds=ACQUISITION_HANDOFF_WAIT_SECONDS,
     )
     lease = HostProviderSocketLease(
         lock_path,
@@ -956,12 +979,10 @@ def run_acquisition(
                 )
                 current_bytes = attempt_bytes + session_bytes
                 extend = False
-                if (
-                    current_messages
-                    + STATUS_MESSAGE_RESERVATION_QUANTUM
-                    > reserved_messages
-                    and reserved_messages
-                    < binding.decoded_message_ceiling
+                if _message_reservation_runs_low(
+                    current_messages,
+                    reserved_messages,
+                    binding.decoded_message_ceiling,
                 ):
                     reserved_messages = min(
                         binding.decoded_message_ceiling,

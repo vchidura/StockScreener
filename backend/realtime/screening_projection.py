@@ -43,6 +43,11 @@ SCREENING_BASIS = {
     "discovery_liquidity_basis": "RAW_LAST_20_SESSIONS",
     "current_scale_max_relative_difference": 0.001,
 }
+# G82: the endpoint's raw daily close is derived from the stream's last minute bar while the adjusted
+# one is the official closing-auction print, so a normal auction move (AMZN 0.119% on Nov 5) is not a
+# scale error; a split moves the scale by 30% or more. Kept out of SCREENING_BASIS on purpose: the API
+# compares that block for equality with every stored publication.
+ENDPOINT_CLOSE_SCALE_MAX_RELATIVE_DIFFERENCE = 0.01
 REALTIME_FIELDS = {
     name: dict(spec, source="rt.bar_revisions" if spec["source"] == "canonical_daily_bars" else spec["source"],
                price_basis="RAW_ACTION_GATED" if name in {"price", "volume"} else
@@ -330,7 +335,7 @@ def produce_realtime_screening(inputs: RealtimeScreeningInput) -> RealtimeScreen
         endpoint_scale_difference = abs(
             float(raw[-1]["close"]) / float(adjusted[-1]["close"]) - 1
         )
-        if endpoint_scale_difference > SCREENING_BASIS["current_scale_max_relative_difference"]:
+        if endpoint_scale_difference > ENDPOINT_CLOSE_SCALE_MAX_RELATIVE_DIFFERENCE:
             raise ValueError(f"Screening current adjusted/raw scale drift: {ticker}")
         historical = [dict(b) for b in adjusted[-253:]]
         nominal = {b["session_date"]: b for b in raw}

@@ -1,4 +1,5 @@
 import asyncio
+import dataclasses
 import json
 import threading
 from collections import deque
@@ -684,6 +685,41 @@ def test_gateway_can_continue_message_numbers_across_reconnect_attempts():
 
     assert claim.messages[0].message_number == 7
     assert gateway.next_message_number == 8
+
+
+def _full_handoff(wait_seconds):
+    buffer = _buffer(maximum_events=1, maximum_bytes=128)
+    buffer.put_nowait(
+        RawMessageEnvelope(SESSION, 99, MarketFeed.STOCKS, NOW, 100, b"already-admitted")
+    )
+    gateway = _gateway(MarketFeed.STOCKS, FakeConnection(()), buffer)
+    gateway.configuration = dataclasses.replace(
+        gateway.configuration, handoff_wait_seconds=wait_seconds
+    )
+    return buffer, gateway
+
+
+def test_a_burst_waits_for_room_instead_of_disconnecting():
+    buffer, gateway = _full_handoff(5.0)
+
+    async def run():
+        admit = asyncio.create_task(gateway._admit(b"burst", SESSION, FakeConnection(())))
+        await asyncio.sleep(0.02)
+        assert not admit.done(), "it waits while the handoff is full"
+        claim = buffer.claim_nowait(maximum_events=1, maximum_bytes=128)
+        buffer.acknowledge(claim.claim_id)
+        return await asyncio.wait_for(admit, 2)
+
+    assert asyncio.run(run()) == len(b"burst")
+    assert buffer.snapshot().admitted_events == 1
+    assert buffer.snapshot().full_count == 0, "waiting is not a rejection"
+
+
+def test_a_handoff_that_stays_full_is_still_an_overload():
+    _buffer_full, gateway = _full_handoff(0.02)
+
+    with pytest.raises(GatewayOverload, match="MAXIMUM_EVENTS_EXCEEDED"):
+        asyncio.run(gateway._admit(b"burst", SESSION, FakeConnection(())))
 
 
 def test_gateway_handoff_overload_disconnects_without_evicting():

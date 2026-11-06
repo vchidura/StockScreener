@@ -136,3 +136,33 @@ def test_signal_rejects_forming_future_and_noncausal_bars():
             decision_at=values[-1].bar_end + timedelta(minutes=15),
             session_close=datetime(2026, 9, 28, 20, tzinfo=UTC))
         assert not signals
+
+
+def test_os_signals_read_v3_coded_intraday_bars_and_s_signals_still_do_not():
+    # Every V3 5m bar records that it was built from the AM 1m stream. Before Nov 5 OS1 and OS2
+    # dropped them all and could never fire (G81).
+    coded = tuple(
+        replace(item, quality_codes=("DERIVED_FROM_ADVANCED_AM_1M",))
+        for item in (bar("5m", OPEN, 5, 100), bar("5m", OPEN + timedelta(minutes=5), 5, 101.1))
+    )
+    scope = dict(security_id=SECURITY, underlyer="AAPL", market_cutoff=coded[-1].bar_end,
+        decision_at=coded[-1].bar_end + timedelta(minutes=15), session_close=datetime(2026, 9, 28, 20, tzinfo=UTC))
+
+    signals = detect_canonical_stock_signals(**scope, bars=inputs(*coded), detector_ids=("OS1", "OS2"))
+    assert [(signal.detector_id, signal.interval, signal.direction) for signal in signals] == [("OS1", "5m", 1)]
+
+    assert not detect_canonical_stock_signals(**scope, bars=inputs(*coded)), "S1 and S2 keep the legacy rule"
+    unknown = tuple(replace(item, quality_codes=("UNREVIEWED_DERIVATION",)) for item in coded)
+    assert not detect_canonical_stock_signals(**scope, bars=inputs(*unknown), detector_ids=("OS1", "OS2")), (
+        "only the listed V3 derivations are accepted"
+    )
+
+
+def test_os_policy_identity_records_the_accepted_intraday_codes():
+    from options.stock_bar_detection import (
+        ADVANCED_OPTIONS_STOCK_BAR_SIGNAL_POLICY,
+        STOCK_BAR_SIGNAL_POLICY,
+    )
+
+    assert ["DERIVED_FROM_ADVANCED_AM_1M"] in ADVANCED_OPTIONS_STOCK_BAR_SIGNAL_POLICY["intraday_quality_codes"]["5m"]
+    assert "intraday_quality_codes" not in STOCK_BAR_SIGNAL_POLICY

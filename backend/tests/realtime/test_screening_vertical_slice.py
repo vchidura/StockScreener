@@ -152,6 +152,75 @@ def screening_fixture(session=date(2026, 10, 2), *, current=True):
     )
 
 
+def _intraday_asof(inputs):
+    calendar = exchange_calendars.get_calendar("XNYS")
+    cutoff = calendar.session_open(str(inputs.session)).to_pydatetime() + timedelta(hours=2)
+    older = []
+    for ticker in {row["ticker"] for row in inputs.members}:
+        first = min(
+            (
+                row for row in inputs.bars
+                if row["ticker"] == ticker and row["interval"] == "1d"
+                and row["adjustment_basis"] == "ADJUSTED"
+            ),
+            key=lambda row: row["session_date"],
+        )
+        prior = calendar.previous_session(str(first["session_date"]))
+        older.append({
+            **first, "bar_revision_id": uuid5(NAMESPACE_URL, f"asof-older-session:{ticker}"),
+            "session_date": prior.date(), "bar_start": calendar.session_open(prior).to_pydatetime(),
+            "bar_end": calendar.session_close(prior).to_pydatetime(),
+        })
+    return replace(
+        inputs,
+        cutoff=cutoff,
+        bars=(*older, *(row for row in inputs.bars if row["bar_end"] <= cutoff)),
+        known_by=cutoff + timedelta(minutes=15),
+    )
+
+
+def _scale_official_close(inputs, session_date, factor, ticker="AMZN"):
+    """Moves the official (adjusted) close away from the stream-derived raw close, as a closing auction does."""
+    bars = []
+    for row in inputs.bars:
+        if (row["ticker"] == ticker and row["interval"] == "1d" and row["adjustment_basis"] == "ADJUSTED"
+                and row["session_date"] == session_date):
+            close = row["close"] * factor
+            row = dict(row, close=close, high=max(row["high"], close), low=min(row["low"], close))
+        bars.append(row)
+    return replace(inputs, bars=tuple(bars))
+
+
+# G82: AMZN 0.119% on Nov 5 and MSFT 0.29% on Oct 28 are closing-auction moves; 1.011 is just over the
+# 1% endpoint tolerance; 1.5 and 0.5 are what a 3:2 or 2:1 split does to the scale.
+@pytest.mark.parametrize("factor,accepted", [(1 / 1.00119, True), (1 / 1.0029, True), (1.011, False), (1.5, False), (0.5, False)])
+@pytest.mark.parametrize("intraday", [False, True], ids=["closing-window", "next-session-intraday"])
+def test_endpoint_scale_check_accepts_closing_auction_moves_and_rejects_splits(factor, accepted, intraday):
+    inputs = screening_fixture()
+    calendar = exchange_calendars.get_calendar("XNYS")
+    if intraday:
+        inputs = _intraday_asof(inputs)
+        endpoint = calendar.previous_session(str(inputs.session)).date()
+    else:
+        endpoint = inputs.session
+    scaled = _scale_official_close(inputs, endpoint, factor)
+    if accepted:
+        generation = produce_realtime_screening(scaled)
+        assert generation.status == "COMPLETE"
+        assert len(generation.rows) == len(inputs.members)
+    else:
+        with pytest.raises(ValueError, match="Screening current adjusted/raw scale drift: AMZN"):
+            produce_realtime_screening(scaled)
+
+
+def test_endpoint_tolerance_stays_out_of_the_published_screening_basis():
+    from realtime.screening_projection import ENDPOINT_CLOSE_SCALE_MAX_RELATIVE_DIFFERENCE, SCREENING_BASIS
+
+    assert ENDPOINT_CLOSE_SCALE_MAX_RELATIVE_DIFFERENCE == 0.01
+    assert SCREENING_BASIS["current_scale_max_relative_difference"] == 0.001
+    assert "endpoint_close_scale_max_relative_difference" not in SCREENING_BASIS
+
+
 def test_intraday_asof_projection_uses_prior_daily_session_and_completed_intraday_bars():
     inputs = screening_fixture()
     calendar = exchange_calendars.get_calendar("XNYS")

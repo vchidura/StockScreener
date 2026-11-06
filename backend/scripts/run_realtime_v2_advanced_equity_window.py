@@ -59,6 +59,8 @@ from realtime.advanced_scheduler import (  # noqa: E402
     discover_advanced_window_recovery_cursor,
 )
 from realtime.runner_environment import RunnerEnvironment  # noqa: E402
+from realtime.screening_delta_loader import ScreeningInputLoader  # noqa: E402
+from realtime.ticker_projection import TickerProjectionState  # noqa: E402
 from realtime.stage_graph import (  # noqa: E402
     STAGES_V3,
     STAGE_CATALOG_VERSION_V3,
@@ -510,8 +512,72 @@ def _ensure_reference_readiness(provider, repository, args):
     )
 
 
+class _WarmProjection:
+    """G85: the incremental loader and projection state, kept between windows of one cohort in this process.
+
+    The Advanced scheduler runs every window through `main()` in its own process. A new `RunnerEnvironment`
+    per window used to start both empty, so each window re-read every retained bar and projected every ticker
+    from scratch (Nov 5, 9 tickers: about 33 s cold against 3.6 s warm, identical output). A window gets the
+    warm pair only when its cutoff is newer than the last one this pair served, for the same cohort; a retry or
+    recovery of an older or equal cutoff gets a fresh pair and leaves the warm one alone, as rehydration does.
+    A window that does not complete, or raises, drops the warm pair, so the next window starts cold."""
+
+    def __init__(self):
+        self.cohort_id = None
+        self.cutoff = None
+        self.state = None
+        self.loader = None
+
+    def take(self, cohort_id, cutoff):
+        if self.cohort_id == cohort_id and self.cutoff is not None and cutoff > self.cutoff:
+            return self.state, self.loader, True
+        return TickerProjectionState(), ScreeningInputLoader(), False
+
+    def settle(self, cohort_id, cutoff, state, loader, *, warm, complete):
+        if warm:
+            if complete:
+                self.cutoff = cutoff
+            else:
+                self.drop()
+            return
+        # A fresh pair becomes the warm one only when it is now the newest for its cohort (first window after a
+        # start, or a new cohort); an older or equal cutoff (retry, recovery) leaves the warm pair as it was.
+        if complete and (self.cohort_id != cohort_id or self.cutoff is None or cutoff > self.cutoff):
+            self.cohort_id, self.cutoff, self.state, self.loader = cohort_id, cutoff, state, loader
+
+    def drop(self):
+        self.cohort_id = self.cutoff = self.state = self.loader = None
+
+
+_WARM = _WarmProjection()
+
+
+def dashboard_due(cutoff, *, warm: bool) -> bool:
+    """The Dashboard is rebuilt on a process's first window for a cohort (session start, restart, retry with a
+    fresh pair) and hourly on the :35 windows; PORTAL_PUBLISH adds the session close. In between the previous one
+    is carried forward. The user accepts a stale Dashboard (Nov 6): it is a sample page awaiting a redesign."""
+    return not warm or cutoff.minute == 35
+
+
 def main(argv=None) -> int:
     args = parse_args(argv)
+    ticker_state, screening_loader, warm = _WARM.take(args.cohort_id, args.cutoff)
+    complete = False
+    try:
+        code = _main(
+            args, ticker_state=ticker_state, screening_loader=screening_loader,
+            dashboard_due=dashboard_due(args.cutoff, warm=warm),
+        )
+        complete = code == 0
+        return code
+    finally:
+        _WARM.settle(
+            args.cohort_id, args.cutoff, ticker_state, screening_loader,
+            warm=warm, complete=complete,
+        )
+
+
+def _main(args, *, ticker_state, screening_loader, dashboard_due=True) -> int:
     strategy_history = _validate_strategy_history_binding(args)
     validation_policy = _validation_policy(args, os.environ)
     config = RealtimeV2PipelineConfig.from_mapping(
@@ -664,6 +730,9 @@ def main(argv=None) -> int:
         environment = RunnerEnvironment(
             provider,
             build_id=ADVANCED_WINDOW_BUILD_ID,
+            ticker_state=ticker_state,
+            screening_loader=screening_loader,
+            dashboard_due=dashboard_due,
             freeze_heap=True,
             stock_alert_projection_loader=(
                 (

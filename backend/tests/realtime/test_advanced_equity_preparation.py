@@ -685,3 +685,42 @@ def test_preparation_coverage_is_monotonic_across_chunks():
             },
             True,
         ).validate(request)
+
+
+def test_derivation_reference_falls_back_to_the_current_revision_only_when_allowed():
+    """New-member preparation (Nov 6): history from July, first reference revision from today. With
+    allow_late_reference the derivation uses the revision in effect now; without it, it fails closed as before."""
+    from datetime import datetime, timezone
+    from uuid import uuid4
+
+    from realtime.equity_interval_derivation_worker import load_derivation_security_cursor
+
+    security_id, revision_id = uuid4(), uuid4()
+    row = (
+        str(revision_id), str(security_id), "AMD", True, "Advanced Micro Devices", "CS", "0000002488",
+        None, None, "XNAS", "3674", None, None, None, None, None, None, None, None, None,
+        datetime(2026, 11, 6, 5, 33, tzinfo=timezone.utc), datetime(2026, 11, 6, 5, 33, tzinfo=timezone.utc), "a" * 64,
+    )
+
+    class Cursor:
+        def __init__(self):
+            self.calls = []
+
+        def execute(self, sql, params):
+            self.calls.append(params)
+
+        def fetchone(self):
+            # Nothing was in effect at the July bar end; the revision in effect at as_of is found.
+            return None if len(self.calls) == 1 else row
+
+    window_end = datetime(2026, 7, 1, 20, 0, tzinfo=timezone.utc)
+    as_of = datetime(2026, 11, 6, 6, 0, tzinfo=timezone.utc)
+    cursor = Cursor()
+    security = load_derivation_security_cursor(
+        cursor, instrument_id=10459, window_end=window_end, as_of=as_of, allow_late_reference=True,
+    )
+    assert security.ticker == "AMD" and str(security.security_id) == str(security_id)
+    assert cursor.calls[0][1] == window_end and cursor.calls[1][1] == as_of
+
+    with pytest.raises(ValueError, match="finalizer security reference is unavailable"):
+        load_derivation_security_cursor(Cursor(), instrument_id=10459, window_end=window_end, as_of=as_of)

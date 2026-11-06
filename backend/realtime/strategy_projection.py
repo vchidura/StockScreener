@@ -18,7 +18,7 @@ from .dashboard_projection import DAILY_SCANNER_CONTRACTS, SCANNER_BASIS, dashbo
 from .portal_projection import build_portal_snapshot
 from .preflight import ProviderTier
 from .reference_continuity import source_manifest_continuity_fields
-from .screening_projection import SCREENING_BASIS, _validate_bars
+from .screening_projection import ENDPOINT_CLOSE_SCALE_MAX_RELATIVE_DIFFERENCE, _validate_bars
 from .setup_summary_projection import produce_daily_setup_summary, produce_hourly_setup_summary
 from .strategy_persistence import build_strategy_persistence
 from .ticker_projection import _security
@@ -134,7 +134,7 @@ def _validate_strategy_inputs(inputs):
                 raise ValueError("Strategy adjusted split/action drift")
         raw = [row for row in own if row["interval"] == "1d" and row["adjustment_basis"] == "RAW_UNADJUSTED"
                and row["session_date"] == inputs.session]
-        if len(raw) != 1 or abs(float(raw[0]["close"]) / float(daily[-1]["close"]) - 1) > SCREENING_BASIS["current_scale_max_relative_difference"]:
+        if len(raw) != 1 or abs(float(raw[0]["close"]) / float(daily[-1]["close"]) - 1) > ENDPOINT_CLOSE_SCALE_MAX_RELATIVE_DIFFERENCE:
             raise ValueError("Strategy current adjusted/raw scale drift")
     return market_time, unavailable_members, action_context
 

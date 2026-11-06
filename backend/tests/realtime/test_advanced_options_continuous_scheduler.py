@@ -416,3 +416,87 @@ def test_connection_error_still_consumes_one_ledger_attempt(monkeypatch):
     assert completion.state is ProviderRequestState.FAILED
     assert completion.outcome is ProviderRequestOutcome.HTTP_ERROR
     assert completion.response_bytes == 0
+
+
+# G74: a stale or failed snapshot for one Equity window is a labelled skip, not a crash loop.
+class _CycleCursor:
+    def __init__(self, receipt):
+        self.rows = [("cohort",), receipt]
+        self.fetched = []
+
+    def execute(self, sql, params=()):
+        self.sql = sql
+
+    def fetchone(self):
+        return self.rows.pop(0)
+
+    def fetchall(self):
+        return []
+
+
+class _CycleProvider:
+    def __init__(self, receipt):
+        self.cursor = _CycleCursor(receipt)
+
+    @contextmanager
+    def transaction(self, *_args, **_kwargs):
+        yield SimpleNamespace(cursor=self.cursor)
+
+
+def _cycle(monkeypatch, *, capture=None, skipped=frozenset(), cutoff_after=None):
+    receipt = ("receipt-1", NOW - timedelta(seconds=20), NOW - timedelta(seconds=15), "a" * 64)
+    acquisition = SimpleNamespace(
+        authority=SimpleNamespace(acquisition_stop=NOW + timedelta(hours=6), authorization_id=uuid4()),
+        contract_tickers=("O:SPY261106C00700000",),
+    )
+    state = SimpleNamespace(
+        load_package=lambda: {"authorization_reference": "ref"},
+        load_bundle_document=lambda: {}, load_preopen_session_binding=lambda bundle: "session",
+        load_downstream_bindings=lambda session: (), load_acquisition_binding=lambda: acquisition,
+    )
+    monkeypatch.setattr(scheduler, "PostgresContinuousSessionStateRepository", lambda *a, **k: state)
+    monkeypatch.setattr(scheduler, "_scheduler_budget", lambda *a, **k: "budget")
+    calls = []
+
+    def fake_capture(*_args, **_kwargs):
+        calls.append(1)
+        if capture is None:
+            raise scheduler.OptionsSnapshotStale("Options snapshot interval retry budget exhausted")
+        return capture
+
+    monkeypatch.setattr(scheduler, "_capture", fake_capture)
+    if cutoff_after is not None:
+        monkeypatch.setattr(scheduler, "p8_options_cycle_cutoff_from_capture", lambda *a, **k: cutoff_after)
+    result = scheduler._run_schedule_cycle(
+        _CycleProvider(receipt), session_date=NOW.date(), api_key="k", clock=lambda: NOW,
+        transport_factory=None, skipped_receipts=skipped,
+    )
+    return result, calls
+
+
+def test_exhausted_snapshot_retries_are_a_labelled_skip_not_a_crash(monkeypatch):
+    result, calls = _cycle(monkeypatch)
+    assert calls == [1]
+    assert result == {
+        "status": scheduler.STALE_SNAPSHOT_SKIPPED, "equity_receipt_id": "receipt-1",
+        "equity_cutoff": (NOW - timedelta(seconds=20)).isoformat(),
+        "reason": "OPTIONS_SNAPSHOT_RETRY_BUDGET_EXHAUSTED",
+    }
+
+
+def test_a_skipped_equity_window_is_not_captured_again(monkeypatch):
+    result, calls = _cycle(monkeypatch, skipped=frozenset({"receipt-1"}))
+    assert calls == []
+    assert result["status"] == scheduler.WAITING_AFTER_STALE_SNAPSHOT
+
+
+def test_a_missed_options_deadline_is_a_skip_not_a_crash(monkeypatch):
+    capture = SimpleNamespace(selection=SimpleNamespace(reviewed_at=NOW))
+    result, calls = _cycle(monkeypatch, capture=capture, cutoff_after=NOW - timedelta(seconds=1))
+    assert calls == [1]
+    assert result["status"] == scheduler.STALE_SNAPSHOT_SKIPPED
+    assert result["reason"] == "OPTIONS_E_O_DEADLINE_MISSED"
+
+
+def test_the_stale_error_is_still_the_runtime_error_callers_expect():
+    assert issubclass(scheduler.OptionsSnapshotStale, RuntimeError)

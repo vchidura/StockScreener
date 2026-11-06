@@ -1094,6 +1094,23 @@ def test_status_publisher_latches_synchronous_storage_failure(
         publisher.persist()
 
 
+def test_message_reservation_flushes_rarely_and_always_stays_ahead():
+    """It runs on the socket thread for every message (G63)."""
+    quantum = runtime.STATUS_MESSAGE_RESERVATION_QUANTUM
+    reserved, flushes = quantum, 0
+    for current in range(1, 100_001):
+        if runtime._message_reservation_runs_low(current, reserved, 10_000_000):
+            reserved = current + quantum
+            flushes += 1
+        assert reserved > current, "a crash must never burn more than was reserved"
+    assert flushes <= 100_000 / (quantum - runtime.STATUS_MESSAGE_RESERVATION_LOW_WATER) + 1
+
+
+def test_message_reservation_stops_extending_at_the_ceiling():
+    assert not runtime._message_reservation_runs_low(9_990, 10_000, 10_000)
+    assert runtime._message_reservation_runs_low(9_990, 9_999, 10_000)
+
+
 def test_crash_resume_burns_only_durable_reserved_budget():
     usage = runtime._resume_budget_usage({
         "decoded_messages": 100,

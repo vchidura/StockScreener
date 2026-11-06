@@ -68,6 +68,15 @@ _RETRYABLE_POSTGRES_SQLSTATES = frozenset({"40001", "40P01"})
 # A gap this short that has ended no longer blocks a window. Nothing repairs an
 # Options gap, and the feed has been seen to reconnect within seconds.
 MAXIMUM_TOLERATED_GAP_SECONDS = 120
+# The one long gap the user accepted, Nov 5 2026: publish that session with a labelled
+# hole (G68). Restarting acquisition to fix the feed throttle (G63) discarded its backlog.
+# It matches only this gap, so a new long gap that day and every other day still block.
+ACCEPTED_LONG_GAP_SESSION = date(2026, 11, 5)
+ACCEPTED_LONG_GAP_START_FROM = datetime(2026, 11, 5, 15, 18, 12, tzinfo=timezone.utc)
+ACCEPTED_LONG_GAP_START_BEFORE = datetime(2026, 11, 5, 15, 18, 13, tzinfo=timezone.utc)
+ACCEPTED_LONG_GAP_END_BEFORE = datetime(2026, 11, 5, 15, 33, 54, tzinfo=timezone.utc)
+ACCEPTED_LONG_GAP_REASON = "GATEWAY_SESSION_CHANGED"
+OPTION_EVENT_UNDERLYING_NOT_ALIGNED = "OPTION_EVENT_UNDERLYING_NOT_ALIGNED"
 # These evidence rows can be READY and still name what the window tolerated.
 _TOLERATING_EVIDENCE_KINDS = frozenset({
     "UNRESOLVED_GAPS",
@@ -790,6 +799,16 @@ def advanced_options_unresolved_gaps_sha256(
     ))
 
 
+def _is_accepted_long_gap(row: Mapping[str, object]) -> bool:
+    return (
+        str(row["reason"]) == ACCEPTED_LONG_GAP_REASON
+        and ACCEPTED_LONG_GAP_START_FROM
+        <= row["gap_start"]
+        < ACCEPTED_LONG_GAP_START_BEFORE
+        and row["gap_end"] < ACCEPTED_LONG_GAP_END_BEFORE
+    )
+
+
 def advanced_options_gap_blocks(
     row: Mapping[str, object],
     known_at: datetime,
@@ -801,8 +820,11 @@ def advanced_options_gap_blocks(
         str(row["recovery_status"]) == "UNRESOLVED"
         and gap_end is not None
         and gap_end < known_at
-        and (gap_end - row["gap_start"]).total_seconds()
-        <= MAXIMUM_TOLERATED_GAP_SECONDS
+        and (
+            (gap_end - row["gap_start"]).total_seconds()
+            <= MAXIMUM_TOLERATED_GAP_SECONDS
+            or _is_accepted_long_gap(row)
+        )
     )
 
 
@@ -1715,17 +1737,24 @@ def _market_state(
                 snapshot = equity_binding.price_for(
                     str(equity["ticker"])
                 )
-                ticks.append(UnderlyingSnapshotTick(
-                    instrument_id=instrument_id,
-                    evidence=snapshot,
-                    selected_at=plan.known_at,
-                    option_market_time=option_time_by_security[
-                        str(equity["security_id"])
-                    ],
-                    maximum_price_age_seconds=(
-                        equity_binding.maximum_price_age_seconds
-                    ),
-                ))
+                # After a feed gap the newest option event can predate the price by
+                # more than the limit. That window waits; it must not crash the role (G67).
+                try:
+                    ticks.append(UnderlyingSnapshotTick(
+                        instrument_id=instrument_id,
+                        evidence=snapshot,
+                        selected_at=plan.known_at,
+                        option_market_time=option_time_by_security[
+                            str(equity["security_id"])
+                        ],
+                        maximum_price_age_seconds=(
+                            equity_binding.maximum_price_age_seconds
+                        ),
+                    ))
+                except ValueError as error:
+                    if "are not aligned" not in str(error):
+                        raise
+                    reasons.append(OPTION_EVENT_UNDERLYING_NOT_ALIGNED)
                 continue
             quote_row = by_key[("Q", instrument_id)]
             trade_row = by_key[("T", instrument_id)]
@@ -1866,7 +1895,12 @@ def _volumes(
     for row in rows:
         ticker = str(row["contract_ticker"])
         baseline = BaselineKind(str(row["baseline_kind"]))
-        if baseline not in COMPLETE_BASELINES:
+        # The accepted gap left these totals short. Each contract's state still says
+        # VOLUME_INCOMPLETE; it just no longer stops that session's windows (G68).
+        if baseline not in COMPLETE_BASELINES and not (
+            baseline is BaselineKind.INCOMPLETE
+            and plan.control_plane.session_date == ACCEPTED_LONG_GAP_SESSION
+        ):
             reasons.append("OPTION_VOLUME_CHECKPOINT_INCOMPLETE")
         if (
             (

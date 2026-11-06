@@ -333,7 +333,8 @@ def test_source_identity_availability_and_action_gates(fault):
     elif fault == "scale":
         current = next(row for row in bars if row["interval"] == "1d" and row["adjustment_basis"] == "ADJUSTED"
                        and row["session_date"] == inputs.session)
-        current["close"] *= 1.01
+        # A 3:2 split's scale error (G82: a 1% closing-auction move is now accepted at the endpoint).
+        current["close"] *= 1.5
         current["high"] = max(current["high"], current["close"])
     elif fault == "coverage":
         inputs = replace(inputs, coverage=())

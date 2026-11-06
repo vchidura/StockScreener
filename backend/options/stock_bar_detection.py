@@ -47,11 +47,24 @@ STOCK_BAR_SIGNAL_POLICY = {
 STOCK_BAR_SIGNAL_POLICY_SHA256 = hashlib.sha256(
     canonical_json(STOCK_BAR_SIGNAL_POLICY).encode("ascii")
 ).hexdigest()
+# Advanced (V3) intraday bars always record how they were built: 5m from the AM 1m stream, 15m, 30m
+# and 1h from canonical 5m. The legacy rule below accepts only uncoded intraday bars, so on V3 data
+# OS1 and OS2 never saw an intraday bar and could not fire (found Nov 5, G81). S1 and S2 keep it.
+ADVANCED_INTRADAY_QUALITY_CODES = {
+    "5m": ((), ("DERIVED_FROM_ADVANCED_AM_1M",), ("DERIVED_FROM_CANONICAL_1M",)),
+    "15m": ((), ("DERIVED_FROM_CANONICAL_5M",)),
+    "30m": ((), ("DERIVED_FROM_CANONICAL_5M",)),
+    "1h": ((), ("DERIVED_FROM_CANONICAL_30M",), ("DERIVED_FROM_CANONICAL_5M",)),
+}
 ADVANCED_OPTIONS_STOCK_BAR_SIGNAL_POLICY = {
     **STOCK_BAR_SIGNAL_POLICY,
     "minimum_bars": {"OS1": 2, "OS2": 3},
     "OS1": STOCK_BAR_SIGNAL_POLICY["S1"],
     "OS2": STOCK_BAR_SIGNAL_POLICY["S2"],
+    "intraday_quality_codes": {
+        interval: [list(value) for value in codes]
+        for interval, codes in ADVANCED_INTRADAY_QUALITY_CODES.items()
+    },
 }
 del ADVANCED_OPTIONS_STOCK_BAR_SIGNAL_POLICY["S1"]
 del ADVANCED_OPTIONS_STOCK_BAR_SIGNAL_POLICY["S2"]
@@ -95,11 +108,12 @@ class CanonicalStockBarPoint(Contract):
                 not in DAILY_HISTORY_QUALITY_CODES
             )
             or (
-                self.interval == "1h"
-                and self.quality_codes
-                not in ((), ("DERIVED_FROM_CANONICAL_30M",))
-            )
-            or (self.interval not in ("1d", "1h") and self.quality_codes)):
+                # The family's own rule decides which of these it reads; a point only has to be
+                # one of them. ADVANCED_INTRADAY_QUALITY_CODES holds the legacy codes too.
+                self.interval != "1d"
+                and tuple(self.quality_codes)
+                not in ADVANCED_INTRADAY_QUALITY_CODES[self.interval]
+            )):
             raise ValueError("canonical stock signal bar is invalid")
         return self
 
@@ -221,16 +235,22 @@ def detect_canonical_stock_signals(*, security_id: UUID, underlyer: str,
         raise ValueError("canonical stock signal detector family is invalid")
     eligible = []
     signal_session = market_cutoff.astimezone(ZoneInfo("America/New_York")).date()
+    intraday_codes = policy.get("intraday_quality_codes")
     for bar, created_at in bars:
-        quality_eligible = (
-            bar.interval == "1d"
-            and bar.quality_codes in DAILY_HISTORY_QUALITY_CODES
-            or bar.interval == "1h"
-            and bar.quality_codes
-            in ((), ("DERIVED_FROM_CANONICAL_30M",))
-            or bar.interval not in ("1d", "1h")
-            and not bar.quality_codes
-        )
+        if bar.interval == "1d":
+            quality_eligible = bar.quality_codes in DAILY_HISTORY_QUALITY_CODES
+        elif intraday_codes is not None:
+            quality_eligible = tuple(bar.quality_codes) in {
+                tuple(value) for value in intraday_codes.get(bar.interval, ())
+            }
+        else:
+            quality_eligible = (
+                bar.interval == "1h"
+                and bar.quality_codes
+                in ((), ("DERIVED_FROM_CANONICAL_30M",))
+                or bar.interval != "1h"
+                and not bar.quality_codes
+            )
         availability_eligible = (
             bar.availability_mode is BarAvailabilityMode.LIVE_OBSERVED
             or (

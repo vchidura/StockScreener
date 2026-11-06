@@ -1041,6 +1041,76 @@ def test_v2_portal_ready_proves_projection_but_publishes_into_the_input_ready_re
     assert published[0][1].receipt_id == input_row["receipt_id"]
     assert dashboards[0]["known_by"] == SEALED_KNOWN_BY
     assert dashboards[0]["allow_late_identity_continuity"] is False
+    # G85: the Dashboard reads through the runner's long-lived loader, not a full reload.
+    assert dashboards[0]["loader"] is environment.screening_loader
+
+
+
+@pytest.mark.parametrize("session_close", [False, True])
+def test_dashboard_is_skipped_when_not_due_except_at_the_close(monkeypatch, session_close):
+    """G85: a window that is not due publishes no Dashboard (the release carries the previous one forward); the
+    session close always builds it."""
+    published, dashboards = [], []
+    monkeypatch.setattr(
+        runners, "publish_realtime_portal_cycle_atomic",
+        lambda database, cycle, dashboard, **options: published.append((dashboard, options["session_close"])),
+    )
+    monkeypatch.setattr(
+        runners, "compute_realtime_dashboard", lambda database, **options: dashboards.append(options) or "dashboard",
+    )
+    monkeypatch.setattr(runners, "_is_session_close", lambda context: session_close)
+    context = _context("PORTAL_PUBLISH")
+    context = replace(context, plan=SimpleNamespace(
+        cohort_id=context.plan.cohort_id, session_date=SESSION, stage_catalog_version="stages_v2",
+    ))
+    portal_row = _receipt_row(context)
+    input_row = dict(_receipt_row(context), receipt_id=uuid4())
+    context = replace(context, database=_Database([portal_row, input_row]))
+    environment = RunnerEnvironment(None, dashboard_due=False)
+    environment.handoff.put(context.plan.cohort_id, NOW, "the-cycle")
+
+    assert runners.portal_publish_runner(environment)(context).state == "COMPLETE"
+    if session_close:
+        assert published == [("dashboard", True)] and len(dashboards) == 1
+    else:
+        assert published == [(None, False)] and dashboards == []
+
+def test_dashboard_loader_returns_what_the_full_load_returns(monkeypatch):
+    """G85: `compute_realtime_dashboard(loader=...)` loads through the loader with the full load's scope."""
+    from realtime import dashboard_repository
+
+    calls = []
+
+    class _Loader:
+        def load(self, cursor, **scope):
+            calls.append(scope)
+            return "inputs"
+
+    class _Transaction:
+        def __enter__(self):
+            return "cursor"
+
+        def __exit__(self, *exc):
+            return False
+
+    database = SimpleNamespace(transaction=lambda **_: _Transaction())
+    monkeypatch.setattr(dashboard_repository, "RealtimeProcessDatabase", SimpleNamespace)
+    monkeypatch.setattr(
+        dashboard_repository, "RealtimeDatabaseRole", SimpleNamespace(COMPUTE="COMPUTE"),
+    )
+    database.process_plan = SimpleNamespace(role="COMPUTE")
+    monkeypatch.setattr(dashboard_repository, "produce_realtime_dashboard", lambda inputs: ("dashboard", inputs))
+    monkeypatch.setattr(
+        dashboard_repository, "load_realtime_screening_input",
+        lambda *a, **k: pytest.fail("a loader was given; the full reload must not run"),
+    )
+
+    assert dashboard_repository.compute_realtime_dashboard(
+        database, loader=_Loader(), cohort_id="c", cutoff=NOW,
+    ) == ("dashboard", "inputs")
+    assert calls == [{
+        "include_portal_history": True, "include_strategy_action_details": True, "cohort_id": "c", "cutoff": NOW,
+    }]
 
 
 def test_publication_recovery_reads_both_receipts_from_the_explicit_source_window(monkeypatch):
