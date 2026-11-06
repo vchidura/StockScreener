@@ -120,3 +120,8 @@ docker-compose.options-p6.yml
 docker-compose.realtime-v2.yml
 docker-compose.realtime-v2.yml
 docs/agent-context/advanced-realtime.md
+
+# Personal Claude Code settings
+.claude/settings.local.json
+backend/tests/.artifacts/v3-review-corrections-products-20261103.xml
+backend/tests/.artifacts/v3-review-current-20261104.xml
