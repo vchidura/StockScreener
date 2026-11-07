@@ -62,6 +62,39 @@ Equity part of A3 doesn't depend on it.
 
 **Gate:** you review this section before building past the Monday scope.
 
+### 1.6 Benefit check and completeness audit (Nov 7, 21:00 UTC)
+
+The user asked, before building A2, A3 and A5 for Monday: does each step fix something that broke (not only in
+theory), and was anything marked done not actually done? Evidence is from live (read-only), the copy and the code.
+
+**Remaining steps against the measured failures**
+
+| Step | Failure it fixes | Evidence | Verdict |
+| --- | --- | --- | --- |
+| A2: missed work redone later | B20/G105: a MISSED window leaves a 5m hole for every member; the raw daily bar derives from 5m, so the close fails (`CLOSING_DAILY_INPUTS_PENDING`) and the completed-session recovery stops after one attempt. Nov 6 needed a manual fill (23:46) and a manually run fifth attempt (01:51 Nov 7) | G105 | Build for Monday |
+| A2: ingress plan revisions | B2: a blocked plan or quarantined journal ends streaming for the day; Nov 6 needed a database override | B1's trigger is fixed; the terminal rule remains | Build, scoped to an audited reopen |
+| A2: window attempts that supersede | B14b, B17: an Options window that failed once can never complete | All on P8 tables, which the P8-or-v3 decision may replace; Equity never needs a past window rerun (the next window publishes), except the close (row 1) | Defer until that decision |
+| A2: member outcomes table (052) | None open: outcomes are in the page manifests since fast-track item 2 | | With A2, low urgency |
+| A3 | None: the Equity cohort's configuration hash changed once in five sessions (Nov 6); model bundle and valuation never changed; all mid-session changes were code hotfixes (55 on Nov 5-7) and none needed a new cohort. Options configuration changes daily, but its A3 part waits for the P8-or-v3 decision (1.4) | live `rt.cohorts` | Defer until a configuration change needs it |
+| A5 | None: `/api/realtime/portal/current` already returns the current Equity and Options cohorts and a session-date-to-cohort map for each, and the frontend uses it; A5 would take `cohort_id` out of URLs (150 mentions in 32 files) | API access log, live response | Defer: a cleanup, not a fix |
+
+Open failures in no A-step: B3, B11, B9c (a service exits and crash-loops instead of waiting with a status); G103 (the
+close waits about 40 minutes for daily bars at 25 members, longer at 50); G84 and B25 (the raw daily close is the last
+trade before 16:00; Chg% mixes bases); G38 and B19 (no daily strategies producer; Strategies is 503 since Nov 4); B10
+(SPY/QQQ literals, before Options on 23).
+
+**Completeness audit**
+
+| Check | Result |
+| --- | --- |
+| Live images against commits | Every file in the 11 live images equals a committed version; no fix exists only in an image |
+| Committed code not in the images | G81 (`backend/options/`): the build copies `realtime`, `scripts`, `equity` and `tests` only. Its commit says live; the register says not deployed. Not in r52 either |
+| Frontend | The live f17 build's 96 source files equal the committed source |
+| Database | Live (with 049-051) equals a database built from the migrations alone: 1,351 statements each after normalizing how Postgres prints casts; no manual change, nothing missing |
+| One-off data fixes | G92 earnings for the 10 added stocks expires Nov 9 13:07 UTC: deferred by the user (N/A; alerts unaffected) |
+| Decided or planned for this weekend, not built | G75 Options coverage (user's decision Nov 6 18:50, `OPTIONS_COVERAGE_TASK.md` "for Monday"; not in the fast track); G37 Financials tab (`FINANCIALS_TAB_TASK.md`, design needs review); G84 |
+| Done items wired into the services | Fast-track items 2-7 run in the live entry points (the replays used the services' code; retention runs the statistics step every 300 s by default) |
+
 ### 1.5 Code footprint of the live services (measured Nov 7)
 
 Static import closure from the 21 entry points in `docker-compose.realtime-v2.yml` (every import statement, including
