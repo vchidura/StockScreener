@@ -212,10 +212,14 @@ CREATE INDEX idx_rt_bar_revision_key_end ON rt.bar_revisions (instrument_id, int
 
 ### 4.3 Selection policy `bar-selection-v1`
 
-Order for one key: the active provider tier first, then today's source precedence (`_current_source_precedence`),
-then the later `observed_at`, then the later `created_at`, then `bar_revision_id`. This is today's read order with
-the tier made explicit; today the tier is implied by which cohort a read starts from. The difference query (4.7) shows
-where it changes a pick.
+Order for one key: today's source precedence (`_current_source_precedence`), then the later `observed_at`, then the
+provider tier (Advanced over Developer, only between equal observations), then the later `created_at`, then
+`bar_revision_id`. This is today's read order with the tier as a tie-break.
+
+**Changed after the rehearsal (Nov 7).** The first version put the tier first. On a copy of live it changed 29 of
+200 published chart groups: Advanced provider weekly bars displaced the derived weekly bars the precedence table
+prefers (AAPL: 61 weekly bars, 32 with different values), and Advanced derivations displaced Developer REST 5m bars.
+With the order above, all 200 groups pick exactly what they were published with (4.10).
 
 ### 4.4 Writer
 
@@ -272,6 +276,45 @@ stays, unread, until Monday passes; `scripts/bind_realtime_v2_advanced_history.p
 Rebuilt with the new code: bridge, finalizer, preparation, Equity scheduler, detectors, stock alerts, Options roles
 that read Equity bars (window, flow, lifecycle), API. Tests: the existing suites of the 25 converted modules; new
 tests for the 5 read functions and the writer's head upsert; the read-boundary test; the replay of Nov 6 on a copy.
+
+### 4.10 Rehearsal on a copy of live (Nov 7) and the completion plan
+
+**Copy:** read-only dump of live at 18:02 UTC (1.08 GB, `backend/backups/stocks_db_backup_v3-g102-a4-rehearsal-*`),
+restored in 67 s into a throwaway Postgres 17 container on a private Docker network (no route to live): 2.8 GB,
+472,812 `rt.bar_current` rows, 762,063 revisions, migrations through 048.
+
+| Step | Result |
+| --- | --- |
+| Migrations 049-051 with `scripts/apply_realtime_migrations.py` (the live path) | Plan: only 049-051 pending, no checksum drift; apply 2 s |
+| Backfill (`scripts/backfill_realtime_v2_bar_head.py`, one transaction per instrument) | 26 instruments, 472,812 cohort rows to 432,684 head rows (40,128 keys duplicated across cohorts) in 17 s; slowest instrument 0.9 s |
+| Counts against the history plan (Monday: history through Nov 6) | 25 members x 9 interval groups: all match |
+| Ticker charts: today's read (cohort and history chain) vs the head, over every published chart group | 200 of 200 groups verify against their published lineage under both reads (after the 4.3 change) |
+| Screening: today's head verification vs the head | today 0 of 25 members verify (G83 reproduced); head 25 of 25 |
+| Writer on a real database | `test_bar_head_v2_db.py` and the 19 database suites that write or read bars, run against the throwaway server |
+
+**What remains.** Outside `equity_bar_repository.py`, 38 runtime modules (about 75 statements) name the bar tables,
+23 modules carry cohort history-scope parameters (some for manifest identity, not bars), and 30 scripts read the bar
+tables. `test_bar_head.py` lists the 38 modules; the list may only shrink, and no new module may query the tables.
+Conversion order, each group tested and replayed on the copy before the next:
+
+1. **Page reads** (ticker charts, screening verification, lineage heads, Stock Alerts): `load_bar_heads_cursor` /
+   `load_bar_groups_cursor`. Removes G83 from the portal.
+2. **Window inputs** (screening loader and delta loader, Equity history, ticker projection inputs, portal projection
+   worker, Stock Alerts and detectors): `load_bar_range_cursor` with `as_of`. Gate: a replay of Nov 6 windows on the
+   copy gives the same input hashes through the old and the new loaders, or every difference is explained.
+3. **Coverage, repair and workers** (session-close coverage, gap repair (B23's query), recent repair, finalizer,
+   derivation, preparation, backfill source, bar drain, journal check (B24's query), session recovery, stage runners).
+4. **Options readers of Equity bars** (Equity input, native loader, OS1/OS2, P8 production, projection, reference
+   producer, v3 history).
+5. **Retire history scopes**: remove the scope parameters, stop `bind_realtime_v2_advanced_history.py` at activation;
+   `rt.cohort_history_bindings` stays unread for a week.
+6. **Scripts** move after the runtime, then `rt.bar_current` is dropped.
+
+**Going live (in place).** (a) Migration 051 and the head writer (every bar writer calls
+`persist_realtime_equity_bars_cursor`, so the bridge, finalizer, derivation, repair and preparation images), then
+(b) the backfill and the counts and differences checks on live (seconds to minutes), then (c) each converted group.
+(a) and (b) are additive: no reader uses the head until (c). Recommended timing: (a) and (b) Monday night after the
+live test, not in Sunday's fast-track deploy, so Monday tests only what was planned.
 
 ## 5. A1: onboarding, statistics and the bridge query
 

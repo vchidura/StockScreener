@@ -284,6 +284,8 @@ RELATIONS: dict[str, Relation] = {
     "rt.bar_catalog": _r("equity", "HISTORY_PLAN", append=True, api=True),
     "rt.bar_revisions": _r("equity", "HISTORY_PLAN", append=True, partitioned=True, api=True),
     "rt.bar_current": _r("equity", "HISTORY_PLAN", mutable=True, api=True),
+    # G102 A4: one current bar per instrument, interval, bar start, scope and basis (no cohort).
+    "rt.bar_head": _r("equity", "HISTORY_PLAN", mutable=True, api=True),
     "rt.session_close_audits": _r("equity", "KEPT_3M", append=True, api=True),
     "rt.session_close_anomalies": _r("equity", "KEPT_3M", append=True, api=True),
     "rt.session_close_current": _r("equity", "BOUNDED", mutable=True, api=True),

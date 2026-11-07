@@ -28,6 +28,10 @@ def _values_executor(cursor, statement, rows, *, page_size):
 
 def _batch_executor(cursor, statement, rows, *, page_size):
     assert page_size == 100
+    if statement.startswith("INSERT INTO rt.bar_head"):  # G102 A4: the cohort-free head, same transaction
+        cursor.recorded_head_rows = tuple(rows)
+        cursor.recorded_head_statement = statement
+        return
     cursor.recorded_current_rows = tuple(rows)
     cursor.recorded_current_statement = statement
 

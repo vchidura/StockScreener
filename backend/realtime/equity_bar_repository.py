@@ -37,6 +37,56 @@ def _current_source_precedence(alias: str) -> str:
     )
 
 
+# G102 A4 (design 4.3): one current bar per (instrument, interval, bar start, session scope, basis) across every
+# writer, in today's read order: the source precedence above, then the later observation, then the provider tier
+# (real-time Advanced over delayed Developer, only between equal observations), then the later write, then the
+# revision id. The A4 rehearsal on a copy of live (Nov 7) showed that putting the tier first overrides the precedence
+# table: Advanced provider weekly bars displaced the derived weekly bars it prefers (32 of 61 values differed for
+# AAPL).
+BAR_SELECTION_POLICY = "bar-selection-v1"
+BAR_KEY_COLUMNS = ("instrument_id", "interval", "bar_start", "session_scope", "adjustment_basis")
+_HEAD_VALUE_COLUMNS = (
+    "bar_revision_id", "provider_tier", "source_kind", "session_date", "bar_end", "observed_at", "is_final",
+    "open_price", "high_price", "low_price", "close_price", "volume", "vwap", "transaction_count", "payload_sha256",
+)
+
+
+def _provider_tier_rank(alias: str) -> str:
+    return f"CASE WHEN {alias}.provider_tier='MASSIVE_ADVANCED' THEN 2 ELSE 1 END"
+
+
+def _head_replaces(new: str, old: str) -> str:
+    """True when revision `new` wins over `old` for the same key under `bar-selection-v1`. A write is always the
+    later one, so between equal observations and tiers the new write wins, as `rt.bar_current` does."""
+    return (
+        f"({_current_source_precedence(new)} > {_current_source_precedence(old)} "
+        f"OR ({_current_source_precedence(new)} = {_current_source_precedence(old)} "
+        f"AND ({old}.observed_at < {new}.observed_at OR ({old}.observed_at = {new}.observed_at "
+        f"AND {_provider_tier_rank(new)} >= {_provider_tier_rank(old)}))))"
+    )
+
+
+def _selection_order(alias: str) -> str:
+    """ORDER BY terms that put the `bar-selection-v1` winner first among revisions of one key."""
+    return (
+        f"{_current_source_precedence(alias)} DESC,{alias}.observed_at DESC,{_provider_tier_rank(alias)} DESC,"
+        f"{alias}.created_at DESC,{alias}.bar_revision_id"
+    )
+
+
+_HEAD_INSERT = (
+    "INSERT INTO rt.bar_head (" + ",".join((*BAR_KEY_COLUMNS, *_HEAD_VALUE_COLUMNS)) + ","
+    "selection_policy,written_by_cohort_id) "
+)
+_HEAD_CONFLICT = (
+    "ON CONFLICT (" + ",".join(BAR_KEY_COLUMNS) + ") DO UPDATE SET "
+    + ",".join(f"{column}=EXCLUDED.{column}" for column in _HEAD_VALUE_COLUMNS if column != "bar_end")
+    + ",selection_policy=EXCLUDED.selection_policy,written_by_cohort_id=EXCLUDED.written_by_cohort_id,"
+    "updated_at=clock_timestamp() WHERE rt.bar_head.bar_end=EXCLUDED.bar_end AND "
+    + _head_replaces("EXCLUDED", "rt.bar_head")
+)
+
+
 def persist_realtime_equity_bars_cursor(
     cursor,
     facts: Sequence[RealtimeEquityBarFact],
@@ -247,6 +297,62 @@ def persist_realtime_equity_bars_cursor(
         ],
         page_size=BAR_BATCH_PAGE_SIZE,
     )
+    # G102 A4 (design 4.4): the same transaction keeps the cohort-free head. rt.bar_current stays written during
+    # the transition (design section 2) and is retired once every reader uses the head.
+    batch_executor(
+        cursor,
+        _HEAD_INSERT + "VALUES (" + ",".join(["%s"] * (len(BAR_KEY_COLUMNS) + len(_HEAD_VALUE_COLUMNS) + 2))
+        + ") " + _HEAD_CONFLICT,
+        [
+            (
+                fact.instrument_id,
+                fact.revision.interval,
+                fact.revision.bar_start,
+                fact.revision.session_scope.value,
+                "ADJUSTED" if fact.revision.adjusted else "RAW_UNADJUSTED",
+                str(fact.revision.bar_revision_id),
+                fact.provider_tier.value,
+                fact.revision.source_kind.value,
+                fact.revision.session_date,
+                fact.revision.bar_end,
+                stored_catalog[str(fact.revision.bar_revision_id)][6],
+                fact.revision.is_final,
+                fact.revision.open_price,
+                fact.revision.high_price,
+                fact.revision.low_price,
+                fact.revision.close_price,
+                fact.revision.volume,
+                fact.revision.vwap,
+                fact.revision.transaction_count,
+                fact.revision.payload_sha256,
+                BAR_SELECTION_POLICY,
+                str(fact.cohort_id),
+            )
+            for fact in rows
+        ],
+        page_size=BAR_BATCH_PAGE_SIZE,
+    )
+
+
+def backfill_bar_head_cursor(cursor, *, instrument_id: int) -> int:
+    """G102 A4 (design 4.7 step 1): fill one instrument's head from every cohort's current bars, choosing across
+    cohorts by `bar-selection-v1`. Idempotent and resumable per instrument (existing head rows are kept: the writer
+    already chose them by the same policy). Returns the rows inserted."""
+    cursor.execute(
+        _HEAD_INSERT
+        + "SELECT DISTINCT ON (revision.instrument_id,revision.interval,revision.bar_start,"
+        "revision.session_scope,revision.adjustment_basis) "
+        + ",".join(f"revision.{column}" for column in (*BAR_KEY_COLUMNS, *_HEAD_VALUE_COLUMNS))
+        + ",%s,revision.cohort_id FROM rt.bar_current AS cur "
+        "JOIN rt.bar_revisions AS revision ON revision.bar_revision_id=cur.bar_revision_id "
+        "AND revision.observed_at=cur.observed_at "
+        "WHERE cur.instrument_id=%s "
+        "ORDER BY revision.instrument_id,revision.interval,revision.bar_start,revision.session_scope,"
+        "revision.adjustment_basis," + _selection_order("revision") + " "
+        "ON CONFLICT DO NOTHING",
+        (BAR_SELECTION_POLICY, instrument_id),
+    )
+    return max(0, int(getattr(cursor, "rowcount", 0) or 0))
 
 
 def persist_realtime_equity_bars(
@@ -438,4 +544,165 @@ def load_current_bar_heads_cursor(
             ("security_id", "interval", "adjustment_basis", "bar_revision_id", "bar_start", "bar_end",
              "payload_sha256", *(("source_revision_ids",) if with_sources else ())), fetched))
         result[(row["security_id"], f"{row['interval']}:{row['adjustment_basis']}")].append(row)
+    return result
+
+_HEAD_ROW_COLUMNS = (
+    "instrument_id", "interval", "adjustment_basis", "bar_revision_id", "bar_start", "bar_end", "session_date",
+    "observed_at", "source_kind", "provider_tier", "open_price", "high_price", "low_price", "close_price", "volume",
+    "vwap", "transaction_count", "payload_sha256",
+)
+
+
+def _head_rows_sql(target_sql: str, *, with_sources: bool, as_of: datetime | None) -> str:
+    """The final bars of every target range from `rt.bar_head`; with `as_of` (a rerun's cutoff, design 4.6), a key
+    whose head was observed later is read from `rt.bar_revisions` as it stood then (same selection order), and a
+    key first observed later is left out. `target_sql` must expose instrument_id, bar_interval, basis, scope,
+    first_bar_start, last_bar_end and key_text."""
+    columns = ",".join(f"chosen.{column}" for column in _HEAD_ROW_COLUMNS)
+    sources = ",chosen.source_revision_ids" if with_sources else ""
+    head = (
+        "SELECT target.key_text,head.* FROM " + target_sql + " "
+        "JOIN rt.bar_head AS head ON head.instrument_id=target.instrument_id "
+        "AND head.interval=target.bar_interval AND head.adjustment_basis=target.basis "
+        "AND head.session_scope=target.scope AND head.bar_start>=target.first_bar_start "
+        "AND head.bar_end<=target.last_bar_end"
+    )
+    current = (
+        "SELECT candidate.key_text," + ",".join(f"candidate.{column}" for column in _HEAD_ROW_COLUMNS)
+        + ",candidate.is_final"
+        + (",revision.source_revision_ids" if with_sources else "")
+        + " FROM candidate"
+        + (
+            " JOIN rt.bar_revisions AS revision ON revision.bar_revision_id=candidate.bar_revision_id "
+            "AND revision.observed_at=candidate.observed_at"
+            if with_sources else ""
+        )
+        + (" WHERE candidate.observed_at<=%(as_of)s" if as_of is not None else "")
+    )
+    corrected = "" if as_of is None else (
+        " UNION ALL SELECT candidate.key_text,"
+        + ",".join(f"revision.{column}" for column in _HEAD_ROW_COLUMNS)
+        + ",revision.is_final" + (",revision.source_revision_ids" if with_sources else "")
+        + " FROM candidate CROSS JOIN LATERAL (SELECT revision.* FROM rt.bar_revisions AS revision "
+        "WHERE revision.instrument_id=candidate.instrument_id AND revision.interval=candidate.interval "
+        "AND revision.bar_end=candidate.bar_end AND revision.bar_start=candidate.bar_start "
+        "AND revision.session_scope=candidate.session_scope "
+        "AND revision.adjustment_basis=candidate.adjustment_basis AND revision.observed_at<=%(as_of)s "
+        "ORDER BY " + _selection_order("revision") + " LIMIT 1) AS revision "
+        "WHERE candidate.observed_at>%(as_of)s"
+    )
+    return (
+        "WITH candidate AS (" + head + "), chosen AS (" + current + corrected + ") "
+        "SELECT chosen.key_text," + columns + sources + " FROM chosen WHERE chosen.is_final "
+        "ORDER BY chosen.key_text,chosen.interval,chosen.adjustment_basis,chosen.bar_start"
+    )
+
+
+def _bar_group(key: str) -> tuple[str, str]:
+    interval, _, basis = key.partition(":")
+    if interval not in _BAR_INTERVALS or basis not in _BAR_BASES:
+        raise ValueError("bar group key must be interval:basis")
+    return interval, basis
+
+
+def load_bar_heads_cursor(
+    cursor,
+    *,
+    targets: Sequence[tuple[int, UUID, str, str, datetime, datetime]],
+    with_sources: bool = False,
+    as_of: datetime | None = None,
+) -> dict[tuple[str, str], list[dict]]:
+    """G102 A4: `load_current_bar_heads_cursor` without the cohort, the tier or history bindings.
+
+    `targets` are (instrument id, security id, ticker, group key `interval:basis`, first bar start, last bar end).
+    The result maps (security id, group key) to the group's final RTH bars ordered by bar start, each with the
+    revision id and payload hash a lineage recomputation needs and the OHLCV values (and, with `with_sources`,
+    `source_revision_ids`). The instrument must belong to the security (checked against `rt.instruments`)."""
+    result: dict[tuple[str, str], list[dict]] = {}
+    if not targets:
+        return result
+    instruments, securities, keys, intervals, bases, firsts, lasts = ([] for _ in range(7))
+    for instrument_id, security_id, _ticker, key, first_bar_start, last_bar_end in targets:
+        interval, basis = _bar_group(key)
+        instruments.append(int(instrument_id))
+        securities.append(str(security_id))
+        keys.append(f"{security_id}|{key}")
+        intervals.append(interval)
+        bases.append(basis)
+        firsts.append(first_bar_start)
+        lasts.append(last_bar_end)
+        result[(str(security_id), key)] = []
+    target_sql = (
+        "(SELECT target.*,'RTH'::varchar AS scope FROM unnest(%(instruments)s::bigint[],%(securities)s::uuid[],"
+        "%(keys)s::text[],%(intervals)s::text[],%(bases)s::text[],%(firsts)s::timestamptz[],"
+        "%(lasts)s::timestamptz[]) AS target(instrument_id,security_id,key_text,bar_interval,basis,"
+        "first_bar_start,last_bar_end) JOIN rt.instruments AS instrument "
+        "ON instrument.instrument_id=target.instrument_id AND instrument.security_id=target.security_id) AS target"
+    )
+    cursor.execute(
+        _head_rows_sql(target_sql, with_sources=with_sources, as_of=as_of),
+        dict(instruments=instruments, securities=securities, keys=keys, intervals=intervals, bases=bases,
+             firsts=firsts, lasts=lasts, as_of=as_of),
+    )
+    names = ("key_text", *_HEAD_ROW_COLUMNS, *(("source_revision_ids",) if with_sources else ()))
+    for fetched in cursor.fetchall():
+        row = dict(fetched) if isinstance(fetched, Mapping) else dict(zip(names, fetched))
+        security_id, _, key = row.pop("key_text").partition("|")
+        result[(security_id, key)].append(row)
+    return result
+
+
+def load_bar_groups_cursor(
+    cursor,
+    *,
+    instrument_id: int,
+    security_id: UUID,
+    groups: Mapping[str, tuple[datetime, datetime]],
+    as_of: datetime | None = None,
+) -> dict[str, list[dict]]:
+    """G102 A4: `load_current_bar_groups_cursor` for one instrument without the cohort, the tier or history
+    scopes: per group key `interval:basis`, the final RTH bars of its (first bar start, last bar end) range."""
+    if not groups:
+        return {}
+    loaded = load_bar_heads_cursor(
+        cursor,
+        targets=tuple((instrument_id, security_id, "", key, first, last) for key, (first, last) in groups.items()),
+        as_of=as_of,
+    )
+    return {key: loaded[(str(security_id), key)] for key in groups}
+
+
+def load_bar_range_cursor(
+    cursor,
+    *,
+    instrument_ids: Sequence[int],
+    interval: str,
+    basis: str,
+    start: datetime,
+    end: datetime,
+    scope: str = "RTH",
+    as_of: datetime | None = None,
+) -> dict[int, list[dict]]:
+    """G102 A4: the final bars of one interval and basis for many instruments over [start, end), from the head
+    (point in time with `as_of`). Maps instrument id to its bars ordered by bar start."""
+    _bar_group(f"{interval}:{basis}")
+    if scope not in {"RTH", "EXTENDED", "FULL_DAY"}:
+        raise ValueError("bar session scope is invalid")
+    ids = sorted({int(value) for value in instrument_ids})
+    result: dict[int, list[dict]] = {value: [] for value in ids}
+    if not ids:
+        return result
+    target_sql = (
+        "(SELECT target.instrument_id,target.instrument_id::text AS key_text,%(interval)s::varchar AS bar_interval,"
+        "%(basis)s::varchar AS basis,%(scope)s::varchar AS scope,%(start)s::timestamptz AS first_bar_start,"
+        "%(end)s::timestamptz AS last_bar_end FROM unnest(%(ids)s::bigint[]) AS target(instrument_id)) AS target"
+    )
+    cursor.execute(
+        _head_rows_sql(target_sql, with_sources=False, as_of=as_of),
+        dict(ids=ids, interval=interval, basis=basis, scope=scope, start=start, end=end, as_of=as_of),
+    )
+    for fetched in cursor.fetchall():
+        row = dict(fetched) if isinstance(fetched, Mapping) else dict(zip(("key_text", *_HEAD_ROW_COLUMNS), fetched))
+        row.pop("key_text")
+        result[int(row["instrument_id"])].append(row)
     return result
