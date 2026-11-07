@@ -168,7 +168,7 @@ keeps all 4 contracts from their first trigger: NVDA 192.5C one row with 24 trad
   `advanced_options_p8_production.py`, `advanced_options_v3_history.py`, `equity_bar_repository.py`). 18 scripts read
   it too.
 
-### 4.2 Schema (migration `049_g102_bar_head.sql`)
+### 4.2 Schema (migration `051_g102_bar_head.sql`)
 
 ```sql
 CREATE TABLE rt.bar_head (
@@ -291,6 +291,19 @@ the same as the Nov 6 script's, but nothing is deleted.
 
 **Monday use:** this is what lets the Options-on-23 revision replace the Nov 9 preparation that opened with 9.
 
+**Built (Nov 7), simpler than the outline:** migration 045 already gave preparation sessions `expiration_state`
+(`EXPIRED` or `SUPERSEDED`), `expired_at` and `expiration_reason`, used by the supersede of an *older* date. So
+migration `049_g102_options_preparation_supersede.sql` only replaces `UNIQUE(session_date)` (live name
+`advanced_options_preparation_sessions_session_date_key`, checked) with a unique index on `session_date WHERE
+expiration_state IS NULL`; no new columns. The reconcile (`_supersede_date_preparation_cursor`, before any write)
+marks another revision's never-activated, not-READY preparation for the date SUPERSEDED with reason
+`SUPERSEDED_BY_REVISION:<new>` and blocks its open work, as the older-date supersede does; nothing is deleted. A READY
+or activated preparation holds the date: the reconcile returns `WAITING_DESIRED` with
+`OPTIONS_DATE_HELD_BY_REVISION:<old>:<status>` and writes nothing (today the ACTIVE path would also have hit the
+constraint). Live now: the Nov 9 preparation (revision `37d20e26`, Options on 9) is PREPARING, so an Options-on-23
+revision for Nov 9 supersedes it until it is READY; after that it waits for Nov 10. Tests: 11 new; lifecycle suites no
+new failure. The writes were planned with EXPLAIN against the live schema (`runner/g102_sql_explain.py`).
+
 ### 5.2 G91: prepare only what changed
 
 **Today:** `_persist_equity_preparation_work_cursor` (`advanced_realtime_desired_state_repository.py`) creates work
@@ -302,6 +315,18 @@ with the same security, member kind and identical stage target (`_equity_prepara
 history policy). If found, insert the new revision's readiness as READY with reason `CARRIED_FROM:<revision>` and
 create no work. In-progress work for an identical target is reused the same way. Prepare only members that are new or
 whose target changed.
+
+**Built (Nov 7), adjusted:** a READY readiness row may not carry reasons (table check), so the origin goes into the
+member binding's `source_lineage` (`carried_from`). Two conditions were added because preparation writes into the
+revision's source cohort: the earlier revision must have the same source cohort and effective session (so its data is
+where the new revision reads, and the targets match). `_carried_equity_preparations_cursor`: a member whose five
+stages are COMPLETE on identical targets in such a revision is READY at once with no work (completed stages are the
+evidence; the earlier readiness is not required). `_resume_equity_preparation_work_cursor`: the new revision's PENDING
+work takes the earlier progress per stage on an identical target (COMPLETE stays COMPLETE, RUNNING or RETRY resumes from
+its watermark as RETRY), the same copy a promoted rollover revision already makes; claims take only the current
+revision's work, so without this the earlier progress was lost. FAILED and BLOCKED stages start again. Tests: 3 new;
+desired-state and preparation suites no new failure; both statements checked against the live schema (the current
+revision `37d20e26` would carry nothing today: no earlier revision shares its source cohort and date).
 
 ### 5.3 G99: statistics step in the retention worker
 
@@ -322,7 +347,7 @@ whose target changed.
 **Today:** `advanced_journal_replay.py:304` runs `SELECT COALESCE(MAX(source_offset),0)` on `rt.bar_revisions` every
 tick with no index and no partition bound (32% of database time, up to 2.8 s per call).
 
-**Change:** partial index (in migration 049)
+**Change:** partial index (migration `050`, on its own)
 `CREATE INDEX idx_rt_bar_revision_journal_offset ON rt.bar_revisions (journal_generation, stream_session_id,
 source_offset) WHERE stream_session_id IS NOT NULL`, and the query bounded by `observed_at >=` the stream session's
 start, so it reads only the current partition.
@@ -340,7 +365,7 @@ soon as any member failed (`materialization_jobs.py:778`).
   page rows carry a label and its last good values; the other tickers publish.
 - **Barrier verdict:** `PARTIAL` when no member is pending, at least one completed and some failed; `FAILED` only
   when none completed. Callers treat `PARTIAL` like `COMPLETE` and pass the failed members on as labels.
-- **Record (migration `051_g102_member_outcomes.sql`):** `rt.window_member_outcomes (window_id, stage_id, member_key,
+- **Record (migration `052_g102_member_outcomes.sql`, not in v1):** `rt.window_member_outcomes (window_id, stage_id, member_key,
   outcome, reason_codes, recorded_at)`, primary key `(window_id, stage_id, member_key)`; the `rt.job_barriers` state
   check gains `PARTIAL`.
 - **Monitoring:** the failure watcher reports DEGRADED tickers per window instead of a failed window.
@@ -439,8 +464,8 @@ stop, and the P8 roles stop within their bound. Fallback: close the row by hand,
 
 **Fast track (user, Nov 7; plan section 15):** the weekend builds B14a, section 6 (per-ticker outcomes), flags instead
 of 503 (6.1), section 3 (A0), 5.1-5.4 and the G94 lookback, deployed Sunday night.
-Migrations 050 and 051 go in this weekend; the B24 index from 049 goes in on its own; the rest of 049 and section 4
-(bars without the cohort) move to Thursday-Friday. Items without detail here (B14a, flags instead of 503, G94) get a
+Migrations go in contiguously (the catalog requires it): 049 (G90 supersede) and 050 (B24 index) this weekend; 051
+(section 4, bars without the cohort) Thursday-Friday; 052 (member outcomes) only if v2 needs it. Items without detail here (B14a, flags instead of 503, G94) get a
 short design note in this file before code (flags instead of 503: 6.1).
 
 **Saturday:** B14a; section 6; flags instead of 503; restore one copy of live for the weekend's tests.

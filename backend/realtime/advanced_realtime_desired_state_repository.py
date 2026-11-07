@@ -734,6 +734,12 @@ def _persist_desired_members_cursor(
         }
     else:
         security_revision_ids = {}
+    carried = _carried_equity_preparations_cursor(
+        cursor,
+        revision,
+        security_ids=security_ids,
+        source_base=source_base,
+    )
     for member in revision.members:
         security_id = security_ids.get(member.ticker)
         intent_id = desired_member_intent_id(
@@ -767,6 +773,7 @@ def _persist_desired_members_cursor(
                 "security_revision_id": security_revision_id,
                 "instrument_id": instrument_id,
             })
+            origin = carried.get((security_id, member.kind.value))
             binding_values.append((
                 str(intent_id),
                 str(revision.revision_id),
@@ -774,7 +781,11 @@ def _persist_desired_members_cursor(
                 str(security_revision_id),
                 instrument_id,
                 identity_sha256,
-                Json({"source": "STORED_REFERENCE"}),
+                Json(
+                    {"source": "STORED_REFERENCE"}
+                    if origin is None
+                    else {"source": "STORED_REFERENCE", "carried_from": origin}
+                ),
                 checked_at,
             ))
         else:
@@ -795,6 +806,7 @@ def _persist_desired_members_cursor(
                 and security_id in source_underlyings
                 and security_id in ready_option_securities
             )
+            or (resolved and (security_id, member.kind.value) in carried)
         )
         readiness_status = (
             MemberPreparationStatus.READY.value
@@ -879,7 +891,64 @@ def _persist_desired_members_cursor(
         instrument_ids=instrument_ids,
         source_base=source_base,
         checked_at=checked_at,
+        carried=carried,
     )
+
+
+def _carried_equity_preparations_cursor(
+    cursor,
+    revision: DesiredStateRevision,
+    *,
+    security_ids: dict[str, UUID],
+    source_base: set[UUID],
+) -> dict[tuple[UUID, str], str]:
+    """G102 design 5.2 (G91): prepare only what changed.
+
+    A list change used to re-run all five stages for every new member (about 450 provider requests and 1.5 hours on
+    Nov 6). A member an earlier revision already prepared is READY for this one, with no work, when that revision has
+    the same source cohort (preparation writes into the source cohort, so the data is where this revision reads it)
+    and the same effective session, and its five stages are COMPLETE with targets identical to this revision's.
+    Returns (security, member kind) -> the revision whose work prepared it; that origin is recorded in the binding's
+    `source_lineage` (a READY readiness row carries no reasons). A member only partly prepared gets new work that
+    resumes from the earlier progress (`_resume_equity_preparation_work_cursor`)."""
+    wanted = {
+        (security_ids[member.ticker], member.kind.value)
+        for member in revision.members
+        if member.enabled
+        and member.kind in {DesiredMemberKind.EQUITY, DesiredMemberKind.SECTOR_ETF}
+        and member.ticker in security_ids
+        and security_ids[member.ticker] not in source_base
+    }
+    if not wanted:
+        return {}
+    cursor.execute(
+        "SELECT work.revision_id::text,work.security_id::text,work.member_kind,"
+        "work.stage,work.status,work.target "
+        "FROM rt.realtime_equity_preparation_work AS work "
+        "JOIN rt.realtime_desired_revisions AS earlier "
+        "ON earlier.revision_id=work.revision_id "
+        "WHERE work.security_id=ANY(%s::uuid[]) AND work.revision_id<>%s "
+        "AND earlier.source_cohort_id=%s AND earlier.effective_session_date=%s "
+        "ORDER BY work.revision_id,work.security_id,work.member_kind,work.stage",
+        (
+            sorted({str(security_id) for security_id, _kind in wanted}),
+            str(revision.revision_id),
+            str(revision.source_cohort_id),
+            revision.effective_session_date,
+        ),
+    )
+    targets = {stage: target for stage, _order, target in _equity_preparation_targets(revision)}
+    stages: dict[tuple[str, UUID, str], dict[str, bool]] = {}
+    for row in cursor.fetchall():
+        key = (str(row[0]), UUID(str(row[1])), str(row[2]))
+        stages.setdefault(key, {})[str(row[3])] = (
+            str(row[4]) == "COMPLETE" and row[5] == targets.get(str(row[3]))
+        )
+    carried: dict[tuple[UUID, str], str] = {}
+    for (origin, security_id, kind), done in sorted(stages.items(), key=lambda item: item[0][0]):
+        if (security_id, kind) in wanted and set(done) == set(targets) and all(done.values()):
+            carried.setdefault((security_id, kind), origin)
+    return carried
 
 
 def _equity_preparation_targets(
@@ -1008,6 +1077,7 @@ def _persist_equity_preparation_work_cursor(
     instrument_ids: dict[str, int],
     source_base: set[UUID],
     checked_at: datetime,
+    carried: dict[tuple[UUID, str], str] | None = None,
 ) -> None:
     warming = tuple(
         member
@@ -1021,6 +1091,7 @@ def _persist_equity_preparation_work_cursor(
             member.ticker not in security_ids
             or security_ids[member.ticker] not in source_base
         )
+        and (security_ids.get(member.ticker), member.kind.value) not in (carried or {})
     )
     if not warming:
         return
@@ -1057,6 +1128,60 @@ def _persist_equity_preparation_work_cursor(
             for stage, stage_order, target in targets
         ],
         page_size=_DESIRED_MEMBER_BATCH_SIZE,
+    )
+    _resume_equity_preparation_work_cursor(
+        cursor,
+        revision,
+        security_ids=tuple(
+            security_ids[member.ticker] for member in warming if member.ticker in security_ids
+        ),
+    )
+
+
+def _resume_equity_preparation_work_cursor(
+    cursor,
+    revision: DesiredStateRevision,
+    *,
+    security_ids: tuple[UUID, ...],
+) -> None:
+    """G102 design 5.2 (G91): new work resumes where an earlier revision of the same source cohort and effective
+    session left the same stage on an identical target: COMPLETE stays COMPLETE, RUNNING or RETRY resumes from its
+    watermark as RETRY (as a promoted rollover revision does). Claims take only the current revision's work, so the
+    earlier progress would otherwise be lost. FAILED and BLOCKED stages start again."""
+    if not security_ids:
+        return
+    cursor.execute(
+        "UPDATE rt.realtime_equity_preparation_work AS target "
+        "SET status=CASE WHEN source.status='RUNNING' THEN 'RETRY' ELSE source.status END,"
+        "watermark=source.watermark,coverage=source.coverage,"
+        "source_lineage=source.source_lineage"
+        "||jsonb_build_object('carried_from_revision',source.revision_id::text),"
+        "attempts=source.attempts,failure_streak=source.failure_streak,"
+        "next_retry_at=source.next_retry_at,lease_owner=NULL,"
+        "lease_epoch=source.lease_epoch,lease_until=NULL,"
+        "terminal_reason=source.terminal_reason,blocked_reason=source.blocked_reason,"
+        "provider_request_count=source.provider_request_count,"
+        "response_bytes=source.response_bytes,"
+        "completed_at=source.completed_at,updated_at=clock_timestamp() "
+        "FROM (SELECT DISTINCT ON (work.security_id,work.member_kind,work.stage) work.* "
+        "FROM rt.realtime_equity_preparation_work AS work "
+        "JOIN rt.realtime_desired_revisions AS earlier ON earlier.revision_id=work.revision_id "
+        "WHERE work.revision_id<>%s AND earlier.source_cohort_id=%s "
+        "AND earlier.effective_session_date=%s AND work.security_id=ANY(%s::uuid[]) "
+        "AND work.status IN ('COMPLETE','RUNNING','RETRY') "
+        "ORDER BY work.security_id,work.member_kind,work.stage,"
+        "(work.status='COMPLETE') DESC,work.updated_at DESC) AS source "
+        "WHERE target.revision_id=%s AND target.status='PENDING' "
+        "AND target.security_id=source.security_id "
+        "AND target.member_kind=source.member_kind "
+        "AND target.stage=source.stage AND target.target=source.target",
+        (
+            str(revision.revision_id),
+            str(revision.source_cohort_id),
+            revision.effective_session_date,
+            sorted(str(value) for value in security_ids),
+            str(revision.revision_id),
+        ),
     )
 
 

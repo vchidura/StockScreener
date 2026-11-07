@@ -1546,6 +1546,59 @@ def run_advanced_options_preparation_cycle(
     }
 
 
+def _supersede_date_preparation_cursor(
+    cursor,
+    *,
+    revision_id: UUID,
+    session_date: date,
+    checked_at: datetime,
+) -> str | None:
+    """G102 design 5.1 (G90): one current Options preparation per session date (migration 049).
+
+    When another revision's preparation for the date was never activated and is not READY, it is marked SUPERSEDED
+    (its open work BLOCKED, as `expire_obsolete_advanced_options_preparation_cursor` does for an older date; nothing
+    is deleted) and None is returned, so this revision prepares the date. A READY or activated preparation is never
+    superseded: the date is held, the reason code is returned, and this revision waits for its next date."""
+    cursor.execute(
+        "SELECT revision_id::text,status,activated_session_binding_id "
+        "FROM rt.advanced_options_preparation_sessions "
+        "WHERE session_date=%s AND expiration_state IS NULL "
+        "AND revision_id<>%s FOR UPDATE",
+        (session_date, str(revision_id)),
+    )
+    current = cursor.fetchone()
+    if current is None:
+        return None
+    other, status, binding = str(current[0]), str(current[1]), current[2]
+    if binding is not None or status in {"READY", "ACTIVE"}:
+        return f"OPTIONS_DATE_HELD_BY_REVISION:{other}:{status}"
+    reason = f"SUPERSEDED_BY_REVISION:{revision_id}"
+    cursor.execute(
+        "UPDATE rt.advanced_options_preparation_work SET "
+        "status='BLOCKED',lease_owner=NULL,lease_until=NULL,"
+        "retry_reason=NULL,terminal_reason=NULL,"
+        "blocked_reason=%s,completed_at=%s,"
+        "expiration_state=%s,expired_at=%s,"
+        "expiration_reason=%s,updated_at=clock_timestamp() "
+        "WHERE revision_id=%s "
+        "AND status IN ('PENDING','RUNNING','RETRY')",
+        ("SUPERSEDED", checked_at, "SUPERSEDED", checked_at, reason, other),
+    )
+    cursor.execute(
+        "UPDATE rt.advanced_options_preparation_sessions SET "
+        "status='DEGRADED',next_retry_at=%s,checked_at=%s,"
+        "last_error=%s,expiration_state=%s,expired_at=%s,"
+        "expiration_reason=%s,updated_at=clock_timestamp() "
+        "WHERE revision_id=%s "
+        "AND activated_session_binding_id IS NULL "
+        "AND expiration_state IS NULL",
+        (checked_at, checked_at, reason, "SUPERSEDED", checked_at, reason, other),
+    )
+    if cursor.rowcount != 1:
+        raise ValueError("Options preparation supersede lost its scope")
+    return None
+
+
 def reconcile_advanced_options_lifecycle_cursor(
     cursor,
     *,
@@ -1597,6 +1650,24 @@ def reconcile_advanced_options_lifecycle_cursor(
                 f"{expired_session[0]}:"
                 f"{expired_session[2]}",
             ),
+        )
+    held = _supersede_date_preparation_cursor(
+        cursor,
+        revision_id=revision.revision_id,
+        session_date=target_session_date,
+        checked_at=checked,
+    )
+    if held is not None:
+        return AdvancedOptionsLifecycleStatus(
+            revision.revision_id,
+            target_session_date,
+            "WAITING_DESIRED",
+            "EQUITY_READINESS",
+            underlyings,
+            None,
+            None,
+            None,
+            (held,),
         )
     preparations = load_desired_member_preparations_cursor(
         cursor,
