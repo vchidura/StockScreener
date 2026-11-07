@@ -2906,6 +2906,23 @@ export interface OptionDiscoveryCatalog {
     output_kind: 'STRUCTURE' | 'OBSERVATION'
     structures: { id: string; category_ids: OptionCandidatePersona[] }[]
   }[]
+  /** Built-in screens defined by the backend (options-screen-v1); the API applies them by `screen_id`. */
+  screens?: OptionScreenDefinitionSummary[]
+}
+
+export interface OptionScreenDefinitionSummary {
+  id: string
+  version: number
+  sha256: string
+  name: string
+  summary: string
+  contract_type: 'CALL' | 'PUT' | null
+  sort: string
+  descending: boolean
+  caps: { per_underlying: number | null; total: number | null }
+  rules: string[]
+  tiers: Record<string, string> | null
+  source: string
 }
 
 export interface EligibleChainRow {
@@ -2952,7 +2969,18 @@ export interface EligibleChainRow {
   extrinsic_value?: string | null
   single_contract_breakeven?: string | null
   provider_iv?: number | null
+  provider_delta?: number | null
   provider_gamma?: number | null
+  provider_theta?: number | null
+  provider_vega?: number | null
+  /** STREAM rows are published by the Options window; BREADTH rows come from the chain snapshot. */
+  coverage_source?: 'BREADTH' | null
+  greeks_reason?: string | null
+  valuation_basis?: 'EXACT_EXPIRY' | 'NEAREST_EXPIRY' | null
+  day_premium?: string | null
+  screen_tier?: string | null
+  last_trade_price?: string | null
+  last_trade_at?: string | null
   risk_free_rate?: number | null
   dividend_yield?: number | null
   iv_converged?: boolean | null
@@ -2983,6 +3011,7 @@ export interface EligibleChainRequest {
   descending: boolean
   limit: number
   offset: number
+  screen_id?: string
 }
 
 export interface EligibleChainData {
@@ -2994,6 +3023,7 @@ export interface EligibleChainData {
   coverage_status?: 'MISSING' | 'PARTIAL' | 'COVERED'
   selection_basis?: 'LATEST_COMPLETE_MATRIX_PER_UNDERLYING'
   serving_mode?: 'CURRENT_POLICY'
+  screen?: { id: string; version: number; sha256: string; matched: number; shown: number; untiered_underlyings: string[] }
 }
 
 export interface OptionScenarioResult {

@@ -1,4 +1,4 @@
-import type { EligibleChainRow, OptionDiscoveryCatalog } from '../services/api'
+import type { EligibleChainRow, OptionDiscoveryCatalog, OptionScreenDefinitionSummary } from '../services/api'
 
 export const OPTIONS_LIBRARY_KEY = 'options-screen-library-v1'
 export type OptionsView = 'contracts' | 'packages' | 'chain'
@@ -41,6 +41,9 @@ export const chainColumns: OptionsColumn[] = [
   { key: 'local_vega_per_vol_point', label: 'Vega / vol point', group: 'Greeks & volatility', hiddenByDefault: true, tip: 'USD per share per volatility percentage point.' },
   { key: 'local_rho_per_rate_point', label: 'Rho / rate point', group: 'Greeks & volatility', hiddenByDefault: true, tip: 'USD per share per interest-rate percentage point.' },
   { key: 'volume_open_interest_ratio', label: 'Volume / OI', group: 'Price & activity', hiddenByDefault: true, tip: 'Unavailable when snapshot open interest is zero or missing.' },
+  { key: 'day_premium', label: 'Day premium', group: 'Price & activity', hiddenByDefault: true, tip: 'Day volume x option price x 100 (USD).' },
+  { key: 'coverage_source', label: 'Coverage', group: 'Evidence', hiddenByDefault: true, tip: 'BREADTH: the chain snapshot (not streamed, no detector evaluation). Empty: a streamed contract published by the Options window.' },
+  { key: 'provider_iv', label: 'Provider IV', group: 'Greeks & volatility', hiddenByDefault: true, tip: "The data provider's implied volatility, shown beside ours (IV)." },
   { key: 'bid_ask', label: 'Bid / ask', group: 'Price & activity', hiddenByDefault: true, tip: 'Retained quotes only; unavailable quotes are not inferred from model marks.' },
   { key: 'mark_market_data_time', label: 'Option price time (ET)', group: 'Evidence', hiddenByDefault: true },
   { key: 'mark_source', label: 'Option price basis', group: 'Evidence', hiddenByDefault: true },
@@ -74,11 +77,16 @@ const contractDetailGroups: Array<{ title: string; fields: Array<[keyof Eligible
     ['local_iv', 'Local IV', 'percent'], ['local_delta', 'Delta', 'number'], ['absolute_delta', 'Absolute delta', 'number'],
     ['local_gamma', 'Gamma', 'number'], ['local_theta_per_day', 'Theta / share / day', 'number'],
     ['local_vega_per_vol_point', 'Vega / share / vol point', 'number'], ['local_rho_per_rate_point', 'Rho / share / rate point', 'number'],
-    ['provider_iv', 'Provider IV', 'percent'], ['provider_gamma', 'Provider gamma', 'number'],
+    ['greeks_reason', 'Why our Greeks are unavailable'], ['valuation_basis', 'Rate / dividend basis'],
+    ['provider_iv', 'Provider IV', 'percent'], ['provider_delta', 'Provider delta', 'number'],
+    ['provider_gamma', 'Provider gamma', 'number'], ['provider_theta', 'Provider theta / day', 'number'],
+    ['provider_vega', 'Provider vega', 'number'],
   ] },
   { title: 'Activity', fields: [
     ['day_volume', 'Day volume (contracts)', 'number'], ['open_interest', 'Snapshot open interest', 'number'],
-    ['volume_open_interest_ratio', 'Volume / OI ratio', 'number'],
+    ['volume_open_interest_ratio', 'Volume / OI ratio', 'number'], ['day_premium', 'Day premium (USD)', 'money'],
+    ['last_trade_price', 'Last trade / share', 'money'], ['last_trade_at', 'Last trade (ET)', 'time'],
+    ['coverage_source', 'Coverage'], ['screen_tier', 'Screen tier'],
   ] },
   { title: 'Model quality and assumptions', fields: [
     ['model_version', 'Model version'], ['iv_converged', 'IV converged', 'boolean'], ['iv_solver', 'IV solver'],
@@ -232,10 +240,27 @@ export function makeOptionsScreen(name: string, query: Record<string, string>, c
   return { id: prior?.id || crypto.randomUUID(), name: name.trim(), query: validateScreenQuery(query, catalog), created_at: prior?.created_at || now, updated_at: now }
 }
 
-export type OptionTemplate = { id: string; name: string; query: Record<string, string>; summary: string; unavailable?: string }
+export type OptionTemplate = { id: string; name: string; query: Record<string, string>; summary: string; unavailable?: string; serverScreen?: OptionScreenDefinitionSummary }
+
+/** A backend-defined built-in screen (options-screen-v1): the API applies it by id; the page only passes the id. */
+export function serverScreenTemplate(screen: OptionScreenDefinitionSummary): OptionTemplate {
+  return { id: screen.id, name: screen.name, summary: screen.summary, serverScreen: screen,
+    query: { view: 'chain', ...(screen.contract_type ? { type: screen.contract_type } : {}), sort: screen.sort } }
+}
+
+export function serverScreenFor(builtin: string | null, catalog?: OptionDiscoveryCatalog): OptionScreenDefinitionSummary | undefined {
+  return builtin ? catalog?.screens?.find(screen => screen.id === builtin) : undefined
+}
 
 export function optionTemplates(catalog?: OptionDiscoveryCatalog): OptionTemplate[] {
   const missing = catalog?.contract_filters ? undefined : 'Contract screening fields are unavailable.'
+  const server = (catalog?.screens || []).map(serverScreenTemplate)
+  const local = localOptionTemplates(missing)
+  // The backend's Unusual-activity screens replace the old single-rule Vol/OI templates when it publishes them.
+  return server.length ? [local[0], ...server, ...local.filter(item => !['all', 'unusual-calls', 'unusual-puts'].includes(item.id))] : local
+}
+
+function localOptionTemplates(missing: string | undefined): OptionTemplate[] {
   return [
     { id: 'all', name: 'All options', query: { view: 'chain' }, summary: 'All eligible retained contracts, independent of alert detections.', unavailable: missing },
     { id: 'unusual-calls', name: 'Unusual Calls', query: { view: 'chain', type: 'CALL', range_volume_open_interest_ratio_min: '3' }, summary: 'Calls with volume at least 3 times snapshot open interest. Activity does not imply buying or opening flow.', unavailable: missing },
