@@ -73,6 +73,10 @@ from realtime.security_v2 import build_role_names_v2  # noqa: E402
 from realtime.session_archive import SESSION_KINDS, ArchiveIdentity  # noqa: E402
 from realtime.session_archive_repository import PostgresSessionArchiveRepository  # noqa: E402
 from realtime.session_archive_worker import SessionArchiveWorker  # noqa: E402
+from realtime.statistics_maintenance import (  # noqa: E402
+    STATISTICS_INTERVAL_SECONDS,
+    refresh_planner_statistics_cursor,
+)
 
 UTC = timezone.utc
 LOCK_NAME = "realtime-v2-retention-service-v1"
@@ -114,6 +118,12 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--authorization-reference")
     parser.add_argument("--interval-seconds", type=int, default=DEFAULT_INTERVAL_SECONDS)
     parser.add_argument("--statement-timeout-seconds", type=int, default=300)
+    parser.add_argument(
+        "--statistics-interval-seconds",
+        type=int,
+        default=STATISTICS_INTERVAL_SECONDS,
+        help="G99: planner statistics step between retention cycles; 0 turns it off",
+    )
     parser.add_argument(
         "--maximum-status-age-seconds",
         type=int,
@@ -277,6 +287,55 @@ class AppPartitionMaintenance:
             except Exception:
                 connection.rollback()
                 raise
+
+
+class PlannerStatistics:
+    """G102 design 5.3 (G99): the planner-statistics step, on the admin connection (the admin role owns the bar
+    tables). Writes its result next to the retention status file and returns it."""
+
+    def __init__(
+        self,
+        connect: Callable[[], object],
+        status_path: Path,
+        *,
+        calendar: OptionExchangeCalendar | None = None,
+        statement_timeout: str = "120s",
+    ) -> None:
+        self._connect = connect
+        self._status_path = status_path
+        self._calendar = calendar or OptionExchangeCalendar()
+        self._statement_timeout = statement_timeout
+
+    def __call__(self, checked_at: datetime) -> dict[str, object]:
+        from zoneinfo import ZoneInfo
+
+        day = checked_at.astimezone(ZoneInfo("America/New_York")).date()
+        trading = self._calendar.session_on_or_after(day) == day
+        with closing(self._connect()) as connection:
+            try:
+                with connection.cursor() as cursor:
+                    cursor.execute("SET LOCAL statement_timeout = %s", (self._statement_timeout,))
+                    # A table lock held elsewhere (autovacuum) fails the step fast; the next step retries.
+                    cursor.execute("SET LOCAL lock_timeout = '5s'")
+                    result = refresh_planner_statistics_cursor(
+                        cursor,
+                        checked_at=checked_at,
+                        session_open=self._calendar.session_open(day) if trading else None,
+                        session_close=self._calendar.session_close(day) if trading else None,
+                    )
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+        payload = {"statistics": result}
+        temporary = self._status_path.with_suffix(".tmp")
+        temporary.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+        temporary.replace(self._status_path)
+        return payload
+
+
+def statistics_status_path(status_path: Path) -> Path:
+    return status_path.with_name(f"{status_path.stem}.statistics.json")
 
 
 @contextmanager
@@ -489,18 +548,31 @@ def run_cycles(
     clock: Callable[[], datetime] = _now,
     calendar: OptionExchangeCalendar | None = None,
     emit: Callable[[str], None] = print,
+    statistics: Callable[[datetime], dict[str, object]] | None = None,
 ) -> int:
+    """The retention cycle every `--interval-seconds`; with `statistics` (G99), the planner-statistics step after each
+    cycle and every `--statistics-interval-seconds` between cycles. A failed statistics step is reported and retried
+    at the next step; it never stops retention."""
     exit_code = 0
+    next_cycle = clock()
     while not stop.is_set():
-        status = cycle.run(build_request(args, clock(), calendar=calendar), execute=True)
-        emit(json.dumps(status.as_dict(), sort_keys=True))
-        if status.state == STATUS_ALARM:
-            exit_code = 1
-        if args.once or _wait_until_next_cycle(
-            stop,
-            clock() + timedelta(seconds=args.interval_seconds),
-            clock=clock,
-        ):
+        if clock() >= next_cycle:
+            status = cycle.run(build_request(args, clock(), calendar=calendar), execute=True)
+            emit(json.dumps(status.as_dict(), sort_keys=True))
+            if status.state == STATUS_ALARM:
+                exit_code = 1
+            next_cycle = clock() + timedelta(seconds=args.interval_seconds)
+        if statistics is not None:
+            try:
+                emit(json.dumps(statistics(clock()), sort_keys=True))
+            except Exception as error:  # noqa: BLE001 - statistics are advisory; retention keeps running
+                emit(json.dumps({"statistics": {"state": "FAILED", "error": str(error)[:300]}}, sort_keys=True))
+        if args.once:
+            return exit_code
+        wake = next_cycle
+        if statistics is not None:
+            wake = min(wake, clock() + timedelta(seconds=args.statistics_interval_seconds))
+        if _wait_until_next_cycle(stop, wake, clock=clock):
             return exit_code
     return exit_code
 
@@ -600,8 +672,13 @@ def main(argv=None) -> int:
     if args.continuous:
         signal.signal(signal.SIGINT, lambda *_: stop.set())
         signal.signal(signal.SIGTERM, lambda *_: stop.set())
+    statistics = (
+        PlannerStatistics(admin_connect, statistics_status_path(args.status_path))
+        if args.statistics_interval_seconds > 0
+        else None
+    )
     with retention_leadership(admin_connect):
-        return run_cycles(cycle, args, stop=stop)
+        return run_cycles(cycle, args, stop=stop, statistics=statistics)
 
 
 if __name__ == "__main__":

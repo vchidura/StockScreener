@@ -364,7 +364,7 @@ in place, and Monday's session is the test (no separate environment, no dual wri
 | 3 | Flags instead of 503 on page reads. **Done Nov 7 (design 6.1: charts, Screener hourly details, Dashboard, Stock Alerts); read-only check on live: today's code refuses hourly details for all 25 members, patched code serves all 25 labelled** | Pages blanked on harmless reference or lineage differences (G97, G36, G83) | A2 (part) |
 | 4 | Options Alerts as a session list on `rt.alert_current`. **Done Nov 7 (design 3); replay of Nov 6's detections: the page showed 0-3 alerts per window, the session list keeps all 4, NVDA 192.5C one row with 24 trades** | Alerts left the page after two windows (G100) | A0 |
 | 5 | A revision supersedes an open Options preparation; readiness carries over. **Done Nov 7 (design 5.1, 5.2; migration 049, applied Sunday with the deploy)** | Crash loop on a list change (G90, G104); everything re-prepared (G91) | A1 |
-| 6 | Statistics step in the retention worker; bridge journal index | Stale statistics (B23, G99); 32% of database time (B24) | A1 |
+| 6 | Statistics step in the retention worker; bridge journal index. **Done Nov 7 (design 5.3, 5.4; migration 050, applied Sunday with the deploy)** | Stale statistics (B23, G99); 32% of database time (B24) | A1 |
 | 7 | New members' split lookback from the history plan | Screening needs 283 sessions of split coverage (G94); needed for 50 | A1 |
 
 **Testing shortcuts:** one copy of live restored once on Saturday for all weekend tests; read-only replays on live

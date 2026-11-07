@@ -342,6 +342,19 @@ revision `37d20e26` would carry nothing today: no earlier revision shares its so
   creates.
 - Write last-analyzed times to the status file, with an alarm when a watched table's statistics predate activation.
 
+**Built (Nov 7):** `realtime/statistics_maintenance.py` (`refresh_planner_statistics_cursor`) and
+`PlannerStatistics` in the retention service, on its admin connection (the admin role owns `rt.bar_catalog`,
+`rt.bar_current`, `rt.bar_revisions` and its partitions; checked on live). Watch list today: `rt.bar_catalog`,
+`rt.bar_current` and the month's `rt.bar_revisions` partition (`rt.bar_head` joins with section 4). Activation is 30
+minutes before the open. The loop runs the retention cycle hourly as before and the step after each cycle and every
+300 s (`--statistics-interval-seconds`, 0 turns it off); a failed step (5 s lock timeout) is reported and retried, never
+stopping retention. Status goes to `<status>.statistics.json` and the log. The statistics views are cached per
+transaction, so the after-state comes from what the step analyzed; the alarm names a table still predating activation
+at the start of a step once two steps have passed (an ANALYZE without ownership only warns). Dry run on live today
+(read-only, writes recorded): the first step after the deploy analyzes all three (32,583, 5,786 and 5,786 changes since
+the last analyze) and sets their autoanalyze options; the parent has never been analyzed and is after Monday's close.
+Tests: 10 new, retention-service tests unchanged.
+
 ### 5.4 B24: the bridge's journal check
 
 **Today:** `advanced_journal_replay.py:304` runs `SELECT COALESCE(MAX(source_offset),0)` on `rt.bar_revisions` every
@@ -351,6 +364,11 @@ tick with no index and no partition bound (32% of database time, up to 2.8 s per
 `CREATE INDEX idx_rt_bar_revision_journal_offset ON rt.bar_revisions (journal_generation, stream_session_id,
 source_offset) WHERE stream_session_id IS NOT NULL`, and the query bounded by `observed_at >=` the stream session's
 start, so it reads only the current partition.
+
+**Built (Nov 7):** migration `050_g102_bar_revision_journal_offset.sql` (the index on the partitioned parent, so every
+partition and each later one gets it). The `observed_at` bound is left out: with the index each partition answers
+from a short index read, and the query stays exact. Measured on live Nov 7 (idle): the check takes 634 ms as a parallel
+scan of the October and November partitions (about 750k rows); the build takes seconds.
 
 ## 6. A2, Monday part: per-ticker outcomes
 
