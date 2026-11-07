@@ -418,7 +418,7 @@ def capture_options_breadth(
 
 # ---- reads (Options Screener) -------------------------------------------------------------------------------------
 
-BREADTH_QUALITY_FLAGS = ("BREADTH_SNAPSHOT", "PROVIDER_GREEKS", "NOT_DETECTOR_EVALUATED")
+BREADTH_QUALITY_FLAGS = ("BREADTH_SNAPSHOT", "PROVIDER_GREEKS_ONLY", "NOT_DETECTOR_EVALUATED")
 
 
 def _text(value) -> str | None:
@@ -430,8 +430,9 @@ def _iso(value) -> str | None:
 
 
 def breadth_screener_row(row: Mapping[str, object]) -> dict[str, object]:
-    """One breadth contract in the Options Screener's row shape. Greeks and IV are the provider's (flagged), since no
-    model values exist for contracts outside the stream; the mark is the quote midpoint."""
+    """One breadth contract in the Options Screener's row shape; the mark is the quote midpoint. Our model's Greeks
+    (`local_*`) are not computed for breadth rows yet, so they are empty with a reason; the provider's are in
+    `provider_*`."""
     bid, ask = row.get("bid"), row.get("ask")
     mark = (Decimal(str(bid)) + Decimal(str(ask))) / 2 if bid is not None and ask is not None and ask >= bid else None
     spot = row.get("underlying_price")
@@ -463,15 +464,20 @@ def breadth_screener_row(row: Mapping[str, object]) -> dict[str, object]:
         "model_mark": _text(mark),
         "mark": _text(mark),
         "display_mark": _text(mark),
-        "absolute_delta": None if row.get("delta") is None else abs(float(row["delta"])),
-        "local_delta": row.get("delta"),
-        "local_iv": row.get("implied_volatility"),
-        "local_gamma": row.get("gamma"),
-        "local_theta_per_day": row.get("theta"),
-        "local_vega_per_vol_point": row.get("vega"),
+        # `local_*` is only ever our model's value; the provider's values are carried beside it, never in its place.
+        "absolute_delta": None,
+        "local_delta": None,
+        "local_iv": None,
+        "local_gamma": None,
+        "local_theta_per_day": None,
+        "local_vega_per_vol_point": None,
         "local_rho_per_rate_point": None,
+        "greeks_reason": "NOT_MODELLED_BREADTH",
         "provider_iv": row.get("implied_volatility"),
+        "provider_delta": row.get("delta"),
         "provider_gamma": row.get("gamma"),
+        "provider_theta": row.get("theta"),
+        "provider_vega": row.get("vega"),
         "bid": _text(bid),
         "ask": _text(ask),
         "mark_market_data_time": _iso(row.get("quote_at")) or observed.isoformat(),

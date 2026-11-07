@@ -206,9 +206,10 @@ def test_a_breadth_row_has_the_screeners_fields_flagged_as_provider_values():
     row = breadth.breadth_screener_row(_stored_breadth("O:SPY251120C00760000"))
     assert row["contract_type"] == "CALL" and row["calendar_dte"] == 11 and row["strike"] == "760"
     assert row["mark"] == "1.1" and row["volume_open_interest_ratio"] == "9" and row["day_volume"] == 900
-    assert row["absolute_delta"] == 0.3 and row["local_iv"] == 0.2 and row["provider_iv"] == 0.2
+    assert row["local_iv"] is None and row["absolute_delta"] is None and row["greeks_reason"] == "NOT_MODELLED_BREADTH"
+    assert (row["provider_iv"], row["provider_delta"], row["provider_gamma"]) == (0.2, 0.3, 0.01)
     assert Decimal(row["otm_fraction"]) > 0 and row["contract_id"] == 0
-    assert row["coverage_source"] == "BREADTH" and "PROVIDER_GREEKS" in row["quality_flags"]
+    assert row["coverage_source"] == "BREADTH" and "PROVIDER_GREEKS_ONLY" in row["quality_flags"]
     put = breadth.breadth_screener_row(_stored_breadth("O:SPY251120P00700000", kind="put", strike="700", oi=0))
     assert put["volume_open_interest_ratio"] is None and Decimal(put["otm_fraction"]) > 0
 
