@@ -298,3 +298,95 @@ budgets, window cutoffs, partition policies, leases and owner epochs, and append
    replaces them.
 5. **Superseded revisions:** keep them for the fact's existing partition retention. Recommended.
 6. **Scale budget:** warm window p95 at every rung (proposed 60 s).
+
+## 14. Prerequisites and schedule (estimate, Nov 7; superseded by section 15)
+
+**Before any G102 step except A0 (Monday Nov 9, Options on 23):** the five agreed weekend gates in
+`advanced-realtime.md` (G74 item 2 chain freshness on one Options image for all 7 roles; G72 label instead of block;
+CPU limits on the Options roles; the 11.5x copy rehearsal with Equity windows running; the Options-on-23 revision
+applied over the Nov 9 preparation that opened with 9, G104/G90), plus B14a (Options session close) and the Dashboard
+build-once change. G75 breadth goes in only if it is rehearsed on a copy by Sunday evening; otherwise it follows in the
+week. If a gate fails, Monday runs the 9 liquid names, as agreed.
+
+**Before the 50-ticker revision (after the Nov 9 close):** G86 check of the new names (renames, listings under 5
+years), G94 code fix, G103 close duration measured at 50, and the rung-50 activation check on a copy. G91 is needed
+only if the list changes after it is applied.
+
+| Step | Work (working days) | Live-session needs | Earliest finish |
+| --- | --- | --- | --- |
+| A0 | 1 | Page check in Monday's session | Nov 8 |
+| A1 | 3-4 | B24 index built after a close | Nov 13 |
+| A2 | 10-12, including 2 of change-gate rehearsal | Deploy outside sessions; mode switch at a session boundary | Nov 27 |
+| A3 | 11-13, including 2 of rehearsal | An O1 version in shadow for one session | Dec 11 |
+| A4 | Read boundary 5 (alongside A3); `bar_head` 4 | One shadow-read session; contract after two clean weeks, in the background | Dec 18 |
+| A5 | 5-6 | Validator after one session | Dec 31 |
+| A6 | 5-7, optional | One mid-session add on a copy | If needed |
+| B0 | 3-4: preparation speed (G89; 87 min per 16 members today, about 34 h for 375) and provider budget at 400 | — | Early Jan |
+| B1 | 8-10 | Same output as serial on a replayed session | Late Jan |
+| B2 | 4-5 | Restart during a session on a copy | Late Jan |
+| B4 | One rung (100, 200, 400) per accepted session, copy first | Three accepted sessions | Mid Feb |
+
+**Totals:** Phase A about 7-8 weeks (to early January), Phase B about 5-6 weeks (to mid February): about 3 months to
+400 tickers live. Assumes one driver, deploys outside sessions and the market holidays (Nov 26, Dec 25, Jan 1).
+Biggest uncertainty: A2 and A3 inside the Options P8 lineage (C13), which was built for two underlyings. Ways to
+shorten: run A4's read boundary in its own worktree alongside A3, and do A3 for Equity detectors before Options.
+
+**At continuous pace (Claude implementing around the clock, user asked Nov 7):** work time is about 12-15 days for
+Phase A and 5-7 days for Phase B. What doesn't compress: one live session per weekday for the shadow, switch and
+acceptance checks (about 8 in all), deploys and heavy tests only outside 14:00-21:10 UTC (the copy shares the live
+host), overnight preparation for each ladder rung, and the user's yes for each live switch. Pipelined, Phase A
+finishes about Dec 1 and 400 tickers go live about Dec 15 (about 5 weeks from Nov 10). With the live interruptions
+seen so far (Nov 5 and Nov 6 each took most of a day), plan on 6-7 weeks: late December.
+
+| Step | Work at continuous pace | Live gate | Target |
+| --- | --- | --- | --- |
+| A1 | 1-1.5 days | Index after a close | Nov 11 |
+| A2 | 3-4 days | Mode switch, one session | Nov 17 |
+| A3 | 3-4 days | One shadow session, then promote | Nov 24 |
+| A4 | 3 days | Backfill after a close, one shadow-read session, switch | Nov 30 |
+| A5 | 1.5-2 days | One session with the validator | Dec 1 |
+| B0-B2 | 5-7 days | Restart and fan-out on a copy | Dec 7 |
+| B4 | Rungs 100, 200, 400 | One accepted session each, preparation overnight | Dec 15 |
+
+## 15. Fast track (user, Nov 7): ready early this week
+
+The user asked for shortcuts to have a testable setup early this week. The shortcut is order, not lower standards:
+the small items that cost the most time last week come first; the data-model re-key and the scale work follow. Every
+item is a piece of this plan, so nothing is redone later. The platform is in development stage, so changes go to live
+in place, and Monday's session is the test (no separate environment, no dual writes, no shadow sessions).
+
+**Weekend Nov 7-8, deployed Sunday night (about 20 hours of work):**
+
+| # | Item | Why first | Plan step |
+| --- | --- | --- | --- |
+| 1 | B14a: a new Options stream session ends stale ones; P8 roles get 60 s to stop. **Done, deployed Nov 7 08:05 UTC (r51)** | Nov 6's session `d42b2d84` is still LIVE, so Monday's Options start would fail | Monday blocker |
+| 2 | Per-ticker outcomes: a ticker's failure is recorded and labelled; the window completes for the rest | One ticker failed whole windows (B4, B5, B18) | A2 (first part) |
+| 3 | Flags instead of 503 on page reads | Pages blanked on harmless reference or lineage differences (G97, G36, G83) | A2 (part) |
+| 4 | Options Alerts as a session list on `rt.alert_current` | Alerts left the page after two windows (G100) | A0 |
+| 5 | A revision supersedes an open Options preparation; readiness carries over | Crash loop on a list change (G90, G104); everything re-prepared (G91) | A1 |
+| 6 | Statistics step in the retention worker; bridge journal index | Stale statistics (B23, G99); 32% of database time (B24) | A1 |
+| 7 | New members' split lookback from the history plan | Screening needs 283 sessions of split coverage (G94); needed for 50 | A1 |
+
+**Testing shortcuts:** one copy of live restored once on Saturday for all weekend tests; read-only replays on live
+inputs where they prove a fix (as on Nov 6); unit tests for each changed module; deploy straight to live Sunday night.
+
+**This week:**
+
+| Day | Work |
+| --- | --- |
+| Mon Nov 9 | Live test with Equity 25 and Options on 9; fix what it finds. Night: Options-on-23 gates (G72, CPU limits, G74 item 2); apply the Options-on-23 revision (item 5 lets it supersede Tuesday's preparation) |
+| Tue Nov 10 | Options on 23 live, measured on live under the stop rule instead of the 11.5x copy rehearsal |
+| Wed Nov 11 | 50-ticker revision if Tuesday is clean (G86 check of the new names first) |
+| Thu-Fri | A4 (bars without the cohort, designed in `G102_DETAILED_DESIGN.md` section 4); P8-or-v3 decision for Options |
+
+**Next week (Nov 16-20):** A3 (detector and policy versions), A2's rest (window attempts, ingress plan revisions), A5
+(page pointers, URLs without cohort), then B0-B2 (needed for 400, not for 50). SPX/NDX (G87) after G102.
+
+**Monday checklist (fast track):**
+
+- Options starts without a manual fix; at the decision stop the stream session ends and no role restarts with an error.
+- A ticker failure shows as DEGRADED for that ticker; the window completes.
+- No page returns 503 for a reference or lineage difference; affected rows are flagged.
+- Options Alerts lists the whole session's alerts, one per contract.
+- Statistics fresh before the first window (status file); the bridge journal check under 50 ms.
+- After the close: the close completes; the validator runs on the pages.
