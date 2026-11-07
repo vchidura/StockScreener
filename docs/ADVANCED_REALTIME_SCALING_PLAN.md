@@ -1,5 +1,13 @@
 # Advanced Realtime Scaling Plan
 
+> **Superseded in part (user, Nov 7 2026).** The exact-hash and "complete or BLOCKED" rules were an earlier design
+> choice and no longer apply: the Correctness and Coverage rows of Acceptance Gates; "INPUT_READY is
+> exact/fail-closed for every cohort member" (Oct 14 starter decision) and the exact cohort barrier in Lane Split And
+> Cohort Flow; "exact complete-universe finalization" (S2); "no partial-universe READY" (S4, E8); "barrier exact" (E7).
+> They are replaced by recorded hashes compared in replay, per-ticker outcomes with labels, and the change and scale
+> gates in [REALTIME_SCHEMA_VERSIONING_PLAN.md](REALTIME_SCHEMA_VERSIONING_PLAN.md) section 9. The latency, provider,
+> database, recovery, operations and storage gates still apply.
+
 > **Capacity and scaling reference.** Current runtime lifecycle, membership
 > reconciliation and implementation status are maintained in
 > [REALTIME_V3_PIPELINE.md](REALTIME_V3_PIPELINE.md). Measurements and finite
@@ -586,6 +594,8 @@ E1-E4 pass.
 - Require one accepted monitoring day at each scale tier before the next expansion.
 
 ## Acceptance Gates
+
+> Correctness and Coverage rows superseded Nov 7 2026; see the note at the top of this plan.
 
 | Gate | Required Evidence |
 |---|---|
