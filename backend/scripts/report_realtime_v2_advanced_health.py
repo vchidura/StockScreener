@@ -530,7 +530,7 @@ def _detector_health(cursor, cohort_id):
         cursor,
         "SELECT count(*) FROM rt.consumer_checkpoints "
         "WHERE cohort_id=%s AND consumer_name LIKE "
-        "'advanced-equity-detector-shadow:ADVANCED_EQUITY_S_:0'",
+        "'advanced-equity-detector-shadow:ADVANCED_EQUITY_S_:%:0'",
         (str(cohort_id),),
     )[0])
     required_leases = expected * active_journals

@@ -125,18 +125,17 @@ def _load_bars_cursor(
     daily = tuple((_bar_revision(row), row["created_at"]) for row in history.rows)
     cursor.execute(
         "SELECT " + columns
-        + "FROM rt.bar_current AS current "
+        # G102 A4: the session's current 5m bars by instrument from the head, whatever cohort wrote them.
+        + "FROM rt.bar_head AS current "
         "JOIN rt.bar_revisions AS revision "
         "ON revision.bar_revision_id=current.bar_revision_id "
         "AND revision.observed_at=current.observed_at "
-        "AND revision.cohort_id=current.cohort_id "
-        "AND revision.provider_tier=current.provider_tier "
         "AND revision.instrument_id=current.instrument_id "
         "AND revision.interval=current.interval "
         "AND revision.bar_start=current.bar_start "
         "AND revision.session_scope=current.session_scope "
         "AND revision.adjustment_basis=current.adjustment_basis "
-        "WHERE revision.cohort_id=%s AND revision.security_id=%s "
+        "WHERE revision.security_id=%s "
         "AND revision.interval='5m' AND revision.is_final "
         "AND revision.availability_mode='LIVE_OBSERVED' "
         "AND revision.adjustment_basis='RAW_UNADJUSTED' "
@@ -144,7 +143,6 @@ def _load_bars_cursor(
         "AND revision.session_date=%s AND revision.bar_end<=%s "
         "ORDER BY revision.bar_end DESC LIMIT 3",
         (
-            str(record.cohort_id),
             str(record.security_id),
             record.bar_end.date(),
             record.bar_end,
@@ -270,7 +268,9 @@ def os1_os2_evaluator_cursor(
             payload_schema=PAYLOAD_SCHEMA,
             payload=payload,
             state_key=f"{detector_id}:{record.security_id}",
-            state_revision=record.source_offset,
+            # Nov 7: the record's progress coordinate, not its journal offset; offsets start again when the stream
+            # reconnects, which moved the revision backward and stopped OS1/OS2 ("state identity conflict").
+            state_revision=record.progress_coordinate,
             state_payload={
                 "detector_id": detector_id,
                 "last_bar_revision_id": str(record.bar_revision_id),

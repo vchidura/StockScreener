@@ -202,3 +202,42 @@ def test_derived_5m_consumer_does_not_skip_an_incomplete_cutoff():
     source_query = cursor.execute.call_args_list[1].args[0]
     assert "receipt.receipt_kind='INPUT_READY'" in source_query
     assert "revision.instrument_id=%s" in source_query
+
+
+def test_5m_slice_spanning_a_stream_reconnect_moves_forward():
+    """Nov 7 rehearsal of Nov 6: the stream reconnected after the 14:35 outage and its offsets started again (about
+    9,338 before, 109 after). A 5m consumer reads in bar order, so the offsets fell inside one slice and the OS1/OS2
+    state revision moved backward ("persisted detector state identity conflict"). The coordinate is the bar end."""
+    cursor = MagicMock()
+    cursor.fetchone.return_value = (1, 9338, "d" * 64, b'{"trigger_at":"2026-10-20T14:30:00+00:00"}')
+    before = datetime(2026, 10, 20, 14, 35, tzinfo=UTC)
+    cursor.fetchall.return_value = (
+        _row(interval="5m", end=before, offset=9338 + 5),
+        _row(interval="5m", end=before + timedelta(minutes=5), offset=109),
+    )
+
+    def evaluator(record, inputs):
+        decision = _evaluator(record, inputs)
+        return AdvancedEquityDetectorDecision(**{
+            **{name: getattr(decision, name) for name in decision.__dataclass_fields__},
+            "state_revision": record.progress_coordinate,
+        })
+
+    planned = plan_advanced_equity_detector_slice_cursor(
+        cursor, _config(interval="5m"), evaluator=evaluator, clock=lambda: before + timedelta(hours=1),
+    )
+
+    coordinates = [int(before.timestamp()), int((before + timedelta(minutes=5)).timestamp())]
+    assert [record.progress_coordinate for record in planned.records] == coordinates
+    assert [batch.checkpoint.committed_offset for batch in planned.batches] == coordinates
+    assert planned.committed_offset == coordinates[-1] > planned.start_offset == 9338
+    # The journal offset stays in the evidence.
+    assert [record.source_offset for record in planned.records] == [9343, 109]
+
+
+def test_1m_records_keep_the_journal_offset_as_their_coordinate():
+    cursor = MagicMock()
+    cursor.fetchone.return_value = None
+    cursor.fetchall.return_value = (_row(offset=42),)
+    planned = plan_advanced_equity_detector_slice_cursor(cursor, _config(), evaluator=_evaluator, clock=lambda: NOW)
+    assert planned.records[0].progress_coordinate == 42 == planned.committed_offset

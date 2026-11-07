@@ -180,22 +180,18 @@ def load_advanced_options_detector_scopes_cursor(
         "AND registry.status IN ('WRITING','DRAINING','DRAINED') "
         "AND (binding.target_cohort_id IS NULL "
         "OR registry.created_at>=binding.created_at) "
+        # G102 A4: the instrument's current daily bars from the head, whatever cohort wrote them (the binding stays
+        # the run's identity, not a bar filter).
         "AND (binding.target_cohort_id IS NULL OR ("
         "SELECT count(DISTINCT history.session_date) "
-        "FROM rt.bar_current AS history_current "
+        "FROM rt.bar_head AS history_current "
         "JOIN rt.bar_revisions AS history "
         "ON history.bar_revision_id=history_current.bar_revision_id "
         "AND history.observed_at=history_current.observed_at "
-        "AND history.cohort_id=history_current.cohort_id "
-        "AND history.provider_tier=history_current.provider_tier "
-        "AND history.instrument_id=history_current.instrument_id "
-        "AND history.interval=history_current.interval "
-        "AND history.bar_start=history_current.bar_start "
-        "AND history.session_scope=history_current.session_scope "
-        "AND history.adjustment_basis=history_current.adjustment_basis "
-        "WHERE history.cohort_id=binding.source_cohort_id "
-        "AND history.provider_tier=binding.source_provider_tier "
-        "AND history.security_id=instrument.security_id "
+        "WHERE history_current.instrument_id=instrument.instrument_id "
+        "AND history_current.interval='1d' "
+        "AND history_current.adjustment_basis='RAW_UNADJUSTED' "
+        "AND history_current.session_scope='RTH' "
         "AND history.interval='1d' "
         "AND history.adjustment_basis='RAW_UNADJUSTED' "
         "AND history.availability_mode='HISTORICAL_RECONSTRUCTED' "
@@ -209,7 +205,9 @@ def load_advanced_options_detector_scopes_cursor(
         "AND (history.provider_published_at IS NULL "
         "OR history.provider_published_at<=registry.created_at)"
         ")>=15) "
-        "ORDER BY registry.journal_generation,instrument.instrument_id",
+        # Oldest journal first: a session that reconnects has two (Nov 6: 4006c6a7 to 14:37, then 34b1b4f1), and a
+        # detector's state is per security, so the earlier journal's bars must be read before the later one's.
+        "ORDER BY registry.created_at,registry.journal_generation,instrument.instrument_id",
         (str(cohort_id), session_date),
     )
     scopes = tuple(
@@ -261,8 +259,13 @@ def run_detector_cycle(
         )
     records = 0
     active_consumers = 0
+    # A detector's state is per security across the session's journals. While an older journal of an instrument may
+    # still have records (its slice was full), its newer journal waits for the next cycle.
+    unfinished: set[tuple[str, int]] = set()
     for scope in scopes:
         for detector_id in DETECTORS:
+            if (detector_id, scope.instrument_id) in unfinished:
+                continue
             resource_key = detector_lease_resource_key(
                 cohort_id=cohort_id,
                 session_date=session_date,
@@ -273,11 +276,14 @@ def run_detector_cycle(
                 APP_ROLE,
                 isolation_level="SERIALIZABLE",
             ) as unit:
+                # B22 (Nov 6): each claim is stamped when it is made. Stamped with the cycle's start, every scope
+                # after the first `lease_seconds` of a long cycle (a backlog over 25 tickers x 2 detectors) got a
+                # lease that had already expired, and its write failed "detector lease is stale or expired".
                 owner_epoch = claim_advanced_equity_detector_lease_cursor(
                     unit.cursor,
                     resource_key=resource_key,
                     owner_id=owner_id,
-                    checked_at=checked_at,
+                    checked_at=clock().astimezone(UTC),
                     lease_seconds=lease_seconds,
                 )
                 config = build_os1_os2_consumer_config(
@@ -311,6 +317,8 @@ def run_detector_cycle(
                 )
             active_consumers += 1
             records += len(planned.records)
+            if len(planned.records) >= maximum_records:
+                unfinished.add((detector_id, scope.instrument_id))
     return {
         "status": "PROCESSED" if records else "IDLE",
         "checked_at_utc": checked_at.isoformat(),

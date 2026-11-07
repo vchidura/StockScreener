@@ -8,6 +8,7 @@ from typing import Callable, Mapping
 from uuid import UUID
 
 from .advanced_equity_detector_shadow import (
+    detector_shadow_consumer_name,
     AdvancedEquityDetectorShadowBatch,
     build_advanced_equity_detector_shadow_batch,
     persist_advanced_equity_detector_shadow_cursor,
@@ -58,6 +59,19 @@ class AdvancedEquityDetectorSourceRecord:
         object.__setattr__(self, "bar_start", started)
         object.__setattr__(self, "bar_end", ended)
         object.__setattr__(self, "observed_at", observed)
+
+    @property
+    def progress_coordinate(self) -> int:
+        """Where a consumer has got to: its checkpoint offset and the detector state's revision.
+
+        1m records are read in journal offset order, so the offset. 5m records are read in bar order, and a stream
+        that reconnects within one journal generation starts its offsets again (Nov 6: about 9,338 before the
+        14:35 outage, 109 after), so their coordinate is the bar's end in epoch seconds: it rises with every bar and
+        is above any journal offset, so a checkpoint written earlier with an offset still moves forward. The record's
+        own journal offset stays in its evidence (`detector_inputs`)."""
+        if self.interval == "5m":
+            return int(self.bar_end.timestamp())
+        return self.source_offset
 
     def detector_inputs(self) -> tuple[RealtimeDetectorInput, ...]:
         lineage = {
@@ -146,9 +160,8 @@ class AdvancedEquityDetectorConsumerConfig:
 
     @property
     def consumer_name(self) -> str:
-        return (
-            f"advanced-equity-detector-shadow:"
-            f"{self.detector_id}:{self.shard_id}"
+        return detector_shadow_consumer_name(
+            detector_id=self.detector_id, instrument_id=self.instrument_id, shard_id=self.shard_id,
         )
 
 
@@ -160,7 +173,7 @@ class AdvancedEquityDetectorSlice:
     batches: tuple[AdvancedEquityDetectorShadowBatch, ...]
 
     def __post_init__(self) -> None:
-        offsets = tuple(row.source_offset for row in self.records)
+        offsets = tuple(row.progress_coordinate for row in self.records)
         if len(self.records) != len(self.batches):
             raise ValueError("detector slice record and batch counts differ")
         if offsets and (
@@ -309,12 +322,12 @@ def load_advanced_equity_detector_records_cursor(
         "'source_revision_ids',revision.source_revision_ids,"
         "'payload_sha256',revision.payload_sha256"
         ") AS retained_bar "
-        "FROM rt.bar_current AS current "
+        # G102 A4: the current bar per key from the head. This consumer reads its own cohort's journal, so the
+        # revision's cohort below is the run's identity, not a key of the current bar.
+        "FROM rt.bar_head AS current "
         "JOIN rt.bar_revisions AS revision "
         "ON revision.bar_revision_id=current.bar_revision_id "
         "AND revision.observed_at=current.observed_at "
-        "AND revision.cohort_id=current.cohort_id "
-        "AND revision.provider_tier=current.provider_tier "
         "AND revision.instrument_id=current.instrument_id "
         "AND revision.interval=current.interval "
         "AND revision.bar_start=current.bar_start "
@@ -460,11 +473,11 @@ def plan_advanced_equity_detector_slice_cursor(
             shard_id=config.shard_id,
             shard_map_sha256=config.shard_map_sha256,
             owner_epoch=config.owner_epoch,
-            committed_offset=record.source_offset,
+            committed_offset=record.progress_coordinate,
             committed_at=clock(),
         ))
     committed_offset = (
-        records[-1].source_offset if records else start_offset
+        records[-1].progress_coordinate if records else start_offset
     )
     return AdvancedEquityDetectorSlice(
         start_offset=start_offset,

@@ -26,6 +26,13 @@ from .preflight import ProviderTier
 
 
 CONTRACT_VERSION = "advanced-equity-detector-shadow-v1"
+
+
+def detector_shadow_consumer_name(*, detector_id: str, instrument_id: int, shard_id: int) -> str:
+    """One checkpoint per detector and instrument. Nov 7 rehearsal of Nov 6: the name held only the detector and the
+    shard, so the 25 instruments of a journal shared one checkpoint; the first instrument moved it to the close and
+    the other 24 then found nothing after it, so OS1/OS2 only ever evaluated one instrument."""
+    return f"advanced-equity-detector-shadow:{detector_id}:{instrument_id}:{shard_id}"
 STATE_SCHEMA = "advanced_equity_detector_shadow_state_v1"
 PAYLOAD_SOURCE = "MASSIVE_ADVANCED_JOURNAL"
 PRODUCTION_AUTHORITY: Mapping[str, bool] = MappingProxyType({
@@ -203,8 +210,8 @@ def build_advanced_equity_detector_shadow_batch(
             "state_sha256": state.state_sha256,
             "committed_offset": committed_offset,
         },
-        consumer_name=(
-            f"advanced-equity-detector-shadow:{detector_id}:{shard_id}"
+        consumer_name=detector_shadow_consumer_name(
+            detector_id=detector_id, instrument_id=instrument_id, shard_id=shard_id,
         ),
         cohort_id=adapter.cohort_id,
         journal_generation=journal_generation,
