@@ -370,6 +370,20 @@ partition and each later one gets it). The `observed_at` bound is left out: with
 from a short index read, and the query stays exact. Measured on live Nov 7 (idle): the check takes 634 ms as a parallel
 scan of the October and November partitions (about 750k rows); the build takes seconds.
 
+### 5.5 G94: new members' split lookback
+
+**Today:** the Equity preparation REFERENCE stage builds `MassiveReferenceAdapter` with its default 180-day
+corporate-action lookback, while screening needs SPLIT coverage from the first of the 283 retained adjusted sessions
+(about 410 days). Bootstrap computed the lookback from the history plan (`forward_bootstrap.py:173`); preparation did
+not, so the 16 members added Nov 6 had coverage only from 2026-05-09 and every window failed until a manual fill.
+
+**Built (Nov 7):** `advanced_equity_preparation._reference` passes `corporate_action_lookback_days` = days from the
+stage target's `window_start` (the first retained adjusted session, already in the target) to its
+`history_through_session`, plus one (at least 180). The coverage end was already `session + 365 days`. Test: a target
+from 2025-07-09 requests splits and dividends from 2025-07-08. **Pre-open check** (`runner/g94_coverage_check.py
+SESSION`, read-only): every Equity member of the current revision has SPLIT coverage from the session's first retained
+adjusted session; for Nov 9 (first 2025-09-24) 25 of 25 pass.
+
 ## 6. A2, Monday part: per-ticker outcomes
 
 **Today:** one ticker's bad input raises inside a loop over tickers and fails the whole stage, for example

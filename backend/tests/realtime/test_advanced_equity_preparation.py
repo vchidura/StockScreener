@@ -407,7 +407,7 @@ class _WholeMarketPaginatingSession:
         })
 
 
-def _reference_chunk(overview):
+def _reference_chunk(overview, window_start="2026-05-03"):
     session = _WholeMarketPaginatingSession(overview)
     source = MassiveEquityPreparationSource(
         BoundedPolygonEquityPreparationClient("test-key", session=session)
@@ -421,7 +421,7 @@ def _reference_chunk(overview):
                 security_id=None,
                 target={
                     "history_through_session": "2026-10-30",
-                    "window_start": "2026-05-03",
+                    "window_start": window_start,
                     "window_end": "2026-10-30",
                 },
             ),
@@ -430,6 +430,16 @@ def _reference_chunk(overview):
         )
     )
     return chunk, session.calls
+
+
+def test_reference_split_coverage_starts_at_the_first_retained_session():
+    """G94 (Nov 6): a new member's split coverage must reach the target's window_start (about 283 sessions), not the
+    adapter's 180-day default; members added Nov 6 had coverage only from 2026-05-09 and every window failed."""
+    chunk, calls = _reference_chunk(STOCK_OVERVIEW, window_start="2025-07-09")
+    assert chunk.complete is True
+    splits, dividends = calls[1][1], calls[2][1]
+    assert "2025-07-08" in {str(value) for value in splits.values()}
+    assert "2025-07-08" in {str(value) for value in dividends.values()}
 
 
 def test_provider_fence_runs_before_each_network_request_and_can_stop_a_chunk():

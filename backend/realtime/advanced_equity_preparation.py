@@ -1275,6 +1275,15 @@ class MassiveEquityPreparationSource:
         def no_options(*_args):
             raise AssertionError("Equity preparation cannot request Options data")
 
+        session_date = date.fromisoformat(
+            str(claim.target["history_through_session"])
+        )
+        # G94 (Nov 6): screening needs split coverage from the first retained adjusted session (the target's
+        # window_start, about 283 sessions back). The adapter's default 180-day lookback left every member added on
+        # Nov 6 without it, and each window failed on "split/action evidence unavailable". Same rule as bootstrap.
+        lookback_days = (
+            session_date - date.fromisoformat(str(claim.target["window_start"]))
+        ).days + 1
         adapter = MassiveReferenceAdapter(
             fetch_security=(
                 lambda ticker, as_of: self.client.fetch_ticker_overview(
@@ -1298,9 +1307,7 @@ class MassiveEquityPreparationSource:
             ),
             fetch_option_catalog=no_options,
             fetch_open_interest=no_options,
-        )
-        session_date = date.fromisoformat(
-            str(claim.target["history_through_session"])
+            corporate_action_lookback_days=max(180, lookback_days),
         )
         created = request.checked_at
         generation = adapter.collect(
