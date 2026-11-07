@@ -289,3 +289,29 @@ def test_a_breadth_row_shows_ours_and_the_providers_side_by_side():
     assert (row["local_iv"], row["absolute_delta"], row["provider_iv"], row["provider_delta"]) == (0.19, 0.31, 0.2, 0.3)
     assert row["spot"] == "735.4" and row["model_version"] == "black-scholes-merton-v1" and row["greeks_reason"] is None
     assert "VALUATION_INPUT_NEAREST_EXPIRY" in row["quality_flags"]
+
+
+def test_breadth_reads_work_with_the_apis_dict_cursor_and_with_tuple_cursors():
+    """Nov 8 rehearsal: the API's dict cursor returned mappings; the read assumed tuples, failed inside its
+    savepoint, and the Screener quietly served the published rows only."""
+    stored = _stored_breadth("O:SPY251120C00760000")
+    capture = {"underlying": "SPY", "state": "COMPLETE", "observed_at": NOW, "contracts": 1, "reason": None}
+
+    class _Cursor:
+        def __init__(self, mapping):
+            self.mapping, self.calls = mapping, 0
+            self.description = [(name,) for name in stored]
+
+        def execute(self, *_args):
+            self.calls += 1
+
+        def fetchall(self):
+            row = stored if self.calls == 1 else capture
+            return [dict(row)] if self.mapping else [tuple(row.values())]
+
+    for mapping in (True, False):
+        rows, captures = breadth.load_breadth_screener_rows_cursor(
+            _Cursor(mapping), session_date=SESSION, underlyings=("SPY",), available_by=NOW,
+        )
+        assert [row["contract_ticker"] for row in rows] == ["O:SPY251120C00760000"]
+        assert captures["SPY"]["breadth_state"] == "COMPLETE" and captures["SPY"]["breadth_contracts"] == 1

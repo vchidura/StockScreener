@@ -554,7 +554,7 @@ def breadth_screener_row(row: Mapping[str, object]) -> dict[str, object]:
         otm = (strike - spot) / spot if kind == "CALL" else (spot - strike) / spot
     volume, open_interest = row.get("day_volume"), row.get("open_interest")
     ratio = (
-        Decimal(volume) / Decimal(open_interest)
+        (Decimal(volume) / Decimal(open_interest)).quantize(Decimal("0.0001"))
         if volume is not None and open_interest
         else None
     )
@@ -633,19 +633,24 @@ def load_breadth_screener_rows_cursor(
         "WHERE breadth.session_date=%s AND breadth.underlying=ANY(%s) AND breadth.observed_at<=%s",
         (session_date, list(underlyings), available_by),
     )
+    # The API reads with a dict cursor; other callers with a tuple cursor. Both shapes give the same rows.
     columns = [column[0] for column in cursor.description]
-    rows = [breadth_screener_row(dict(zip(columns, values))) for values in cursor.fetchall()]
+    rows = [
+        breadth_screener_row(dict(values) if isinstance(values, Mapping) else dict(zip(columns, values)))
+        for values in cursor.fetchall()
+    ]
     cursor.execute(
         "SELECT DISTINCT ON (underlying) underlying,state,observed_at,contracts,reason "
         "FROM rt.option_breadth_captures WHERE session_date=%s AND underlying=ANY(%s) AND observed_at<=%s "
         "ORDER BY underlying,observed_at DESC",
         (session_date, list(underlyings), available_by),
     )
-    captures = {
-        str(values[0]): {
-            "breadth_state": values[1], "breadth_observed_at": values[2].isoformat(),
-            "breadth_contracts": int(values[3]), "breadth_reason": values[4],
+    names = ("underlying", "state", "observed_at", "contracts", "reason")
+    captures = {}
+    for values in cursor.fetchall():
+        item = dict(values) if isinstance(values, Mapping) else dict(zip(names, values))
+        captures[str(item["underlying"])] = {
+            "breadth_state": item["state"], "breadth_observed_at": item["observed_at"].isoformat(),
+            "breadth_contracts": int(item["contracts"]), "breadth_reason": item["reason"],
         }
-        for values in cursor.fetchall()
-    }
     return rows, captures
