@@ -346,6 +346,9 @@ RELATIONS: dict[str, Relation] = {
     "ref.exchange_codes": _r("shared", append=True, **_REF),
     "ref.option_condition_semantics": _r("shared", append=True, **_REF),
     "rt.option_flow_events": _r("options", "ARCHIVE_FIRST", append=True, partitioned=True, api=True),
+    # G75 breadth: the current row per contract is replaced each capture (pruning old sessions belongs to retention).
+    "rt.option_breadth_current": _r("options", "BOUNDED", mutable=True, api=True),
+    "rt.option_breadth_captures": _r("options", "BOUNDED", append=True, api=True),
     "rt.option_flow_event_profiles": _r(
         "options", "ARCHIVE_FIRST", append=True, partitioned=True, api=True
     ),

@@ -14,6 +14,7 @@ from .acquisition_ledger import (
     load_recorded_provider_request_cursor,
     load_raw_payload_cursor, persist_raw_payload_cursor, PriceBasis, ProviderRequestLane,
 )
+from . import advanced_options_breadth as breadth_capture
 from .advanced_options_control_plane import ADVANCED_OPTIONS_REST_LANES
 from .advanced_options_p8_production import (
     _P8ProductionCapture, p8_options_cycle_cutoff_from_capture,
@@ -397,8 +398,58 @@ def _run_schedule_cycle(
         production_binding=factory.production_binding_payload,
     )
     state.attach_downstream_binding(session, downstream)
+    breadth = _capture_breadth(
+        provider, package=package, acquisition=acquisition, equity_cutoff=receipt[1], api_key=api_key,
+        clock=clock, transport_factory=transport_factory,
+    )
     return {
         "status": "ATTACHED", "window_id": str(target_window_id),
         "equity_cutoff": receipt[1].isoformat(), "options_cutoff": options_cutoff.isoformat(),
         "contracts": len(acquisition.contract_tickers), "sequence": downstream.sequence,
+        "breadth": breadth,
     }
+
+
+BREADTH_SECONDS = 150
+
+
+def _breadth_spots(provider, underlyings, available_before):
+    from .advanced_options_p8_production import _PostgresSelectionSpots
+
+    spots = _PostgresSelectionSpots(provider, UUID(int=1))
+    try:
+        return dict(spots.load_spots(underlyings=underlyings, available_before=available_before))
+    except Exception:  # noqa: BLE001 - one missing spot only drops that underlying
+        found = {}
+        for underlying in underlyings:
+            try:
+                found.update(spots.load_spots(underlyings=(underlying,), available_before=available_before))
+            except Exception:  # noqa: BLE001
+                continue
+        return found
+
+
+def _capture_breadth(provider, *, package, acquisition, equity_cutoff, api_key, clock, transport_factory):
+    """G75: the option chain beside the stream, after the window is attached, so it never delays or decides it."""
+    try:
+        underlyings = tuple(sorted({
+            str(ticker).strip().upper() for ticker in (package.get("cohort") or {}).get("underlyings") or ()
+        }))
+        if not underlyings:
+            return {"status": "NO_UNDERLYINGS"}
+        deadline = min(clock() + timedelta(seconds=BREADTH_SECONDS), acquisition.authority.acquisition_stop)
+        if deadline <= clock():
+            return {"status": "AFTER_ACQUISITION_STOP"}
+        spots = _breadth_spots(provider, underlyings, clock())
+        transport = transport_factory(
+            api_key, maximum_response_bytes=breadth_capture.RESPONSE_BYTE_CEILING, deadline=deadline, clock=clock,
+        )
+        return breadth_capture.capture_options_breadth(
+            provider, session_date=acquisition.authority.session_date, underlyings=underlyings, spots=spots,
+            equity_cutoff=equity_cutoff, cohort_id=acquisition.authority.cohort_id,
+            authorization_reference=str(package["authorization_reference"]),
+            authorized_until=acquisition.authority.acquisition_stop, transport=transport, deadline=deadline,
+            clock=clock,
+        )
+    except Exception as error:  # noqa: BLE001 - breadth is display and detector input, never a window gate
+        return {"status": "FAILED", "reason": f"{type(error).__name__}: {str(error)[:160]}"}

@@ -1871,7 +1871,11 @@ class AdvancedOptionsScreenerPagePublication:
         cohort_id: UUID,
         provider_tier: ProviderTier,
         scope_sha256: str,
+        breadth_rows=(),
+        breadth_coverage=None,
     ) -> dict[str, object]:
+        """G75: `breadth_rows` are the chain's other contracts (read at the page's time, not published); a contract in
+        the publication keeps its published row. Each underlying's coverage carries its breadth capture label."""
         from options.analytics.eligible_chain_projection import (
             query_stored_eligible_chain,
         )
@@ -1882,10 +1886,21 @@ class AdvancedOptionsScreenerPagePublication:
             provider_tier=provider_tier,
             scope_sha256=scope_sha256,
         )
+        published = tuple(self._payload["rows"])
+        known = {str(row.get("contract_ticker")) for row in published}
+        rows = published + tuple(
+            row for row in breadth_rows if str(row["contract_ticker"]) not in known
+        )
+        coverage = tuple(
+            {**row, **((breadth_coverage or {}).get(str(row["underlying"])) or {
+                "breadth_state": "NOT_CAPTURED",
+            })}
+            for row in self._payload["coverage"]
+        )
         result = query_stored_eligible_chain(
             request,
-            rows=tuple(self._payload["rows"]),
-            coverage=tuple(self._payload["coverage"]),
+            rows=rows,
+            coverage=coverage,
             underlyers=tuple(self._payload["underlyers"]),
             filter_values=self._payload["filter_values"],
         )

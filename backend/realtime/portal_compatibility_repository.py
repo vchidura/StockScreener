@@ -623,6 +623,38 @@ class RealtimeOptionFlowRepository(_RealtimeCompatibilityRepository):
         }
 
 
+def _option_breadth(cursor, publication, *, cutoff):
+    """G75: the chain's breadth rows for the Screener at the read time, or None (the published rows alone) when they
+    cannot be read; breadth never fails the page."""
+    import logging
+
+    from .advanced_options_breadth import load_breadth_screener_rows_cursor
+
+    payload = getattr(publication, "_payload", None) or {}
+    try:
+        session_date = date.fromisoformat(str(payload["session_date"]))
+        underlyings = tuple(str(item) for item in payload["underlyers"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    saved = False
+    try:
+        cursor.execute("SAVEPOINT options_breadth")
+        saved = True
+        result = load_breadth_screener_rows_cursor(
+            cursor, session_date=session_date, underlyings=underlyings, available_by=cutoff,
+        )
+        cursor.execute("RELEASE SAVEPOINT options_breadth")
+        return result
+    except Exception:  # noqa: BLE001
+        if saved:
+            try:
+                cursor.execute("ROLLBACK TO SAVEPOINT options_breadth")
+            except Exception:  # noqa: BLE001
+                pass
+        logging.getLogger(__name__).warning("Options breadth unavailable; serving the release's rows")
+        return None
+
+
 class RealtimeOptionScreenerRepository(_RealtimeCompatibilityRepository):
     def eligible_chain(
         self,
@@ -690,11 +722,19 @@ class RealtimeOptionScreenerRepository(_RealtimeCompatibilityRepository):
                         )
                     if retained is not None:
                         publication, release = retained
+                        breadth = (
+                            _option_breadth(cursor, publication, cutoff=cutoff)
+                            if active["provider_tier"] == "MASSIVE_ADVANCED"
+                            else None
+                        )
                         result = publication.query(
                             request,
                             cohort_id=cohort_id,
                             provider_tier=publication.provider_tier,
                             scope_sha256=release["scope_sha256"],
+                            **({} if breadth is None else {
+                                "breadth_rows": breadth[0], "breadth_coverage": breadth[1],
+                            }),
                         )
                         return (
                             _retained_options_envelope(result, release)
