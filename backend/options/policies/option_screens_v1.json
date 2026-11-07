@@ -1,0 +1,70 @@
+{
+  "schema_version": "options-screen-catalog-v1",
+  "purpose": "Built-in Options Screener definitions. Thresholds follow docs/ADVANCED_OPTIONS_FLOW_POLICY.md (tiers, DTE lanes, Volume/OI overlay); the prior-OI floor of 500 and the tier minimums are the user's decision of Nov 8, 2026.",
+  "screens": [
+    {
+      "schema_version": "options-screen-v1",
+      "id": "unusual-activity-calls",
+      "version": 1,
+      "name": "Unusual activity: calls",
+      "summary": "Calls trading at least 3 times their prior open interest, with tier-sized volume and premium. An observation of activity: it does not show buying, opening flow or direction.",
+      "contract_type": "CALL",
+      "rule": {"all": [
+        {"field": "open_interest", "op": ">=", "value": 500},
+        {"field": "volume_open_interest_ratio", "op": ">=", "value": 3},
+        {"not": {"field": "calendar_dte", "op": "in", "value": [3, 4]}},
+        {"field": "day_volume", "op": ">=", "parameter": "minimum_day_volume"},
+        {"field": "day_premium", "op": ">=", "parameter": "minimum_day_premium"}
+      ]},
+      "parameters": {
+        "underlying_tiers": {
+          "SPY": "ETF", "QQQ": "ETF", "IWM": "ETF",
+          "AAPL": "CORE_MEGA_CAP", "AMZN": "CORE_MEGA_CAP", "MSFT": "CORE_MEGA_CAP",
+          "NFLX": "HIGH_BETA_HIGH_PREMIUM", "NVDA": "HIGH_BETA_HIGH_PREMIUM", "TSLA": "HIGH_BETA_HIGH_PREMIUM"
+        },
+        "values": {
+          "ETF": {"minimum_day_volume": 5000, "minimum_day_premium": 1000000},
+          "CORE_MEGA_CAP": {"minimum_day_volume": 1500, "minimum_day_premium": 500000},
+          "HIGH_BETA_HIGH_PREMIUM": {"minimum_day_volume": 750, "minimum_day_premium": 500000}
+        },
+        "untiered": "EXCLUDE"
+      },
+      "sort": "day_premium",
+      "descending": true,
+      "caps": {"per_underlying": 3, "total": 20},
+      "source": "ADVANCED_OPTIONS_FLOW_POLICY.md: Reviewed Universe Tiers, DTE Lanes, Opening And Volume/OI Overlay, Candidate Caps"
+    },
+    {
+      "schema_version": "options-screen-v1",
+      "id": "unusual-activity-puts",
+      "version": 1,
+      "name": "Unusual activity: puts",
+      "summary": "Puts trading at least 3 times their prior open interest, with tier-sized volume and premium. An observation of activity: it does not show selling, opening flow or direction.",
+      "contract_type": "PUT",
+      "rule": {"all": [
+        {"field": "open_interest", "op": ">=", "value": 500},
+        {"field": "volume_open_interest_ratio", "op": ">=", "value": 3},
+        {"not": {"field": "calendar_dte", "op": "in", "value": [3, 4]}},
+        {"field": "day_volume", "op": ">=", "parameter": "minimum_day_volume"},
+        {"field": "day_premium", "op": ">=", "parameter": "minimum_day_premium"}
+      ]},
+      "parameters": {
+        "underlying_tiers": {
+          "SPY": "ETF", "QQQ": "ETF", "IWM": "ETF",
+          "AAPL": "CORE_MEGA_CAP", "AMZN": "CORE_MEGA_CAP", "MSFT": "CORE_MEGA_CAP",
+          "NFLX": "HIGH_BETA_HIGH_PREMIUM", "NVDA": "HIGH_BETA_HIGH_PREMIUM", "TSLA": "HIGH_BETA_HIGH_PREMIUM"
+        },
+        "values": {
+          "ETF": {"minimum_day_volume": 5000, "minimum_day_premium": 1000000},
+          "CORE_MEGA_CAP": {"minimum_day_volume": 1500, "minimum_day_premium": 500000},
+          "HIGH_BETA_HIGH_PREMIUM": {"minimum_day_volume": 750, "minimum_day_premium": 500000}
+        },
+        "untiered": "EXCLUDE"
+      },
+      "sort": "day_premium",
+      "descending": true,
+      "caps": {"per_underlying": 3, "total": 20},
+      "source": "ADVANCED_OPTIONS_FLOW_POLICY.md: Reviewed Universe Tiers, DTE Lanes, Opening And Volume/OI Overlay, Candidate Caps"
+    }
+  ]
+}

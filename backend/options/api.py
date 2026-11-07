@@ -275,6 +275,7 @@ def option_eligible_chain(request: EligibleChainQuery) -> OptionsEnvelope:
                        ABS(snapshot.local_delta) AS absolute_delta,
                        snapshot.model_mark AS mark,
                        snapshot.day_volume::double precision / NULLIF(snapshot.open_interest, 0) AS volume_open_interest_ratio,
+                       snapshot.day_volume * snapshot.model_mark * 100 AS day_premium,
                        CASE snapshot.contract_type WHEN 'CALL' THEN (snapshot.strike - snapshot.spot) / snapshot.spot
                            ELSE (snapshot.spot - snapshot.strike) / snapshot.spot END AS otm_fraction
                 FROM latest

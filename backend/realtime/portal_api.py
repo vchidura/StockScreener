@@ -882,7 +882,9 @@ def create_realtime_portal_app(
     def option_discovery_catalog(cohort_id: UUID | None = None):
         if cohort_id is None:
             raise HTTPException(422, "Options Screener requires an explicit realtime cohort")
-        return {**build_discovery_catalog(), "contract_filters": CONTRACT_FILTERS}
+        from options.screens import builtin_screen_catalog
+
+        return {**build_discovery_catalog(), "contract_filters": CONTRACT_FILTERS, "screens": builtin_screen_catalog()}
 
     @app.post("/api/options/eligible-chain/query")
     def option_eligible_chain(

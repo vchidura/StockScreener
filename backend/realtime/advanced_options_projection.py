@@ -1890,11 +1890,23 @@ class AdvancedOptionsScreenerPagePublication:
             provider_tier=provider_tier,
             scope_sha256=scope_sha256,
         )
+        from options.screens import builtin_screens, derive_screen_fields, evaluate_screen
+
         published = tuple(self._payload["rows"])
         known = {str(row.get("contract_ticker")) for row in published}
-        rows = published + tuple(
-            row for row in breadth_rows if str(row["contract_ticker"]) not in known
+        rows = tuple(
+            {**row, **derive_screen_fields(row)}
+            for row in published + tuple(
+                row for row in breadth_rows if str(row["contract_ticker"]) not in known
+            )
         )
+        screen_note = None
+        if getattr(request, "screen_id", None):
+            definition = builtin_screens().get(request.screen_id)
+            if definition is None:
+                raise ValueError(f"Unknown Options screen: {request.screen_id}")
+            selected, screen_note = evaluate_screen(definition, rows)
+            rows = tuple(selected)
         coverage = tuple(
             {**row, **((breadth_coverage or {}).get(str(row["underlying"])) or {
                 "breadth_state": "NOT_CAPTURED",
@@ -1908,6 +1920,8 @@ class AdvancedOptionsScreenerPagePublication:
             underlyers=tuple(self._payload["underlyers"]),
             filter_values=self._payload["filter_values"],
         )
+        if screen_note is not None:
+            result = {**result, "data": {**result["data"], "screen": screen_note}}
         return {
             **result,
             "data_tier": "REAL-TIME ADVANCED RESEARCH DATA",

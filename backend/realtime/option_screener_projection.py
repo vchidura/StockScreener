@@ -72,7 +72,7 @@ def seal_offline_eligible_chain_publication(
             if row is not None:
                 eligible.append(row)
                 filter_values[str(snapshot.snapshot_id)] = {field: str(row[field]) for field in CONTRACT_FILTERS
-                    if isinstance(row[field], Decimal)}
+                    if isinstance(row.get(field), Decimal)}
         rows.extend(eligible)
         coverage.append(dict(underlying=matrix.analysis.underlying.underlyer, batch_id=matrix.ingress.batch_id,
             matrix_id=matrix.matrix_id, market_time=market_time, observed_time=observed_time,

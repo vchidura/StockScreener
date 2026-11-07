@@ -19,12 +19,15 @@ CONTRACT_FILTERS = {
     "day_volume": {"label": "Volume", "unit": "contracts", "minimum": 0, "integer": True},
     "open_interest": {"label": "Open interest", "unit": "contracts", "minimum": 0, "integer": True},
     "volume_open_interest_ratio": {"label": "Volume / OI", "unit": "ratio", "minimum": 0},
+    # Derived per row by the realtime Screener (options/screens.py): day volume x option mark x 100.
+    "day_premium": {"label": "Day premium", "unit": "USD", "minimum": 0},
 }
+DERIVED_CONTRACT_FIELDS = frozenset({"day_premium"})
 
 ContractField = Literal[
     "calendar_dte", "model_mark", "spot", "absolute_delta", "local_iv", "local_gamma",
     "local_theta_per_day", "local_vega_per_vol_point", "otm_fraction", "day_volume",
-    "open_interest", "volume_open_interest_ratio",
+    "open_interest", "volume_open_interest_ratio", "day_premium",
 ]
 
 
@@ -61,6 +64,8 @@ class EligibleChainQuery(BaseModel):
     descending: bool = True
     limit: int = Field(default=100, ge=1, le=500)
     offset: int = Field(default=0, ge=0)
+    # A built-in screen (options/policies/option_screens_v1.json) applied before these filters.
+    screen_id: str | None = Field(default=None, pattern=r"^[a-z0-9][a-z0-9-]{0,63}$")
 
     @model_validator(mode="after")
     def unique_filters(self):
@@ -75,6 +80,8 @@ def contract_filter_sql(request: EligibleChainQuery) -> tuple[str, tuple[object,
     if request.contract_type:
         clauses.append("contract_type = %s")
         parameters.append(request.contract_type)
+    if request.screen_id is not None:
+        raise ValueError("built-in screens are served by the realtime Options Screener only")
     for condition in request.filters:
         for operator, value in ((">=", condition.minimum), ("<=", condition.maximum)):
             if value is not None:

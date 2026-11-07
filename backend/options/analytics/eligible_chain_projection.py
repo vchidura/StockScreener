@@ -41,6 +41,10 @@ def query_stored_eligible_chain(
     underlyers: tuple[str, ...], filter_values: Mapping[str, Mapping] | None = None,
 ) -> dict:
     request = EligibleChainQuery.model_validate(request.model_dump())
+    from options.screens import derive_screen_fields
+
+    # Derived fields (day premium) exist for every stored row, whichever producer stored it.
+    rows = tuple(row if "day_premium" in row else {**row, **derive_screen_fields(row)} for row in rows)
     requested = [request.underlyer] if request.underlyer else list(underlyers)
     if any(symbol not in underlyers for symbol in requested):
         return dict(available=False, reason="UNDERLYING_NOT_CONFIGURED",
