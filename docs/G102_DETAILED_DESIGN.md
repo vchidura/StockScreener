@@ -473,7 +473,8 @@ no reference or action change is pending on live now.
 
 ## 7. Later steps (outline; detailed the same way before they are built)
 
-- **A2, rest:** window attempts that supersede (lineage columns on `rt.window_runs`); ingress plan revisions
+- **A2, rest:** window attempts that supersede (lineage columns on `rt.window_runs`) with each attempt's per-ticker
+  outcomes in `rt.window_member_outcomes` (migration 052; v1 keeps them only in the page manifests); ingress plan revisions
   (`UNIQUE (authorization_id, session_date)` becomes unique per revision, C12). (The read labels are built: 6.1.)
 - **A3:** `rt.detector_activations`, `rt.policy_versions`, `rt.configuration_generation`, a resolver called once per
   window, recorded on the window run. Equity detectors first. Options only after the P8-or-v3 decision (1.4). Today's
@@ -497,7 +498,7 @@ stop, and the P8 roles stop within their bound. Fallback: close the row by hand,
 **Fast track (user, Nov 7; plan section 15):** the weekend builds B14a, section 6 (per-ticker outcomes), flags instead
 of 503 (6.1), section 3 (A0), 5.1-5.4 and the G94 lookback, deployed Sunday night.
 Migrations go in contiguously (the catalog requires it): 049 (G90 supersede) and 050 (B24 index) this weekend; 051
-(section 4, bars without the cohort) Thursday-Friday; 052 (member outcomes) only if v2 needs it. Items without detail here (B14a, flags instead of 503, G94) get a
+(section 4, bars without the cohort) Thursday-Friday; 052 (member outcomes on the window run) with A2's rest. Items without detail here (B14a, flags instead of 503, G94) get a
 short design note in this file before code (flags instead of 503: 6.1).
 
 **Saturday:** B14a; section 6; flags instead of 503; restore one copy of live for the weekend's tests.
@@ -514,7 +515,7 @@ migrations; deploy; run the pre-open data audit.
 | Tue Nov 10 | Options on 23 live, measured under the stop rule (replaces the 11.5x copy rehearsal) |
 | Wed Nov 11 | 50-ticker revision if Tuesday is clean |
 | Thu-Fri | Section 4 (bars without the cohort); P8-or-v3 decision for Options |
-| Nov 16-20 | A3, A2's rest (window attempts, ingress plan revisions), A5, then B0-B2; A6 only if needed |
+| Nov 16-20 | A3, A2's rest (window attempts with per-ticker outcomes, ingress plan revisions), A5, then B0-B2; A6 only if needed |
 
 **Monday checklist:**
 
