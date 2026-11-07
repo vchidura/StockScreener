@@ -375,6 +375,19 @@ never reached a live image: `build_candidate.sh` copies `realtime`, `scripts`, `
 changes Options alert output, so it goes in after a replay, not untested on Monday. The Options OS detectors stay stopped
 (G93/B22).
 
+**Superseded Nov 8: the Monday bundle adds G81 and G75 (user's decision).** Image r54
+(`stable-nov8-r54-monday-50fabfd0a5266760`, commit `4c91c62`, now with `options/`; `build_candidate.sh` copies it from
+now on) and frontend f18. G81 needed four detector fixes found by replaying Nov 6's whole journal (B22 lease stamping,
+oldest journal first, bar-end progress coordinate, one checkpoint per detector and instrument; 583fb1b); the Options OS
+detectors start again with the deploy. G75 (`OPTIONS_COVERAGE_TASK.md`): breadth capture (migration 052), our Greeks
+beside the provider's on every row, built-in Unusual-activity screens (`options/screens.py`). Rehearsed on a fresh copy
+hardened like live with the r53 image (r54 adds only the breadth read fix): migrations 049-052 in 0.7 s; hardening
+changes only `rt.bar_head` and the two breadth tables; backfill 432,684 rows in 16 s; the validator passes with 052;
+breadth capture of the 9 Options underlyings 15,612 contracts in 71 requests and 29 s; the Options Screener served SPY
+4,750 rows (8 published, 4,742 breadth) and the Unusual-activity screens 15 calls of 35 and 18 puts of 24, ours and the
+provider's IV on every row (breadth: 0.247 vs 0.242, 0.278 vs 0.274). The rehearsal found one bug, fixed in r54: the
+breadth read assumed tuple rows while the API reads with a dict cursor.
+
 ## 5. A1: onboarding, statistics and the bridge query
 
 ### 5.1 G90: a revision supersedes an open Options preparation
