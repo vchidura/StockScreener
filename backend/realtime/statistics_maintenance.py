@@ -25,7 +25,7 @@ UTC = timezone.utc
 STATISTICS_INTERVAL_SECONDS = 300
 MODIFIED_ROWS_THRESHOLD = 5_000
 ACTIVATION_LEAD = timedelta(minutes=30)
-WATCHED_TABLES = ("bar_catalog", "bar_current")
+WATCHED_TABLES = ("bar_catalog", "bar_head")  # G102 A4: the head is the hot current-bar table
 PARTITIONED_PARENT = "bar_revisions"
 AUTOANALYZE_OPTIONS = ("autovacuum_analyze_scale_factor=0", "autovacuum_analyze_threshold=5000")
 _NAME = re.compile(r"^[a-z][a-z0-9_]{0,62}$")

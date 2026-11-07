@@ -17,7 +17,7 @@ from .contracts import canonical_sha256
 from .advanced_options_read_pin import (
     load_enabled_advanced_options_release_cursor,
 )
-from .equity_bar_repository import load_current_bar_heads_cursor
+from .equity_bar_repository import load_bar_heads_cursor
 from .screening_projection import REALTIME_FIELDS, REALTIME_GAP_CATALOG, SCREENING_BASIS
 from . import screening_references
 from .ticker_references import BarLineageChanged
@@ -1205,17 +1205,15 @@ class RealtimeScreeningRepository(_RealtimeCompatibilityRepository):
     generation is remembered by id (a bounded cache), so a bar revised after its first load is noticed when
     the entry leaves the cache or the process restarts, as for the Ticker Workspace snapshot cache."""
 
-    def __init__(self, cursor_factory, *, transaction_configured=False, bar_loader=load_current_bar_heads_cursor):
+    def __init__(self, cursor_factory, *, transaction_configured=False, bar_loader=load_bar_heads_cursor):
         super().__init__(cursor_factory, transaction_configured=transaction_configured)
         self._bar_loader = bar_loader
         self._verified = BoundedCache(VERIFIED_GENERATION_CACHE_SIZE)
 
     def _bars(self, cursor, record, payload, security_ids=None, *, with_sources=False):
+        # G102 A4: the members' bars by instrument from the head (G83: the cohort's own bars held 7 of 283).
         targets = screening_references.bar_targets(payload, security_ids)
-        return self._bar_loader(
-            cursor, cohort_id=UUID(str(record["cohort_id"])), provider_tier=record["provider_tier"],
-            targets=targets, with_sources=with_sources,
-        )
+        return self._bar_loader(cursor, targets=targets, with_sources=with_sources)
 
     def _verify_bars(self, cursor, record, payload):
         key = str(record["generation_id"])

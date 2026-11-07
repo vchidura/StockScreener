@@ -882,7 +882,7 @@ def test_tenth_member_resumes_bounded_work_and_promotes_next_snapshot():
         try:
             with connection.cursor() as cursor:
                 cursor.execute(
-                    "SELECT count(*) FROM rt.bar_current AS current "
+                    "SELECT count(*) FROM rt.bar_head AS current "
                     "JOIN rt.bar_revisions AS revision "
                     "ON revision.bar_revision_id=current.bar_revision_id "
                     "AND revision.observed_at=current.observed_at "
@@ -928,7 +928,7 @@ def test_tenth_member_resumes_bounded_work_and_promotes_next_snapshot():
             with connection.cursor() as cursor:
                 cursor.execute(
                     "SELECT current.interval,count(*) "
-                    "FROM rt.bar_current AS current "
+                    "FROM rt.bar_head AS current "
                     "JOIN rt.bar_revisions AS revision "
                     "ON revision.bar_revision_id=current.bar_revision_id "
                     "AND revision.observed_at=current.observed_at "

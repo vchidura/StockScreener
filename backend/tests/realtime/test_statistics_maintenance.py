@@ -43,7 +43,7 @@ def refresh(rows, checked_at):
 
 
 def test_the_watch_list_follows_the_month():
-    assert watched_tables(OPEN) == ("bar_catalog", "bar_current", "bar_revisions_p20261101")
+    assert watched_tables(OPEN) == ("bar_catalog", "bar_head", "bar_revisions_p20261101")
     assert watched_tables(datetime(2026, 12, 1, 0, 5, tzinfo=UTC))[-1] == "bar_revisions_p20261201"
 
 
@@ -54,27 +54,27 @@ def test_before_activation_fresh_statistics_are_left_alone():
 
 
 def test_at_activation_yesterdays_statistics_are_refreshed_and_autoanalyze_is_tuned():
-    rows = {"bar_catalog": (100, YESTERDAY, []), "bar_current": (100, YESTERDAY, TUNED),
+    rows = {"bar_catalog": (100, YESTERDAY, []), "bar_head": (100, YESTERDAY, TUNED),
             "bar_revisions_p20261101": (100, None, ["fillfactor=80"])}
     result, writes = refresh(rows, OPEN - timedelta(minutes=29))
     assert writes == [
         'ALTER TABLE rt."bar_catalog" SET (autovacuum_analyze_scale_factor = 0, autovacuum_analyze_threshold = 5000)',
         'ANALYZE rt."bar_catalog"',
-        'ANALYZE rt."bar_current"',
+        'ANALYZE rt."bar_head"',
         'ALTER TABLE rt."bar_revisions_p20261101" SET '
         '(autovacuum_analyze_scale_factor = 0, autovacuum_analyze_threshold = 5000)',
         'ANALYZE rt."bar_revisions_p20261101"',
     ]
     assert result["autoanalyze_tuned"] == ["bar_catalog", "bar_revisions_p20261101"]
-    assert result["last_analyzed"]["bar_current"] == (OPEN - timedelta(minutes=29)).isoformat()
+    assert result["last_analyzed"]["bar_head"] == (OPEN - timedelta(minutes=29)).isoformat()
 
 
 def test_during_the_session_only_tables_with_many_changes_are_analyzed():
     fresh = OPEN + timedelta(minutes=5)
-    rows = {"bar_catalog": (4_000, fresh, TUNED), "bar_current": (5_001, fresh, TUNED),
+    rows = {"bar_catalog": (4_000, fresh, TUNED), "bar_head": (5_001, fresh, TUNED),
             "bar_revisions_p20261101": (12_000, fresh, TUNED)}
     result, writes = refresh(rows, OPEN + timedelta(hours=1))
-    assert writes == ['ANALYZE rt."bar_current"', 'ANALYZE rt."bar_revisions_p20261101"']
+    assert writes == ['ANALYZE rt."bar_head"', 'ANALYZE rt."bar_revisions_p20261101"']
     assert result["state"] == "READY"
 
 

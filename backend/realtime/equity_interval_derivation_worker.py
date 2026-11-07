@@ -64,15 +64,12 @@ def load_current_five_minute_facts_cursor(
     checked_at: datetime,
 ):
     cursor.execute(
-        "SELECT revision.* FROM rt.bar_current AS current "
+        # G102 A4: the current bar by instrument from the head, whatever cohort wrote it.
+        "SELECT revision.* FROM rt.bar_head AS current "
         "JOIN rt.bar_revisions AS revision "
         "ON revision.bar_revision_id=current.bar_revision_id "
         "AND revision.observed_at=current.observed_at "
-        "AND revision.cohort_id=current.cohort_id "
-        "AND revision.provider_tier=current.provider_tier "
-        "AND revision.instrument_id=current.instrument_id "
-        "AND revision.interval=current.interval "
-        "WHERE current.cohort_id=%s AND current.instrument_id=%s "
+        "WHERE current.instrument_id=%s "
         "AND current.interval='5m' AND current.session_scope='RTH' "
         "AND current.adjustment_basis='RAW_UNADJUSTED' "
         "AND current.bar_start>=%s::date "
@@ -85,7 +82,6 @@ def load_current_five_minute_facts_cursor(
         "OR revision.provider_published_at<=%s) "
         "ORDER BY revision.bar_start",
         (
-            str(cohort_id),
             instrument_id,
             session_date,
             session_date,

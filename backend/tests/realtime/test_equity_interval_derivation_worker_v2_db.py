@@ -59,8 +59,8 @@ def test_closure_jobs_derive_exact_higher_intervals(pool):
     assert status.claimed == status.completed == status.output_count == 47
     with provider.transaction(read_only=True) as unit:
         unit.cursor.execute(
-            "SELECT interval,source_kind,count(*) FROM rt.bar_current "
-            "WHERE cohort_id=%s AND adjustment_basis='RAW_UNADJUSTED' "
+            "SELECT interval,source_kind,count(*) FROM rt.bar_head "
+            "WHERE written_by_cohort_id=%s AND adjustment_basis='RAW_UNADJUSTED' "
             "AND interval=ANY(%s) GROUP BY interval,source_kind "
             "ORDER BY interval,source_kind",
             (
@@ -84,8 +84,8 @@ def test_closure_jobs_derive_exact_higher_intervals(pool):
         )
         member = unit.cursor.fetchone()
         unit.cursor.execute(
-            "SELECT MIN(observed_at) FROM rt.bar_current "
-            "WHERE cohort_id=%s AND instrument_id=%s AND interval='5m'",
+            "SELECT MIN(observed_at) FROM rt.bar_head "
+            "WHERE written_by_cohort_id=%s AND instrument_id=%s AND interval='5m'",
             (str(plan.cohort_id), instrument_id),
         )
         observed_at = unit.cursor.fetchone()[0]

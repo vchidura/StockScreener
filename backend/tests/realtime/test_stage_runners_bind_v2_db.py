@@ -376,7 +376,7 @@ def test_the_ingest_evidence_alerts_and_strategy_stages_run_in_dependency_order_
     assert world.writes(fenced=True) and world.reads()
     # The bar phase materialized the two ingested 1m bars in the same window, before the (stubbed) projection.
     assert _query(pool, "SELECT count(*) FROM rt.bar_catalog WHERE cohort_id = %s", (cohort,))[0][0] == 2
-    assert _query(pool, "SELECT count(*) FROM rt.bar_current WHERE cohort_id = %s", (cohort,))[0][0] == 2
+    assert _query(pool, "SELECT count(*) FROM rt.bar_head WHERE written_by_cohort_id = %s", (cohort,))[0][0] == 2
     assert _query(pool, "SELECT status, count(*) FROM rt.materialization_jobs WHERE cohort_id = %s GROUP BY status",
                   (cohort,)) == [("COMPLETE", 2)]
 
@@ -484,7 +484,7 @@ def _bar_rows(pool, cohort):
         revisions=_query(pool, "SELECT bar_revision_id::text, provider_tier, instrument_id, ticker, interval, "
                          "payload_sha256 FROM rt.bar_revisions WHERE cohort_id = %s", parameters),
         current=_query(pool, "SELECT bar_revision_id::text, provider_tier, instrument_id, interval, source_kind "
-                       "FROM rt.bar_current WHERE cohort_id = %s", parameters))
+                       "FROM rt.bar_head WHERE written_by_cohort_id = %s", parameters))
 
 
 def _expected_bars(result, tickers=None):

@@ -169,11 +169,12 @@ def _coverage(cursor, sessions: tuple[date, ...], known_at: datetime):
         "revision.session_date,current.adjustment_basis,"
         "revision.bar_revision_id::text,"
         "revision.observed_at,revision.payload_sha256 "
-        "FROM rt.bar_current AS current "
+        # G102 A4: the current bar by instrument from the head, whatever cohort wrote it.
+        "FROM rt.bar_head AS current "
         "JOIN rt.bar_revisions AS revision "
         "ON revision.bar_revision_id=current.bar_revision_id "
         "AND revision.observed_at=current.observed_at "
-        "WHERE current.cohort_id=%s AND current.interval='1d' "
+        "WHERE current.interval='1d' "
         "AND current.adjustment_basis=ANY(%s) "
         "AND revision.is_final AND revision.ticker=ANY(%s) "
         "AND revision.session_date=ANY(%s) "
@@ -181,7 +182,6 @@ def _coverage(cursor, sessions: tuple[date, ...], known_at: datetime):
         "ORDER BY revision.ticker,current.adjustment_basis,"
         "revision.session_date",
         (
-            str(ADVANCED_OPTIONS_V3_HISTORY_SOURCE_COHORT_ID),
             ["ADJUSTED", "RAW_UNADJUSTED"],
             list(ADVANCED_OPTIONS_V3_HISTORY_UNDERLYINGS),
             list(sessions),

@@ -26,7 +26,7 @@ START = datetime(2026, 11, 6, 14, 30, tzinfo=UTC)
 SECURITY = UUID(int=7)
 
 
-def test_the_writer_keeps_the_head_in_the_same_transaction():
+def test_the_writer_writes_the_head_and_not_the_cohort_table():
     fact = _fact()
     cursor = _cursor(fact)
     persist_realtime_equity_bars_cursor(cursor, (fact,), values_executor=_values_executor, batch_executor=_batch_executor)
@@ -40,8 +40,8 @@ def test_the_writer_keeps_the_head_in_the_same_transaction():
                        "ADJUSTED" if revision.adjusted else "RAW_UNADJUSTED", str(revision.bar_revision_id))
     assert row[-2:] == (BAR_SELECTION_POLICY, str(fact.cohort_id))
     assert row[10] == revision.system_observed_at and row[19] == revision.payload_sha256
-    # rt.bar_current is still written during the transition.
-    assert "INSERT INTO rt.bar_current" in cursor.recorded_current_statement
+    # rt.bar_current is no longer written (the target design runs Monday).
+    assert not isinstance(getattr(cursor, "recorded_current_rows", None), tuple)
 
 
 def test_the_selection_order_is_precedence_then_observation_then_tier():

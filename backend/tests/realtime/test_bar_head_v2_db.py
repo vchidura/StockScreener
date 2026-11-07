@@ -133,6 +133,16 @@ def test_the_backfill_reaches_the_same_head_as_the_writer(pool, member):
     connection = pool.getconn()
     try:
         with connection.cursor() as cursor:
+            # The state the migration starts from: each cohort's own current pointer in rt.bar_current (the latest
+            # revision it wrote per key). The writer no longer fills that table.
+            cursor.execute(
+                "INSERT INTO rt.bar_current (cohort_id,provider_tier,instrument_id,interval,bar_start,session_scope,"
+                "adjustment_basis,source_kind,bar_revision_id,bar_end,observed_at,updated_at) "
+                "SELECT DISTINCT ON (cohort_id,interval,bar_start,session_scope,adjustment_basis) cohort_id,"
+                "provider_tier,instrument_id,interval,bar_start,session_scope,adjustment_basis,source_kind,"
+                "bar_revision_id,bar_end,observed_at,observed_at FROM rt.bar_revisions WHERE instrument_id=%s "
+                "ORDER BY cohort_id,interval,bar_start,session_scope,adjustment_basis,observed_at DESC",
+                (instrument_id,))
             cursor.execute("DELETE FROM rt.bar_head WHERE instrument_id=%s", (instrument_id,))
             assert backfill_bar_head_cursor(cursor, instrument_id=instrument_id) == 1
             assert backfill_bar_head_cursor(cursor, instrument_id=instrument_id) == 0  # idempotent

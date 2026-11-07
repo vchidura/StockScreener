@@ -242,12 +242,12 @@ class FakeCursor:
         return cutoff, known_by
 
     def _candidates(self, params, portal):
-        cohort, tier, tickers, *rest = params
+        # G102 A4: bars are selected across every writer; the cohort is the screening's identity, not a filter.
+        tickers, *rest = params
         history = tuple(rest[5:])
         assert len(history) == (10 if portal else 6)
         cutoff, known_by = self._clocks(rest[:5])
         return [row for row in self.db.rows if row["_committed"]
-                and str(row["cohort_id"]) == cohort and row["provider_tier"] == tier
                 and row["ticker"] in tickers and row["session_scope"] == "RTH" and row["is_final"]
                 and visible_at(row, cutoff, known_by) and in_window(row, history, portal)]
 
@@ -259,7 +259,7 @@ class FakeCursor:
     def _winners(self, sql, params):
         portal = "interval='1wk'" in sql
         with_state = " AS visible_total" in sql
-        size = 3 + 5 + (10 if portal else 6)
+        size = 1 + 5 + (10 if portal else 6)
         assert len(params) == size * (2 if with_state else 1)
         if with_state:
             assert params[:size] == params[size:]
@@ -283,7 +283,7 @@ class FakeCursor:
 
     def _delta(self, sql, params):
         portal = "interval='1wk'" in sql
-        size = 3 + 5 + (10 if portal else 6)
+        size = 1 + 5 + (10 if portal else 6)
         assert len(params) == 2 * size + 5
         assert params[:size] == params[size:2 * size]
         previous_cutoff, previous_known_by = self._clocks(params[2 * size:])
@@ -297,12 +297,11 @@ class FakeCursor:
 
     def _sources(self, sql, params):
         portal = "availability_mode" in sql
-        ids, cohort, tier, *clocks = params
+        ids, *clocks = params
         cutoff, known_by = self._clocks(clocks)
         assert sql.rstrip().endswith("ORDER BY bar_revision_id")
         wanted = set(ids)
         rows = [row for row in self.db.rows if row["_committed"] and row["bar_revision_id"] in wanted
-                and str(row["cohort_id"]) == cohort and row["provider_tier"] == tier
                 and visible_at(row, cutoff, known_by) and row["is_final"]]
         return [self._project(row, portal) for row in sorted(rows, key=lambda row: row["bar_revision_id"])]
 
@@ -905,7 +904,8 @@ def test_a_default_known_by_reproduces_the_single_clock_statements_exactly(datab
         recorded.append((cursor.kinds, cursor.statements, cursor.params))
     assert recorded[0] == recorded[1]
     kinds, _, params = recorded[0]
-    assert params[kinds.index("winners")][3:8] == (at(20),) * 5
+    # After the tickers come the five visibility clocks (G102 A4: no cohort or tier before them).
+    assert params[kinds.index("winners")][1:6] == (at(20),) * 5
 
 
 def test_a_bar_fetched_after_the_cutoff_but_before_known_by_is_visible_in_its_own_window(database):
@@ -919,7 +919,17 @@ def test_a_bar_fetched_after_the_cutoff_but_before_known_by_is_visible_in_its_ow
     # The identity of the input stays the market cutoff.
     assert result.cutoff == cutoff
     winners = next(p for k, p in zip(cursor.kinds, cursor.params) if k == "winners_state")
-    assert winners[3:8] == (known_by,) * 4 + (cutoff,)
+    assert winners[1:6] == (known_by,) * 4 + (cutoff,)
+
+
+def test_bars_written_under_another_cohort_are_part_of_the_input(database):
+    """G102 A4: the screening input selects bars by what they are; the cohort that wrote them is provenance."""
+    cutoff, _, _ = window(0)
+    other = database.add(start=cutoff - 5 * MINUTE, observed=cutoff - MINUTE)
+    other["cohort_id"] = UUID(int=4242)
+    loader = ScreeningInputLoader()
+    result, _ = agree(database, loader, cutoff)
+    assert other["bar_revision_id"] in ids_of(result)
 
 
 def test_a_bar_inserted_after_known_by_is_not_visible_until_a_later_window(database):

@@ -252,53 +252,8 @@ def persist_realtime_equity_bars_cursor(
     }
     if stored != expected:
         raise ValueError("persisted realtime bar revision identity conflict")
-    batch_executor(
-        cursor,
-        "INSERT INTO rt.bar_current ("
-        "cohort_id, provider_tier, instrument_id, interval, bar_start, "
-        "session_scope, adjustment_basis, source_kind, bar_revision_id, bar_end, observed_at"
-        ") VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
-        "ON CONFLICT (cohort_id, instrument_id, interval, bar_start, "
-        "session_scope, adjustment_basis) DO UPDATE SET "
-        "provider_tier=EXCLUDED.provider_tier, source_kind=EXCLUDED.source_kind, "
-        "bar_revision_id=EXCLUDED.bar_revision_id, "
-        "observed_at=EXCLUDED.observed_at, updated_at=clock_timestamp() "
-        "WHERE (rt.bar_current.provider_tier=EXCLUDED.provider_tier "
-        "OR EXCLUDED.provider_tier=("
-        "SELECT profile.provider_tier FROM rt.cohorts AS cohort "
-        "JOIN rt.subscription_manifests AS manifest USING(manifest_id) "
-        "JOIN rt.capability_profiles AS profile USING(profile_id) "
-        "WHERE cohort.cohort_id=rt.bar_current.cohort_id"
-        ")) "
-        "AND rt.bar_current.bar_end=EXCLUDED.bar_end AND ("
-        + _current_source_precedence("EXCLUDED") + " > "
-        + _current_source_precedence("rt.bar_current")
-        + " OR (rt.bar_current.source_kind=EXCLUDED.source_kind "
-        # On a tie the later write wins: writes follow source offset, and two
-        # revisions can share one observed_at. The 5m bar uses the later one.
-        "AND rt.bar_current.observed_at <= EXCLUDED.observed_at))",
-        [
-            (
-                str(fact.cohort_id),
-                fact.provider_tier.value,
-                fact.instrument_id,
-                fact.revision.interval,
-                fact.revision.bar_start,
-                fact.revision.session_scope.value,
-                "ADJUSTED" if fact.revision.adjusted else "RAW_UNADJUSTED",
-                fact.revision.source_kind.value,
-                str(fact.revision.bar_revision_id),
-                fact.revision.bar_end,
-                stored_catalog[
-                    str(fact.revision.bar_revision_id)
-                ][6],
-            )
-            for fact in rows
-        ],
-        page_size=BAR_BATCH_PAGE_SIZE,
-    )
-    # G102 A4 (design 4.4): the same transaction keeps the cohort-free head. rt.bar_current stays written during
-    # the transition (design section 2) and is retired once every reader uses the head.
+    # G102 A4 (design 4.4): the current bar lives only in the cohort-free head. rt.bar_current is no longer
+    # written (user, Nov 7: the target design runs Monday, no entries into old tables).
     batch_executor(
         cursor,
         _HEAD_INSERT + "VALUES (" + ",".join(["%s"] * (len(BAR_KEY_COLUMNS) + len(_HEAD_VALUE_COLUMNS) + 2))
@@ -338,12 +293,15 @@ def backfill_bar_head_cursor(cursor, *, instrument_id: int) -> int:
     """G102 A4 (design 4.7 step 1): fill one instrument's head from every cohort's current bars, choosing across
     cohorts by `bar-selection-v1`. Idempotent and resumable per instrument (existing head rows are kept: the writer
     already chose them by the same policy). Returns the rows inserted."""
+    # The migrated row keeps the time its pointer was last updated, so causal reads (`updated_at <= checked_at`)
+    # mean what they meant on rt.bar_current. The A4 rehearsal (Nov 7) caught the backfill time standing in for it:
+    # every history read before the backfill came back empty.
     cursor.execute(
-        _HEAD_INSERT
+        _HEAD_INSERT.replace(",written_by_cohort_id) ", ",written_by_cohort_id,updated_at) ")
         + "SELECT DISTINCT ON (revision.instrument_id,revision.interval,revision.bar_start,"
         "revision.session_scope,revision.adjustment_basis) "
         + ",".join(f"revision.{column}" for column in (*BAR_KEY_COLUMNS, *_HEAD_VALUE_COLUMNS))
-        + ",%s,revision.cohort_id FROM rt.bar_current AS cur "
+        + ",%s,revision.cohort_id,cur.updated_at FROM rt.bar_current AS cur "
         "JOIN rt.bar_revisions AS revision ON revision.bar_revision_id=cur.bar_revision_id "
         "AND revision.observed_at=cur.observed_at "
         "WHERE cur.instrument_id=%s "

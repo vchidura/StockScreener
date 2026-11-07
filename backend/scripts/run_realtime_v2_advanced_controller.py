@@ -1219,17 +1219,13 @@ def _load_hybrid_bars_cursor(
     cursor.execute(
         "SELECT current.instrument_id,current.bar_start,current.bar_end,"
         "revision.source_kind,revision.quality_codes "
-        "FROM rt.bar_current AS current "
+        # G102 A4: the current minute by instrument from the head, whatever cohort wrote it (`cohort_id` is the
+        # repair's identity only).
+        "FROM rt.bar_head AS current "
         "JOIN rt.bar_revisions AS revision "
         "ON revision.bar_revision_id=current.bar_revision_id "
         "AND revision.observed_at=current.observed_at "
-        "AND revision.cohort_id=current.cohort_id "
-        "AND revision.provider_tier=current.provider_tier "
-        "AND revision.instrument_id=current.instrument_id "
-        "AND revision.interval=current.interval "
-        "WHERE current.cohort_id=%s "
-        "AND current.provider_tier='MASSIVE_ADVANCED' "
-        "AND current.instrument_id=ANY(%s::bigint[]) "
+        "WHERE current.instrument_id=ANY(%s::bigint[]) "
         "AND current.interval='1m' "
         "AND current.session_scope='RTH' "
         "AND current.adjustment_basis='RAW_UNADJUSTED' "
@@ -1237,7 +1233,6 @@ def _load_hybrid_bars_cursor(
         "AND revision.is_final "
         "ORDER BY current.instrument_id,current.bar_start",
         (
-            str(cohort_id),
             list(instrument_ids),
             requested_from,
             requested_to,

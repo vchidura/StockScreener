@@ -248,8 +248,8 @@ def test_complete_and_gap_jobs_persist_atomic_bar_job_and_barrier_outcomes(datab
             (second_instrument, "COMPLETE"),
         ]
         cursor.execute(
-            "SELECT instrument_id, count(*) FROM rt.bar_current "
-            "WHERE cohort_id=%s AND interval='5m' "
+            "SELECT instrument_id, count(*) FROM rt.bar_head "
+            "WHERE written_by_cohort_id=%s AND interval='5m' "
             "GROUP BY instrument_id ORDER BY instrument_id",
             (str(cohort_id),),
         )

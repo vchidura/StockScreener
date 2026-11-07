@@ -75,7 +75,7 @@ def test_nine_name_first_load_verification_cost():
         with pool.plain() as cursor:
             for offset in range(0, len(facts), 1000):
                 persist_realtime_equity_bars_cursor(cursor, facts[offset:offset + 1000])
-            cursor.execute("ANALYZE rt.bar_current")
+            cursor.execute("ANALYZE rt.bar_head")
             cursor.execute("ANALYZE rt.bar_revisions")
         print(f"\nloaded {len(bars)} bars in {perf_counter() - started:.1f} s")
         generation = project_realtime_ticker_workspace(inputs).screening_generation
@@ -86,7 +86,7 @@ def test_nine_name_first_load_verification_cost():
                 "SELECT octet_length(generation.manifest::text) AS manifest_bytes, "
                 "(SELECT sum(octet_length(stored.payload::text)) FROM rt.screening_rows AS stored "
                 "WHERE stored.generation_id=generation.generation_id) AS rows_bytes, "
-                "(SELECT count(*) FROM rt.bar_current WHERE cohort_id=%s) AS current_bars "
+                "(SELECT count(*) FROM rt.bar_head WHERE written_by_cohort_id=%s) AS current_bars "
                 "FROM rt.screening_generations AS generation WHERE generation.cohort_id=%s",
                 (str(cohort), str(cohort)))
             sizes = dict(cursor.fetchone())

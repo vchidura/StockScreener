@@ -951,6 +951,35 @@ class TickerStore(PortalV2Statements):
                 ))
         return rows
 
+    def _head_rows(self, params):
+        """G102 A4: what `load_bar_heads_cursor` reads from rt.bar_head for the targets (same retire and revise
+        controls as `_bar_rows`)."""
+        tickers = {str(member["security_id"]): member["ticker"] for member in ticker_fixture().members}
+        rows = []
+        for key_text, interval, basis, first, last in zip(
+            params["keys"], params["intervals"], params["bases"], params["firsts"], params["lasts"],
+        ):
+            security_id = key_text.partition("|")[0]
+            ticker = tickers[security_id]
+            group = [row for row in stored_bars()[(ticker, interval, basis)]
+                     if first <= row["bar_start"] and row["bar_end"] <= last]
+            if (ticker, interval) in self.retired_bars:
+                group = group[:-1]
+            for position, row in enumerate(group):
+                revision, payload_sha256 = row["bar_revision_id"], row["payload_sha256"]
+                if (ticker, interval) in self.revised_bars and position == len(group) - 1:
+                    revision, payload_sha256 = uuid5(NAMESPACE_URL, f"revised:{revision}"), "e" * 64
+                rows.append(dict(
+                    key_text=key_text, instrument_id=None, interval=interval, adjustment_basis=basis,
+                    bar_revision_id=revision, bar_start=row["bar_start"], bar_end=row["bar_end"],
+                    session_date=row["bar_start"].date(), observed_at=row["bar_end"], source_kind="NATIVE_REST",
+                    provider_tier="MASSIVE_ADVANCED", open_price=_numeric(row["open"]),
+                    high_price=_numeric(row["high"]), low_price=_numeric(row["low"]),
+                    close_price=_numeric(row["close"]), volume=_numeric(row["volume"]), vwap=None,
+                    transaction_count=None, payload_sha256=payload_sha256,
+                ))
+        return rows
+
     def _evidence_rows(self, security_id, evidence_ids, known_by):
         return [row for evidence_id in evidence_ids
                 if (row := stored_evidence().get(UUID(str(evidence_id)))) is not None
@@ -1099,6 +1128,8 @@ class TickerStore(PortalV2Statements):
                                             dependency_evidence_id=dependency))
         elif sql.startswith("SELECT DISTINCT ON (cur.interval,cur.adjustment_basis,cur.bar_start) cur.interval AS interval"):
             self.result = self._bar_rows(params)
+        elif sql.startswith("WITH candidate AS (SELECT target.key_text,head.* FROM"):
+            self.result = self._head_rows(params)
         elif sql.startswith("SELECT security_id, ticker, revision_id"):
             if self.reference_expired and params[1] > OBSERVED_AT:
                 return
@@ -2265,7 +2296,8 @@ def test_reader_composes_the_charts_and_evidence_the_payload_used_to_embed():
                 cursor, manifest, stored, cohort_id=COHORT_ID, cutoff=OBSERVED_AT)
         assert as_stored_json(compose_evidence(stored["evidence_index"], bodies)) == as_stored_json(
             old_embedded_evidence(snapshot))
-    assert all(sql.startswith(("SELECT", "SET")) for sql in store.statements[start:])
+    # Reads only (the G102 A4 head read is a read-only WITH ... SELECT).
+    assert all(sql.startswith(("SELECT", "SET", "WITH candidate AS (SELECT")) for sql in store.statements[start:])
     assert not any("canonical" in sql or "public." in sql for sql in store.statements)
 
 
@@ -2276,7 +2308,7 @@ def test_a_chart_is_composed_when_it_is_read_and_cached_per_snapshot_and_interva
     start = len(store.statements)
 
     def bar_reads():
-        return [sql for sql in store.statements[start:] if sql.startswith("SELECT DISTINCT ON (cur.interval,")]
+        return [sql for sql in store.statements[start:] if sql.startswith("WITH candidate AS (")]
 
     read = lambda interval: reader.read(  # noqa: E731
         "AAPL", "chart", interval=interval, period="5y", available_by=OBSERVED_AT, cohort_id=COHORT_ID)
@@ -2288,7 +2320,7 @@ def test_a_chart_is_composed_when_it_is_read_and_cached_per_snapshot_and_interva
     assert len(bar_reads()) == 3 and len(reader._chart_cache) == 2
     read("1d")
     assert len(bar_reads()) == 4
-    assert all(sql.count("cur.bar_start>=%s") == 1 for sql in bar_reads())
+    assert all(sql.count("head.bar_start>=target.first_bar_start") == 1 for sql in bar_reads())
 
 
 @pytest.mark.parametrize("interval", ["1m", "5m", "1d", "1wk", "1mo"])
@@ -2318,7 +2350,7 @@ def test_a_chart_whose_bar_changed_after_publication_draws_the_current_bars(defe
 
 def test_a_chart_with_no_current_bar_in_its_published_range_is_unavailable():
     _app, store = ticker_app()
-    store._bar_rows = lambda params: []
+    store._bar_rows = store._head_rows = lambda params: []
     with pytest.raises(ticker_repository.TickerPublicationUnavailable, match="no current bars in its published range"):
         RealtimeTickerWorkspaceRepository(store.cursor).read(
             "AAPL", "chart", interval="1d", period="5y", available_by=OBSERVED_AT, cohort_id=COHORT_ID)

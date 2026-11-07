@@ -311,10 +311,8 @@ WITH expected AS (
 SELECT expected.instrument_id, expected.bar_start,
        current.bar_revision_id::text, current.observed_at, current.updated_at
 FROM expected
-LEFT JOIN rt.bar_current AS current
-  ON current.cohort_id = %s
- AND current.provider_tier = %s
- AND current.instrument_id = expected.instrument_id
+LEFT JOIN rt.bar_head AS current  -- G102 A4: the current bar by instrument, whatever cohort wrote it
+  ON current.instrument_id = expected.instrument_id
  AND current.interval = '5m'
  AND current.bar_start = expected.bar_start
  AND current.bar_end = expected.bar_start + interval '5 minutes'
@@ -337,15 +335,11 @@ LEFT JOIN LATERAL (
     JOIN rt.bar_revisions AS revision
       ON revision.bar_revision_id = catalog.bar_revision_id
      AND revision.observed_at = catalog.observed_at
-     AND revision.cohort_id = catalog.cohort_id
-     AND revision.provider_tier = catalog.provider_tier
      AND revision.instrument_id = catalog.instrument_id
      AND revision.interval = catalog.interval
      AND revision.bar_start = catalog.bar_start
      AND revision.bar_end = catalog.bar_end
-    WHERE catalog.cohort_id = %s
-      AND catalog.provider_tier = %s
-      AND catalog.instrument_id = expected.instrument_id
+    WHERE catalog.instrument_id = expected.instrument_id
       AND catalog.interval = '5m'
       AND catalog.bar_start = expected.bar_start
       AND catalog.bar_end = expected.bar_start + interval '5 minutes'
@@ -558,8 +552,6 @@ def audit_session_close_cursor(
         session.opened_at,
         session.closed_at,
         instrument_ids,
-        str(cohort_id),
-        tier,
     )
     cursor.execute(
         _COVERAGE_MEMBERS_SQL,
@@ -592,7 +584,7 @@ def audit_session_close_cursor(
             (
                 [instrument_id for instrument_id, _ in historical_members],
                 [bar_start for _, bar_start in historical_members],
-                str(cohort_id), tier, known, session.opened_at, known, known, known,
+                known, session.opened_at, known, known, known,
             ),
         )
         historical_rows = tuple(cursor.fetchall())

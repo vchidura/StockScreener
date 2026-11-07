@@ -69,6 +69,45 @@ def insert_service_plan(cursor, cohort: UUID, enabled_stages, now: datetime) -> 
     return plan
 
 
+# G102 A4: production no longer writes rt.bar_current. Fixtures written before A4 still seed current bars through it;
+# in disposable test databases only, this trigger points rt.bar_head at the same revision (inserts by the production
+# selection order, a fixture's explicit update or delete as written), so the converted readers see the seeded state.
+# Fixtures move to rt.bar_head directly in the A4 cleanup.
+_FIXTURE_BAR_HEAD_MIRROR_SQL = """
+CREATE FUNCTION rt.fixture_mirror_bar_current() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    IF TG_OP = 'DELETE' THEN
+        DELETE FROM rt.bar_head WHERE instrument_id = OLD.instrument_id AND interval = OLD.interval
+            AND bar_start = OLD.bar_start AND session_scope = OLD.session_scope
+            AND adjustment_basis = OLD.adjustment_basis AND bar_revision_id = OLD.bar_revision_id;
+        RETURN NULL;
+    END IF;
+    INSERT INTO rt.bar_head AS head (instrument_id, interval, bar_start, session_scope, adjustment_basis,
+        bar_revision_id, provider_tier, source_kind, session_date, bar_end, observed_at, is_final, open_price,
+        high_price, low_price, close_price, volume, vwap, transaction_count, payload_sha256, selection_policy,
+        written_by_cohort_id, updated_at)
+    SELECT r.instrument_id, r.interval, r.bar_start, r.session_scope, r.adjustment_basis, r.bar_revision_id,
+        r.provider_tier, r.source_kind, r.session_date, r.bar_end, r.observed_at, r.is_final, r.open_price,
+        r.high_price, r.low_price, r.close_price, r.volume, r.vwap, r.transaction_count, r.payload_sha256,
+        'bar-selection-v1', r.cohort_id, NEW.updated_at
+    FROM rt.bar_revisions AS r WHERE r.bar_revision_id = NEW.bar_revision_id AND r.observed_at = NEW.observed_at
+    ON CONFLICT (instrument_id, interval, bar_start, session_scope, adjustment_basis) DO UPDATE SET
+        bar_revision_id = EXCLUDED.bar_revision_id, provider_tier = EXCLUDED.provider_tier,
+        source_kind = EXCLUDED.source_kind, session_date = EXCLUDED.session_date, bar_end = EXCLUDED.bar_end,
+        observed_at = EXCLUDED.observed_at, is_final = EXCLUDED.is_final, open_price = EXCLUDED.open_price,
+        high_price = EXCLUDED.high_price, low_price = EXCLUDED.low_price, close_price = EXCLUDED.close_price,
+        volume = EXCLUDED.volume, vwap = EXCLUDED.vwap, transaction_count = EXCLUDED.transaction_count,
+        payload_sha256 = EXCLUDED.payload_sha256, written_by_cohort_id = EXCLUDED.written_by_cohort_id,
+        updated_at = EXCLUDED.updated_at
+    WHERE TG_OP = 'UPDATE' OR head.observed_at <= EXCLUDED.observed_at;
+    RETURN NULL;
+END
+$$;
+CREATE TRIGGER fixture_mirror_bar_current AFTER INSERT OR UPDATE OR DELETE ON rt.bar_current
+    FOR EACH ROW EXECUTE FUNCTION rt.fixture_mirror_bar_current();
+"""
+
+
 def drop_database_if_exists(name: str) -> None:
     if not name.startswith("test_realtime_v2_"):
         raise ValueError("only test_realtime_v2_ databases can be dropped")
@@ -110,6 +149,10 @@ def _disposable_v2_database(
                     cursor.execute(migration.sql)
                     cursor.execute("INSERT INTO rt.schema_migrations (version, checksum_sha256) VALUES (%s, %s)",
                                    (migration.version, migration.checksum_sha256))
+                connection.commit()
+            if any(migration.version == "051_g102_bar_head" for migration in migrations):
+                with connection.cursor() as cursor:
+                    cursor.execute(_FIXTURE_BAR_HEAD_MIRROR_SQL)
                 connection.commit()
         pool = ThreadedConnectionPool(
             1, 8, dbname=name, user=settings["POSTGRES_ADMIN_USER"],

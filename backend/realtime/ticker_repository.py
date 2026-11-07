@@ -17,7 +17,7 @@ from equity.ticker_contracts import PATTERN_WATCH_INTERVALS, PATTERN_WATCH_POLIC
 
 from .contracts import canonical_sha256
 from .database_access import RealtimeDatabaseRole
-from .equity_bar_repository import load_current_bar_groups_cursor
+from .equity_bar_repository import load_bar_groups_cursor
 from .equity_history import EquityHistoryScope
 from .equity_evidence_repository import (
     EvidenceRef,
@@ -707,30 +707,10 @@ class RealtimeTickerWorkspaceRepository(_RealtimeCompatibilityRepository):
         refs = {interval: group_key}
         with self._cursor() as cursor:
             self._begin(cursor)
-            rows = load_current_bar_groups_cursor(
-                cursor, cohort_id=UUID(source["cohort_id"]), provider_tier=source["provider_tier"],
-                instrument_id=source["instrument_id"], security_id=UUID(source["security_id"]),
-                ticker=source["ticker"], groups=chart_group_ranges(manifest, refs),
-                history_source_cohort_id=(
-                    UUID(source["history_source_cohort_id"])
-                    if source.get("history_source_cohort_id")
-                    else None
-                ),
-                history_source_provider_tier=source.get(
-                    "history_source_provider_tier"
-                ),
-                history_before=(
-                    datetime.fromisoformat(source["history_before"])
-                    if source.get("history_before")
-                    else None
-                ),
-                history_source_scopes=tuple(
-                    (scope.cohort_id, scope.provider_tier.value, scope.history_before)
-                    for scope in (
-                        EquityHistoryScope.from_payload(value)
-                        for value in source.get("history_scope_chain", ())
-                    )
-                ),
+            # G102 A4: the chart's bars by instrument from the head, whatever cohort wrote them.
+            rows = load_bar_groups_cursor(
+                cursor, instrument_id=source["instrument_id"], security_id=UUID(source["security_id"]),
+                groups=chart_group_ranges(manifest, refs),
             )
         try:
             return compose_charts(manifest, refs, chart_market_times, rows)[interval]
@@ -949,11 +929,12 @@ class RealtimeTickerWorkspaceRepository(_RealtimeCompatibilityRepository):
             raise ValueError("Realtime trading session limit must be in [1, 2000]")
         with self._cursor() as cursor:
             self._begin(cursor)
+            # G102 A4: sessions with bars of this interval, whatever cohort wrote them.
             cursor.execute(
-                "SELECT DISTINCT session_date FROM rt.bar_catalog "
-                "WHERE cohort_id=%s AND interval=%s AND observed_at<=%s "
+                "SELECT DISTINCT session_date FROM rt.bar_head "
+                "WHERE interval=%s AND observed_at<=%s "
                 "ORDER BY session_date DESC LIMIT %s",
-                (str(cohort_id), interval, cutoff, limit),
+                (interval, cutoff, limit),
             )
             sessions = tuple(row["session_date"] for row in cursor.fetchall())
         if not sessions:

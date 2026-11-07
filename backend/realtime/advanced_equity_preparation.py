@@ -2316,15 +2316,13 @@ def load_equity_preparation_status_cursor(
             "current.interval,current.adjustment_basis) AS first_market_time,"
             "max(revision.bar_end) OVER (PARTITION BY revision.ticker,"
             "current.interval,current.adjustment_basis) AS last_market_time "
-            "FROM rt.bar_current AS current "
+            # G102 A4: the current bar by instrument from the head, whatever cohort wrote it.
+            "FROM rt.bar_head AS current "
             "JOIN rt.bar_revisions AS revision "
             "ON revision.bar_revision_id=current.bar_revision_id "
             "AND revision.observed_at=current.observed_at "
-            "AND revision.cohort_id=current.cohort_id "
-            "AND revision.provider_tier=current.provider_tier "
-            "AND revision.instrument_id=current.instrument_id "
-            "AND revision.interval=current.interval "
-            "WHERE current.cohort_id=%s "
+            "WHERE current.instrument_id IN (SELECT instrument_id FROM rt.instruments "
+            "WHERE security_id=ANY(%s::uuid[]) AND contract_id IS NULL) "
             "AND revision.security_id=ANY(%s::uuid[]) "
             "AND revision.is_final"
             ") SELECT DISTINCT ON (ticker,interval,adjustment_basis) "
@@ -2335,7 +2333,7 @@ def load_equity_preparation_status_cursor(
             "ingestion_segment_id,payload_sha256 "
             "FROM selected ORDER BY ticker,interval,adjustment_basis,"
             "bar_end DESC,observed_at DESC,bar_revision_id DESC",
-            (str(current[3]), list(security_ids)),
+            (list(security_ids), list(security_ids)),
         )
         for availability in cursor.fetchall():
             summary = {

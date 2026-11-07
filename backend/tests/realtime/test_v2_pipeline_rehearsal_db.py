@@ -671,10 +671,13 @@ class Rehearsal:
                            (cutoff,))
 
     def counts(self):
-        tables = ("rt.bar_catalog", "rt.bar_revisions", "rt.bar_current", "rt.evidence_catalog",
+        tables = ("rt.bar_catalog", "rt.bar_revisions", "rt.bar_head", "rt.evidence_catalog",
                   "rt.equity_evidence", "rt.snapshot_catalog", "rt.portal_releases", "rt.cycle_receipts",
                   "rt.materialization_jobs", "rt.acquisition_batches", "rt.screening_generations")
-        return {table: self.scalar(f"SELECT count(*) FROM {table} WHERE cohort_id = %s", (str(self.cohort),))
+        # G102 A4: the head records the cohort that wrote its current bar.
+        return {table: self.scalar(
+            f"SELECT count(*) FROM {table} WHERE "
+            f"{'written_by_cohort_id' if table == 'rt.bar_head' else 'cohort_id'} = %s", (str(self.cohort),))
                 for table in tables}
 
     def stage_rows(self, window_key):
@@ -902,7 +905,7 @@ def test_a3_bars_jobs_and_watermarks_of_the_ingest_and_evidence_stages(rehearsal
     runtime, cohort = rehearsal.deferred, str(rehearsal.cohort)
     facts = [fact for ticker in TICKERS for fact in rehearsal.history[ticker]]
     counts = w1.extra["counts"]
-    assert counts["rt.bar_catalog"] == counts["rt.bar_revisions"] == counts["rt.bar_current"] == len(facts) == 27_608
+    assert counts["rt.bar_catalog"] == counts["rt.bar_revisions"] == counts["rt.bar_head"] == len(facts) == 27_608
     assert rehearsal.q("SELECT provider_tier, count(*) FROM rt.bar_catalog WHERE cohort_id = %s GROUP BY 1",
                        (cohort,)) == [("MASSIVE_DEVELOPER", len(facts))]
     stored_ids = {str(row[0]) for row in rehearsal.q("SELECT bar_revision_id FROM rt.bar_revisions "
@@ -1218,8 +1221,8 @@ def test_a6_the_second_window_takes_the_delta_loader_path_and_publishes_a_new_id
     before, after = w2.extra["before"], w2.extra["counts"]
     for table in ("rt.bar_catalog", "rt.bar_revisions"):
         assert after[table] == before["counts"][table] + 6
-    assert after["rt.bar_current"] == before["counts"]["rt.bar_current"]  # the six bars now point at their revisions
-    assert rehearsal.scalar("SELECT count(*) FROM rt.bar_current WHERE bar_revision_id = ANY(%s::uuid[])",
+    assert after["rt.bar_head"] == before["counts"]["rt.bar_head"]  # the six bars now point at their revisions
+    assert rehearsal.scalar("SELECT count(*) FROM rt.bar_head WHERE bar_revision_id = ANY(%s::uuid[])",
                             (ids,)) == 6
     assert after["rt.materialization_jobs"] == before["counts"]["rt.materialization_jobs"] + 2
     assert rehearsal.q("SELECT status, count(*) FROM rt.materialization_jobs WHERE cohort_id = %s GROUP BY 1",
@@ -1301,7 +1304,7 @@ def test_a7_a_runner_killed_after_its_work_is_retried_without_duplicating_bars_e
     assert {key: value[0] for key, value in rows.items() if key[0] != "EQUITY_EVIDENCE" or key[1] == 2} == {
         (stage, 1 if stage != "EQUITY_EVIDENCE" else 2): "COMPLETE" for stage in WINDOW_STAGES}
     # Idempotent: the replayed bar drain, evidence and screening-generation persistence added no row of any kind.
-    for table in ("rt.bar_catalog", "rt.bar_revisions", "rt.bar_current", "rt.evidence_catalog", "rt.equity_evidence",
+    for table in ("rt.bar_catalog", "rt.bar_revisions", "rt.bar_head", "rt.evidence_catalog", "rt.equity_evidence",
                   "rt.materialization_jobs", "rt.acquisition_batches"):
         assert final[table] == crashed["counts"][table], table
     cohort = str(rehearsal.cohort)
@@ -1474,7 +1477,7 @@ def test_a7c_a_late_arrival_forces_a_full_reload_that_publishes_the_identity_of_
     assert w3b.extra["published"] == w3b.extra["fresh"] and set(w3b.extra["fresh"]) == set(TICKERS)
     assert w3b.extra["counts_after_fresh"] == w3b.extra["after"]  # the fresh recompute persisted nothing new
     assert len(ids) == 4 and rehearsal.scalar(
-        "SELECT count(*) FROM rt.bar_current WHERE bar_revision_id = ANY(%s::uuid[])", (ids,)) == 4
+        "SELECT count(*) FROM rt.bar_head WHERE bar_revision_id = ANY(%s::uuid[])", (ids,)) == 4
 
 
 # --- Part A: the role audit and the timings --------------------------------------------------------------------------
@@ -1888,7 +1891,7 @@ def test_c1_a_restart_between_the_evidence_and_publication_stages_recovers_the_i
     after = recovery["counts"]
     assert after["rt.snapshot_catalog"] == before["rt.snapshot_catalog"] + len(TICKERS) + 2
     assert after["rt.portal_releases"] == before["rt.portal_releases"] + 1
-    for table in ("rt.bar_catalog", "rt.bar_revisions", "rt.bar_current", "rt.evidence_catalog", "rt.equity_evidence",
+    for table in ("rt.bar_catalog", "rt.bar_revisions", "rt.bar_head", "rt.evidence_catalog", "rt.equity_evidence",
                   "rt.cycle_receipts", "rt.screening_generations", "rt.materialization_jobs"):
         assert after[table] == died["counts"][table], table  # the recovery is read-only apart from the release
     # Identical identities: every snapshot (id, manifest and payload digests) and the release itself are the ones
@@ -3015,7 +3018,7 @@ def test_d2_synthetic_advanced_bytes_restart_through_real_api_to_one_exact_share
     assert reconnect_result.persisted_bars == len(TICKERS)
     assert rehearsal.scalar(
         "SELECT count(DISTINCT revision.journal_generation) "
-        "FROM rt.bar_current AS current "
+        "FROM rt.bar_head AS current "
         "JOIN rt.bar_revisions AS revision "
         "ON revision.bar_revision_id=current.bar_revision_id "
         "AND revision.observed_at=current.observed_at "
@@ -3627,7 +3630,7 @@ def test_d2_synthetic_advanced_bytes_restart_through_real_api_to_one_exact_share
     stored_after_commit = {
         "bars": rehearsal.q(
             "SELECT instrument_id, interval, bar_start, count(*) "
-            "FROM rt.bar_current WHERE cohort_id=%s "
+            "FROM rt.bar_head WHERE written_by_cohort_id=%s "
             "AND interval IN ('1m','5m') AND bar_start>=%s AND bar_end<=%s "
             "GROUP BY instrument_id, interval, bar_start ORDER BY 1,2,3",
             (
@@ -3663,7 +3666,7 @@ def test_d2_synthetic_advanced_bytes_restart_through_real_api_to_one_exact_share
     stored_after_retry = {
         "bars": rehearsal.q(
             "SELECT instrument_id, interval, bar_start, count(*) "
-            "FROM rt.bar_current WHERE cohort_id=%s "
+            "FROM rt.bar_head WHERE written_by_cohort_id=%s "
             "AND interval IN ('1m','5m') AND bar_start>=%s AND bar_end<=%s "
             "GROUP BY instrument_id, interval, bar_start ORDER BY 1,2,3",
             (

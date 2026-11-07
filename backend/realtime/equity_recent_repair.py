@@ -596,9 +596,10 @@ def execute_recent_native_repair(provider: V2ConnectionProvider, transport, plan
         known_by = _clock_utc(clock)
         with provider.transaction(APP_ROLE, read_only=True, dict_cursor=True) as unit:
             unit.cursor.execute(
-                "SELECT revision.* FROM rt.bar_current cur JOIN rt.bar_revisions revision "
+                # G102 A4: the current bar by instrument from the head, whatever cohort wrote it.
+                "SELECT revision.* FROM rt.bar_head cur JOIN rt.bar_revisions revision "
                 "ON revision.bar_revision_id=cur.bar_revision_id AND revision.observed_at=cur.observed_at "
-                "WHERE cur.cohort_id=%s AND cur.instrument_id=%s AND cur.session_scope='RTH' "
+                "WHERE cur.instrument_id=%s AND cur.session_scope='RTH' "
                 "AND revision.is_final AND revision.observed_at<=%s AND revision.created_at<=%s "
                 "AND (revision.replay_available_at IS NULL OR revision.replay_available_at<=%s) "
                 "AND (revision.provider_published_at IS NULL OR revision.provider_published_at<=%s) "
@@ -608,7 +609,7 @@ def execute_recent_native_repair(provider: V2ConnectionProvider, transport, plan
                 "AND revision.session_date BETWEEN %s AND %s)) "
                 "ORDER BY revision.interval,revision.bar_start",
                 (
-                    str(plan.cohort_id), identity.instrument_id,
+                    identity.instrument_id,
                     known_by, known_by, known_by, known_by,
                     plan.sessions[0], plan.sessions[-1], history_start, plan.sessions[-1],
                 ),

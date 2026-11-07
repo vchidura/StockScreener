@@ -9,6 +9,7 @@ from uuid import UUID
 from options.calendar import OptionExchangeCalendar
 
 from .contracts import canonical_sha256
+from .equity_bar_repository import _current_source_precedence
 from .equity_bar_adapter import (
     MAXIMUM_HISTORY_BINDING_DEPTH,
     RealtimeEquityBarFact,
@@ -317,24 +318,21 @@ def load_equity_history_cursor(
     target_tier, histories = resolve_equity_history_scopes_cursor(
         cursor, cohort_id=cohort_id, checked_at=checked_at,
     )
-    predicates = ["(revision.cohort_id=%s AND revision.provider_tier=%s)"]
-    parameters = [str(cohort_id), target_tier]
-    for history in histories:
-        predicates.append(
-            "(revision.cohort_id=%s AND revision.provider_tier=%s AND revision.bar_end<%s)"
-        )
-        parameters.extend((
-            str(history.cohort_id), history.provider_tier.value, history.history_before,
-        ))
+    # G102 A4: the history scopes stay the run's recorded identity (binding_sha256 below); bars are read by what
+    # they are, across every writer, so no scope predicate filters them.
+    parameters = []
     binding_hashes = [history.binding_sha256 for history in histories]
-    scope_sql = "(" + " OR ".join(predicates) + ")"
+    # G102 A4 (design 4.6): a key whose head was last updated by `checked_at` reads the head's revision; a key
+    # corrected later reads, among the revisions visible at `checked_at`, the one `bar-selection-v1` puts first, so
+    # an earlier read time sees the bar as it stood then (the rehearsal: XLE, XLK and XLY daily bars re-adjusted
+    # after Nov 6 dropped 51 days from Nov 6 reads otherwise).
     revision_sql = (
+        "AND ((current.updated_at<=%s "
         "AND revision.bar_revision_id=current.bar_revision_id "
-        "AND revision.observed_at=current.observed_at "
+        "AND revision.observed_at=current.observed_at) OR current.updated_at>%s) "
         if source_kind is None else "AND revision.source_kind=%s "
     )
-    if source_kind is not None:
-        parameters.append(source_kind)
+    parameters.extend((checked_at, checked_at) if source_kind is None else (source_kind,))
     weekly_revalidation = (
         "EXISTS (SELECT 1 FROM rt.realtime_equity_preparation_chunks AS chunk "
         "JOIN rt.realtime_desired_revisions AS desired USING(revision_id) "
@@ -351,8 +349,9 @@ def load_equity_history_cursor(
         if interval == "1wk" and adjusted else "FALSE"
     )
     cursor.execute(
-        "SELECT DISTINCT ON (revision.cohort_id,revision.bar_start) "
-        "revision.*,current.updated_at,"
+        "SELECT DISTINCT ON (revision.bar_start) "
+        "revision.*,CASE WHEN current.updated_at<=%s THEN current.updated_at "
+        "ELSE revision.created_at END AS updated_at,"
         + weekly_revalidation + " AS weekly_coordinate_revalidated,"
         +
         "EXISTS (SELECT 1 FROM ref.corporate_action_revisions AS action "
@@ -370,36 +369,37 @@ def load_equity_history_cursor(
         "JOIN rt.bar_catalog AS catalog "
         "ON catalog.bar_revision_id=revision.bar_revision_id "
         "AND catalog.observed_at=revision.observed_at "
-        "JOIN rt.bar_current AS current "
-        "ON revision.cohort_id=current.cohort_id "
-        "AND revision.provider_tier=current.provider_tier "
-        "AND revision.instrument_id=current.instrument_id "
+        "JOIN rt.bar_head AS current "
+        "ON revision.instrument_id=current.instrument_id "
         "AND revision.interval=current.interval "
         "AND revision.adjustment_basis=current.adjustment_basis "
         "AND revision.session_scope=current.session_scope "
         "AND revision.bar_start=current.bar_start "
         "AND revision.bar_end=current.bar_end "
-        "WHERE " + scope_sql + " " + revision_sql
+        "WHERE TRUE " + revision_sql
         + "AND revision.security_id=%s AND revision.ticker=%s "
         "AND revision.interval=%s AND revision.session_scope='RTH' "
         "AND revision.adjustment_basis=%s "
         "AND revision.session_date=ANY(%s) AND revision.is_final "
         "AND revision.bar_end<=%s "
         "AND revision.observed_at<=%s AND revision.created_at<=%s "
-        "AND current.updated_at<=%s "
         "AND (revision.replay_available_at IS NULL "
         "OR revision.replay_available_at<=%s) "
         "AND (revision.provider_published_at IS NULL "
         "OR revision.provider_published_at<=%s) "
-        "ORDER BY revision.cohort_id,revision.bar_start,"
-        "revision.observed_at DESC,revision.bar_revision_id",
+        # One row per bar start: a candidate whose split adjustment is not stale, then a revalidated weekly
+        # coordinate, then the later observation (the rules the cross-cohort merge below applied).
+        "ORDER BY revision.bar_start,stale_adjustment_lineage,weekly_coordinate_revalidated DESC,"
+        + _current_source_precedence("revision") + " DESC,"
+        "revision.observed_at DESC,revision.created_at DESC,revision.bar_revision_id",
         (
+            checked_at,
             *((checked_at,) if interval == "1wk" and adjusted else ()),
             adjustments_through or sessions[-1], checked_at, *parameters,
             str(security_id), ticker, interval,
             "ADJUSTED" if adjusted else "RAW_UNADJUSTED",
             list(sessions), checked_at, checked_at, checked_at,
-            checked_at, checked_at, checked_at,
+            checked_at, checked_at,
         ),
     )
     selected = {}

@@ -148,7 +148,7 @@ def test_incremental_cycle_reserves_persists_materializes_and_replays(pool):
     },)
     with provider.transaction(read_only=True) as unit:
         unit.cursor.execute(
-            "SELECT count(*) FROM rt.bar_current WHERE cohort_id=%s "
+            "SELECT count(*) FROM rt.bar_head WHERE written_by_cohort_id=%s "
             "AND interval='1m' AND adjustment_basis='RAW_UNADJUSTED'",
             (str(native.cohort_id),),
         )

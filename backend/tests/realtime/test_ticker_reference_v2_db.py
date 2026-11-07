@@ -191,6 +191,9 @@ def publish_world(pool) -> World:
     """A fresh cohort with one ticker's bars, evidence and a published release (the real writers)."""
     now = datetime.now(UTC)
     with pool.transaction() as cursor:
+        # G102 A4: bars are keyed by instrument, and every world here shares one instrument; a world starts from an
+        # empty head (before A4 each world's cohort had its own rt.bar_current).
+        cursor.execute("DELETE FROM rt.bar_head WHERE instrument_id=%s", (INSTRUMENT["id"],))
         cohort = insert_cohort(cursor, now)
         plan = insert_service_plan(cursor, cohort, {"PORTAL_PUBLISH"}, now)
         cursor.execute(
@@ -215,7 +218,7 @@ def publish_world(pool) -> World:
         for offset in range(0, len(facts), 1000):
             persist_realtime_equity_bars_cursor(cursor, facts[offset:offset + 1000])
         # Autovacuum keeps these statistics fresh in production; a bulk load in a test must do it by hand.
-        cursor.execute("ANALYZE rt.bar_current")
+        cursor.execute("ANALYZE rt.bar_head")
         cursor.execute("ANALYZE rt.bar_revisions")
     cycle = compute(pool, inputs)
     receipt = new_receipt(pool, plan, cohort, inputs.cutoff)
@@ -479,8 +482,8 @@ def test_a_bar_retired_after_publication_is_not_drawn(database):
     published = read(database, world, "chart", interval="1h", period="5y")
     with database.transaction() as cursor:
         cursor.execute(
-            "DELETE FROM rt.bar_current WHERE cohort_id=%s AND interval='1h' AND adjustment_basis='RAW_UNADJUSTED' "
-            "AND bar_start=(SELECT min(bar_start) FROM rt.bar_current WHERE cohort_id=%s AND interval='1h')",
+            "DELETE FROM rt.bar_head WHERE written_by_cohort_id=%s AND interval='1h' AND adjustment_basis='RAW_UNADJUSTED' "
+            "AND bar_start=(SELECT min(bar_start) FROM rt.bar_head WHERE written_by_cohort_id=%s AND interval='1h')",
             (str(world.cohort), str(world.cohort)))
         assert cursor.rowcount == 1
     assert read(database, world, "chart", interval="1h", period="5y") == published[1:]
@@ -580,8 +583,8 @@ def test_the_audit_reports_a_revised_or_retired_bar_as_chart_drift(database):
             supersedes_bar_revision_id=fact.revision.bar_revision_id, system_observed_at=datetime.now(UTC))),))
     with database.transaction() as cursor:
         cursor.execute(
-            "DELETE FROM rt.bar_current WHERE cohort_id=%s AND interval='1h' AND adjustment_basis='RAW_UNADJUSTED' "
-            "AND bar_start=(SELECT min(bar_start) FROM rt.bar_current WHERE cohort_id=%s AND interval='1h')",
+            "DELETE FROM rt.bar_head WHERE written_by_cohort_id=%s AND interval='1h' AND adjustment_basis='RAW_UNADJUSTED' "
+            "AND bar_start=(SELECT min(bar_start) FROM rt.bar_head WHERE written_by_cohort_id=%s AND interval='1h')",
             (str(world.cohort), str(world.cohort)))
     drifted = _audit(database, world)["chart_groups_drifted"]
     assert {(row["interval"], row["published_count"] - row["current_count"]) for row in drifted} == {

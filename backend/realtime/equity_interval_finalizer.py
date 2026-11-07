@@ -763,12 +763,12 @@ def prepare_five_minute_finalizer_output(
             build_id=job.build_id,
         )
         cursor.execute(
-            "SELECT source_kind FROM rt.bar_current "
-            "WHERE cohort_id=%s AND instrument_id=%s AND interval='5m' "
+            # G102 A4: the current bar by instrument from the head, whatever cohort wrote it.
+            "SELECT source_kind FROM rt.bar_head "
+            "WHERE instrument_id=%s AND interval='5m' "
             "AND bar_start=%s AND bar_end=%s AND session_scope='RTH' "
             "AND adjustment_basis='RAW_UNADJUSTED'",
             (
-                str(job.cohort_id),
                 job.instrument_id,
                 window.window_start,
                 window.window_end,

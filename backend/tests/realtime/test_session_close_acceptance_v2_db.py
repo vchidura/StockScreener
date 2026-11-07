@@ -67,7 +67,7 @@ def _snapshot(pool):
                 "SELECT (SELECT count(*) FROM rt.bar_catalog), "
                 "(SELECT count(*) FROM rt.bar_revisions), "
                 "(SELECT md5(string_agg(bar_revision_id::text || observed_at::text || "
-                "updated_at::text, ',' ORDER BY bar_revision_id)) FROM rt.bar_current), "
+                "updated_at::text, ',' ORDER BY bar_revision_id)) FROM rt.bar_head), "
                 "(SELECT count(*) FROM rt.provider_request_ledger), "
                 "(SELECT count(*) FROM rt.portal_releases), "
                 "(SELECT count(*) FROM rt.session_close_audits), "
@@ -136,7 +136,7 @@ def _revise_all_heads(pool, fixture):
                 "instrument_id, interval, bar_start, bar_end, observed_at, session_date) "
                 "SELECT gen_random_uuid(), cur.cohort_id, cur.provider_tier, "
                 "cur.instrument_id, cur.interval, cur.bar_start, cur.bar_end, %s, cat.session_date "
-                "FROM rt.bar_current cur JOIN rt.bar_catalog cat "
+                "FROM rt.bar_head cur JOIN rt.bar_catalog cat "
                 "ON cat.bar_revision_id=cur.bar_revision_id WHERE cur.cohort_id=%s",
                 (revised_at, str(cohort)),
             )
@@ -152,8 +152,8 @@ def _revise_all_heads(pool, fixture):
                 "old.low_price, old.close_price, old.volume, old.source_kind, old.availability_mode, "
                 "old.is_final, cat.observed_at, old.ingestion_segment_id, "
                 "repeat(md5(cat.bar_revision_id::text),2), cat.observed_at "
-                "FROM rt.bar_catalog cat JOIN rt.bar_current cur "
-                "ON cur.cohort_id=cat.cohort_id AND cur.instrument_id=cat.instrument_id "
+                "FROM rt.bar_catalog cat JOIN rt.bar_head cur "
+                "ON cur.written_by_cohort_id=cat.cohort_id AND cur.instrument_id=cat.instrument_id "
                 "AND cur.interval=cat.interval AND cur.bar_start=cat.bar_start "
                 "JOIN rt.bar_revisions old ON old.bar_revision_id=cur.bar_revision_id "
                 "AND old.observed_at=cur.observed_at "
@@ -161,11 +161,12 @@ def _revise_all_heads(pool, fixture):
                 (str(cohort), revised_at),
             )
             cursor.execute(
-                "UPDATE rt.bar_current cur SET bar_revision_id=cat.bar_revision_id, "
-                "observed_at=cat.observed_at, updated_at=cat.observed_at "
-                "FROM rt.bar_catalog cat WHERE cat.cohort_id=cur.cohort_id "
-                "AND cat.instrument_id=cur.instrument_id AND cat.interval=cur.interval "
-                "AND cat.bar_start=cur.bar_start AND cat.cohort_id=%s AND cat.observed_at=%s",
+                "UPDATE rt.bar_head cur SET bar_revision_id=rev.bar_revision_id, "
+                "observed_at=rev.observed_at, updated_at=rev.observed_at, payload_sha256=rev.payload_sha256 "
+                "FROM rt.bar_revisions rev WHERE rev.cohort_id=cur.written_by_cohort_id "
+                "AND rev.instrument_id=cur.instrument_id AND rev.interval=cur.interval "
+                "AND rev.bar_start=cur.bar_start AND rev.session_scope=cur.session_scope "
+                "AND rev.adjustment_basis=cur.adjustment_basis AND rev.cohort_id=%s AND rev.observed_at=%s",
                 (str(cohort), revised_at),
             )
         connection.commit()
@@ -180,7 +181,7 @@ def _fragment_heads(pool, fixture):
     try:
         with connection.cursor() as cursor:
             cursor.execute(
-                "DELETE FROM rt.bar_current WHERE cohort_id=%s "
+                "DELETE FROM rt.bar_head WHERE written_by_cohort_id=%s "
                 "AND mod((extract(epoch FROM (bar_start-%s::timestamptz))/300)::integer,2)=1",
                 (str(cohort), session.opened_at),
             )
@@ -229,8 +230,8 @@ def _contention(database, prefix, settings, audit_fixture, writer_fixture):
             with providers[role].transaction(role, read_only=role == API_ROLE) as unit:
                 if role == API_ROLE:
                     unit.cursor.execute(
-                        "SELECT bar_revision_id, bar_start, bar_end FROM rt.bar_current "
-                        "WHERE cohort_id=%s AND instrument_id=%s AND interval='5m' "
+                        "SELECT bar_revision_id, bar_start, bar_end FROM rt.bar_head "
+                        "WHERE written_by_cohort_id=%s AND instrument_id=%s AND interval='5m' "
                         "AND session_scope='RTH' AND adjustment_basis='RAW_UNADJUSTED' "
                         "ORDER BY bar_start DESC LIMIT 20",
                         (str(cohort), members[0][0]),

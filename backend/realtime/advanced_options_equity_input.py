@@ -362,18 +362,13 @@ def load_advanced_options_equity_context_cursor(
                     "SELECT revision.bar_revision_id::text,"
                     "revision.bar_end,revision.observed_at,"
                     "revision.payload_sha256 "
-                    "FROM rt.bar_current AS current "
+                    # G102 A4: the current bar by instrument from the head, whatever cohort wrote it.
+                    "FROM rt.bar_head AS current "
                     "JOIN rt.bar_revisions AS revision "
                     "ON revision.bar_revision_id=current.bar_revision_id "
                     "AND revision.observed_at=current.observed_at "
-                    "AND revision.cohort_id=current.cohort_id "
-                    "AND revision.provider_tier=current.provider_tier "
-                    "AND revision.instrument_id=current.instrument_id "
-                    "AND revision.interval=current.interval "
-                    "AND revision.bar_start=current.bar_start "
-                    "AND revision.session_scope=current.session_scope "
-                    "AND revision.adjustment_basis=current.adjustment_basis "
-                    "WHERE current.cohort_id=%s "
+                    "WHERE current.instrument_id IN (SELECT instrument_id FROM rt.instruments "
+                    "WHERE security_id=%s AND contract_id IS NULL) "
                     "AND revision.security_id=%s "
                     "AND revision.interval=%s "
                     "AND revision.adjustment_basis=%s "
@@ -386,12 +381,7 @@ def load_advanced_options_equity_context_cursor(
                     "AND revision.observed_at<=%s "
                     "ORDER BY revision.bar_end DESC LIMIT %s",
                     (
-                        str(
-                            equity_plan.cohort_id
-                            if requirement.source
-                            is AdvancedOptionsEquityContextSource.LIVE_EQUITY
-                            else history_source_cohort_id
-                        ),
+                        str(security_ids[ticker]),
                         str(security_ids[ticker]),
                         requirement.interval,
                         requirement.adjustment_basis,

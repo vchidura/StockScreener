@@ -537,19 +537,15 @@ def verify_and_close_gap_repair_cursor(
     )
     cursor.execute(
         "SELECT current.interval,COUNT(DISTINCT current.bar_start) "
-        "FROM rt.bar_current AS current "
-        "JOIN rt.bar_revisions AS revision "
-        "ON revision.bar_revision_id=current.bar_revision_id "
-        "AND revision.observed_at=current.observed_at "
-        "WHERE current.cohort_id=("
-        "SELECT cohort_id FROM rt.advanced_ingress_plans WHERE plan_id=%s"
-        ") AND current.instrument_id=%s "
+        # G102 A4: the current bar by instrument from the head, whatever cohort wrote it.
+        "FROM rt.bar_head AS current "
+        "WHERE current.instrument_id=%s "
         "AND current.bar_start>=%s AND current.bar_end<=%s "
         "AND current.interval IN ('1m','5m') "
         "AND current.session_scope='RTH' "
         "AND current.adjustment_basis='RAW_UNADJUSTED' "
-        "AND revision.is_final GROUP BY current.interval",
-        (str(repair[1]), int(repair[2]), repair[3], repair[4]),
+        "AND current.is_final GROUP BY current.interval",
+        (int(repair[2]), repair[3], repair[4]),
     )
     counts = {str(interval): int(count) for interval, count in cursor.fetchall()}
     if counts.get("1m", 0) != expected_1m or (

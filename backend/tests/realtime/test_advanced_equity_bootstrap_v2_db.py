@@ -18,7 +18,7 @@ from realtime.advanced_equity_bootstrap import (
 )
 from realtime.advanced_options_reference_producer import _load_bars_and_metrics
 from realtime.equity_bar_repository import (
-    load_current_bar_groups_cursor,
+    load_bar_groups_cursor,
     persist_realtime_equity_bars_cursor,
 )
 from realtime.equity_history import (
@@ -369,17 +369,13 @@ def test_bound_history_adoption_and_real_hv_reader_preserve_original_sources():
                     row["bar_revision_id"] for row in inputs.bars
                     if row["interval"] == "1d" and row["adjustment_basis"] == "ADJUSTED"
                 } == set(expected_ids)
-                chart_rows = load_current_bar_groups_cursor(
-                    cursor, cohort_id=head, provider_tier="MASSIVE_ADVANCED",
-                    instrument_id=instrument_id, security_id=_security_id("QQQ"),
-                    ticker="QQQ",
+                # G102 A4: the chart reads the cohort-free head; no history scopes are needed to reach the
+                # adopted history.
+                chart_rows = load_bar_groups_cursor(
+                    cursor, instrument_id=instrument_id, security_id=_security_id("QQQ"),
                     groups={"1d:ADJUSTED": (
                         CALENDAR.session_open(sessions[0]), CALENDAR.session_close(sessions[-1]),
                     )},
-                    history_source_scopes=tuple(
-                        (scope.cohort_id, scope.provider_tier.value, scope.history_before)
-                        for scope in inputs.history_scopes
-                    ),
                 )
                 assert [row["bar_revision_id"] for row in chart_rows["1d:ADJUSTED"]] == expected_ids
                 chain = [scope.payload() for scope in inputs.history_scopes]

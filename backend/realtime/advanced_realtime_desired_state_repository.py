@@ -906,8 +906,9 @@ def _carried_equity_preparations_cursor(
 
     A list change used to re-run all five stages for every new member (about 450 provider requests and 1.5 hours on
     Nov 6). A member an earlier revision already prepared is READY for this one, with no work, when that revision has
-    the same source cohort (preparation writes into the source cohort, so the data is where this revision reads it)
-    and the same effective session, and its five stages are COMPLETE with targets identical to this revision's.
+    the same effective session and its five stages are COMPLETE with targets identical to this revision's. Since
+    G102 A4 bars are read by instrument, not by the cohort that wrote them, the earlier revision's source cohort does
+    not matter.
     Returns (security, member kind) -> the revision whose work prepared it; that origin is recorded in the binding's
     `source_lineage` (a READY readiness row carries no reasons). A member only partly prepared gets new work that
     resumes from the earlier progress (`_resume_equity_preparation_work_cursor`)."""
@@ -928,12 +929,11 @@ def _carried_equity_preparations_cursor(
         "JOIN rt.realtime_desired_revisions AS earlier "
         "ON earlier.revision_id=work.revision_id "
         "WHERE work.security_id=ANY(%s::uuid[]) AND work.revision_id<>%s "
-        "AND earlier.source_cohort_id=%s AND earlier.effective_session_date=%s "
+        "AND earlier.effective_session_date=%s "
         "ORDER BY work.revision_id,work.security_id,work.member_kind,work.stage",
         (
             sorted({str(security_id) for security_id, _kind in wanted}),
             str(revision.revision_id),
-            str(revision.source_cohort_id),
             revision.effective_session_date,
         ),
     )
@@ -1144,8 +1144,8 @@ def _resume_equity_preparation_work_cursor(
     *,
     security_ids: tuple[UUID, ...],
 ) -> None:
-    """G102 design 5.2 (G91): new work resumes where an earlier revision of the same source cohort and effective
-    session left the same stage on an identical target: COMPLETE stays COMPLETE, RUNNING or RETRY resumes from its
+    """G102 design 5.2 (G91): new work resumes where an earlier revision of the same effective session left the
+    same stage on an identical target (any source cohort since G102 A4): COMPLETE stays COMPLETE, RUNNING or RETRY resumes from its
     watermark as RETRY (as a promoted rollover revision does). Claims take only the current revision's work, so the
     earlier progress would otherwise be lost. FAILED and BLOCKED stages start again."""
     if not security_ids:
@@ -1166,7 +1166,7 @@ def _resume_equity_preparation_work_cursor(
         "FROM (SELECT DISTINCT ON (work.security_id,work.member_kind,work.stage) work.* "
         "FROM rt.realtime_equity_preparation_work AS work "
         "JOIN rt.realtime_desired_revisions AS earlier ON earlier.revision_id=work.revision_id "
-        "WHERE work.revision_id<>%s AND earlier.source_cohort_id=%s "
+        "WHERE work.revision_id<>%s "
         "AND earlier.effective_session_date=%s AND work.security_id=ANY(%s::uuid[]) "
         "AND work.status IN ('COMPLETE','RUNNING','RETRY') "
         "ORDER BY work.security_id,work.member_kind,work.stage,"
@@ -1177,7 +1177,6 @@ def _resume_equity_preparation_work_cursor(
         "AND target.stage=source.stage AND target.target=source.target",
         (
             str(revision.revision_id),
-            str(revision.source_cohort_id),
             revision.effective_session_date,
             sorted(str(value) for value in security_ids),
             str(revision.revision_id),

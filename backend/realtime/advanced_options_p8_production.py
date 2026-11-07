@@ -1353,19 +1353,18 @@ class _PostgresSelectionSpots:
             unit.cursor.execute(
                 "SELECT DISTINCT ON (revision.ticker) revision.ticker,"
                 "revision.close_price,revision.observed_at "
-                "FROM rt.bar_current AS current "
+                # G102 A4: the current bar by instrument from the head, whatever cohort wrote it.
+                "FROM rt.bar_head AS current "
                 "JOIN rt.bar_revisions AS revision "
                 "ON revision.bar_revision_id=current.bar_revision_id "
                 "AND revision.observed_at=current.observed_at "
-                "WHERE current.cohort_id=%s "
-                "AND revision.ticker=ANY(%s) "
+                "WHERE revision.ticker=ANY(%s) "
                 "AND current.interval='1m' "
                 "AND current.adjustment_basis='RAW_UNADJUSTED' "
                 "AND revision.observed_at<=%s "
                 "ORDER BY revision.ticker,revision.bar_end DESC,"
                 "revision.observed_at DESC",
                 (
-                    str(self._source_cohort_id),
                     list(underlyings),
                     available_before,
                 ),

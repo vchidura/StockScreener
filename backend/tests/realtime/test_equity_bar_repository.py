@@ -86,9 +86,10 @@ def test_current_pointer_tie_goes_to_the_later_write():
         batch_executor=_batch_executor,
     )
 
+    # G102 A4: the current bar lives in the head; between equal observations (and tiers) the later write wins.
     assert (
-        "rt.bar_current.observed_at <= EXCLUDED.observed_at"
-        in cursor.recorded_current_statement
+        "rt.bar_head.observed_at < EXCLUDED.observed_at OR (rt.bar_head.observed_at = EXCLUDED.observed_at"
+        in cursor.recorded_head_statement
     )
 
 
@@ -109,30 +110,20 @@ def test_bar_revision_and_current_pointer_commit_atomically_in_batches():
     assert "INSERT INTO rt.bar_catalog" in cursor.value_statements[0]
     assert "INSERT INTO rt.bar_revisions" in cursor.value_statements[1]
     assert all("ON CONFLICT DO NOTHING" in statement for statement in cursor.value_statements)
-    assert "INSERT INTO rt.bar_current" in cursor.recorded_current_statement
-    assert "rt.bar_current.provider_tier=EXCLUDED.provider_tier" in cursor.recorded_current_statement
-    assert (
-        "JOIN rt.capability_profiles AS profile USING(profile_id)"
-        in cursor.recorded_current_statement
-    )
-    assert (
-        "JOIN rt.subscription_manifests AS manifest USING(manifest_id)"
-        in cursor.recorded_current_statement
-    )
-    assert (
-        "profile.provider_tier FROM rt.cohorts AS cohort"
-        in cursor.recorded_current_statement
-    )
+    # G102 A4: one cohort-free head upsert; rt.bar_current is no longer written, and no cohort decides the tier.
+    assert cursor.recorded_head_statement.startswith("INSERT INTO rt.bar_head")
+    assert not hasattr(cursor, "recorded_current_rows") or not isinstance(cursor.recorded_current_rows, tuple)
+    assert "rt.cohorts" not in cursor.recorded_head_statement
     assert (
         "EXCLUDED.adjustment_basis='RAW_UNADJUSTED' "
         "AND EXCLUDED.interval IN ('15m','30m','1h','1d') "
         "AND EXCLUDED.source_kind='DERIVED' THEN 5"
-    ) in cursor.recorded_current_statement
+    ) in cursor.recorded_head_statement
     assert (
         "EXCLUDED.adjustment_basis='ADJUSTED' "
         "AND EXCLUDED.interval IN ('1wk','1mo') "
         "AND EXCLUDED.source_kind='DERIVED' THEN 5"
-    ) in cursor.recorded_current_statement
+    ) in cursor.recorded_head_statement
     assert cursor.recorded_catalog_rows[0][7] == fact.revision.system_observed_at
     assert cursor.recorded_revision_rows[0][2] == "MASSIVE_DEVELOPER"
     # observed_at is the partition key and must equal the catalog's observed_at.
@@ -194,7 +185,7 @@ def test_cursor_level_bar_persistence_composes_without_owning_transaction():
     )
 
     assert "INSERT INTO rt.bar_revisions" in cursor.recorded_revision_statement
-    assert "INSERT INTO rt.bar_current" in cursor.recorded_current_statement
+    assert "INSERT INTO rt.bar_head" in cursor.recorded_head_statement
 
 
 def test_derived_bar_persists_typed_uuid_source_lineage():

@@ -378,9 +378,9 @@ class ScreeningStore:
 
 
 def current_bars_of(inputs):
-    """What `rt.bar_current` holds for an input: the bar loader of an offline fixture, same contract as
-    `load_current_bar_heads_cursor` (rows per (security id, group key), ordered by bar start)."""
-    def load(cursor, *, cohort_id, provider_tier, targets, with_sources=False):
+    """What `rt.bar_head` holds for an input: the bar loader of an offline fixture, same contract as
+    `load_bar_heads_cursor` (rows per (security id, group key), ordered by bar start)."""
+    def load(cursor, *, targets, with_sources=False, **_scope):  # G102 A4: no cohort or tier (kept accepted)
         result = {}
         for _, security_id, ticker, key, first, last in targets:
             interval, _, basis = key.partition(":")
@@ -591,7 +591,8 @@ def test_real_repository_loader_pins_manifest_references_cutoff_and_causal_sourc
     assert "member.feed" not in queries[1]
     assert "FROM rt.bar_revisions" in queries[2] and "FROM rt.bar_catalog" not in queries[2]
     assert "created_at<=%s" in queries[2] and "replay_available_at<=%s" in queries[2]
-    assert "bar_revision_id=ANY" in queries[3] and "cohort_id=%s" in queries[3]
+    # G102 A4: source bars by revision id, whatever cohort wrote them.
+    assert "bar_revision_id=ANY" in queries[3] and "cohort_id=%s" not in queries[3]
     assert not any("equity_bar_revisions" in sql for sql in queries)
 
 

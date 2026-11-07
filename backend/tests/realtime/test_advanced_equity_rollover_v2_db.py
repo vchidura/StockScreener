@@ -385,7 +385,7 @@ def test_stale_rollover_completion_cannot_write_or_release_the_replacement_lease
     assert _ledger(provider) == (("RESERVED", 1, None),)
     with provider.transaction(APP_ROLE, read_only=True) as unit:
         unit.cursor.execute(
-            "SELECT count(*) FROM rt.bar_current WHERE cohort_id=%s "
+            "SELECT count(*) FROM rt.bar_head WHERE written_by_cohort_id=%s "
             "AND instrument_id=%s AND interval='1d' AND adjustment_basis='ADJUSTED'",
             (str(plan.source_cohort_id), work.member.instrument_id),
         )

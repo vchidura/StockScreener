@@ -183,7 +183,7 @@ def test_native_repair_replays_without_provider_calls_and_preserves_basis(pool):
         )
         assert unit.cursor.fetchone()[0] == 3
         unit.cursor.execute(
-            "SELECT interval,source_kind,count(*) FROM rt.bar_current WHERE cohort_id=%s "
+            "SELECT interval,source_kind,count(*) FROM rt.bar_head WHERE written_by_cohort_id=%s "
             "AND adjustment_basis='RAW_UNADJUSTED' "
             "GROUP BY interval,source_kind ORDER BY interval,source_kind",
             (str(plan.cohort_id),)
@@ -228,8 +228,8 @@ def test_full_minute_repair_persists_exact_1m_and_5m_inputs(pool):
     } == {"1m", "5m"}
     with provider.transaction(read_only=True) as unit:
         unit.cursor.execute(
-            "SELECT interval,count(*) FROM rt.bar_current "
-            "WHERE cohort_id=%s AND interval IN ('1m','5m') "
+            "SELECT interval,count(*) FROM rt.bar_head "
+            "WHERE written_by_cohort_id=%s AND interval IN ('1m','5m') "
             "GROUP BY interval ORDER BY interval",
             (str(plan.cohort_id),),
         )
@@ -286,8 +286,8 @@ def test_adjusted_daily_repair_replays_without_provider_and_preserves_basis(pool
     assert len(transport.calls) == 1
     with provider.transaction(read_only=True) as unit:
         unit.cursor.execute(
-            "SELECT count(*),max(bar_end) FROM rt.bar_current "
-            "WHERE cohort_id=%s AND interval='1d' "
+            "SELECT count(*),max(bar_end) FROM rt.bar_head "
+            "WHERE written_by_cohort_id=%s AND interval='1d' "
             "AND adjustment_basis='ADJUSTED'",
             (str(plan.cohort_id),),
         )
@@ -331,8 +331,8 @@ def test_exact_raw_daily_repair_uses_per_ticker_response(pool):
     assert params["adjusted"] == "false"
     with provider.transaction(read_only=True) as unit:
         unit.cursor.execute(
-            "SELECT count(*) FROM rt.bar_current "
-            "WHERE cohort_id=%s AND interval='1d' "
+            "SELECT count(*) FROM rt.bar_head "
+            "WHERE written_by_cohort_id=%s AND interval='1d' "
             "AND adjustment_basis='RAW_UNADJUSTED'",
             (str(plan.cohort_id),),
         )
@@ -373,8 +373,8 @@ def test_exact_raw_daily_grouped_repair_preserves_selected_members(pool):
     assert params == {"adjusted": "false"}
     with provider.transaction(read_only=True) as unit:
         unit.cursor.execute(
-            "SELECT count(*) FROM rt.bar_current "
-            "WHERE cohort_id=%s AND interval='1d' "
+            "SELECT count(*) FROM rt.bar_head "
+            "WHERE written_by_cohort_id=%s AND interval='1d' "
             "AND adjustment_basis='RAW_UNADJUSTED'",
             (str(plan.cohort_id),),
         )
@@ -424,12 +424,12 @@ def test_adjusted_weekly_monthly_rebuild_requires_the_latest_complete_period(poo
     assert result["status"] == "COMPLETE"
     with provider.transaction() as unit:
         unit.cursor.execute(
-            "SELECT DISTINCT adjustment_basis FROM rt.bar_current WHERE cohort_id=%s "
+            "SELECT DISTINCT adjustment_basis FROM rt.bar_head WHERE written_by_cohort_id=%s "
             "AND interval IN ('1wk','1mo')", (str(plan.cohort_id),),
         )
         assert unit.cursor.fetchall() == [("ADJUSTED",)]
         unit.cursor.execute(
-            "DELETE FROM rt.bar_current WHERE cohort_id=%s AND interval='1d' "
+            "DELETE FROM rt.bar_head WHERE written_by_cohort_id=%s AND interval='1d' "
             "AND adjustment_basis='ADJUSTED' AND bar_start::date='2026-09-30'",
             (str(plan.cohort_id),),
         )
@@ -446,7 +446,7 @@ def test_changed_payload_creates_new_revision_without_mutating_prior_bars(pool):
     execute_recent_native_repair(provider, Transport(provider), plan, clock=clock)
     with provider.transaction(read_only=True) as unit:
         unit.cursor.execute(
-            "SELECT bar_revision_id FROM rt.bar_current WHERE cohort_id=%s AND interval='5m' "
+            "SELECT bar_revision_id FROM rt.bar_head WHERE written_by_cohort_id=%s AND interval='5m' "
             "ORDER BY bar_start LIMIT 1", (str(plan.cohort_id),),
         )
         original = str(unit.cursor.fetchone()[0])
@@ -460,10 +460,8 @@ def test_changed_payload_creates_new_revision_without_mutating_prior_bars(pool):
         )
         assert unit.cursor.fetchone()[0] == 100
         unit.cursor.execute(
-            "SELECT bar_revision_id,close_price FROM rt.bar_current "
-            "JOIN rt.bar_revisions USING (bar_revision_id,observed_at,cohort_id,provider_tier,"
-            "instrument_id,interval,bar_start,bar_end,session_scope,adjustment_basis,source_kind) "
-            "WHERE cohort_id=%s AND interval='5m' ORDER BY bar_start LIMIT 1",
+            "SELECT bar_revision_id,close_price FROM rt.bar_head "
+            "WHERE written_by_cohort_id=%s AND interval='5m' ORDER BY bar_start LIMIT 1",
             (str(plan.cohort_id),),
         )
         latest_id, close = unit.cursor.fetchone()

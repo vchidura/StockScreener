@@ -254,7 +254,7 @@ def test_bars_use_a_catalog_then_a_monthly_body_and_replay_is_idempotent(databas
         persist_realtime_equity_bars_cursor(cursor, facts)
         assert _scalar(cursor, "SELECT count(*) FROM rt.bar_catalog WHERE cohort_id=%s", (str(cohort),)) == 3
         assert _scalar(cursor, "SELECT count(*) FROM rt.bar_revisions WHERE cohort_id=%s", (str(cohort),)) == 3
-        assert _scalar(cursor, "SELECT count(*) FROM rt.bar_current WHERE cohort_id=%s", (str(cohort),)) == 3
+        assert _scalar(cursor, "SELECT count(*) FROM rt.bar_head WHERE written_by_cohort_id=%s", (str(cohort),)) == 3
         cursor.execute("SELECT DISTINCT tableoid::regclass::text FROM rt.bar_revisions WHERE cohort_id=%s",
                        (str(cohort),))
         assert all(row[0].startswith("rt.bar_revisions_p") for row in cursor.fetchall())

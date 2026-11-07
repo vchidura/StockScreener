@@ -7,7 +7,7 @@ evidence pointers against their immutable rows, the retained current bars per ti
 current portal release and the current screening generation. It also checks that the current ticker workspaces,
 which are stored by reference (`chart_refs`, `evidence_index`), still resolve: every pinned evidence row exists with
 its type and payload hash, and every chart group's published lineage head (count and chain digest) equals the bars
-`rt.bar_current` holds now. No provider request and no write. Targets
+`rt.bar_head` holds now (G102 A4). No provider request and no write. Targets
 stocks_realtime_v2 or an explicit test_realtime_v2_ database (--allow-disposable).
 
 The v1 checks that read embedded v1 portal payloads (pattern watch parity, AAPL technical summary, snapshot
@@ -87,7 +87,7 @@ _EVIDENCE_REFERENCES = (
     "AND evidence.evidence_id=catalog.evidence_id AND evidence.durable_at=catalog.durable_at "
     "GROUP BY refs.ticker ORDER BY refs.ticker"
 )
-# Each chart group's published lineage head against the bars rt.bar_current points at now: the count and the
+# Each chart group's published lineage head against the bars rt.bar_head (G102 A4) points at now: the count and the
 # ordered chain digest over (revision id, payload hash), computed in the database exactly as the reader does.
 _CHART_LINEAGE = (
     "WITH " + _CURRENT_WORKSPACES + ", chart_groups AS (SELECT workspace.ticker,chart.key AS chart_interval,"
@@ -101,10 +101,9 @@ _CHART_LINEAGE = (
     "FROM chart_groups CROSS JOIN LATERAL (SELECT COUNT(*) AS current_count,"
     "encode(sha256(convert_to(COALESCE(string_agg(cur.bar_revision_id::text||':'||revision.payload_sha256||';',"
     "'' ORDER BY cur.bar_start),''),'UTF8')),'hex') AS current_chain "
-    "FROM rt.bar_current AS cur JOIN rt.bar_revisions AS revision ON revision.bar_revision_id=cur.bar_revision_id "
-    "AND revision.observed_at=cur.observed_at AND revision.cohort_id=cur.cohort_id "
-    "AND revision.instrument_id=cur.instrument_id AND revision.interval=cur.interval AND revision.is_final "
-    "WHERE cur.cohort_id=%s AND cur.instrument_id=chart_groups.instrument_id AND cur.session_scope='RTH' "
+    "FROM rt.bar_head AS cur JOIN rt.bar_revisions AS revision ON revision.bar_revision_id=cur.bar_revision_id "
+    "AND revision.observed_at=cur.observed_at AND revision.is_final "
+    "WHERE cur.instrument_id=chart_groups.instrument_id AND cur.session_scope='RTH' "
     "AND cur.interval=split_part(chart_groups.group_key,':',1) "
     "AND cur.adjustment_basis=split_part(chart_groups.group_key,':',2) "
     "AND cur.bar_start>=(chart_groups.head->>'first_bar_start')::timestamptz "
@@ -118,7 +117,7 @@ def by_reference_integrity(cursor, cohort: str) -> dict:
     payload hash; each chart group's count and chain digest must equal its published lineage head (a bar
     revised or retired since publication shows up here as drift, and the reader refuses that chart)."""
     evidence = query_rows(cursor, _EVIDENCE_REFERENCES, (cohort, cohort))
-    groups = query_rows(cursor, _CHART_LINEAGE, (cohort, cohort))
+    groups = query_rows(cursor, _CHART_LINEAGE, (cohort,))
     drifted = [
         {"ticker": row["ticker"], "interval": row["chart_interval"], "published_count": row["published_count"],
          "current_count": row["current_count"]}

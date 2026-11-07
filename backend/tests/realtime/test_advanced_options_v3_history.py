@@ -70,7 +70,7 @@ class Cursor:
                 for index in (1, 2)
             ]
             return
-        if "FROM rt.bar_current AS current" in statement:
+        if "FROM rt.bar_head AS current" in statement:  # G102 A4: the cohort-free head
             sessions = OptionExchangeCalendar().trailing_sessions_before(
                 SESSION_DATE,
                 31,

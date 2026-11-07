@@ -98,9 +98,9 @@ def plan_gap_repair_cursor(
                 "%s::timestamptz-%s::interval,%s::interval) AS bar_start "
                 "FROM unnest(%s::bigint[]) AS member(instrument_id)) "
                 "SELECT expected.instrument_id,expected.bar_start "
-                "FROM expected LEFT JOIN rt.bar_current AS current "
-                "ON current.cohort_id=%s "
-                "AND current.instrument_id=expected.instrument_id "
+                # G102 A4: the current bar by instrument from the head, whatever cohort wrote it.
+                "FROM expected LEFT JOIN rt.bar_head AS current "
+                "ON current.instrument_id=expected.instrument_id "
                 "AND current.interval=%s "
                 "AND current.bar_start=expected.bar_start "
                 "AND current.bar_end=expected.bar_start+%s::interval "
@@ -109,7 +109,6 @@ def plan_gap_repair_cursor(
                 "LEFT JOIN rt.bar_revisions AS revision "
                 "ON revision.bar_revision_id=current.bar_revision_id "
                 "AND revision.observed_at=current.observed_at "
-                "AND revision.cohort_id=current.cohort_id "
                 "AND revision.instrument_id=current.instrument_id "
                 "AND revision.interval=current.interval "
                 "AND revision.is_final "
@@ -121,7 +120,6 @@ def plan_gap_repair_cursor(
                     f"{minutes} minutes",
                     f"{minutes} minutes",
                     [row[0] for row in members],
-                    str(cohort_id),
                     interval,
                     f"{minutes} minutes",
                 ),

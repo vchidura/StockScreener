@@ -61,8 +61,8 @@ def test_only_a_member_finished_on_identical_targets_is_carried():
     )
     assert carried == {(SECURITIES["AMD"], "EQUITY"): EARLIER}
     sql, params = cursor.execute.call_args.args
-    assert "earlier.source_cohort_id=%s AND earlier.effective_session_date=%s" in sql
-    assert params[1:] == (str(current.revision_id), str(SOURCE_COHORT), date(2026, 11, 9))
+    assert "earlier.effective_session_date=%s" in sql and "source_cohort_id" not in sql  # G102 A4: any cohort
+    assert params[1:] == (str(current.revision_id), date(2026, 11, 9))
     assert params[0] == sorted(str(SECURITIES[ticker]) for ticker in ("AMD", "CRWD", "PLTR"))
 
 
@@ -105,4 +105,5 @@ def test_a_carried_member_is_ready_without_work_and_the_others_resume(monkeypatc
     assert resume_sql.startswith("UPDATE rt.realtime_equity_preparation_work AS target")
     assert "target.status='PENDING'" in resume_sql and "target.target=source.target" in resume_sql
     assert "terminal_reason=source.terminal_reason" in resume_sql
-    assert resume_params[3] == sorted(str(SECURITIES[ticker]) for ticker in ("CRWD", "PLTR"))
+    assert resume_params[2] == sorted(str(SECURITIES[ticker]) for ticker in ("CRWD", "PLTR"))
+    assert "source_cohort_id" not in resume_sql

@@ -236,6 +236,12 @@ def bar_columns(include_portal_history: bool) -> str:
 
 
 def _bar_scope_sql(scope: BarScope) -> tuple[str, tuple]:
+    """G102 A4: bars are selected by what they are, across every writer; the cohort and its history scopes stay
+    the screening's recorded identity, not a filter."""
+    return "TRUE", ()
+
+
+def _cohort_bar_scope_sql(scope: BarScope) -> tuple[str, tuple]:  # retired with A4; kept for the old tests
     target = "(cohort_id=%s AND provider_tier=%s)"
     params: tuple = (str(scope.cohort_id), scope.provider_tier)
     if scope.history_scopes:
