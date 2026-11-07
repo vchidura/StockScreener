@@ -241,24 +241,31 @@ def build_advanced_options_input_closure(
         )
     ):
         raise ValueError("Advanced Options Tier A reference state changed")
-    if (
-        rolling_state.cohort_id != control_plane.cohort_id
-        or rolling_state.session_date != cycle_input.scheduled_cycle.date()
-        or rolling_state.journal_generation
-        != control_plane.source_flow.journal_generation
-        or tuple(
-            row.ticker for row in rolling_state.underlying_ticks
-        ) != tuple(row.underlyer for row in cycle_input.underlyings)
-        or rolling_state.market_state_checkpoint_sha256
-        != _sha256(
-            market_state_checkpoint_sha256,
-            "market_state_checkpoint_sha256",
+    # B9c/B16 (Nov 6): name the condition that failed instead of one opaque message.
+    tier_b_failures = [
+        name for name, failed in (
+            ("cohort", rolling_state.cohort_id != control_plane.cohort_id),
+            ("session", rolling_state.session_date != cycle_input.scheduled_cycle.date()),
+            ("journal_generation", rolling_state.journal_generation
+             != control_plane.source_flow.journal_generation),
+            ("underlying_ticks:" + ",".join(row.ticker for row in rolling_state.underlying_ticks)
+             + "|cycle:" + ",".join(row.underlyer for row in cycle_input.underlyings),
+             # B16 (Nov 6): same 9 underlyings, different order (market state put NFLX last); compare as sets.
+             sorted(row.ticker for row in rolling_state.underlying_ticks)
+             != sorted(row.underlyer for row in cycle_input.underlyings)),
+            ("market_state_checkpoint", rolling_state.market_state_checkpoint_sha256
+             != _sha256(market_state_checkpoint_sha256, "market_state_checkpoint_sha256")),
+            ("flow_checkpoint", rolling_state.flow_checkpoint_sha256
+             != _sha256(flow_checkpoint_sha256, "flow_checkpoint_sha256")),
+            (f"committed_at:{rolling_state.committed_at.isoformat()}>known_at:"
+             f"{producer_plan.clocks.known_at.isoformat()}",
+             rolling_state.committed_at > producer_plan.clocks.known_at),
+        ) if failed
+    ]
+    if tier_b_failures:
+        raise ValueError(
+            "Advanced Options Tier B rolling state changed: " + "; ".join(tier_b_failures)
         )
-        or rolling_state.flow_checkpoint_sha256
-        != _sha256(flow_checkpoint_sha256, "flow_checkpoint_sha256")
-        or rolling_state.committed_at > producer_plan.clocks.known_at
-    ):
-        raise ValueError("Advanced Options Tier B rolling state changed")
     binding = rolling_state.producer_binding
     if binding is not None and (
         binding.reference_state_id != reference_state.state_id

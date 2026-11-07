@@ -9,7 +9,12 @@ All functions run on the caller's cursor and transaction (CONTROL role writes; r
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+
+# G96 B15 (Nov 6): the pre-session slot set took effect at 14:29:59, and the catalog versions it references at
+# 14:31:34-49, when the provider window opened and the chain capture that built it ran. Accept catalog versions that
+# became effective within this skew after the slot set instead of refusing every window.
+SLOT_SET_CATALOG_EFFECTIVE_SKEW = timedelta(minutes=10)
 from decimal import Decimal
 from uuid import UUID
 
@@ -113,7 +118,7 @@ def _verify_member_identities(
             or version[4] != Decimal("100")
             or version[5] != []
             or version[6] != "VALIDATED_ACTIVE"
-            or version[7] > effective
+            or version[7] > effective + SLOT_SET_CATALOG_EFFECTIVE_SKEW
             or (version[8] is not None and version[8] <= effective)
         ):
             raise ValueError(

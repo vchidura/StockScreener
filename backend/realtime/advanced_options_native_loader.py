@@ -708,6 +708,89 @@ def _packages_for_events(
     }
 
 
+OPTIONS_ALERT_V1_POLICY = "options-alert-v1-single-contract-entry-nbbo-mid-close-at-session-end"
+OPTIONS_ALERT_V1_VALUATION_SHA256 = canonical_sha256({
+    "policy": OPTIONS_ALERT_V1_POLICY,
+    "mark": "NBBO_MIDPOINT",
+    "side": "BUY",
+    "ratio": 1,
+})
+
+
+def options_alert_v1_event_package(row, *, cohort_id, matrix_id, session_date, unmarked_instrument_ids=()):
+    """Options alerts v1 (user's rules, Nov 6): a single-contract package from the event's own contract.
+
+    Entry is the contract's NBBO midpoint recorded with the event; the package is long one contract (BUY, ratio 1),
+    capital at risk is the premium paid, and it closes at the session close (no stops or targets yet). Returns None
+    when the event has no usable two-sided quote or its contract has no current mark, so the detection stays an
+    observation instead of failing the window."""
+    from options.domain import ContractType
+    from options.strategies.domain import OptionSide
+
+    from .option_portal_adapter import RealtimeOptionPackageLeg
+    from .preflight import ProviderTier
+
+    bid, ask = row.get("quote_bid"), row.get("quote_ask")
+    if bid is None or ask is None or row.get("instrument_id") is None or row.get("version_id") is None:
+        return None
+    bid, ask = Decimal(str(bid)), Decimal(str(ask))
+    if not bid.is_finite() or not ask.is_finite() or bid <= 0 or ask < bid:
+        return None
+    instrument_id = int(row["instrument_id"])
+    if instrument_id in set(unmarked_instrument_ids):
+        return None
+    mid = (bid + ask) / 2
+    multiplier = int(Decimal(str(row["multiplier"])))
+    contract_type = {"C": ContractType.CALL, "P": ContractType.PUT}.get(str(row["call_put"]).upper())
+    if contract_type is None or multiplier <= 0:
+        return None
+    event_time = row["event_time"]
+    quote_time = row.get("quote_time") or event_time
+    leg_time = min(quote_time, event_time)
+    entry_time = max(quote_time, event_time)
+    event_id = UUID(str(row["event_id"]))
+    identity = {
+        "policy": OPTIONS_ALERT_V1_POLICY,
+        "cohort_id": str(cohort_id),
+        "event_id": str(event_id),
+        "contract_id": int(row["contract_id"]),
+        "catalog_version_id": int(row["version_id"]),
+        "entry_mark": str(mid),
+        "entry_market_time": entry_time.isoformat(),
+    }
+    premium = mid * multiplier
+    close = OptionExchangeCalendar().session_close(session_date)
+    return RealtimeOptionPackage(
+        candidate_id=uuid5(NAMESPACE_URL, f"stockscreener:options-alert-v1:{cohort_id}:{event_id}"),
+        event_id=event_id,
+        matrix_id=matrix_id,
+        candidate_identity_sha256=canonical_sha256(identity),
+        cohort_id=cohort_id,
+        provider_tier=ProviderTier.MASSIVE_ADVANCED,
+        entry_market_time=entry_time,
+        # Package premium convention (options/outcomes.py `_package_premium`): SELL +, BUY -, so a debit is negative.
+        entry_net_premium=-premium,
+        capital_at_risk=premium,
+        exit_deadline=close if close > entry_time else None,
+        legs=(RealtimeOptionPackageLeg(
+            leg_index=0,
+            instrument_id=instrument_id,
+            contract_id=int(row["contract_id"]),
+            catalog_version_id=int(row["version_id"]),
+            contract_ticker=str(row["contract_ticker"]),
+            side=OptionSide.BUY,
+            ratio=1,
+            multiplier=multiplier,
+            strike=Decimal(str(row["strike"])),
+            expiration_date=row["expiration"],
+            contract_type=contract_type,
+            entry_mark=mid,
+            entry_market_time=leg_time,
+            valuation_policy_sha256=OPTIONS_ALERT_V1_VALUATION_SHA256,
+        ),),
+    )
+
+
 def _load_o1(
     cursor,
     plan: AdvancedOptionsNativeInputPlan,
@@ -720,6 +803,9 @@ def _load_o1(
         "event.source_flow_id::text,event.source_offset,event.created_at,"
         "contract.underlying_security_id::text,version.call_put,"
         "version.expiration,event.flow_policy_sha256,"
+        # Options alerts v1 (Nov 6): the leg and entry quote for a single-contract package.
+        "instrument.instrument_id,version.version_id,version.strike,version.multiplier,"
+        "event.quote_bid,event.quote_ask,event.quote_time,"
         "array_agg(profile.profile ORDER BY profile.profile) AS profiles "
         "FROM rt.option_flow_events AS event "
         # Flow writes contract_ticker and leaves contract_id empty, so joining on the id
@@ -752,7 +838,9 @@ def _load_o1(
         "event.prior_open_interest,event.open_interest_as_of,"
         "event.source_flow_id,event.source_offset,event.created_at,"
         "contract.underlying_security_id,version.call_put,"
-        "version.expiration,event.flow_policy_sha256 "
+        "version.expiration,event.flow_policy_sha256,"
+        "instrument.instrument_id,version.version_id,version.strike,version.multiplier,"
+        "event.quote_bid,event.quote_ask,event.quote_time "
         "ORDER BY event.event_time,event.event_id",
         (
             str(plan.control_plane.cohort_id),
@@ -817,10 +905,25 @@ def _load_o1(
             reason = str(error).splitlines()[-1][:120] if str(error) else type(error).__name__
             rejected[reason] = rejected.get(reason, 0) + 1
             continue
+        package = packages.get(event_id)
+        if package is None:
+            try:
+                package = options_alert_v1_event_package(
+                    row,
+                    cohort_id=plan.control_plane.cohort_id,
+                    matrix_id=plan.rolling_state.state_id,
+                    session_date=plan.control_plane.session_date,
+                    unmarked_instrument_ids=plan.unmarked_instrument_ids,
+                )
+            except (ValueError, TypeError, ArithmeticError) as error:
+                # A package that cannot be built leaves the detection an observation; it never stops the window.
+                reason = f"OPTIONS_ALERT_V1_PACKAGE:{type(error).__name__}"
+                rejected[reason] = rejected.get(reason, 0) + 1
+                package = None
         invocations.append(AdvancedO1Invocation(
             event_id,
             source,
-            packages.get(event_id),
+            package,
         ))
     if rejected:
         print(

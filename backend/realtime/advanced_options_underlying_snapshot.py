@@ -1,6 +1,7 @@
 """Typed underlying-price evidence from the bounded P8 option snapshots."""
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
@@ -18,6 +19,8 @@ PRICE_SOURCE = "MASSIVE_OPTION_CHAIN_UNDERLYING_ASSET_V1"
 REQUIRED_TIMEFRAME = "REAL-TIME"
 MAXIMUM_PRICE_AGE_SECONDS = 300
 MAXIMUM_PROVIDER_CLOCK_SKEW_SECONDS = 5
+_UNDERLYING_TICKER = re.compile(r"[A-Z]{1,5}")
+_OPTION_ON_UNDERLYING = re.compile(r"O:([A-Z]{1,5})\d{6}[CP]\d{8}")
 PRICE_POLICY_SHA256 = canonical_sha256({
     "contract": "advanced-options-underlying-snapshot-policy-v1",
     "price_source": PRICE_SOURCE,
@@ -86,10 +89,13 @@ class UnderlyingSnapshotPrice:
         timeframe = self.timeframe.strip().upper()
         selected_contract = self.selected_contract_ticker.strip().upper()
         market_time = _utc(self.market_time, "underlying market_time")
+        # G96 (Nov 6): any underlying in the session's capture, not only SPY and QQQ. The contract must still be an
+        # option on exactly this underlying (the next character after the symbol is the expiry's first digit).
         if (
-            ticker not in {"QQQ", "SPY"}
+            not _UNDERLYING_TICKER.fullmatch(ticker)
             or timeframe != REQUIRED_TIMEFRAME
-            or not selected_contract.startswith(f"O:{ticker}")
+            or not _OPTION_ON_UNDERLYING.fullmatch(selected_contract)
+            or _OPTION_ON_UNDERLYING.fullmatch(selected_contract).group(1) != ticker
             or not isinstance(self.session_date, date)
             or isinstance(self.session_date, datetime)
             or market_time.date() != self.session_date
@@ -147,7 +153,8 @@ class UnderlyingSnapshotBinding:
         if (
             type(self.maximum_price_age_seconds) is not int
             or self.maximum_price_age_seconds <= 0
-            or tuple(row.ticker for row in prices) != ("QQQ", "SPY")
+            or not prices
+            or len({row.ticker for row in prices}) != len(prices)
             or reviewed >= valid
         ):
             raise ValueError("P8 underlying snapshot binding is invalid")

@@ -462,6 +462,7 @@ def produce_realtime_stock_alerts(
     *,
     streams=(),
     retained_projection=None,
+    detector_input_sha256=None,
 ):
     if (
         isinstance(retained_projection, Mapping)
@@ -471,6 +472,7 @@ def produce_realtime_stock_alerts(
         return _produce_canonical_realtime_stock_alerts(
             inputs,
             retained_projection,
+            detector_input_sha256=detector_input_sha256,
         )
     inputs = alert_source_inputs(inputs)
     bars, actions = alert_domain_inputs(inputs)
@@ -703,6 +705,8 @@ def _historical_membership_partial(entry) -> bool:
 def _produce_canonical_realtime_stock_alerts(
     inputs: RealtimeScreeningInput,
     retained: Mapping[str, object],
+    *,
+    detector_input_sha256: str | None = None,
 ):
     body = dict(retained)
     projection_sha256 = body.pop("projection_sha256", None)
@@ -714,7 +718,8 @@ def _produce_canonical_realtime_stock_alerts(
         or not isinstance(evaluations, list)
         or str(batch.get("cohort_id")) != str(inputs.cohort_id)
         or batch.get("cutoff") != inputs.cutoff.isoformat()
-        or batch.get("detector_input_sha256") != inputs_sha256(inputs)
+        or batch.get("detector_input_sha256")
+        != (detector_input_sha256 or inputs_sha256(inputs))
     ):
         raise ValueError(
             "canonical Stock Alert projection is not bound to exact E"

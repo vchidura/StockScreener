@@ -232,6 +232,8 @@ def advanced_input_gate_identity(
             "FROM rt.consumer_checkpoints AS checkpoint "
             "WHERE checkpoint.cohort_id=%s "
             "AND checkpoint.journal_generation=ANY(%s::uuid[]) "
+            # B1/G93 (Nov 6): only the stream bridge's checkpoints; detector shadow lanes share the journal.
+            "AND checkpoint.consumer_name='advanced-equity-am-v1' "
             "ORDER BY checkpoint.journal_generation,checkpoint.shard_id",
             (
                 str(plan.cohort_id),

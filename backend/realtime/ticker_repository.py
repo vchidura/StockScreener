@@ -3,6 +3,7 @@ from copy import deepcopy
 from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta
 import hashlib
+import logging
 from pathlib import Path
 from threading import Lock
 from uuid import UUID
@@ -559,6 +560,22 @@ def _stamp(value):
     return _utc(value if isinstance(value, datetime) else datetime.fromisoformat(value), "stored ticker clock")
 
 
+def _running_session(calendar, generated_at):
+    """B7/G98 (Nov 6): the session a publication was generated in, while that session is open; None otherwise.
+
+    Intraday publications carry the previous close as their daily quote, so the quote date alone always reported the
+    last close as current and the portal never followed the running session."""
+    if generated_at is None:
+        return None
+    stamp = _stamp(generated_at)
+    day = str(stamp.date())
+    if not calendar.is_session(day):
+        return None
+    opens = calendar.session_open(day).to_pydatetime()
+    closes = calendar.session_close(day).to_pydatetime()
+    return day if opens <= stamp < closes else None
+
+
 def _availability(market_time, cutoff, interval, provider_tier):
     if provider_tier not in {"MASSIVE_ADVANCED", "MASSIVE_DEVELOPER"}:
         raise ValueError("Ticker availability requires a supported provider tier")
@@ -582,9 +599,14 @@ def _availability(market_time, cutoff, interval, provider_tier):
 
 
 def _reference_matches(reference, rows):
-    return (len(rows) == 1
-            and str(rows[0]["revision_id"]) == str(reference["security_revision_id"])
-            and rows[0]["payload_sha256"] == reference["payload_sha256"])
+    # G97 (Nov 6): routine reference refreshes leave overlapping validity windows, so more than one revision can be
+    # current at a cutoff (AAPL: Nov 2 and Nov 6; new members: three each). The publication is valid when the
+    # revision it was built from is one of them, with the same payload; requiring exactly one refused every page.
+    return any(
+        str(row["revision_id"]) == str(reference["security_revision_id"])
+        and row["payload_sha256"] == reference["payload_sha256"]
+        for row in rows
+    )
 
 
 def _retained_read_state(reference_current, action_drift):
@@ -600,9 +622,19 @@ def _retained_read_state(reference_current, action_drift):
 
 
 def _reference_set_matches(expected, rows):
-    return sorted((str(item["security_id"]), item["ticker"], str(item["security_revision_id"]), item["payload_sha256"])
-                  for item in expected) == sorted((str(item["security_id"]), item["ticker"], str(item["revision_id"]), item["payload_sha256"])
-                                                 for item in rows)
+    # G97b (Nov 6): with overlapping validity windows a security can have several current revisions. Each expected
+    # reference must be one of its security's current revisions (same ticker and payload), and the set of securities
+    # must be exactly the expected one.
+    current = {}
+    for item in rows:
+        current.setdefault(str(item["security_id"]), set()).add(
+            (item["ticker"], str(item["revision_id"]), item["payload_sha256"]))
+    if {str(item["security_id"]) for item in expected} != set(current):
+        return False
+    return all(
+        (item["ticker"], str(item["security_revision_id"]), item["payload_sha256"]) in current[str(item["security_id"])]
+        for item in expected
+    )
 
 
 def _with_retained_state(payload, read_state):
@@ -780,6 +812,13 @@ class RealtimeTickerWorkspaceRepository(_RealtimeCompatibilityRepository):
             _stamp(selected["quote"]["as_of"])
             == calendar.session_close(current_session).to_pydatetime()
         )
+        data_as_of = selected["quote"]["as_of"]
+        running = _running_session(calendar, current["generated_at"])
+        if running is not None and running > current_session:
+            # B7: today's window publication is the running session, not the close its daily quote comes from.
+            current_session = running
+            current_is_session_close = False
+            data_as_of = _stamp(current["generated_at"]).isoformat()
         sessions[current_session] = str(current["snapshot_id"])
         return dict(
             ticker=symbol,
@@ -789,7 +828,7 @@ class RealtimeTickerWorkspaceRepository(_RealtimeCompatibilityRepository):
             current_session=current_session,
             current_snapshot=str(current["snapshot_id"]),
             current_is_session_close=current_is_session_close,
-            data_as_of=selected["quote"]["as_of"],
+            data_as_of=data_as_of,
             data_interval="1d",
             provider_fetch_performed=False,
         )
@@ -863,6 +902,14 @@ class RealtimeTickerWorkspaceRepository(_RealtimeCompatibilityRepository):
             selected.get("snapshot_class") == "SESSION_CLOSE"
             or current_session in sessions
         )
+        running = (
+            None if selected.get("snapshot_class") == "SESSION_CLOSE"
+            else _running_session(calendar, selected.get("generated_at"))
+        )
+        if running is not None and running > current_session:
+            # B7: an intraday summary belongs to the running session; daily pages still read the last close.
+            current_session = running
+            current_is_session_close = False
         sessions.setdefault(current_session, str(selected["snapshot_id"]))
         return dict(
             cohort_id=str(cohort_id),
@@ -1467,6 +1514,43 @@ class RealtimeTickerWorkspaceRepository(_RealtimeCompatibilityRepository):
         read_state = _retained_read_state(reference_current, action_drift) if read_mode == "retained" else None
         return identity, UUID(str(cohort_id)), read_state, notice
 
+    def _store_quote(self, ticker, quote, cutoff):
+        """G78/B20 (Nov 6): during a running session, the ticker's current price from the Equity store.
+
+        A publication's quote falls back to the previous close whenever its intraday history is incomplete (a missed
+        window leaves a 5-minute hole for the day), which left every page without today's price. Returns the latest
+        final RTH 5-minute close recorded by `cutoff`, dated today, with the change from the stored quote's close;
+        None outside a running session or when nothing newer is stored."""
+        calendar = exchange_calendars.get_calendar("XNYS")
+        running = _running_session(calendar, cutoff)
+        if running is None or str(quote["trade_date"]) >= running:
+            return None
+        with self._cursor() as cursor:
+            self._begin(cursor)
+            cursor.execute(
+                "SELECT close_price, bar_end FROM rt.bar_revisions "
+                "WHERE ticker=%s AND provider_tier='MASSIVE_ADVANCED' AND interval='5m' "
+                "AND adjustment_basis='RAW_UNADJUSTED' AND session_scope='RTH' AND is_final "
+                "AND session_date=%s AND bar_end<=%s AND observed_at<=%s "
+                "ORDER BY bar_end DESC, observed_at DESC LIMIT 1",
+                (ticker, running, cutoff, cutoff),
+            )
+            row = cursor.fetchone()
+        if row is None:
+            return None
+        price = float(row["close_price"])
+        base = float(quote["price"])
+        return dict(
+            quote,
+            price=price,
+            as_of=_stamp(row["bar_end"]).isoformat(),
+            trade_date=running,
+            source="5m_store",
+            previous_close=base,
+            change=round(price - base, 4),
+            change_percent=round((price / base - 1) * 100, 2) if base else None,
+        )
+
     def _snapshot(self, ticker, cutoff, cohort_id, snapshot_id=None, read_mode="current", *, strict_snapshot=False):
         symbol = ticker.strip().upper()
         if not _TICKER_PATTERN.fullmatch(symbol):
@@ -1713,6 +1797,14 @@ class RealtimeTickerWorkspaceRepository(_RealtimeCompatibilityRepository):
                 read_state,
                 provider_tier,
             )
+            if not closing_view:
+                try:
+                    stored = self._store_quote(payload["ticker"], quote, cutoff)
+                except Exception:  # noqa: BLE001 - degrade to the publication's own quote, never fail the read
+                    logging.getLogger(__name__).warning("Equity store quote unavailable for %s", payload["ticker"])
+                    stored = None
+                if stored is not None:
+                    return stored
             return quote
         if contract == "multi":
             result = deepcopy(payload["multi"])

@@ -10,6 +10,7 @@ from .advanced_equity_capability_refresh import (
     MASSIVE_STOCKS_CONNECTION_RESOURCE,
 )
 from .advanced_equity_journal_bridge import (
+    ADVANCED_EQUITY_BRIDGE_CONSUMER,
     AdvancedEquityJournalBridgeConfig,
     AdvancedEquityJournalBridgeStatus,
     AdvancedJournalBlockedError,
@@ -268,13 +269,16 @@ def _postgres_reconciliation_cursor(
             "STREAM_IDENTITY_MISMATCH",
             "registered stream session is unavailable",
         )
+    # B1/G93 (Nov 6): only the bridge's own checkpoints. Other consumers of the same journal (the Options OS detector
+    # shadow lanes) keep their own rows; counting them quarantined the Equity journal and blocked the session.
     cursor.execute(
         "SELECT shard_id,shard_map_sha256,owner_epoch,committed_offset "
         "FROM rt.consumer_checkpoints WHERE cohort_id=%s "
-        "AND journal_generation=%s ORDER BY shard_id",
+        "AND journal_generation=%s AND consumer_name=%s ORDER BY shard_id",
         (
             str(registration.cohort_id),
             str(registration.journal_generation),
+            ADVANCED_EQUITY_BRIDGE_CONSUMER,
         ),
     )
     checkpoints = tuple(cursor.fetchall())

@@ -739,6 +739,84 @@ class RealtimeOptionsAlertsPageRepository(_RealtimeCompatibilityRepository):
         "preview": "ASSESSMENT_UNAVAILABLE",
     }
 
+    def _advanced_current_marks(self, cursor, envelope, *, cutoff):
+        """Options alerts v1 (Nov 6, G78 principle): each alert's current price from the stored Options quotes.
+
+        Advanced has no package-mark producer, so every Advanced alert showed its current mark as unavailable. For
+        each row with an original package and no fresh mark, the exit premium is the sum of the legs' latest stored
+        NBBO midpoints (`rt.quote_current`, recorded by the read time) with the package sign rule (SELL +, BUY -);
+        gross P/L is entry minus exit premium and Price P/L is gross over capital at risk, in the same fields a
+        persisted mark carries. A failed or incomplete lookup leaves the row's mark as it was."""
+        from decimal import Decimal, InvalidOperation
+
+        rows = (envelope.get("data") or {}).get("rows") or []
+        pending = []
+        contract_ids = set()
+        for row in rows:
+            original = row.get("original_package") or {}
+            legs = original.get("legs") or []
+            if not legs or (row.get("current_mark") or {}).get("status") == "FRESH":
+                continue
+            pending.append((row, original, legs))
+            contract_ids.update(int(leg["contract_id"]) for leg in legs)
+        if not contract_ids:
+            return envelope
+        cursor.execute(
+            "SELECT contract.contract_id, quote.bid, quote.ask, quote.event_at, quote.received_at "
+            "FROM rt.quote_current AS quote "
+            "JOIN rt.instruments AS instrument USING (instrument_id) "
+            "JOIN ref.option_contracts AS contract USING (contract_id) "
+            "WHERE quote.provider='massive' AND quote.quality='GOOD' "
+            "AND contract.contract_id=ANY(%s::bigint[]) "
+            "AND quote.event_at<=%s AND quote.received_at<=%s",
+            (sorted(contract_ids), cutoff, cutoff),
+        )
+        quotes = {int(item["contract_id"]): item for item in (_row(value) for value in cursor.fetchall())}
+        for row, original, legs in pending:
+            try:
+                exit_premium = Decimal(0)
+                market_times, observed_times = [], []
+                for leg in legs:
+                    quote = quotes.get(int(leg["contract_id"]))
+                    if quote is None or quote["bid"] is None or quote["ask"] is None:
+                        raise InvalidOperation("missing quote")
+                    bid, ask = Decimal(str(quote["bid"])), Decimal(str(quote["ask"]))
+                    if bid <= 0 or ask < bid:
+                        raise InvalidOperation("unusable quote")
+                    sign = Decimal(1) if str(leg["side"]).upper() == "SELL" else Decimal(-1)
+                    exit_premium += sign * (bid + ask) / 2 * int(leg["ratio"]) * int(leg["multiplier"])
+                    market_times.append(_utc(quote["event_at"], "quote event_at"))
+                    observed_times.append(_utc(quote["received_at"], "quote received_at"))
+                entry_premium = Decimal(str(original["net_premium"]))
+                capital = Decimal(str(original["capital_at_risk"]))
+                if capital <= 0:
+                    raise InvalidOperation("capital at risk")
+            except (InvalidOperation, KeyError, TypeError, ValueError):
+                continue
+            gross = entry_premium - exit_premium
+            market_time, observed_time = min(market_times), max(observed_times)
+            row["current_mark"] = {
+                **(row.get("current_mark") or {}),
+                "status": "FRESH",
+                "reason": None,
+                "market_time": market_time.isoformat(),
+                "observed_time": observed_time.isoformat(),
+                "oldest_leg_market_time": market_time.isoformat(),
+                "age_seconds": max(0, int((cutoff - observed_time).total_seconds())),
+                "signed_package_mark": str(exit_premium),
+                "package_price": str(abs(exit_premium)),
+                "gross_pnl": str(gross),
+                "price_return": str(gross / capital),
+                "estimated_cost": None,
+                "net_pnl": None,
+                "net_return": None,
+                "basis": "STORED_NBBO_MIDPOINT",
+                "price_return_basis": "GROSS_PNL_OVER_CAPITAL_AT_RISK",
+                "net_return_basis": None,
+                "source": "PERSISTED_ADVANCED_QUOTE_CURRENT",
+            }
+        return envelope
+
     def _retained_marks(self, cursor, publication, envelope, *, cutoff, cohort_id):
         import json
         from contextlib import nullcontext
@@ -891,6 +969,12 @@ class RealtimeOptionsAlertsPageRepository(_RealtimeCompatibilityRepository):
                         if contract == "detector_runs":
                             from .option_alert_projection import DetectorRunQuery
                             envelope = publication.detector_runs(DetectorRunQuery(**(query or {})), **identity)
+                            if advanced:
+                                try:
+                                    envelope = self._advanced_current_marks(cursor, envelope, cutoff=cutoff)
+                                except Exception:  # noqa: BLE001 - marks are optional; never fail the alert list
+                                    import logging
+                                    logging.getLogger(__name__).warning("Advanced Options alert current marks unavailable")
                             return (
                                 _retained_options_envelope(
                                     envelope,

@@ -964,7 +964,9 @@ def _project_realtime_ticker_workspace(
         own_actions = actions_by_security.of(own_security_id)
         if any(row["action_type"] == "SPLIT" and plan.raw_start <= row["effective_date"] <= plan.raw_end
                for row in own_actions):
-            raise ValueError("Ticker raw split window requires review")
+            # G95 (Nov 6): a split inside the raw window mixes price scales in this ticker's raw intraday history.
+            # Label it for review on this ticker instead of failing every member's window (CRWD 1:4 on 2026-07-02).
+            missing["raw_history"] = "RAW_SPLIT_WINDOW_REVIEW"
         adjusted = groups[("1d", "ADJUSTED")]
         segment = uuid5(NAMESPACE_URL, f"ticker-lineage-check:{inputs.cohort_id}:{security.ticker}")
         verifier = _DerivationVerifier(state, security, inputs, segment)

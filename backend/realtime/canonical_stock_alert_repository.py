@@ -324,6 +324,36 @@ def _context_benchmark_members_cursor(
     return members
 
 
+def canonical_stock_alert_detector_inputs_cursor(cursor, inputs):
+    """The exact inputs the detector sees: the canonical input plus the context benchmark bars.
+
+    B18 (Nov 6): the batch hashed these, while publication hashed the input without the context bars, so every
+    publication was refused once the universe had benchmark context (sector ETFs). Both sides now use this one helper.
+    Returns (membership, context_members, context_inputs)."""
+    membership = _membership_cursor(cursor, inputs)
+    context_members = _context_benchmark_members_cursor(
+        cursor,
+        inputs,
+        membership,
+    )
+    context_bars = select_canonical_stock_alert_context_bars(
+        cursor,
+        cohort_id=inputs.cohort_id,
+        provider_tier=inputs.provider_tier,
+        tickers=tuple(
+            sorted(str(row["ticker"]) for row in context_members)
+        ),
+        session=inputs.session,
+        cutoff=inputs.cutoff,
+        known_by=inputs.recorded_by,
+    )
+    context_inputs = replace(
+        inputs,
+        bars=(*inputs.bars, *context_bars),
+    )
+    return membership, context_members, context_inputs
+
+
 def build_canonical_stock_alert_batch_cursor(
     cursor,
     receipt: Mapping[str, object],
@@ -346,26 +376,8 @@ def build_canonical_stock_alert_batch_cursor(
     )
 
     version = canonical_stock_alert_version()
-    membership = _membership_cursor(cursor, inputs)
-    context_members = _context_benchmark_members_cursor(
-        cursor,
-        inputs,
-        membership,
-    )
-    context_bars = select_canonical_stock_alert_context_bars(
-        cursor,
-        cohort_id=inputs.cohort_id,
-        provider_tier=inputs.provider_tier,
-        tickers=tuple(
-            sorted(str(row["ticker"]) for row in context_members)
-        ),
-        session=inputs.session,
-        cutoff=inputs.cutoff,
-        known_by=inputs.recorded_by,
-    )
-    context_inputs = replace(
-        inputs,
-        bars=(*inputs.bars, *context_bars),
+    membership, context_members, context_inputs = (
+        canonical_stock_alert_detector_inputs_cursor(cursor, inputs)
     )
     market_events, market_event_coverage = (
         _context_reference_rows_cursor(cursor, context_inputs)

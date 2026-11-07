@@ -1,4 +1,5 @@
 """Realtime-only Stock Alerts writer and retained, request-time read projection."""
+import logging
 from copy import deepcopy
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -92,9 +93,18 @@ def compute_realtime_stock_alerts(
             if canonical
             else load_realtime_stock_alert_input
         )(cursor, **scope)
+        detector_input_sha256 = None
+        if canonical:
+            # B18 (Nov 6): hash exactly what the batch's detector saw (input plus context benchmark bars).
+            from .canonical_stock_alert_repository import canonical_stock_alert_detector_inputs_cursor
+            from .lineage_head import inputs_sha256
+            detector_input_sha256 = inputs_sha256(
+                canonical_stock_alert_detector_inputs_cursor(cursor, inputs)[2]
+            )
         return produce_realtime_stock_alerts(
             inputs,
             retained_projection=retained_projection,
+            detector_input_sha256=detector_input_sha256,
         )
 
 
@@ -191,6 +201,34 @@ def materialize_realtime_stock_alerts(compute_database: RealtimeProcessDatabase,
 
 
 class RealtimeStockAlertViewRepository(_RealtimeCompatibilityRepository):
+    def _attach_current_prices(self, snapshot, cutoff):
+        """G78 (Nov 6): each alert's current price from the Equity store, at any hour and for any session.
+
+        The latest final RTH 5-minute close per ticker recorded by `cutoff` (the read time). `alert_page` then derives
+        the direction-adjusted Price P/L from the trigger with its existing guards. A stored price is never replaced."""
+        alerts = [row for row in snapshot.get("alerts", []) if row.get("latest_price") is None]
+        tickers = sorted({str(row["ticker"]) for row in alerts})
+        if not tickers:
+            return
+        with self._cursor() as cursor:
+            self._begin(cursor)
+            cursor.execute(
+                "SELECT DISTINCT ON (ticker) ticker, close_price, bar_end FROM rt.bar_revisions "
+                "WHERE ticker=ANY(%s) AND provider_tier='MASSIVE_ADVANCED' AND interval='5m' "
+                "AND adjustment_basis='RAW_UNADJUSTED' AND session_scope='RTH' AND is_final "
+                "AND bar_end<=%s AND observed_at<=%s AND session_date>=%s "
+                "ORDER BY ticker, bar_end DESC, observed_at DESC",
+                (tickers, cutoff, cutoff, (cutoff - timedelta(days=10)).date()),
+            )
+            latest = {str(row["ticker"]): row for row in cursor.fetchall()}
+        for row in alerts:
+            price = latest.get(str(row["ticker"]))
+            if price is None:
+                continue
+            row["latest_price"] = float(price["close_price"])
+            row["latest_price_at"] = _utc(price["bar_end"], "latest price bar_end").isoformat()
+            row["latest_price_source"] = "EQUITY_STORE_5M_CLOSE"
+
     def _snapshot(self, cutoff, cohort_id):
         with self._cursor() as cursor:
             self._begin(cursor)
@@ -273,13 +311,13 @@ class RealtimeStockAlertViewRepository(_RealtimeCompatibilityRepository):
                     str(reference["security_id"]),
                     (),
                 )
-                if (
-                    len(current) != 1
-                    or current[0]["ticker"] != reference["ticker"]
-                    or str(current[0]["revision_id"])
-                    != str(reference["security_revision_id"])
-                    or current[0]["payload_sha256"]
-                    != reference["payload_sha256"]
+                # G97c (Nov 6): overlapping validity windows leave several current revisions; the reference must be
+                # one of them (same ticker and payload), not the only one.
+                if not any(
+                    item["ticker"] == reference["ticker"]
+                    and str(item["revision_id"]) == str(reference["security_revision_id"])
+                    and item["payload_sha256"] == reference["payload_sha256"]
+                    for item in current
                 ):
                     raise StockAlertPublicationUnavailable("Realtime alert reference changed; republish required")
             ids = reference_ids
@@ -439,6 +477,10 @@ class RealtimeStockAlertViewRepository(_RealtimeCompatibilityRepository):
                 stream.update(status="STALE", projector_stale=True)
         if session_date is not None and cohort_id is not None:
             self._add_regenerated_alerts(snapshot, cutoff, cohort_id, str(session_date))
+        try:
+            self._attach_current_prices(snapshot, cutoff)
+        except Exception:  # noqa: BLE001 - G78: a missing current price leaves the column empty, never fails the page
+            logging.getLogger(__name__).warning("Equity store current prices unavailable for Stock Alerts")
         try:
             page = alert_page(snapshot, session=str(session_date) if session_date else None,
                               offset=offset, limit=limit, **filters)

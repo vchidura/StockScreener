@@ -272,9 +272,13 @@ class RealtimeDashboardRepository(_RealtimeCompatibilityRepository):
                         (str(reference["security_id"]), reference["ticker"], cutoff, cutoff, cutoff),
                     )
                     revisions = cursor.fetchall()
-                    if (len(revisions) != 1
-                        or str(revisions[0]["revision_id"]) != str(reference["security_revision_id"])
-                        or revisions[0]["payload_sha256"] != reference["payload_sha256"]):
+                    # G97b (Nov 6): refreshes leave overlapping validity windows; the reference must be one of the
+                    # current revisions with the same payload, not the only one.
+                    if not any(
+                        str(revision["revision_id"]) == str(reference["security_revision_id"])
+                        and revision["payload_sha256"] == reference["payload_sha256"]
+                        for revision in revisions
+                    ):
                         raise DashboardPublicationUnavailable("Dashboard reference changed; republish required")
                 ids = [str(reference["security_id"]) for reference in references]
                 until = action_evidence_until(stored["generated_at"], cutoff)

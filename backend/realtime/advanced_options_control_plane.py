@@ -1127,6 +1127,25 @@ def build_advanced_options_control_plane_plan(
     )
     if not universe.option_underlyings:
         raise ValueError("Advanced Options requires exact underlying membership")
+    if (
+        isinstance(stored_identity, AdvancedOptionsStoredControlIdentity)
+        and stored_identity.universe_sha256 != universe.sha256
+    ):
+        # G96 (Nov 6): the Options cohort is prepared against the Equity membership of its preparation time. When
+        # Equity grows mid-flight (9 to 25 on Nov 6) the stored scope is the Equity members Options covers; accept
+        # that exact scope instead of refusing every cycle. Any other difference still refuses below.
+        covered = tuple(
+            ticker for ticker in equity_plan.universe.equity_tickers
+            if ticker in set(universe.option_underlyings)
+        )
+        if covered:
+            narrowed = UniverseManifest(
+                version=f"market-options-{len(covered)}-{len(option_underlyings)}-v1",
+                equity_tickers=covered,
+                option_underlyings=option_underlyings,
+            )
+            if narrowed.sha256 == stored_identity.universe_sha256:
+                universe = narrowed
     if stored_identity is not None and (
         not isinstance(stored_identity, AdvancedOptionsStoredControlIdentity)
         or stored_identity.universe_sha256 != universe.sha256
@@ -1500,7 +1519,8 @@ def _validated_enrollment_identity(
         not isinstance(control, AdvancedOptionsControlPlanePlan)
         or not isinstance(equity, AdvancedEquityControlPlanePlan)
         or control.session_date != equity.session_date
-        or control.universe.equity_tickers != equity.universe.equity_tickers
+        # G96 (Nov 6): Options covers a subset of the Equity members once Equity grows (9 of 25).
+        or not set(control.universe.equity_tickers) <= set(equity.universe.equity_tickers)
         or control.cohort_id == equity.cohort_id
         or control.runtime_authorization.any_authorized
         or control.runtime_enabled

@@ -1301,6 +1301,35 @@ def _sealed_current_mark(
     }
 
 
+def _one_alert_per_contract(pairs):
+    """Options alerts v1 grouping (user, Nov 6): one alert per contract and detector in a window.
+
+    A busy contract trades many times and each large trade is its own detection (Nov 6: 24 NVDA 192.5C trades), which
+    listed one near-identical alert per trade. For v1 single-contract packages the earliest detection in the window is
+    the alert; later ones on the same contract add to its hit count and last-seen time. Rows from stored packages keep
+    one row per evaluation, as before."""
+    from .advanced_options_native_loader import OPTIONS_ALERT_V1_VALUATION_SHA256
+
+    groups: dict[tuple[str, str], list] = {}
+    for evaluation, row in pairs:
+        legs = evaluation.package.legs
+        if len(legs) == 1 and legs[0].valuation_policy_sha256 == OPTIONS_ALERT_V1_VALUATION_SHA256:
+            key = (str(row["detector_id"]), f"contract:{legs[0].contract_id}")
+        else:
+            key = (str(row["detector_id"]), f"evaluation:{row['evaluation_id']}")
+        groups.setdefault(key, []).append((evaluation, row))
+    rows = []
+    for members in groups.values():
+        members.sort(key=lambda pair: (pair[0].observed_at, str(pair[1]["evaluation_id"])))
+        first = members[0][1]
+        if len(members) > 1:
+            first["hit_count"] = len(members)
+            first["repeat_count"] = len(members) - 1
+            first["last_seen_at"] = max(pair[0].observed_at for pair in members).isoformat()
+        rows.append(first)
+    return rows
+
+
 def _alert_run_row(
     evaluation,
     cutoff: datetime,
@@ -1730,8 +1759,8 @@ def _build_advanced_options_page_payloads(
         str(row["candidate_id"]): row
         for row in page_source.current_marks
     }
-    run_rows = [
-        stored
+    run_rows = _one_alert_per_contract([
+        (row, stored)
         for row in cycle.evaluations
         if (
             stored := _alert_run_row(
@@ -1740,7 +1769,7 @@ def _build_advanced_options_page_payloads(
                 current_marks,
             )
         ) is not None
-    ]
+    ])
     run = _run_summary(cycle, generated_at)
     alerts = {
         "contract": OPTIONS_PAGE_CONTRACTS["ALERTS"],
