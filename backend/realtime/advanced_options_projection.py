@@ -485,6 +485,8 @@ def _contract_facts(
 
 
 _PROVIDER_SNAPSHOT_READ_LIMIT = 8
+PROVIDER_GREEK_NAMES = ("delta", "gamma", "theta", "vega")
+PROVIDER_VALUE_FIELDS = ("provider_iv", *(f"provider_{name}" for name in PROVIDER_GREEK_NAMES))
 
 
 def _provider_number(value) -> float | None:
@@ -538,12 +540,14 @@ def _provider_greeks_cursor(
             if ticker not in wanted or ticker in seen:
                 continue
             seen.add(ticker)
-            greeks = row.get("greeks")
+            greeks = row.get("greeks") if isinstance(row.get("greeks"), dict) else {}
+            # All of the provider's values the snapshot reports, beside ours (`local_*`), never in their place.
             values = {
                 "provider_iv": _provider_number(row.get("implied_volatility")),
-                "provider_gamma": _provider_number(
-                    (greeks if isinstance(greeks, dict) else {}).get("gamma")
-                ),
+                **{
+                    f"provider_{name}": _provider_number(greeks.get(name))
+                    for name in PROVIDER_GREEK_NAMES
+                },
             }
             found[ticker] = {
                 key: value for key, value in values.items() if value is not None
@@ -1702,7 +1706,7 @@ def _build_advanced_options_page_payloads(
         # Beside our own values on evaluated contracts too, not only the admitted ones.
         for member in members:
             fact = facts_by_contract.get(int(member["contract_id"])) or {}
-            for key in ("provider_iv", "provider_gamma"):
+            for key in PROVIDER_VALUE_FIELDS:
                 if fact.get(key) is not None:
                     member[key] = fact[key]
         screener_rows.extend(members)

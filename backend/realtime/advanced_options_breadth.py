@@ -254,8 +254,103 @@ def fetch_underlying_breadth(
 _COLUMNS = (
     "session_date,contract_ticker,underlying,contract_type,expiration_date,strike_price,day_volume,open_interest,"
     "last_trade_price,last_trade_at,bid,ask,quote_at,implied_volatility,delta,gamma,theta,vega,underlying_price,"
-    "equity_cutoff,observed_at"
+    "local_iv,local_delta,local_gamma,local_theta_per_day,local_vega_per_vol_point,local_rho_per_rate_point,spot,"
+    "risk_free_rate,dividend_yield,valuation_basis,greeks_reason,equity_cutoff,observed_at"
 )
+_LOCAL_FIELDS = (
+    "local_iv", "local_delta", "local_gamma", "local_theta_per_day", "local_vega_per_vol_point",
+    "local_rho_per_rate_point", "spot", "risk_free_rate", "dividend_yield", "valuation_basis", "greeks_reason",
+)
+
+
+def load_valuation_inputs_cursor(cursor, *, session_date: date, known_by: datetime) -> tuple[Mapping, ...]:
+    """The session's stored rate and dividend inputs (per ticker and expiration), the ones the Options window uses."""
+    cursor.execute(
+        "SELECT state_document->'valuation_inputs' FROM rt.advanced_options_reference_states "
+        "WHERE session_date=%s AND known_at<=%s ORDER BY known_at DESC,created_at DESC LIMIT 1",
+        (session_date, known_by),
+    )
+    row = cursor.fetchone()
+    value = None if row is None else row[0]
+    return tuple(item for item in value if isinstance(item, Mapping)) if isinstance(value, list) else ()
+
+
+def breadth_local_greeks(
+    rows: Sequence[BreadthRow],
+    *,
+    spot: Decimal | None,
+    valuation_inputs: Sequence[Mapping],
+    observed_at: datetime,
+) -> dict[str, dict[str, object]]:
+    """Our IV and Greeks for breadth contracts: the solver the streamed contracts use, on the quote midpoint, our spot
+    and the session's stored inputs. An expiration without its own input takes the ticker's nearest stored expiration
+    (valuation_basis NEAREST_EXPIRY). A row the solver cannot price says why in greeks_reason."""
+    from options.analytics.greeks import OptionValuationInput, solve_local_greeks
+    from options.domain import ContractType
+
+    from .advanced_options_projection import _time_to_expiration_years
+
+    by_ticker: dict[str, list[tuple[date, Mapping]]] = {}
+    for item in valuation_inputs:
+        try:
+            by_ticker.setdefault(str(item["ticker"]), []).append(
+                (date.fromisoformat(str(item["expiration_date"])), item)
+            )
+        except (KeyError, ValueError):
+            continue
+    local: dict[str, dict[str, object]] = {}
+    requests = []
+    for row in rows:
+        result = {name: None for name in _LOCAL_FIELDS}
+        local[row.contract_ticker] = result
+        result["spot"] = spot
+        mark = (
+            (row.bid + row.ask) / 2
+            if row.bid is not None and row.ask is not None and row.ask >= row.bid and row.ask > 0
+            else None
+        )
+        years = _time_to_expiration_years(row.expiration_date, observed_at)
+        choices = by_ticker.get(row.underlying) or []
+        chosen = min(
+            choices, key=lambda item: (abs((item[0] - row.expiration_date).days), item[0]), default=None,
+        )
+        if spot is None or not spot > 0:
+            result["greeks_reason"] = "SPOT_UNAVAILABLE"
+            continue
+        if mark is None or not mark > 0:
+            result["greeks_reason"] = "QUOTE_UNAVAILABLE"
+            continue
+        if years is None:
+            result["greeks_reason"] = "EXPIRED"
+            continue
+        if chosen is None:
+            result["greeks_reason"] = "VALUATION_INPUT_UNAVAILABLE"
+            continue
+        try:
+            rate, dividend = float(chosen[1]["risk_free_rate"]), float(chosen[1]["dividend_yield"])
+        except (KeyError, TypeError, ValueError):
+            result["greeks_reason"] = "VALUATION_INPUT_UNAVAILABLE"
+            continue
+        result.update(
+            risk_free_rate=rate, dividend_yield=dividend,
+            valuation_basis="EXACT_EXPIRY" if chosen[0] == row.expiration_date else "NEAREST_EXPIRY",
+        )
+        requests.append((result, OptionValuationInput(
+            contract_type=ContractType.CALL if row.contract_type == "call" else ContractType.PUT,
+            spot=spot, strike=row.strike_price, model_mark=mark, time_to_expiration_years=years,
+            risk_free_rate=rate, dividend_yield=dividend,
+        )))
+    if requests:
+        solved_rows = solve_local_greeks(tuple(item[1] for item in requests))
+        for (result, _input), solved in zip(requests, solved_rows):
+            result.update(
+                local_iv=solved.local_iv, local_delta=solved.local_delta, local_gamma=solved.local_gamma,
+                local_theta_per_day=solved.local_theta_per_day,
+                local_vega_per_vol_point=solved.local_vega_per_vol_point,
+                local_rho_per_rate_point=solved.local_rho_per_rate_point,
+                greeks_reason=None if solved.failure_reason is None else solved.failure_reason.value[:48],
+            )
+    return local
 
 
 def persist_breadth_cursor(
@@ -266,6 +361,7 @@ def persist_breadth_cursor(
     started_at: datetime,
     observed_at: datetime,
     captured: UnderlyingBreadth,
+    local: Mapping[str, Mapping[str, object]] | None = None,
 ) -> UUID:
     """Replace the underlying's current rows with this capture's (a later capture never loses to an earlier one) and
     record the capture."""
@@ -281,7 +377,9 @@ def persist_breadth_cursor(
                     session_date, row.contract_ticker, row.underlying, row.contract_type, row.expiration_date,
                     row.strike_price, row.day_volume, row.open_interest, row.last_trade_price, row.last_trade_at,
                     row.bid, row.ask, row.quote_at, row.implied_volatility, row.delta, row.gamma, row.theta,
-                    row.vega, row.underlying_price, equity_cutoff, observed_at,
+                    row.vega, row.underlying_price,
+                    *(((local or {}).get(row.contract_ticker) or {}).get(name) for name in _LOCAL_FIELDS),
+                    equity_cutoff, observed_at,
                 )
                 for row in captured.rows
             ],
@@ -381,6 +479,12 @@ def capture_options_breadth(
                 ),
             )
 
+    try:
+        with provider.transaction(APP_ROLE, read_only=True) as unit:
+            valuation_inputs = load_valuation_inputs_cursor(unit.cursor, session_date=session_date, known_by=clock())
+    except Exception as error:  # noqa: BLE001 - our Greeks then read VALUATION_INPUT_UNAVAILABLE
+        _LOGGER.warning("options_breadth_valuation_inputs_unavailable error=%s", error)
+        valuation_inputs = ()
     for underlying in underlyings:
         started = clock()
         spot = spots.get(underlying)
@@ -399,10 +503,17 @@ def capture_options_breadth(
             captured = UnderlyingBreadth(underlying, (), 0, 0, 0, "FAILED", f"{type(error).__name__}: {error}"[:160])
         observed = clock()
         try:
+            local = breadth_local_greeks(
+                captured.rows, spot=spot, valuation_inputs=valuation_inputs, observed_at=max(observed, started),
+            ) if captured.rows else {}
+        except Exception as error:  # noqa: BLE001 - the provider's values still store; ours read unavailable
+            _LOGGER.warning("options_breadth_local_greeks_failed underlying=%s error=%s", underlying, error)
+            local = {}
+        try:
             with provider.transaction(APP_ROLE) as unit:
                 persist_breadth_cursor(
                     unit.cursor, session_date=session_date, equity_cutoff=equity_cutoff, started_at=started,
-                    observed_at=max(observed, started), captured=captured,
+                    observed_at=max(observed, started), captured=captured, local=local,
                 )
         except Exception as error:  # noqa: BLE001
             _LOGGER.warning("options_breadth_persist_failed underlying=%s error=%s", underlying, error)
@@ -418,7 +529,7 @@ def capture_options_breadth(
 
 # ---- reads (Options Screener) -------------------------------------------------------------------------------------
 
-BREADTH_QUALITY_FLAGS = ("BREADTH_SNAPSHOT", "PROVIDER_GREEKS_ONLY", "NOT_DETECTOR_EVALUATED")
+BREADTH_QUALITY_FLAGS = ("BREADTH_SNAPSHOT", "NOT_DETECTOR_EVALUATED")
 
 
 def _text(value) -> str | None:
@@ -430,12 +541,11 @@ def _iso(value) -> str | None:
 
 
 def breadth_screener_row(row: Mapping[str, object]) -> dict[str, object]:
-    """One breadth contract in the Options Screener's row shape; the mark is the quote midpoint. Our model's Greeks
-    (`local_*`) are not computed for breadth rows yet, so they are empty with a reason; the provider's are in
-    `provider_*`."""
+    """One breadth contract in the Options Screener's row shape; the mark is the quote midpoint. Our IV and Greeks
+    are in `local_*` (computed at capture), the provider's in `provider_*`; one never stands in for the other."""
     bid, ask = row.get("bid"), row.get("ask")
     mark = (Decimal(str(bid)) + Decimal(str(ask))) / 2 if bid is not None and ask is not None and ask >= bid else None
-    spot = row.get("underlying_price")
+    spot = row.get("spot") or row.get("underlying_price")
     strike = Decimal(str(row["strike_price"]))
     kind = "CALL" if row["contract_type"] == "call" else "PUT"
     otm = None
@@ -465,14 +575,15 @@ def breadth_screener_row(row: Mapping[str, object]) -> dict[str, object]:
         "mark": _text(mark),
         "display_mark": _text(mark),
         # `local_*` is only ever our model's value; the provider's values are carried beside it, never in its place.
-        "absolute_delta": None,
-        "local_delta": None,
-        "local_iv": None,
-        "local_gamma": None,
-        "local_theta_per_day": None,
-        "local_vega_per_vol_point": None,
-        "local_rho_per_rate_point": None,
-        "greeks_reason": "NOT_MODELLED_BREADTH",
+        "absolute_delta": None if row.get("local_delta") is None else abs(float(row["local_delta"])),
+        "local_delta": row.get("local_delta"),
+        "local_iv": row.get("local_iv"),
+        "local_gamma": row.get("local_gamma"),
+        "local_theta_per_day": row.get("local_theta_per_day"),
+        "local_vega_per_vol_point": row.get("local_vega_per_vol_point"),
+        "local_rho_per_rate_point": row.get("local_rho_per_rate_point"),
+        "greeks_reason": (row.get("greeks_reason") or "NOT_COMPUTED") if row.get("local_iv") is None else None,
+        "valuation_basis": row.get("valuation_basis"),
         "provider_iv": row.get("implied_volatility"),
         "provider_delta": row.get("delta"),
         "provider_gamma": row.get("gamma"),
@@ -488,14 +599,18 @@ def breadth_screener_row(row: Mapping[str, object]) -> dict[str, object]:
         "market_data_time": observed.isoformat(),
         "first_observed_at": observed.isoformat(),
         "mark_source": "BREADTH_QUOTE_MIDPOINT" if mark is not None else "UNAVAILABLE",
-        "quality_flags": list(BREADTH_QUALITY_FLAGS),
+        "quality_flags": [
+            *BREADTH_QUALITY_FLAGS,
+            *(["VALUATION_INPUT_NEAREST_EXPIRY"] if row.get("valuation_basis") == "NEAREST_EXPIRY" else []),
+            *([f"LOCAL_GREEKS_UNAVAILABLE:{row.get('greeks_reason') or 'NOT_COMPUTED'}"] if row.get("local_iv") is None else []),
+        ],
         "asset_type": "ETF" if str(row["underlying"]) in {"SPY", "QQQ", "IWM", "DIA"} else "EQUITY",
         "batch_id": None,
         "matrix_id": None,
         "time_to_expiration_years": None,
-        "risk_free_rate": None,
-        "dividend_yield": None,
-        "model_version": None,
+        "risk_free_rate": None if row.get("risk_free_rate") is None else str(row["risk_free_rate"]),
+        "dividend_yield": None if row.get("dividend_yield") is None else str(row["dividend_yield"]),
+        "model_version": None if row.get("local_iv") is None else "black-scholes-merton-v1",
         "valuation_policy_version": BREADTH_POLICY["version"],
         "valuation_policy_sha256": BREADTH_POLICY_SHA256,
         "coverage_source": "BREADTH",

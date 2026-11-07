@@ -822,6 +822,28 @@ def _snapshot(*rows):
     return _json.dumps({"results": list(rows)}).encode("utf-8")
 
 
+def test_all_of_the_providers_greeks_come_from_the_stored_snapshot():
+    from datetime import date, datetime, timezone
+
+    from realtime.advanced_options_projection import PROVIDER_VALUE_FIELDS, _provider_greeks_cursor
+
+    ticker = "O:SPY261120P00766000"
+    cursor = _SnapshotCursor({
+        "11111111-1111-1111-1111-111111111111": _snapshot({
+            "details": {"ticker": ticker}, "implied_volatility": 0.21,
+            "greeks": {"delta": -0.42, "gamma": 0.013, "theta": -0.31, "vega": 0.52},
+        }),
+    })
+    found = _provider_greeks_cursor(
+        cursor, session_date=date(2026, 11, 5), cutoff=datetime(2026, 11, 5, 17, 10, tzinfo=timezone.utc),
+        tickers=(ticker,),
+    )
+    assert found == {ticker: {"provider_iv": 0.21, "provider_delta": -0.42, "provider_gamma": 0.013,
+                              "provider_theta": -0.31, "provider_vega": 0.52}}
+    assert PROVIDER_VALUE_FIELDS == ("provider_iv", "provider_delta", "provider_gamma", "provider_theta",
+                                     "provider_vega")
+
+
 def test_provider_iv_and_gamma_come_from_the_stored_snapshot():
     from datetime import date, datetime, timezone
 

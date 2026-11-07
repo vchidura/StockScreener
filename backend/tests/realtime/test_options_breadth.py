@@ -206,10 +206,10 @@ def test_a_breadth_row_has_the_screeners_fields_flagged_as_provider_values():
     row = breadth.breadth_screener_row(_stored_breadth("O:SPY251120C00760000"))
     assert row["contract_type"] == "CALL" and row["calendar_dte"] == 11 and row["strike"] == "760"
     assert row["mark"] == "1.1" and row["volume_open_interest_ratio"] == "9" and row["day_volume"] == 900
-    assert row["local_iv"] is None and row["absolute_delta"] is None and row["greeks_reason"] == "NOT_MODELLED_BREADTH"
+    assert row["local_iv"] is None and row["absolute_delta"] is None and row["greeks_reason"] == "NOT_COMPUTED"
     assert (row["provider_iv"], row["provider_delta"], row["provider_gamma"]) == (0.2, 0.3, 0.01)
     assert Decimal(row["otm_fraction"]) > 0 and row["contract_id"] == 0
-    assert row["coverage_source"] == "BREADTH" and "PROVIDER_GREEKS_ONLY" in row["quality_flags"]
+    assert row["coverage_source"] == "BREADTH" and "LOCAL_GREEKS_UNAVAILABLE:NOT_COMPUTED" in row["quality_flags"]
     put = breadth.breadth_screener_row(_stored_breadth("O:SPY251120P00700000", kind="put", strike="700", oi=0))
     assert put["volume_open_interest_ratio"] is None and Decimal(put["otm_fraction"]) > 0
 
@@ -243,3 +243,49 @@ def test_the_screener_merges_breadth_under_the_published_rows(monkeypatch):
     alone = publication.query(EligibleChainQuery(), cohort_id=UUID(int=1), provider_tier="MASSIVE_ADVANCED",
                               scope_sha256="s" * 64)
     assert alone["data"]["total"] == 1 and alone["data"]["coverage"][0]["breadth_state"] == "NOT_CAPTURED"
+
+
+# ---- our Greeks for breadth rows -------------------------------------------------------------------------------------
+
+def _valuation(expiration, rate="0.0403", dividend="0.012"):
+    return {"ticker": "SPY", "expiration_date": expiration, "risk_free_rate": rate, "dividend_yield": dividend,
+            "model_version": "black-scholes-merton-v1"}
+
+
+def test_our_greeks_use_the_exact_or_the_nearest_stored_expiration_and_say_why_when_missing():
+    from dataclasses import replace
+
+    parsed, _ = breadth.parse_breadth_page({"results": [
+        _contract("O:SPY251120C00735000", expiration="2026-11-20"),
+        _contract("O:SPY251127C00735000", expiration="2026-11-27"),
+    ]}, underlying="SPY")
+    # An at-the-money SPY call 11 and 18 days out trades near $9-11 (the shared fixture's $1.10 has no IV).
+    rows = [replace(parsed[0], bid=Decimal("9.00"), ask=Decimal("9.40")),
+            replace(parsed[1], bid=Decimal("11.00"), ask=Decimal("11.40"))]
+    one_sided = breadth.BreadthRow(**{**{name: getattr(rows[0], name) for name in rows[0].__slots__},
+                                      "contract_ticker": "O:SPY251120C00740000", "ask": None})
+    local = breadth.breadth_local_greeks(
+        (*rows, one_sided), spot=Decimal("735.44"), valuation_inputs=(_valuation("2026-11-20"),), observed_at=NOW,
+    )
+    exact, nearest, missing = (local[ticker] for ticker in (
+        "O:SPY251120C00735000", "O:SPY251127C00735000", "O:SPY251120C00740000"))
+    assert exact["valuation_basis"] == "EXACT_EXPIRY" and nearest["valuation_basis"] == "NEAREST_EXPIRY"
+    assert exact["local_iv"] and 0 < exact["local_delta"] < 1 and exact["greeks_reason"] is None
+    assert exact["risk_free_rate"] == 0.0403 and exact["spot"] == Decimal("735.44")
+    assert missing["local_iv"] is None and missing["greeks_reason"] == "QUOTE_UNAVAILABLE"
+    none = breadth.breadth_local_greeks(rows, spot=Decimal("735.44"), valuation_inputs=(), observed_at=NOW)
+    assert {item["greeks_reason"] for item in none.values()} == {"VALUATION_INPUT_UNAVAILABLE"}
+    no_spot = breadth.breadth_local_greeks(rows, spot=None, valuation_inputs=(_valuation("2026-11-20"),),
+                                           observed_at=NOW)
+    assert {item["greeks_reason"] for item in no_spot.values()} == {"SPOT_UNAVAILABLE"}
+
+
+def test_a_breadth_row_shows_ours_and_the_providers_side_by_side():
+    stored = _stored_breadth("O:SPY251120C00760000")
+    stored.update(local_iv=0.19, local_delta=0.31, local_gamma=0.012, local_theta_per_day=-0.2,
+                  local_vega_per_vol_point=0.3, local_rho_per_rate_point=0.05, spot=Decimal("735.40"),
+                  risk_free_rate=0.0403, dividend_yield=0.012, valuation_basis="NEAREST_EXPIRY", greeks_reason=None)
+    row = breadth.breadth_screener_row(stored)
+    assert (row["local_iv"], row["absolute_delta"], row["provider_iv"], row["provider_delta"]) == (0.19, 0.31, 0.2, 0.3)
+    assert row["spot"] == "735.4" and row["model_version"] == "black-scholes-merton-v1" and row["greeks_reason"] is None
+    assert "VALUATION_INPUT_NEAREST_EXPIRY" in row["quality_flags"]
