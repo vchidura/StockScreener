@@ -78,14 +78,19 @@ start check as gates.
 
 - **In place:** one migration per step in `backend/realtime/sql_v2/` (049 onwards), applied to live over the weekend,
   when no session runs. Index builds don't need `CONCURRENTLY` then; `lock_timeout` stays 5 s as in migration 021.
-- **Old tables stay** (`rt.bar_current`, `rt.cohort_history_bindings`) until Monday's test passes. The bar writer keeps
-  updating `rt.bar_current` for one week. That is not a shadow process: it keeps the 18 scripts that still read the old
-  table correct, and keeps rollback to the current images a plain image swap.
+- **Old tables stay, unwritten** (`rt.bar_current`, `rt.cohort_history_bindings`). User, Nov 7: Monday runs the target
+  design, nothing is written into old tables that don't fit it, and nothing runs in parallel. So the A4 writer updates
+  only `rt.bar_head`; `rt.bar_current` keeps its Friday state for rollback and for the scripts not yet converted, and is
+  dropped after a week.
 - **Verification (instead of a proof step):** counts against the trading calendar, and one query listing keys where
   the new head picked a different bar revision than today's reads (4.7).
 - **Testing:** unit tests for each changed module; a replay of the Nov 6 session on a copy with the 25 tickers; then
   Monday's live session with the validator after the close.
-- **Rollback:** the current images (window r50, API r48 and the others) with the old tables, which stay current.
+- **Rollback:** migrations 049-051 work with the earlier images (no old statement uses the constraint 049 replaces;
+  050 and 051 only add). Before the A4 writer has written, rollback is an image swap. After it has written,
+  `rt.bar_current` is stale, so first stop the services and run `runner/g102_a4_rollback_fill.py --since <deploy time>`
+  (copies every head row changed since then into `rt.bar_current` under its catalog cohort; rehearsed Nov 7), then swap
+  the images (4.10).
 
 ## 3. A0: Options Alerts as a session list (G100)
 
@@ -310,11 +315,32 @@ Conversion order, each group tested and replayed on the copy before the next:
    `rt.cohort_history_bindings` stays unread for a week.
 6. **Scripts** move after the runtime, then `rt.bar_current` is dropped.
 
-**Going live (in place).** (a) Migration 051 and the head writer (every bar writer calls
-`persist_realtime_equity_bars_cursor`, so the bridge, finalizer, derivation, repair and preparation images), then
-(b) the backfill and the counts and differences checks on live (seconds to minutes), then (c) each converted group.
-(a) and (b) are additive: no reader uses the head until (c). Recommended timing: (a) and (b) Monday night after the
-live test, not in Sunday's fast-track deploy, so Monday tests only what was planned.
+**Going live (in place), Sunday Nov 8 after the 20:00 UTC gate, with the user's yes.** Groups 1-4 are built
+(`6c01f49`): the writer is head-only and every live reader reads the head. One image for all 19 backend services,
+`alpha-research-realtime-v3:stable-nov8-r52-g102a4-e299d39acca41daf` (`3f3a141`; its code equals the commit; all 426
+modules import as in the live images; every live image's code traces to a commit, so no image-only fix is lost).
+Steps (`deploy_candidate.ps1`): stop writers and Options processing, snapshot, `g102-migrate` (plan, apply 049-051,
+harden, backfill, verify), `g102-services` (each service onto the image between windows, the hotfix way), status, the
+pre-open audit.
+
+**Hardening after 051 (found Nov 7).** A migration runs as the database superuser, so `rt.bar_head` is created owned by
+it with no grants; every bar write by the app role would fail. The first rehearsal ran as admin and missed it. The
+deploy runs the hardening routine provisioning used (`harden_database_v2`): rehearsed on a fresh copy first hardened
+like live (375 relations, the live audit passing), it changed exactly one object, `rt.bar_head` (admin owner; app
+SELECT, INSERT, UPDATE; api SELECT), in 0.1 s, and the audit passes, so the services' `AUDITED` startup check holds.
+
+**Final-image rehearsal on that copy (as the app role, not admin).** Backfill 432,684 rows = the distinct current keys,
+17.8 s. App role upserts the head and may not delete; api role reads current and as-of rows and may not write. Nov 6
+windows at 6 cutoffs: equal to the old code and to the first A4 run, lineage equal to live 25 of 25. Bar readers: equal
+to the first A4 run; against the old code only the 5m reads differ (the 20:55 bar whose pointer moved at 01:48 is
+included, 77 bars vs 76). V3 H coverage for Monday (sessions to Nov 6): old code misses Oct 30 to Nov 6 (its fixed
+source cohort ends Oct 29), A4 finds 31 of 31 and 15 of 15 (not on the live P8 path). Rollback fill: 500 removed
+pointers restored, a rerun changes nothing.
+
+**Not in this image.** G81 (`options/stock_bar_detection.py`: OS1/OS2 accept V3 intraday bars) was committed Nov 6 but
+never reached a live image: `build_candidate.sh` copies `realtime`, `scripts`, `equity` and `tests/realtime` only. It
+changes Options alert output, so it goes in after a replay, not untested on Monday. The Options OS detectors stay stopped
+(G93/B22).
 
 ## 5. A1: onboarding, statistics and the bridge query
 
@@ -540,8 +566,9 @@ stop, and the P8 roles stop within their bound. Fallback: close the row by hand,
 
 **Fast track (user, Nov 7; plan section 15):** the weekend builds B14a, section 6 (per-ticker outcomes), flags instead
 of 503 (6.1), section 3 (A0), 5.1-5.4 and the G94 lookback, deployed Sunday night.
-Migrations go in contiguously (the catalog requires it): 049 (G90 supersede) and 050 (B24 index) this weekend; 051
-(section 4, bars without the cohort) Thursday-Friday; 052 (member outcomes on the window run) with A2's rest. Items without detail here (B14a, flags instead of 503, G94) get a
+Migrations go in contiguously (the catalog requires it): 049 (G90 supersede), 050 (B24 index) and, by the user's Nov 7
+decision to run the target design on Monday, 051 (section 4, bars without the cohort) this weekend; 052 (member outcomes
+on the window run) with A2's rest. Items without detail here (B14a, flags instead of 503, G94) get a
 short design note in this file before code (flags instead of 503: 6.1).
 
 **Saturday:** B14a; section 6; flags instead of 503; restore one copy of live for the weekend's tests.
