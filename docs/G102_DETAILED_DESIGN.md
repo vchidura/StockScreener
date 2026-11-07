@@ -589,7 +589,7 @@ no reference or action change is pending on live now.
 ## 7. Later steps (outline; detailed the same way before they are built)
 
 - **A2, rest:** window attempts that supersede (lineage columns on `rt.window_runs`) with each attempt's per-ticker
-  outcomes in `rt.window_member_outcomes` (migration 052; v1 keeps them only in the page manifests); ingress plan revisions
+  outcomes in `rt.window_member_outcomes` (migration 053, since G75 took 052; v1 keeps them only in the page manifests); ingress plan revisions
   (`UNIQUE (authorization_id, session_date)` becomes unique per revision, C12). (The read labels are built: 6.1.)
 - **A3:** `rt.detector_activations`, `rt.policy_versions`, `rt.configuration_generation`, a resolver called once per
   window, recorded on the window run. Equity detectors first. Options only after the P8-or-v3 decision (1.4). Today's
