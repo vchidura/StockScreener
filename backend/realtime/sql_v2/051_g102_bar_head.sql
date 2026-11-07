@@ -3,8 +3,8 @@
 -- rt.bar_current is keyed by cohort, so every new cohort starts an empty key space and readers stitch history back
 -- together through rt.cohort_history_bindings (G83: an overnight read found 7 of 283 bars). rt.bar_head holds one
 -- current bar per (instrument, interval, bar start, session scope, adjustment basis), chosen across all writers by
--- the selection policy `bar-selection-v1` (provider tier, then source precedence, then the later observation; see
--- equity_bar_repository.BAR_SELECTION_POLICY). The values are copied in, so most reads need no join with the
+-- the selection policy `bar-selection-v1` (source precedence, then the later observation, then the provider tier on
+-- an equal observation; see equity_bar_repository.BAR_SELECTION_POLICY). The values are copied in, so most reads need no join with the
 -- partitioned rt.bar_revisions, which stays the source of truth. The writing cohort is provenance only.
 -- ON DELETE CASCADE follows the catalog, as rt.bar_current does, so retention keeps working.
 SET LOCAL lock_timeout = '5s';
