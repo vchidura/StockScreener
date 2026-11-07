@@ -127,6 +127,30 @@ window (p8-window) and API.
 **Tests:** unit (merge rule, idempotent rerun, ordering, filters); replay of Nov 6's 28 O1 detections: 23 packages,
 grouped per contract for the session (NVDA 192.5C: one row with 24 hits).
 
+**Built (Nov 7), with three changes from the outline above:**
+
+- **Hits count trades, not evaluations.** Windows overlap (a 10-minute lookback every 5 minutes) and an evaluation id
+  includes the window's dataset, so one trade gets two evaluation ids. The row keeps `event_ids` (distinct trades)
+  and `evaluation_ids`; `hit_count = len(event_ids)`. A rerun or an overlapping window with no new trade writes
+  nothing.
+- **The anchor event is the earliest trade no other alert holds.** `rt.alert_current.event_id` is unique, and two
+  detectors can fire on one trade; the second alert anchors on its next trade, and one with no free trade stays on the
+  window's own rows (logged). No schema change.
+- **The read merges, it does not replace:** session rows first, then the release's rows they do not cover (stored
+  multi-leg packages, or an alert that could not be stored). A failed lookup (inside a savepoint) serves the release's
+  rows as before. Rows are first-triggered by the release cutoff; `lifecycle` reads CLOSED from `valid_until`.
+
+Code: `advanced_options_projection.persist_options_session_alerts_cursor` (called by
+`persist_advanced_options_projection_cursor`, same transaction as the ALERTS snapshot),
+`load_options_session_alert_rows_cursor`, `AdvancedOptionsAlertsPagePublication.detector_runs(session_rows=...)`;
+`RealtimeOptionsAlertsPageRepository._advanced_session_alerts`. **Tests:** `test_options_session_alerts.py` (6); the
+16 Options and portal suites around it show no new failure against HEAD. **Replay on live data**
+(`runner/g102_g100_replay.py`, read-only, in-memory table): Nov 6 kept 52 O1 detection evaluations on 28 trades over
+17 windows (16:29-17:59 UTC; the stored ALERTS windows of that run carry no package rows, so each detection gets a v1
+package on its trade's contract). The page showed 0 to 3 alerts per window (none at 17:18 and 17:24); the session list
+keeps all 4 contracts from their first trigger: NVDA 192.5C one row with 24 trades (16:22-17:59), QQQ 657P 2, IWM 272C
+1, AAPL 340P 1; 28 of 28 trades counted once; every anchor event is in `rt.detector_events` and unique.
+
 ## 4. A4: bars keyed without the cohort
 
 ### 4.1 Today

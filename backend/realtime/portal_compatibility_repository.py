@@ -739,6 +739,33 @@ class RealtimeOptionsAlertsPageRepository(_RealtimeCompatibilityRepository):
         "preview": "ASSESSMENT_UNAVAILABLE",
     }
 
+    @staticmethod
+    def _advanced_session_alerts(cursor, publication, *, cohort_id, cutoff):
+        """G102 A0 (G100): the session's alerts from `rt.alert_current` (one per detector and contract, first
+        triggered by the release cutoff). None when they cannot be read: the release's own rows are served then, as
+        before. A savepoint keeps a failed lookup from aborting the read's transaction."""
+        import logging
+
+        from .advanced_options_projection import load_options_session_alert_rows_cursor
+
+        saved = False
+        try:
+            cursor.execute("SAVEPOINT options_session_alerts")
+            saved = True
+            rows = load_options_session_alert_rows_cursor(
+                cursor, cohort_id=cohort_id, session_date=publication.session_date, cutoff=cutoff,
+            )
+            cursor.execute("RELEASE SAVEPOINT options_session_alerts")
+            return rows
+        except Exception:  # noqa: BLE001 - the session list is additive; never fail the alert page for it
+            if saved:
+                try:
+                    cursor.execute("ROLLBACK TO SAVEPOINT options_session_alerts")
+                except Exception:  # noqa: BLE001
+                    pass
+            logging.getLogger(__name__).warning("Options session alerts unavailable; serving the release's rows")
+            return None
+
     def _advanced_current_marks(self, cursor, envelope, *, cutoff):
         """Options alerts v1 (Nov 6, G78 principle): each alert's current price from the stored Options quotes.
 
@@ -968,7 +995,18 @@ class RealtimeOptionsAlertsPageRepository(_RealtimeCompatibilityRepository):
                             )
                         if contract == "detector_runs":
                             from .option_alert_projection import DetectorRunQuery
-                            envelope = publication.detector_runs(DetectorRunQuery(**(query or {})), **identity)
+                            request = DetectorRunQuery(**(query or {}))
+                            if advanced:
+                                envelope = publication.detector_runs(
+                                    request,
+                                    session_rows=self._advanced_session_alerts(
+                                        cursor, publication, cohort_id=cohort_id,
+                                        cutoff=min(cutoff, resolved_release.cutoff),
+                                    ),
+                                    **identity,
+                                )
+                            else:
+                                envelope = publication.detector_runs(request, **identity)
                             if advanced:
                                 try:
                                     envelope = self._advanced_current_marks(cursor, envelope, cutoff=cutoff)

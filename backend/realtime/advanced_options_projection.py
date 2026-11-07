@@ -4,10 +4,11 @@ from __future__ import annotations
 from collections import Counter
 from copy import deepcopy
 from dataclasses import dataclass
-from datetime import date, datetime, time as clock_time, timezone
+from datetime import date, datetime, time as clock_time, timedelta, timezone
 from decimal import Decimal
 from enum import Enum
 import json
+import logging
 import math
 import re
 from typing import Mapping
@@ -23,7 +24,7 @@ from .advanced_options_control_plane import (
     AdvancedOptionsControlPlanePlan,
 )
 from .advanced_options_cycle import AdvancedOptionsCycleResult
-from .contracts import canonical_sha256
+from .contracts import canonical_json, canonical_sha256
 from .orchestration_repository import (
     OPTIONS_CYCLE,
     OPTIONS_PORTAL_READY,
@@ -1301,6 +1302,19 @@ def _sealed_current_mark(
     }
 
 
+def _session_alert_contract(evaluation):
+    """The contract a v1 single-contract package alerts on; None for stored multi-leg packages (one row each)."""
+    from .advanced_options_native_loader import OPTIONS_ALERT_V1_VALUATION_SHA256
+
+    package = evaluation.package
+    if package is None:
+        return None
+    legs = package.legs
+    if len(legs) == 1 and legs[0].valuation_policy_sha256 == OPTIONS_ALERT_V1_VALUATION_SHA256:
+        return legs[0].contract_id
+    return None
+
+
 def _one_alert_per_contract(pairs):
     """Options alerts v1 grouping (user, Nov 6): one alert per contract and detector in a window.
 
@@ -1308,13 +1322,11 @@ def _one_alert_per_contract(pairs):
     listed one near-identical alert per trade. For v1 single-contract packages the earliest detection in the window is
     the alert; later ones on the same contract add to its hit count and last-seen time. Rows from stored packages keep
     one row per evaluation, as before."""
-    from .advanced_options_native_loader import OPTIONS_ALERT_V1_VALUATION_SHA256
-
     groups: dict[tuple[str, str], list] = {}
     for evaluation, row in pairs:
-        legs = evaluation.package.legs
-        if len(legs) == 1 and legs[0].valuation_policy_sha256 == OPTIONS_ALERT_V1_VALUATION_SHA256:
-            key = (str(row["detector_id"]), f"contract:{legs[0].contract_id}")
+        contract_id = _session_alert_contract(evaluation)
+        if contract_id is not None:
+            key = (str(row["detector_id"]), f"contract:{contract_id}")
         else:
             key = (str(row["detector_id"]), f"evaluation:{row['evaluation_id']}")
         groups.setdefault(key, []).append((evaluation, row))
@@ -1894,6 +1906,7 @@ class AdvancedOptionsAlertsPagePublication:
         )
         self.scope_sha256 = str(payload["scope_sha256"])
         self.dataset_id = str(payload["dataset_id"])
+        self.session_date = str(payload["session_date"])
 
     def _stored(self, identity):
         _validate_page_identity(self._payload, **identity)
@@ -2075,7 +2088,9 @@ class AdvancedOptionsAlertsPagePublication:
         }
         return self._envelope(stored, available=True, data=data)
 
-    def detector_runs(self, request, **identity):
+    def detector_runs(self, request, *, session_rows=None, **identity):
+        """`session_rows` (G102 A0): the session's alerts from `rt.alert_current`; they replace this window's v1
+        rows they cover, and the window's other rows (stored multi-leg packages) stay."""
         stored = self._stored(identity)
         if request.dataset_id != self.dataset_id:
             return self._envelope(
@@ -2083,8 +2098,19 @@ class AdvancedOptionsAlertsPagePublication:
                 available=False,
                 reason="DETECTOR_DATASET_UNAVAILABLE",
             )
+        source = stored["alert_rows"]
+        if session_rows is not None:
+            covered = {
+                evaluation_id
+                for row in session_rows
+                for evaluation_id in row.get("evaluation_ids", ())
+            }
+            source = [
+                *session_rows,
+                *(row for row in source if row["evaluation_id"] not in covered),
+            ]
         rows = [
-            deepcopy(row) for row in stored["alert_rows"]
+            deepcopy(row) for row in source
             if (
                 request.detector is None
                 or row["detector_id"] == request.detector
@@ -3043,11 +3069,170 @@ def persist_advanced_options_projection_cursor(
     batch: AdvancedOptionsProjectionBatch,
     *,
     snapshot_repository=persist_portal_snapshot_cursor,
+    session_alert_writer=None,
 ) -> None:
     if batch.publication_authorized:
         raise ValueError("P4C projection cannot authorize publication")
     for snapshot in batch.snapshots:
         snapshot_repository(cursor, snapshot)
+    # G102 A0 (G100): the session's alert list, in the same transaction as the ALERTS snapshot.
+    alerts = next(
+        (snapshot.payload for snapshot in batch.snapshots if snapshot.payload.get("artifact_kind") == "ALERTS"),
+        None,
+    )
+    if alerts is not None:
+        (session_alert_writer or persist_options_session_alerts_cursor)(
+            cursor,
+            cohort_id=alerts["cohort_id"],
+            session_date=alerts["session_date"],
+            alert_rows=alerts["alert_rows"],
+            evaluations=batch.cycle.evaluations,
+        )
+
+
+OPTIONS_SESSION_ALERT_NAMESPACE = uuid5(NAMESPACE_URL, "stockscreener:options-session-alert:v1")
+OPTIONS_SESSION_ALERT_SCHEMA = "options-alert-session-v1"
+
+
+def options_session_alert_id(session_date, detector_id: str, contract_id: int) -> UUID:
+    """One alert per session, detector and contract; a rerun writes the same row."""
+    return uuid5(OPTIONS_SESSION_ALERT_NAMESPACE, f"{session_date}|{detector_id}|{contract_id}")
+
+
+def _record(row, names):
+    return dict(row) if isinstance(row, Mapping) else dict(zip(names, row, strict=True))
+
+
+def persist_options_session_alerts_cursor(cursor, *, cohort_id, session_date, alert_rows, evaluations) -> int:
+    """G102 A0 (G100): the Options Alerts page as a session list on `rt.alert_current`.
+
+    A window evaluates the last 10 minutes of trades, so its own alert rows dropped an alert after about two windows.
+    Each v1 single-contract alert row of this window is merged into one row per session, detector and contract. The
+    first trigger (its row, event and time) is kept. The hit set is the distinct trades (`event_id`s): overlapping
+    windows evaluate a trade twice under different evaluation ids, so `hit_count` is a set size and a rerun writes
+    nothing. `event_id` must be unique across alerts, so a new alert anchors on its earliest trade no other alert
+    holds (two detectors can fire on one trade). Stored multi-leg packages keep their per-window rows. Returns the
+    number of rows inserted or updated."""
+    evaluations_by_id = {str(row.evaluation_id): row for row in evaluations}
+    groups: dict[tuple[str, int], list] = {}
+    for evaluation in evaluations:
+        contract_id = _session_alert_contract(evaluation)
+        if contract_id is not None:
+            groups.setdefault((evaluation.detector.value, contract_id), []).append(evaluation)
+    rows = {}
+    for row in alert_rows:
+        evaluation = evaluations_by_id.get(str(row["evaluation_id"]))
+        contract_id = None if evaluation is None else _session_alert_contract(evaluation)
+        if contract_id is not None:
+            rows[(str(row["detector_id"]), contract_id)] = row
+    if not rows:
+        return 0
+    alert_ids = {key: str(options_session_alert_id(session_date, *key)) for key in rows}
+    cursor.execute(
+        "SELECT alert_id::text AS alert_id,event_id::text AS event_id,projection FROM rt.alert_current "
+        "WHERE alert_id=ANY(%s::uuid[]) FOR UPDATE",
+        (sorted(alert_ids.values()),),
+    )
+    existing = {
+        item["alert_id"]: item
+        for item in (_record(row, ("alert_id", "event_id", "projection")) for row in cursor.fetchall())
+    }
+    cursor.execute(
+        "SELECT event_id::text AS event_id,alert_id::text AS alert_id FROM rt.alert_current "
+        "WHERE event_id=ANY(%s::uuid[])",
+        (sorted({str(evaluation.event_id) for key in rows for evaluation in groups[key]}),),
+    )
+    held = {
+        item["event_id"]: item["alert_id"]
+        for item in (_record(row, ("event_id", "alert_id")) for row in cursor.fetchall())
+    }
+    written = 0
+    for key in sorted(rows):
+        alert_id, row = alert_ids[key], rows[key]
+        members = sorted(groups[key], key=lambda item: (item.observed_at, str(item.evaluation_id)))
+        window_events = {str(item.event_id) for item in members}
+        latest = max(item.observed_at for item in members)
+        previous = existing.get(alert_id)
+        if previous is None:
+            anchor = next((item for item in members if held.get(str(item.event_id), alert_id) == alert_id), None)
+            if anchor is None:
+                logging.getLogger(__name__).warning(
+                    "Options session alert %s %s not stored: each of its trades anchors another alert", *key,
+                )
+                continue
+            projection = deepcopy(dict(row))
+            projection.update(
+                session_date=str(session_date), contract_id=key[1], session_alert_id=alert_id,
+                event_ids=sorted(window_events),
+                evaluation_ids=sorted(str(item.evaluation_id) for item in members),
+            )
+            event_id, insert = str(anchor.event_id), True
+        else:
+            projection = deepcopy(dict(previous["projection"]))
+            event_ids = sorted(set(projection["event_ids"]) | window_events)
+            if event_ids == projection["event_ids"]:
+                continue
+            projection.update(
+                event_ids=event_ids,
+                evaluation_ids=sorted(
+                    set(projection["evaluation_ids"]) | {str(item.evaluation_id) for item in members}
+                ),
+                current_mark=deepcopy(row["current_mark"]),
+                management_status=row["management_status"],
+            )
+            latest = max(latest, datetime.fromisoformat(projection["last_seen_at"]))
+            event_id, insert = str(previous["event_id"]), False
+        projection.update(
+            hit_count=len(projection["event_ids"]),
+            repeat_count=len(projection["event_ids"]) - 1,
+            last_seen_at=latest.isoformat(),
+        )
+        deadline = projection.get("exit_deadline")
+        valid_until = datetime.fromisoformat(deadline) if deadline else None
+        if valid_until is not None and valid_until <= latest:
+            valid_until = None
+        values = (
+            latest, valid_until, OPTIONS_SESSION_ALERT_SCHEMA,
+            canonical_sha256(projection), canonical_json(projection),
+        )
+        if insert:
+            cursor.execute(
+                "INSERT INTO rt.alert_current(alert_id,cohort_id,event_id,alert_kind,lifecycle,as_of,valid_until,"
+                "projection_schema,projection_sha256,projection) "
+                "VALUES(%s,%s,%s,'OPTION','OPEN',%s,%s,%s,%s,%s) ON CONFLICT (alert_id) DO NOTHING",
+                (alert_id, str(cohort_id), event_id, *values),
+            )
+            held[event_id] = alert_id
+        else:
+            cursor.execute(
+                "UPDATE rt.alert_current SET as_of=%s,valid_until=%s,projection_schema=%s,projection_sha256=%s,"
+                "projection=%s,updated_at=clock_timestamp() WHERE alert_id=%s",
+                (*values, alert_id),
+            )
+        written += 1
+    return written
+
+
+def load_options_session_alert_rows_cursor(cursor, *, cohort_id, session_date, cutoff: datetime) -> list[dict]:
+    """G102 A0: the session's Options alerts first triggered by `cutoff`, newest activity first. The lifecycle reads
+    CLOSED once the cutoff reaches the alert's exit deadline; nothing has to write the close."""
+    day = datetime.combine(date.fromisoformat(str(session_date)), clock_time(0), tzinfo=timezone.utc)
+    cursor.execute(
+        "SELECT projection,valid_until FROM rt.alert_current "
+        "WHERE cohort_id=%s AND alert_kind='OPTION' AND as_of>=%s AND as_of<%s "
+        "AND projection_schema=%s AND projection->>'session_date'=%s "
+        "ORDER BY as_of DESC,alert_id",
+        (str(cohort_id), day, day + timedelta(hours=36), OPTIONS_SESSION_ALERT_SCHEMA, str(session_date)),
+    )
+    rows = []
+    for record in (_record(row, ("projection", "valid_until")) for row in cursor.fetchall()):
+        projection = dict(record["projection"])
+        if datetime.fromisoformat(projection["triggered_at"]) > cutoff:
+            continue
+        valid_until = record["valid_until"]
+        projection["lifecycle"] = "CLOSED" if valid_until is not None and cutoff >= valid_until else "OPEN"
+        rows.append(projection)
+    return rows
 
 
 def load_advanced_options_projection_batch_cursor(
