@@ -2293,18 +2293,35 @@ def test_a_chart_is_composed_when_it_is_read_and_cached_per_snapshot_and_interva
 
 @pytest.mark.parametrize("interval", ["1m", "5m", "1d", "1wk", "1mo"])
 @pytest.mark.parametrize("defect", ["revised", "retired"])
-def test_reader_fails_closed_when_a_published_bar_was_revised_or_retired(defect, interval):
-    app, store = ticker_app()
+def test_a_chart_whose_bar_changed_after_publication_draws_the_current_bars(defect, interval, caplog):
+    """G102 A2 (design 6.1, G36): a bar revised or retired after publication no longer refuses the chart; the
+    chart draws the bars current now over the published range, and the other reads are untouched."""
+    def read(store, ticker, frame, contract="chart"):
+        options = dict(interval=frame, period="5y") if contract == "chart" else {}
+        return RealtimeTickerWorkspaceRepository(store.cursor).read(
+            ticker, contract, available_by=OBSERVED_AT, cohort_id=COHORT_ID, **options)
+
+    _app, clean = ticker_app()
+    _app, store = ticker_app()
     getattr(store, f"{defect}_bars").add(("AAPL", interval))
-    params = {"cohort_id": str(COHORT_ID), "period": "5y"}
-    with TestClient(app) as client:
-        response = client.get("/api/stock/AAPL/chart", params=dict(params, interval=interval))
-        assert response.status_code == 503
-        assert "bar lineage changed; republish required" in response.json()["detail"]
-        other = "15m" if interval != "15m" else "30m"
-        assert client.get("/api/stock/AAPL/chart", params=dict(params, interval=other)).status_code == 200
-        assert client.get("/api/stock/MSFT/chart", params=dict(params, interval=interval)).status_code == 200
-        assert client.get("/api/stock/AAPL/quote", params=params).status_code == 200
+    with caplog.at_level("WARNING", logger="realtime.ticker_repository"):
+        drawn = read(store, "AAPL", interval)
+    assert "chart drawn from current bars" in caplog.text
+    published = read(clean, "AAPL", interval)
+    # The fake revises only the revision id and payload hash, so the points match; a retired bar is not drawn.
+    assert drawn == (published[:-1] if defect == "retired" else published)
+    other = "15m" if interval != "15m" else "30m"
+    assert read(store, "AAPL", other) == read(clean, "AAPL", other)
+    assert read(store, "MSFT", interval) == read(clean, "MSFT", interval)
+    assert read(store, "AAPL", None, "quote") == read(clean, "AAPL", None, "quote")
+
+
+def test_a_chart_with_no_current_bar_in_its_published_range_is_unavailable():
+    _app, store = ticker_app()
+    store._bar_rows = lambda params: []
+    with pytest.raises(ticker_repository.TickerPublicationUnavailable, match="no current bars in its published range"):
+        RealtimeTickerWorkspaceRepository(store.cursor).read(
+            "AAPL", "chart", interval="1d", period="5y", available_by=OBSERVED_AT, cohort_id=COHORT_ID)
 
 
 @pytest.mark.parametrize("read_mode", ["current", "retained"])

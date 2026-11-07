@@ -24,6 +24,7 @@ from .portal_projection_repository import (
     RELEASE_CLASS_SESSION_CLOSE, RETENTION_HOT_AND_KEPT, persist_portal_snapshot_cursor,
     portal_session_date, publish_portal_release_cursor,
 )
+from .read_labels import input_change_labels
 from .reference_continuity import source_manifest_identity_cursor
 from .screening_repository import load_realtime_screening_input
 from .worker_database import RealtimeProcessDatabase
@@ -261,7 +262,9 @@ class RealtimeDashboardRepository(_RealtimeCompatibilityRepository):
                         )
             deadline_expired = stored["valid_until"] is not None and cutoff >= stored["valid_until"]
             # A frozen session-close release stands on its own embedded hashes; only a live
-            # (hot) publication must still match current reference and action data.
+            # (hot) publication is compared with current reference and action data. G102 A2 (design 6.1): a
+            # difference found there is labelled on the publication, not refused.
+            changed_references, action_drift = [], False
             if stored.get("snapshot_class") != "SESSION_CLOSE":
                 for reference in references:
                     cursor.execute(
@@ -279,7 +282,7 @@ class RealtimeDashboardRepository(_RealtimeCompatibilityRepository):
                         and revision["payload_sha256"] == reference["payload_sha256"]
                         for revision in revisions
                     ):
-                        raise DashboardPublicationUnavailable("Dashboard reference changed; republish required")
+                        changed_references.append(reference["ticker"])
                 ids = [str(reference["security_id"]) for reference in references]
                 until = action_evidence_until(stored["generated_at"], cutoff)
                 cursor.execute(
@@ -289,8 +292,7 @@ class RealtimeDashboardRepository(_RealtimeCompatibilityRepository):
                     "WHERE security_id=ANY(%s::uuid[]) AND received_at>%s AND received_at<=%s) AS action_drift",
                     (ids, stored["generated_at"], until, ids, stored["generated_at"], until),
                 )
-                if cursor.fetchone()["action_drift"]:
-                    raise DashboardPublicationUnavailable("Dashboard action evidence changed; republish required")
+                action_drift = bool(cursor.fetchone()["action_drift"])
         delay = 15 if stored["provider_tier"] == "MASSIVE_DEVELOPER" else 0
         actual = _utc(datetime.fromisoformat(payload["market_time"]), "Dashboard market time")
         session_close = exchange_calendars.get_calendar("XNYS").session_close(
@@ -346,6 +348,10 @@ class RealtimeDashboardRepository(_RealtimeCompatibilityRepository):
                 and payload.get("setup_evidence") is not None
             ),
         )
+        labels = input_change_labels(changed_references, action_drift)
+        if labels is not None:
+            publication.update(labels)
+            publication["scope_note"] = " ".join((publication["scope_note"], *labels["section_warnings"].values()))
         if scanner_key:
             return dict(result["scanners"][scanner_key], publication=publication,
                         scanner_basis=deepcopy(payload["scanner_basis"]))

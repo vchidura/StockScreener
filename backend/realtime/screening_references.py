@@ -93,9 +93,15 @@ def compose_hourly_lineage(
     payload: Mapping[str, object], security_id: str, rows_by_group,
 ) -> dict[str, object]:
     """The per-bar hourly lineage a stored generation used to embed, recomposed from the verified bars."""
+    verify_member(payload, security_id, rows_by_group)
+    return hourly_lineage_of(payload, security_id, rows_by_group)
+
+
+def hourly_lineage_of(payload: Mapping[str, object], security_id: str, rows_by_group) -> dict[str, object]:
+    """The hourly lineage over the bars read, unverified: G102 A2 serves it labelled when the bars changed after
+    publication (`compose_hourly_lineage` verifies first)."""
     hourly = payload["hourly_lineage"][security_id]
     rows = rows_by_group.get((security_id, "1h:RAW_UNADJUSTED"), ())
-    verify_member(payload, security_id, rows_by_group)
     return {
         "bars": [str(row["bar_revision_id"]) for row in rows],
         "selected_bar_id": hourly["selected_bar_id"],

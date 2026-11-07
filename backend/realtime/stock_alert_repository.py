@@ -33,6 +33,7 @@ from .screening_repository import (
     load_realtime_canonical_stock_alert_input,
     load_realtime_stock_alert_input,
 )
+from .read_labels import input_change_labels
 from .reference_continuity import source_manifest_identity_cursor
 from .stock_alert_projection import STOCK_ALERTS_VERSION, produce_realtime_stock_alerts
 from .worker_database import RealtimeProcessDatabase
@@ -306,6 +307,8 @@ class RealtimeStockAlertViewRepository(_RealtimeCompatibilityRepository):
                     str(current["security_id"]),
                     [],
                 ).append(current)
+            # G102 A2 (design 6.1): a reference or action change after publication is labelled, not refused.
+            changed_references = []
             for reference in references:
                 current = current_by_security.get(
                     str(reference["security_id"]),
@@ -319,7 +322,7 @@ class RealtimeStockAlertViewRepository(_RealtimeCompatibilityRepository):
                     and item["payload_sha256"] == reference["payload_sha256"]
                     for item in current
                 ):
-                    raise StockAlertPublicationUnavailable("Realtime alert reference changed; republish required")
+                    changed_references.append(reference["ticker"])
             ids = reference_ids
             until = action_evidence_until(row["generated_at"], cutoff)
             cursor.execute(
@@ -329,8 +332,7 @@ class RealtimeStockAlertViewRepository(_RealtimeCompatibilityRepository):
                 "WHERE security_id=ANY(%s::uuid[]) AND received_at>%s AND received_at<=%s) AS action_drift",
                 (ids, row["generated_at"], until, ids, row["generated_at"], until),
             )
-            if cursor.fetchone()["action_drift"]:
-                raise StockAlertPublicationUnavailable("Realtime alert action evidence changed; republish required")
+            action_drift = bool(cursor.fetchone()["action_drift"])
             cursor.execute(
                 "SELECT work_id::text,source_receipt_id::text,cutoff,"
                 "publication_generation,desired_snapshot_sha256,"
@@ -344,6 +346,7 @@ class RealtimeStockAlertViewRepository(_RealtimeCompatibilityRepository):
             publication_work = cursor.fetchone()
         result = deepcopy(payload)
         result["current_disposition"] = "CURRENT"
+        result["_input_change_labels"] = input_change_labels(changed_references, action_drift)
         result["current_release"] = {
             "release_id": str(release.release_id),
             "cutoff": release.cutoff.isoformat(),
@@ -475,6 +478,9 @@ class RealtimeStockAlertViewRepository(_RealtimeCompatibilityRepository):
             snapshot["warnings"].append("Realtime retained alert data stale; no request-time refresh performed")
             for stream in snapshot.get("strategy_streams", []):
                 stream.update(status="STALE", projector_stale=True)
+        labels = payload.get("_input_change_labels")
+        if labels is not None:
+            snapshot.setdefault("warnings", []).extend(labels["section_warnings"].values())
         if session_date is not None and cohort_id is not None:
             self._add_regenerated_alerts(snapshot, cutoff, cohort_id, str(session_date))
         try:
@@ -498,6 +504,8 @@ class RealtimeStockAlertViewRepository(_RealtimeCompatibilityRepository):
         page["schedule_streams"] = schedules
         page.update(provider_fetch_performed=False, execution_permission=False,
                     missing_producers=payload["missing_producers"])
+        if labels is not None:
+            page["input_changes"] = labels
         return page
 
     def eod_review(self, *, available_by, cohort_id=None, session_date=None, **filters):

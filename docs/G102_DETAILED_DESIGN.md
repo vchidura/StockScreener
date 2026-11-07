@@ -349,11 +349,51 @@ evidence: 24 publish, one is labelled; the barrier reads `PARTIAL`.
   (9 selected), summary 9 with 16 listed, generation check passed. Note: the generation's `status` still reads
   COMPLETE because placeholders keep the count; `source_unavailable_members` is the signal.
 
+### 6.1 Flags instead of 503 on page reads (A2 part, G36, G83, G97 class)
+
+**Rule:** a page is served as it was published. When one of its inputs changed after publication (a security
+reference revision, corporate-action evidence, a revised bar), the read labels that input and still serves the page;
+the next window publishes over it. Integrity failures still refuse: a stored hash or identity that does not match, or
+a reference that did not match at the publication's own cutoff.
+
+**Where the portal still refused (checked Nov 7).** In realtime-only builds the portal reads Ticker pages, Strategies
+and the Screener in `retained` mode (`frontend/src/services/api.ts:67`, `services/screening.ts:5`). Those reads
+already label reference and action changes (`_retained_read_state`), and the Screener's retained query and status do
+not verify bars. Four reads still refuse for a later input change:
+
+| Read | Today | Change |
+| --- | --- | --- |
+| Ticker chart (`ticker_repository._load_chart`, G36) | 503 `Ticker bar lineage changed; republish required` until the bar leaves the 5-session range | Draw the bars current now over the published range (a chart draws bars, and the current ones are the newest known), log once per snapshot and interval; 503 only when no bar is current in the range |
+| Screener hourly details (`_compose_hourly_lineage`, G83 class) | 404 `Screening bar lineage changed` | Return the stored hourly values with the lineage composed from current bars and `lineage_status: CHANGED` (`VERIFIED` when the heads match, `UNAVAILABLE` for a member without lineage); the lineage object is always present because the drawer reads `lineage.bars` |
+| Dashboard hot publication (`dashboard_repository`) | 503 `Dashboard reference changed` / `action evidence changed` | Serve it; publication gets `reference_status`, `action_status`, `section_warnings` and the warning appended to `scope_note` (shown in bold on the page) |
+| Stock Alerts (`stock_alert_repository._snapshot`) | 503 `Realtime alert reference changed` / `action evidence changed` | Serve it; the warning goes into the page's `warnings` (listed on the page) |
+
+**Also:** `screening_projection` sets `source_publication_status: DEGRADED` when any member is unavailable (section
+6), so the Screener's existing coverage notice names them (`screeningModel.dailyCoverageNotice` shows only for
+`DEGRADED`); `session_status` keeps PARTIAL or COMPLETE.
+
+**Unchanged:** the `current` read mode (the API default for the Screener and Ticker pages, used by audits and the
+validator) keeps its strict lineage and reference checks, so an audit still sees exact drift. G83's cause, the
+current read's bar lookup missing history held under other cohorts, is removed by section 4. No portal build is
+needed: every label lands in a field the page already shows. **Tests:** each of the four reads with a revised bar,
+reference or action serves the page with the label; integrity drift still refuses.
+
+**Built (Nov 7):** `ticker_repository._load_chart`, `portal_compatibility_repository.hourly_details`,
+`screening_references.hourly_lineage_of`, `dashboard_repository`, `stock_alert_repository`, the new `read_labels.py`,
+and `screening_projection` (DEGRADED). **Tests:** 23 new or rewritten (charts 11, hourly details 5, Dashboard 2,
+Stock Alerts 2, labels 3); across the 16 affected suites no new failure against the untouched baseline (the
+remaining failures are the 259 Starlette test-client errors and 3 older ones, all present at baseline).
+**Read-only check on live** (`runner/g102_read_flags_check.py`, Nov 7 17:08 UTC, cohort `59947a23`, portal read
+modes, image vs patched code at the same moment): Screener hourly details refuse for all 25 members today (`Screening
+bar lineage changed; republish required`, G83's cause: the lookup finds the session cohort's 7 hourly bars); patched,
+all 25 serve their stored values with `lineage_status: CHANGED` and the 7 bars. Charts 200 of 200 serve on both (the
+AAPL head was corrected by hand earlier, so G36 does not reproduce today). Dashboard and Stock Alerts serve on both:
+no reference or action change is pending on live now.
+
 ## 7. Later steps (outline; detailed the same way before they are built)
 
 - **A2, rest:** window attempts that supersede (lineage columns on `rt.window_runs`); ingress plan revisions
-  (`UNIQUE (authorization_id, session_date)` becomes unique per revision, C12); API read checks that label instead of
-  returning 503 (G97, G36, G83).
+  (`UNIQUE (authorization_id, session_date)` becomes unique per revision, C12). (The read labels are built: 6.1.)
 - **A3:** `rt.detector_activations`, `rt.policy_versions`, `rt.configuration_generation`, a resolver called once per
   window, recorded on the window run. Equity detectors first. Options only after the P8-or-v3 decision (1.4). Today's
   Options detector versions are placeholders (code hash = policy hash = detector hash,
@@ -374,10 +414,10 @@ Monday's Options start fails as Nov 6's did. Fix: the acquisition role ends its 
 stop, and the P8 roles stop within their bound. Fallback: close the row by hand, with the user's yes, as on Nov 6.
 
 **Fast track (user, Nov 7; plan section 15):** the weekend builds B14a, section 6 (per-ticker outcomes), flags instead
-of 503 (A2 part, detail to be written first), section 3 (A0), 5.1-5.4 and the G94 lookback, deployed Sunday night.
+of 503 (6.1), section 3 (A0), 5.1-5.4 and the G94 lookback, deployed Sunday night.
 Migrations 050 and 051 go in this weekend; the B24 index from 049 goes in on its own; the rest of 049 and section 4
 (bars without the cohort) move to Thursday-Friday. Items without detail here (B14a, flags instead of 503, G94) get a
-short design note in this file before code.
+short design note in this file before code (flags instead of 503: 6.1).
 
 **Saturday:** B14a; section 6; flags instead of 503; restore one copy of live for the weekend's tests.
 

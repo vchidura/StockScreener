@@ -49,7 +49,9 @@ from .ticker_projection import (
 )
 from .ticker_projection import TICKER_WORKSPACE_SUMMARY_VERSION, produce_realtime_ticker_workspace_summary
 from .ticker_projection import PATTERN_WATCH_PUBLICATION_VERSION, produce_realtime_pattern_watch_publication
-from .ticker_references import BarLineageChanged, chart_group_ranges, compose_charts, evidence_expectations
+from .ticker_references import (
+    BarLineageChanged, chart_group_ranges, chart_points, compose_charts, evidence_expectations,
+)
 from .ticker_reconstruction import publication_source_cutoff
 from .worker_database import RealtimeProcessDatabase
 from research.forming_patterns import summarize_cross_frame_patterns
@@ -732,8 +734,18 @@ class RealtimeTickerWorkspaceRepository(_RealtimeCompatibilityRepository):
             )
         try:
             return compose_charts(manifest, refs, chart_market_times, rows)[interval]
-        except BarLineageChanged as error:
-            raise TickerPublicationUnavailable("Ticker bar lineage changed; republish required") from error
+        except BarLineageChanged:
+            # G102 A2 (G36): a bar in the published range was revised after publication. A chart draws bars, and the
+            # ones current now are the newest known, so draw them instead of refusing until the bar ages out of the
+            # range. The publication's own values are unchanged. Composed once per snapshot and interval (cached).
+            points = chart_points(rows.get(group_key, ()))
+            if not points:
+                raise TickerPublicationUnavailable("Ticker chart has no current bars in its published range") from None
+            logging.getLogger(__name__).warning(
+                "Ticker %s %s chart drawn from current bars: lineage changed since snapshot %s",
+                source["ticker"], interval, source["snapshot_id"],
+            )
+            return points
 
     def _current_workspaces(self, cursor, cohort_id, cutoff):
         release = self._release(cursor, cohort_id)

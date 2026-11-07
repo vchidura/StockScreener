@@ -8,6 +8,7 @@ Offline: the fake `ScreeningStore` and an in-memory bar loader stand in for Post
 """
 from dataclasses import replace
 from datetime import date
+from types import SimpleNamespace
 from uuid import UUID, uuid5, NAMESPACE_URL
 
 import pytest
@@ -189,6 +190,63 @@ def test_the_reader_fails_closed_when_a_published_bar_was_revised_or_retired(inp
     with pytest.raises(ScreeningPublicationUnavailable):
         load(store, reader)
     assert load(store, reader, verify_bars=False)["rows"]
+
+
+def hourly(generation, bar_loader, ticker):
+    """The Screener drawer's hourly-details read (retained mode, as the realtime portal reads it)."""
+    store, reader = stored(generation, bar_loader)
+    security_id = next(str(row.security_id) for row in generation.rows if row.ticker == ticker)
+    request = SimpleNamespace(generation=generation.manifest["generation"], security_id=security_id)
+    return reader.hourly_details(request, available_by=OBSERVED_AT, cohort_id=COHORT_ID, read_mode="retained")
+
+
+@pytest.mark.parametrize("defect", ["revised", "hourly_revised", "hourly_retired"])
+def test_hourly_details_label_a_bar_changed_after_publication_instead_of_refusing(inputs, generation, defect):
+    """G102 A2 (design 6.1): the stored hourly values are served and the lineage, composed from the bars current
+    now, is labelled CHANGED; before, the read refused with 'republish required'."""
+    def mutate(daily, bars):
+        if defect == "revised":
+            daily["payload_sha256"] = "e" * 64
+            return
+        last = max((b for b in bars if b["ticker"] == daily["ticker"] and b["interval"] == "1h"), key=lambda b: b["bar_end"])
+        if defect == "hourly_revised":
+            last["payload_sha256"] = "c" * 64
+        else:
+            bars.remove(last)
+
+    clean = hourly(generation, current_bars_of(inputs), "AAPL")
+    changed = hourly(generation, drifted_loader(inputs, "AAPL", mutate), "AAPL")
+    assert clean["lineage_status"] == "VERIFIED" and changed["lineage_status"] == "CHANGED"
+    assert (changed["values"], changed["missing"], changed["source"]) == (clean["values"], clean["missing"], clean["source"])
+    if defect == "hourly_retired":
+        assert changed["lineage"] == dict(clean["lineage"], bars=clean["lineage"]["bars"][:-1], derived_source_revision_ids={
+            key: value for key, value in clean["lineage"]["derived_source_revision_ids"].items()
+            if key != clean["lineage"]["bars"][-1]})
+    else:
+        # A revision that keeps its id (only the payload hash differs here) leaves the composed list unchanged.
+        assert changed["lineage"] == clean["lineage"]
+    # Another member's lineage still verifies.
+    assert hourly(generation, drifted_loader(inputs, "AAPL", mutate), "MSFT")["lineage_status"] == "VERIFIED"
+
+
+def test_hourly_details_of_an_unavailable_member_return_an_empty_lineage(inputs):
+    """A member section 6 marked unavailable has no bar lineage; the lineage object stays (the drawer reads
+    lineage.bars) and lineage_status says why it is empty."""
+    member = inputs.members[0]
+    bars = [b for b in inputs.bars if not (b["ticker"] == member["ticker"] and b["interval"] == "1d"
+                                           and b["adjustment_basis"] == "ADJUSTED")]
+    generation = produce_realtime_screening(replace(inputs, bars=tuple(bars)))
+    assert [item["ticker"] for item in generation.manifest["source_unavailable_members"]] == [member["ticker"]]
+    detail = hourly(generation, current_bars_of(inputs), member["ticker"])
+    assert detail["lineage_status"] == "UNAVAILABLE"
+    assert detail["lineage"] == dict(bars=[], selected_bar_id=None, reconstructed_from_30m={}, derived_source_revision_ids={})
+    other = next(m["ticker"] for m in inputs.members if m["ticker"] != member["ticker"])
+    assert hourly(generation, current_bars_of(inputs), other)["lineage_status"] == "VERIFIED"
+
+
+def test_a_generation_with_every_member_available_is_not_degraded(generation):
+    assert generation.manifest["source_unavailable_members"] == []
+    assert generation.manifest["source_publication_status"] in {"PARTIAL", "COMPLETE"}
 
 
 def test_bars_appended_after_the_head_do_not_disturb_the_generation(inputs, generation):

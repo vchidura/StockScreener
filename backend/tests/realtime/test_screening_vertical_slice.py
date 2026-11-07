@@ -205,6 +205,9 @@ def assert_member_unavailable(generation, expected=None, match=None):
     if match is not None:
         assert all(re.search(match, item["reason"]) for item in unavailable.values()), unavailable
     assert all(item["status"] == "UNAVAILABLE" for item in unavailable.values())
+    # Design 6.1: DEGRADED makes the Screener's coverage notice name them; session_status keeps the session state.
+    assert generation.manifest["source_publication_status"] == "DEGRADED"
+    assert generation.manifest["session_status"] in {"PARTIAL", "COMPLETE"}
     assert len(generation.rows) == generation.expected_members
     assert generation.manifest["source_selected_members"] == generation.expected_members - len(unavailable)
     lineage, hourly = generation.manifest["lineage"], generation.manifest["hourly_lineage"]

@@ -276,7 +276,7 @@ def test_unsupported_requests_are_not_empty_success(params, status):
         assert client.get("/api/scan/all", params=query).status_code == status
 
 
-@pytest.mark.parametrize("fault", ["checksum", "manifest", "identity", "generation", "clock", "reference", "action"])
+@pytest.mark.parametrize("fault", ["checksum", "manifest", "identity", "generation", "clock"])
 def test_stored_drift_fails_closed(fault):
     app, store = dashboard_app()
     row = next(iter(store.snapshots.values()))
@@ -292,14 +292,39 @@ def test_stored_drift_fails_closed(fault):
             row["payload_sha256"] = canonical_sha256(row["payload"])
     elif fault == "manifest":
         row["source_manifest_sha256"] = "b" * 64
-    elif fault == "generation":
-        row["source_generation"] += 1
-    elif fault == "reference":
-        store.reference_drift = True
     else:
-        store.action_drift = True
+        row["source_generation"] += 1
     with TestClient(app) as client:
         assert client.get("/api/latest-price-date", params={"cohort_id": str(COHORT_ID)}).status_code == 503
+
+
+@pytest.mark.parametrize("fault", ["reference", "action"])
+def test_a_reference_or_action_change_after_publication_is_labelled_not_refused(fault):
+    """G102 A2 (design 6.1): the hot publication is served as published and the later input change is labelled."""
+    def read(store, contract="latest"):
+        return RealtimeDashboardRepository(store.cursor).read(contract, available_by=OBSERVED_AT, cohort_id=COHORT_ID)
+
+    clean = read(dashboard_app()[1])
+    _app, store = dashboard_app()
+    setattr(store, f"{fault}_drift", True)
+    latest = read(store)
+    publication, before = latest["publication"], clean["publication"]
+    labels = {"reference_status", "action_status", "changed_reference_tickers", "section_warnings"}
+    assert latest["latest_date"] == clean["latest_date"] and publication["status"] == before["status"] == "READY"
+    assert {key: value for key, value in publication.items() if key not in labels | {"scope_note"}} == {
+        key: value for key, value in before.items() if key != "scope_note"}
+    assert labels.isdisjoint(before)
+    if fault == "reference":
+        assert publication["reference_status"] == "CHANGED" and publication["action_status"] == "CURRENT"
+        assert publication["changed_reference_tickers"] == sorted(row["ticker"] for row in read(store, "overview"))
+        warning = publication["section_warnings"]["reference"]
+    else:
+        assert publication["reference_status"] == "CURRENT" and publication["action_status"] == "CHANGED"
+        assert publication["changed_reference_tickers"] == []
+        warning = publication["section_warnings"]["actions"]
+    assert list(publication["section_warnings"]) == [{"reference": "reference", "action": "actions"}[fault]]
+    assert publication["scope_note"] == f"{before['scope_note']} {warning}"
+    assert read(store, "overview") == read(dashboard_app()[1], "overview")
 
 
 @pytest.mark.parametrize("days,status", [(1, "READY"), (3, "STALE"), (10, "EXPIRED")])

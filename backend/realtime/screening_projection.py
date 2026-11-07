@@ -395,7 +395,9 @@ def produce_realtime_screening(inputs: RealtimeScreeningInput) -> RealtimeScreen
         provider_tier=inputs.provider_tier.value, source_generation=inputs.source_generation,
         previous_expected_session=str(calendar.previous_session(str(session)).date()),
         expected_members=len(members), source_selected_members=len(members) - len(unavailable),
-        source_publication_status="PARTIAL" if partial_session else "COMPLETE",
+        # G102 A2 (design 6.1): DEGRADED names the unavailable members in the Screener's coverage notice
+        # (screeningModel.dailyCoverageNotice); session_status keeps PARTIAL or COMPLETE.
+        source_publication_status="DEGRADED" if unavailable else "PARTIAL" if partial_session else "COMPLETE",
         source_unavailable_members=unavailable,
         daily_state_contract="daily_state_extracted_v1", screening_basis=SCREENING_BASIS,
         field_contract=REALTIME_FIELDS,

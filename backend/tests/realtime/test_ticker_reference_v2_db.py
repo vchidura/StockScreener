@@ -30,7 +30,7 @@ from realtime.preflight import ProviderTier
 import realtime.ticker_repository as ticker_repository
 from realtime.ticker_projection import TICKER_WORKSPACE_VERSION, _fact
 from realtime.ticker_repository import (
-    RealtimeTickerWorkspaceRepository, TickerPublicationUnavailable, compute_realtime_ticker_cycle,
+    RealtimeTickerWorkspaceRepository, compute_realtime_ticker_cycle,
     publish_realtime_ticker_cycle,
 )
 from realtime.worker_database import RealtimeProcessDatabase
@@ -455,8 +455,10 @@ def test_bars_appended_after_publication_do_not_disturb_the_published_lineage(da
     assert chart[-1]["time"] == int(fact.revision.bar_start.timestamp())
 
 
-def test_a_bar_revised_after_publication_fails_closed(database):
+def test_a_bar_revised_after_publication_draws_the_current_bars(database):
+    """G102 A2 (design 6.1, G36): the chart is drawn from the bars current now instead of refusing."""
     world = publish_world(database)
+    published = read(database, world, "chart", interval="1d", period="5y")
     last = max((row for row in world.inputs.bars if row["interval"] == "1d" and row["adjustment_basis"] == "ADJUSTED"),
                key=lambda row: row["bar_start"])
     fact = _fact(last, world.inputs)
@@ -465,23 +467,23 @@ def test_a_bar_revised_after_publication_fails_closed(database):
         supersedes_bar_revision_id=fact.revision.bar_revision_id, system_observed_at=datetime.now(UTC)))
     with database.plain() as cursor:
         persist_realtime_equity_bars_cursor(cursor, (revised,))
-    with pytest.raises(TickerPublicationUnavailable, match="bar lineage changed; republish required"):
-        read(database, world, "chart", interval="1d", period="5y")
+    # The revision keeps the prices (only its id and payload hash differ), so the drawn points match.
+    assert read(database, world, "chart", interval="1d", period="5y") == published
     # The other intervals and the workspace itself still verify and serve.
     assert read(database, world, "chart", interval="5m", period="5y")
     assert read(database, world)["price"] == world.workspace.payload["quote"]["price"]
 
 
-def test_a_bar_retired_after_publication_fails_closed(database):
+def test_a_bar_retired_after_publication_is_not_drawn(database):
     world = publish_world(database)
+    published = read(database, world, "chart", interval="1h", period="5y")
     with database.transaction() as cursor:
         cursor.execute(
             "DELETE FROM rt.bar_current WHERE cohort_id=%s AND interval='1h' AND adjustment_basis='RAW_UNADJUSTED' "
             "AND bar_start=(SELECT min(bar_start) FROM rt.bar_current WHERE cohort_id=%s AND interval='1h')",
             (str(world.cohort), str(world.cohort)))
         assert cursor.rowcount == 1
-    with pytest.raises(TickerPublicationUnavailable, match="bar lineage changed"):
-        read(database, world, "chart", interval="1h", period="5y")
+    assert read(database, world, "chart", interval="1h", period="5y") == published[1:]
     assert read(database, world, "chart", interval="30m", period="5y")
 
 

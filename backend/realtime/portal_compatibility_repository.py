@@ -1396,16 +1396,26 @@ class RealtimeScreeningRepository(_RealtimeCompatibilityRepository):
         generation, row = self._snapshot_row(request, available_by, cohort_id, read_mode)
         if not supported_hourly_contract(generation.get("hourly_contract")):
             raise ValueError("Stored hourly contract is incompatible")
-        # A member listed in source_unavailable_members (G102 A2) has a placeholder row and no bar lineage.
-        lineage = generation["hourly_lineage"].get(request.security_id)
-        if lineage is not None and screening_references.is_compact(generation):
-            lineage = self._compose_hourly_lineage(generation, request.security_id, available_by, cohort_id)
+        # G102 A2: a member listed in source_unavailable_members has a placeholder row and no bar lineage; the
+        # lineage object stays present (the Screener drawer reads lineage.bars) and lineage_status says why it is empty.
+        # STORED: an older generation's embedded lineage; VERIFIED / CHANGED: composed from current bars.
+        lineage, lineage_status = generation["hourly_lineage"].get(request.security_id), "STORED"
+        if lineage is None:
+            lineage = dict(bars=[], selected_bar_id=None, reconstructed_from_30m={}, derived_source_revision_ids={})
+            lineage_status = "UNAVAILABLE"
+        elif screening_references.is_compact(generation):
+            lineage, lineage_status = self._compose_hourly_lineage(
+                generation, request.security_id, available_by, cohort_id,
+            )
         return dict(generation=request.generation, security_id=request.security_id, source=generation["hourly_source"],
-                    values=row["hourly"]["values"], missing=row["hourly"]["missing"], lineage=lineage)
+                    values=row["hourly"]["values"], missing=row["hourly"]["missing"], lineage=lineage,
+                    lineage_status=lineage_status)
 
     def _compose_hourly_lineage(self, generation, security_id, available_by, cohort_id):
-        """The per-bar hourly lineage, recomposed from the member's current bars and verified against the
-        stored heads (the generation keeps the head, not the list)."""
+        """The per-bar hourly lineage, recomposed from the member's current bars and verified against the stored
+        heads (the generation keeps the head, not the list), with its status. G102 A2 (G83 class): when a bar
+        changed after publication, the lineage over the current bars is returned with status CHANGED; the
+        hourly values are the stored ones either way."""
         if self._bar_loader is None:
             raise ScreeningPublicationUnavailable("Hourly lineage is composed from the bar tables, which are not attached")
         cutoff = _utc(available_by, "available_by")
@@ -1413,13 +1423,11 @@ class RealtimeScreeningRepository(_RealtimeCompatibilityRepository):
             self._begin(cursor)
             cohort = self._cohort(cursor, cutoff, cohort_id)
             record = dict(cohort_id=cohort, provider_tier=generation["provider_tier"])
-            try:
-                return screening_references.compose_hourly_lineage(
-                    generation, security_id,
-                    self._bars(cursor, record, generation, {security_id}, with_sources=True),
-                )
-            except BarLineageChanged as error:
-                raise ScreeningPublicationUnavailable("Screening bar lineage changed; republish required") from error
+            rows = self._bars(cursor, record, generation, {security_id}, with_sources=True)
+        try:
+            return screening_references.compose_hourly_lineage(generation, security_id, rows), "VERIFIED"
+        except BarLineageChanged:
+            return screening_references.hourly_lineage_of(generation, security_id, rows), "CHANGED"
 
 
 class RealtimeStockAlertRepository(_RealtimeCompatibilityRepository):

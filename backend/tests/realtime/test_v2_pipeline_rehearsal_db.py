@@ -1235,8 +1235,8 @@ def test_a6_the_second_window_takes_the_delta_loader_path_and_publishes_a_new_id
     current = {ticker: value[0] for ticker, value in workspace_payloads(rehearsal).items()}
     assert all(current[ticker] != before["ids"][ticker] for ticker in TICKERS)
     # The reader serves the restated 1m bars. The reader composes a chart per interval, lazily: the W1 workspace
-    # pinned by id still loads, its 1m chart (whose bars were restated) fails closed with 'republish required',
-    # while its other charts and its quote keep serving.
+    # pinned by id still loads, and its 1m chart (whose bars were restated) is drawn from the bars current now over
+    # its published range (G102 A2, design 6.1), while its other charts and its quote keep serving.
     reader, _ = reader_for(runtime)
     read_at = datetime.now(UTC)
     for ticker in TICKERS:
@@ -1247,9 +1247,8 @@ def test_a6_the_second_window_takes_the_delta_loader_path_and_publishes_a_new_id
         pinned = dict(available_by=read_at, cohort_id=rehearsal.cohort, snapshot_id=before["ids"][ticker],
                       read_mode="retained", period="5y")
         reader._snapshot(ticker, read_at, rehearsal.cohort, before["ids"][ticker], "retained")  # loads, no bar read
-        with pytest.raises(ticker_repository.TickerPublicationUnavailable,
-                           match="bar lineage changed; republish required"):
-            reader.read(ticker, "chart", interval="1m", **pinned)
+        restated = reader.read(ticker, "chart", interval="1m", **pinned)
+        assert restated and all(point in chart for point in restated)
         assert reader.read(ticker, "chart", interval="1d", **pinned)
         assert reader.read(ticker, "chart", interval="5m", **pinned)
         assert reader.read(ticker, "quote", **{key: value for key, value in pinned.items() if key != "period"})

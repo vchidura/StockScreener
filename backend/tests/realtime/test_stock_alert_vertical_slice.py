@@ -379,7 +379,7 @@ def test_invalid_original_query_shapes_are_rejected(params):
         assert response.status_code == 422
 
 
-@pytest.mark.parametrize("defect", ["checksum", "manifest", "cohort", "reference", "action", "future"])
+@pytest.mark.parametrize("defect", ["checksum", "manifest", "cohort", "future"])
 def test_stored_alert_projection_defects_are_unavailable(defect):
     app, store = alert_app()
     row = next(iter(store.snapshots.values()))
@@ -389,15 +389,35 @@ def test_stored_alert_projection_defects_are_unavailable(defect):
         row["source_manifest_sha256"] = "b" * 64
     elif defect == "cohort":
         row["source_manifest"]["cohort_id"] = str(UUID(int=9))
-    elif defect == "reference":
-        store.reference_drift = True
-    elif defect == "action":
-        store.action_drift = True
     else:
         row["generated_at"] = OBSERVED_AT + timedelta(seconds=1)
     with TestClient(app) as client:
         response = client.get("/api/stocks/alert-view", params=dict(cohort_id=str(COHORT_ID)))
         assert response.status_code == 503
+
+
+@pytest.mark.parametrize("fault", ["reference", "action"])
+def test_a_reference_or_action_change_after_publication_is_a_page_warning_not_a_refusal(fault):
+    """G102 A2 (design 6.1): the alert page is served as published; the later input change is listed in its warnings."""
+    def view(store):
+        return RealtimeStockAlertViewRepository(store.cursor).alert_view(available_by=OBSERVED_AT, cohort_id=COHORT_ID)
+
+    clean = view(alert_app()[1])
+    _app, store = alert_app()
+    setattr(store, f"{fault}_drift", True)
+    page = view(store)
+    assert "input_changes" not in clean
+    labels = page.pop("input_changes")
+    added = [warning for warning in page["warnings"] if warning not in clean["warnings"]]
+    assert len(added) == 1 and added == list(labels["section_warnings"].values())
+    assert {key: value for key, value in page.items() if key != "warnings"} == {
+        key: value for key, value in clean.items() if key != "warnings"}
+    if fault == "reference":
+        assert labels["reference_status"] == "CHANGED" and labels["action_status"] == "CURRENT"
+        assert labels["changed_reference_tickers"] == sorted({row["ticker"] for row in store.references})
+    else:
+        assert labels["reference_status"] == "CURRENT" and labels["action_status"] == "CHANGED"
+        assert labels["changed_reference_tickers"] == []
 
 
 def test_expired_alert_projection_remains_browsable_with_stale_warning():
