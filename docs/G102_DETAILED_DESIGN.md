@@ -62,6 +62,18 @@ Equity part of A3 doesn't depend on it.
 
 **Gate:** you review this section before building past the Monday scope.
 
+### 1.5 Code footprint of the live services (measured Nov 7)
+
+Static import closure from the 21 entry points in `docker-compose.realtime-v2.yml` (every import statement, including
+those inside functions): `realtime` 248 of 284 modules (162,734 of 175,189 lines), `options` 88 of 102, `equity` 41
+of 57, `scripts` 96 of 318. The design generations are woven into the live path (modules named P7: 1, P8: 8, v3: 7,
+canary: 2 are reachable), so a clean folder made by copying only the needed files would drop clutter (35 realtime
+modules such as the developer cycle, bootstrap, P7 executor and shadow, local mock; about 220 scripts) but not the
+mixed designs. Separating those takes code changes: the P8-or-v3 decision (1.4) and G102. Caveats: 7 reachable
+modules import dynamically, and some tools run outside the services (for example
+`canonical_stock_alert_regeneration.py` through `deploy_candidate.ps1`), so pruning needs the test suite and a role
+start check as gates.
+
 ## 2. Approach
 
 - **In place:** one migration per step in `backend/realtime/sql_v2/` (049 onwards), applied to live over the weekend,
@@ -312,6 +324,30 @@ soon as any member failed (`materialization_jobs.py:778`).
 **Files:** `screening_projection.py`, `ticker_projection.py`, the stock alert evaluation loop,
 `materialization_jobs.py` and its 10 barrier callers (to list). **Tests:** a window with one ticker missing split
 evidence: 24 publish, one is labelled; the barrier reads `PARTIAL`.
+
+**Built, v1 (Nov 7), simpler than the plan above, using the legacy pattern:**
+
+- `screening_projection.produce_realtime_screening`: a member whose inputs fail a check (`ValueError`) keeps a
+  full-shape placeholder row built by `project_security` for an unavailable source member (ineligible, every market
+  value missing with `SOURCE_PUBLICATION_MEMBER_UNAVAILABLE`, quality `MEMBER_UNAVAILABLE`), is listed in the
+  manifest's existing `source_unavailable_members` with the reason, and has no bar lineage. The row count still
+  equals the expected members, so every downstream count check holds. With no member left, it still fails.
+- `ticker_projection.project_realtime_ticker_workspace`: a member screening marked unavailable, or whose workspace
+  raises a `ValueError`, gets no workspace this window (its partial writes are rolled back) and is recorded in the
+  new `unavailable_members` field with stage and reason. The summary accepts a subset of members and lists the
+  others in `unavailable_members`.
+- `dashboard_projection`: unavailable members are left out of every list (overview, scanners, setups through the
+  existing `excluded_tickers`, context, references) and listed in `unavailable_members`.
+- `portal_compatibility_repository.hourly_details`: a member without lineage returns its row with no lineage.
+- No schema change and no barrier change in v1. A skipped ticker has no page in that window (showing its previous
+  page is v2). Strategies and stock alerts keep their own per-member loops (v2).
+- **Tests:** 19 fail-closed tests rewritten to the new rule, 2 new; the 17 affected suites show only the 85
+  pre-existing environment failures (Starlette test client), same as the untouched baseline.
+- **Read-only replay on live inputs** (`runner/g102_per_ticker_replay.py`, Nov 6 14:50 UTC, before the 14:54 G94
+  coverage fill): the image's code fails with `Screening split/action evidence unavailable: AMD`, as on Nov 6; the
+  patched code completes: 9 workspaces, the 16 members added Nov 6 unavailable with that reason, screening 25 rows
+  (9 selected), summary 9 with 16 listed, generation check passed. Note: the generation's `status` still reads
+  COMPLETE because placeholders keep the count; `source_unavailable_members` is the signal.
 
 ## 7. Later steps (outline; detailed the same way before they are built)
 

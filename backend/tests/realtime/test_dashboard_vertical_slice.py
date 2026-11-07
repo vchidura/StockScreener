@@ -344,6 +344,17 @@ def test_source_identity_availability_and_action_gates(fault):
         inputs = replace(inputs, actions=(*inputs.actions, dict(
             inputs.actions[0], action_type="MERGER", effective_date=date(2026, 9, 1),
         )))
+    if fault == "scale":
+        # G102 A2 (Nov 7): the member screening cannot compute is left out of every Dashboard list and listed
+        # as unavailable; the Dashboard publishes for the others.
+        payload = produce_realtime_dashboard(replace(inputs, bars=tuple(bars))).payload
+        assert payload["unavailable_members"] == [current["ticker"]]
+        assert current["ticker"] not in payload["tickers"]
+        assert [row["ticker"] for row in payload["overview"]] == payload["tickers"]
+        assert [row["ticker"] for row in payload["context"]["rows"]] == payload["tickers"]
+        assert [row["ticker"] for row in payload["references"]] == payload["tickers"]
+        assert payload["scan"]["total_scanned"] == len(payload["tickers"])
+        return
     match = "availability is beyond cutoff" if fault == "delay" else None
     with pytest.raises(ValueError, match=match):
         produce_realtime_dashboard(replace(inputs, bars=tuple(bars)))

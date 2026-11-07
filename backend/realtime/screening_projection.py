@@ -259,7 +259,7 @@ def produce_realtime_screening(inputs: RealtimeScreeningInput) -> RealtimeScreen
     ordinals = {stamp: index for index, stamp in enumerate(sessions)}
     market_time = inputs.cutoff if partial_session else session_close
     slots = hourly_slots(calendar, market_time)
-    rows, lineage, hourly_lineage = [], {}, {}
+    rows, lineage, hourly_lineage, unavailable = [], {}, {}, []
     # Grouped once (an O(members x rows) rescan per member otherwise), original order kept.
     coverage_by_security, actions_by_security = {}, {}
     for item in inputs.coverage:
@@ -268,97 +268,122 @@ def produce_realtime_screening(inputs: RealtimeScreeningInput) -> RealtimeScreen
         actions_by_security.setdefault(str(item["security_id"]), []).append(item)
     for member in sorted(members, key=lambda m: m["ticker"]):
         ticker, identity = member["ticker"], str(member["security_id"])
-        if not member.get("security_revision_id") or member.get("security_type") not in {"CS", "ETF", "ETV"}:
-            raise ValueError(f"Screening reference identity/type unavailable: {ticker}")
-        if (
-            member["observed_at"] > inputs.cutoff
-            and inputs.identity_continuity_sha256 is None
-        ):
-            raise ValueError(f"Screening reference is not available: {ticker}")
-        own = [dict(bar) for bar in bars_by_ticker.get(ticker, ())]
-        _validate_bars(own, member, inputs)
-        adjusted = sorted((
-            b for b in own
-            if b["interval"] == "1d" and b["adjustment_basis"] == "ADJUSTED"
-            and b["session_date"] in ordinals
-        ), key=lambda b: b["session_date"])
-        raw = sorted((b for b in own if b["interval"] == "1d" and b["adjustment_basis"] == "RAW_UNADJUSTED"), key=lambda b: b["session_date"])
-        if [b["session_date"] for b in adjusted] != sessions:
-            observed = [b["session_date"] for b in adjusted]
-            mismatch = next(
-                (
-                    (index, expected, actual)
-                    for index, (expected, actual) in enumerate(
-                        zip(sessions, observed)
-                    )
-                    if expected != actual
-                ),
-                None,
+        try:
+            if not member.get("security_revision_id") or member.get("security_type") not in {"CS", "ETF", "ETV"}:
+                raise ValueError(f"Screening reference identity/type unavailable: {ticker}")
+            if (
+                member["observed_at"] > inputs.cutoff
+                and inputs.identity_continuity_sha256 is None
+            ):
+                raise ValueError(f"Screening reference is not available: {ticker}")
+            own = [dict(bar) for bar in bars_by_ticker.get(ticker, ())]
+            _validate_bars(own, member, inputs)
+            adjusted = sorted((
+                b for b in own
+                if b["interval"] == "1d" and b["adjustment_basis"] == "ADJUSTED"
+                and b["session_date"] in ordinals
+            ), key=lambda b: b["session_date"])
+            raw = sorted((b for b in own if b["interval"] == "1d" and b["adjustment_basis"] == "RAW_UNADJUSTED"), key=lambda b: b["session_date"])
+            if [b["session_date"] for b in adjusted] != sessions:
+                observed = [b["session_date"] for b in adjusted]
+                mismatch = next(
+                    (
+                        (index, expected, actual)
+                        for index, (expected, actual) in enumerate(
+                            zip(sessions, observed)
+                        )
+                        if expected != actual
+                    ),
+                    None,
+                )
+                raise ValueError(
+                    "Screening adjusted history requires exact 283 retained sessions: "
+                    f"{ticker}; observed={len(observed)} "
+                    f"{observed[:1]}..{observed[-1:]}; mismatch={mismatch}"
+                )
+            if [b["session_date"] for b in raw[-20:]] != sessions[-20:]:
+                observed = [b["session_date"] for b in raw]
+                raise ValueError(
+                    "Screening nominal current/liquidity history unavailable: "
+                    f"{ticker}; observed={len(observed)} "
+                    f"{observed[-20:-19]}..{observed[-1:]}"
+                )
+            own_coverage = [c for c in coverage_by_security.get(identity, ()) if c["action_type"] == "SPLIT"
+                            and c["window_start"] <= sessions[0] and c["window_end"] >= session and c["received_at"] <= inputs.cutoff]
+            if not own_coverage:
+                raise ValueError(f"Screening split/action evidence unavailable: {ticker}")
+            actions = [dict(a) for a in actions_by_security.get(identity, ())]
+            if any(a["received_at"] > inputs.cutoff or a["ticker"] != ticker for a in actions):
+                raise ValueError(f"Screening action evidence drift: {ticker}")
+            if any(a["action_type"] == "SPLIT" and (
+                not np.isfinite([float(a["split_from"]), float(a["split_to"])]).all()
+                or float(a["split_from"]) <= 0 or float(a["split_to"]) <= 0
+            ) for a in actions):
+                raise ValueError(f"Invalid screening split evidence: {ticker}")
+            own_coverage = [c for c in own_coverage if (
+                c["response_action_count"] == sum(a["action_type"] == "SPLIT" and c["window_start"] <= a["effective_date"] <= c["window_end"] for a in actions)
+                and all(a["received_at"] <= c["received_at"] for a in actions
+                        if a["action_type"] == "SPLIT" and c["window_start"] <= a["effective_date"] <= c["window_end"])
+            )]
+            if not own_coverage:
+                raise ValueError(f"Screening split/action coverage drift: {ticker}")
+            split_dates = {a["effective_date"] for a in actions if a["action_type"] == "SPLIT"}
+            for previous, current in zip(adjusted, adjusted[1:]):
+                change = float(current["close"]) / float(previous["close"]) - 1
+                if current["session_date"] in split_dates and (change <= -.38 or change >= .60):
+                    raise ValueError(f"Screening adjusted split/action drift: {ticker}")
+            # The historical basis must meet the nominal current scale at its endpoint.
+            endpoint_scale_difference = abs(
+                float(raw[-1]["close"]) / float(adjusted[-1]["close"]) - 1
             )
-            raise ValueError(
-                "Screening adjusted history requires exact 283 retained sessions: "
-                f"{ticker}; observed={len(observed)} "
-                f"{observed[:1]}..{observed[-1:]}; mismatch={mismatch}"
+            if endpoint_scale_difference > ENDPOINT_CLOSE_SCALE_MAX_RELATIVE_DIFFERENCE:
+                raise ValueError(f"Screening current adjusted/raw scale drift: {ticker}")
+            historical = [dict(b) for b in adjusted[-253:]]
+            nominal = {b["session_date"]: b for b in raw}
+            for bar in historical:
+                nominal_bar = nominal.get(bar["session_date"])
+                bar["raw_close"] = float(nominal_bar["close"]) if nominal_bar else np.nan
+                bar["raw_volume"] = float(nominal_bar["volume"]) if nominal_bar else np.nan
+            selected = dict(member, selected_bar_revision_id=historical[-1]["bar_revision_id"], status="SELECTED")
+            row = project_security(selected, historical, actions, daily_session, ordinals, split_adjusted=True)
+            row["source_bar_id"] = str(raw[-1]["bar_revision_id"])
+            row["values"].update(price=float(raw[-1]["close"]), volume=float(raw[-1]["volume"]))
+            row["quality"] = ["SPLIT_COVERAGE_VERIFIED_OTHER_KNOWN_ACTIONS_ONLY"]
+            hourly = sorted((b for b in own if b["interval"] == "1h" and b["adjustment_basis"] == "RAW_UNADJUSTED"), key=lambda b: b["bar_end"])
+            hourly = [b for b in hourly if slots[0][0] <= b["bar_start"] and b["bar_end"] <= market_time]
+            if any(b["source_kind"] not in {"DERIVED", "RECONCILED"} for b in hourly):
+                raise ValueError(f"Screening hourly context must use raw derived bars: {ticker}")
+            if len({b["bar_end"] for b in hourly}) != len(hourly):
+                raise ValueError(f"Screening hourly revisions are ambiguous: {ticker}")
+            selected_hourly = next((b for b in hourly if b["bar_end"] == slots[-1][1]), None)
+            row["hourly"] = project_hourly(identity, selected_hourly["bar_revision_id"] if selected_hourly else None, hourly, actions, slots)
+            member_lineage = _daily_lineage(member, row, adjusted, raw, actions, own_coverage)
+            member_hourly_lineage = _hourly_lineage(hourly, selected_hourly)
+        except ValueError as error:
+            # Per-ticker outcome (G102 A2, Nov 7). On Nov 6 one ticker's missing split evidence (B4, AMD) failed
+            # every Equity window for all 25. The member keeps a full-shape row with every value missing, as the
+            # legacy screening does for an unavailable source member (equity/screening_projection.py), and is
+            # listed in source_unavailable_members with the reason. It has no bar lineage, so reads never verify
+            # bars for it, and the row count still equals the expected members everywhere downstream.
+            reason = str(error)[:300]
+            unavailable.append(dict(ticker=ticker, security_id=identity, status="UNAVAILABLE", reason=reason))
+            placeholder = project_security(
+                dict(member, selected_bar_revision_id=None, status="UNAVAILABLE"),
+                [], [], daily_session, ordinals, split_adjusted=True,
             )
-        if [b["session_date"] for b in raw[-20:]] != sessions[-20:]:
-            observed = [b["session_date"] for b in raw]
-            raise ValueError(
-                "Screening nominal current/liquidity history unavailable: "
-                f"{ticker}; observed={len(observed)} "
-                f"{observed[-20:-19]}..{observed[-1:]}"
-            )
-        own_coverage = [c for c in coverage_by_security.get(identity, ()) if c["action_type"] == "SPLIT"
-                        and c["window_start"] <= sessions[0] and c["window_end"] >= session and c["received_at"] <= inputs.cutoff]
-        if not own_coverage:
-            raise ValueError(f"Screening split/action evidence unavailable: {ticker}")
-        actions = [dict(a) for a in actions_by_security.get(identity, ())]
-        if any(a["received_at"] > inputs.cutoff or a["ticker"] != ticker for a in actions):
-            raise ValueError(f"Screening action evidence drift: {ticker}")
-        if any(a["action_type"] == "SPLIT" and (
-            not np.isfinite([float(a["split_from"]), float(a["split_to"])]).all()
-            or float(a["split_from"]) <= 0 or float(a["split_to"]) <= 0
-        ) for a in actions):
-            raise ValueError(f"Invalid screening split evidence: {ticker}")
-        own_coverage = [c for c in own_coverage if (
-            c["response_action_count"] == sum(a["action_type"] == "SPLIT" and c["window_start"] <= a["effective_date"] <= c["window_end"] for a in actions)
-            and all(a["received_at"] <= c["received_at"] for a in actions
-                    if a["action_type"] == "SPLIT" and c["window_start"] <= a["effective_date"] <= c["window_end"])
-        )]
-        if not own_coverage:
-            raise ValueError(f"Screening split/action coverage drift: {ticker}")
-        split_dates = {a["effective_date"] for a in actions if a["action_type"] == "SPLIT"}
-        for previous, current in zip(adjusted, adjusted[1:]):
-            change = float(current["close"]) / float(previous["close"]) - 1
-            if current["session_date"] in split_dates and (change <= -.38 or change >= .60):
-                raise ValueError(f"Screening adjusted split/action drift: {ticker}")
-        # The historical basis must meet the nominal current scale at its endpoint.
-        endpoint_scale_difference = abs(
-            float(raw[-1]["close"]) / float(adjusted[-1]["close"]) - 1
-        )
-        if endpoint_scale_difference > ENDPOINT_CLOSE_SCALE_MAX_RELATIVE_DIFFERENCE:
-            raise ValueError(f"Screening current adjusted/raw scale drift: {ticker}")
-        historical = [dict(b) for b in adjusted[-253:]]
-        nominal = {b["session_date"]: b for b in raw}
-        for bar in historical:
-            nominal_bar = nominal.get(bar["session_date"])
-            bar["raw_close"] = float(nominal_bar["close"]) if nominal_bar else np.nan
-            bar["raw_volume"] = float(nominal_bar["volume"]) if nominal_bar else np.nan
-        selected = dict(member, selected_bar_revision_id=historical[-1]["bar_revision_id"], status="SELECTED")
-        row = project_security(selected, historical, actions, daily_session, ordinals, split_adjusted=True)
-        row["source_bar_id"] = str(raw[-1]["bar_revision_id"])
-        row["values"].update(price=float(raw[-1]["close"]), volume=float(raw[-1]["volume"]))
-        row["quality"] = ["SPLIT_COVERAGE_VERIFIED_OTHER_KNOWN_ACTIONS_ONLY"]
-        hourly = sorted((b for b in own if b["interval"] == "1h" and b["adjustment_basis"] == "RAW_UNADJUSTED"), key=lambda b: b["bar_end"])
-        hourly = [b for b in hourly if slots[0][0] <= b["bar_start"] and b["bar_end"] <= market_time]
-        if any(b["source_kind"] not in {"DERIVED", "RECONCILED"} for b in hourly):
-            raise ValueError(f"Screening hourly context must use raw derived bars: {ticker}")
-        if len({b["bar_end"] for b in hourly}) != len(hourly):
-            raise ValueError(f"Screening hourly revisions are ambiguous: {ticker}")
-        selected_hourly = next((b for b in hourly if b["bar_end"] == slots[-1][1]), None)
-        row["hourly"] = project_hourly(identity, selected_hourly["bar_revision_id"] if selected_hourly else None, hourly, actions, slots)
+            placeholder["values"].update(price=None, volume=None)
+            placeholder["quality"] = ["MEMBER_UNAVAILABLE"]
+            placeholder["hourly"] = project_hourly(identity, None, [], [], slots)
+            rows.append(placeholder)
+            continue
         rows.append(row)
-        lineage[identity] = _daily_lineage(member, row, adjusted, raw, actions, own_coverage)
-        hourly_lineage[identity] = _hourly_lineage(hourly, selected_hourly)
+        lineage[identity] = member_lineage
+        hourly_lineage[identity] = member_hourly_lineage
+    if unavailable and len(unavailable) == len(members):
+        raise ValueError(
+            f"Screening has no available member: {unavailable[0]['ticker']}: {unavailable[0]['reason']}"
+        )
+    unavailable_tickers = {item["ticker"] for item in unavailable}
     equity_dir = Path(__file__).resolve().parents[1] / "equity"
     manifest = dict(
         session=str(session), market_time=market_time.isoformat(), observed_at=inputs.cutoff.isoformat(),
@@ -369,9 +394,9 @@ def produce_realtime_screening(inputs: RealtimeScreeningInput) -> RealtimeScreen
         source_manifest_sha256=inputs.source_manifest_sha256, cohort_id=str(inputs.cohort_id),
         provider_tier=inputs.provider_tier.value, source_generation=inputs.source_generation,
         previous_expected_session=str(calendar.previous_session(str(session)).date()),
-        expected_members=len(members), source_selected_members=len(members),
+        expected_members=len(members), source_selected_members=len(members) - len(unavailable),
         source_publication_status="PARTIAL" if partial_session else "COMPLETE",
-        source_unavailable_members=[],
+        source_unavailable_members=unavailable,
         daily_state_contract="daily_state_extracted_v1", screening_basis=SCREENING_BASIS,
         field_contract=REALTIME_FIELDS,
         code_hashes={name: digest((equity_dir / name).read_text(encoding="utf-8")) for name in ("screening_projection.py", "technicals.py", "daily_state.py")},
@@ -387,7 +412,9 @@ def produce_realtime_screening(inputs: RealtimeScreeningInput) -> RealtimeScreen
         action_coverage="SPLIT_COVERAGE_VERIFIED_OTHER_KNOWN_ACTIONS_ONLY",
         hourly_contract=HOURLY_CATALOG, hourly_lineage=hourly_lineage,
         hourly_source=dict(
-            status="READY" if all(r["hourly"]["values"]["close"] is not None for r in rows) else "UNAVAILABLE",
+            status="READY" if all(
+                r["hourly"]["values"]["close"] is not None for r in rows if r["ticker"] not in unavailable_tickers
+            ) else "UNAVAILABLE",
             market_time=market_time.isoformat(), expected_market_time=market_time.isoformat(),
             source_cutoff=inputs.cutoff.isoformat(), source_publication_id=inputs.source_manifest_sha256,
             slot_start=slots[-1][0].isoformat(), slot_minutes=int((slots[-1][1] - slots[-1][0]).total_seconds() / 60),

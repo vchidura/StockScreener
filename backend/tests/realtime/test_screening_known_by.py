@@ -22,7 +22,7 @@ from realtime.ticker_projection import produce_realtime_ticker_workspace
 from tests.realtime.test_dashboard_vertical_slice import dashboard_fixture
 from tests.realtime.test_equity_validation_history import OBSERVED_AT
 from tests.realtime.test_screening_delta_loader import FakeCursor, FakeDatabase
-from tests.realtime.test_screening_vertical_slice import screening_fixture
+from tests.realtime.test_screening_vertical_slice import assert_member_unavailable, screening_fixture
 from tests.realtime.test_stock_alert_vertical_slice import timely_fixture
 from tests.realtime.test_ticker_vertical_slice import ticker_fixture
 
@@ -67,17 +67,22 @@ def test_known_by_is_normalised_validated_and_never_before_the_cutoff():
 
 @pytest.mark.parametrize("clock", ["observed_at", "replay_available_at"])
 def test_screening_checks_the_recording_clocks_against_recorded_by(clock):
+    # G102 A2 (Nov 7): a bar recorded after its bound makes its member unavailable (none of its values are
+    # published, so nothing late leaks into the page); the other members publish.
     inputs = screening_fixture()
+    ticker = inputs.bars[0]["ticker"]
     late = with_clock(inputs, 0, **{clock: LATE})
-    with pytest.raises(ValueError, match="availability drift"):
-        produce_realtime_screening(late)
-    assert produce_realtime_screening(replace(late, known_by=KNOWN_BY)).rows
-    with pytest.raises(ValueError, match="availability drift"):
-        produce_realtime_screening(replace(with_clock(inputs, 0, **{clock: KNOWN_BY + SECOND}), known_by=KNOWN_BY))
+    assert_member_unavailable(produce_realtime_screening(late), {ticker}, match="availability drift")
+    assert not produce_realtime_screening(replace(late, known_by=KNOWN_BY)).manifest["source_unavailable_members"]
+    assert_member_unavailable(
+        produce_realtime_screening(replace(with_clock(inputs, 0, **{clock: KNOWN_BY + SECOND}), known_by=KNOWN_BY)),
+        {ticker}, match="availability drift",
+    )
     # bar_end is a market time: it keeps comparing against the cutoff, whatever known_by is.
     market = with_clock(inputs, 0, bar_end=OBSERVED_AT + SECOND)
-    with pytest.raises(ValueError, match="availability drift"):
-        produce_realtime_screening(replace(market, known_by=KNOWN_BY))
+    assert_member_unavailable(
+        produce_realtime_screening(replace(market, known_by=KNOWN_BY)), {ticker}, match="availability drift",
+    )
 
 
 @pytest.mark.parametrize("clock", CLOCKS)

@@ -125,6 +125,10 @@ def produce_realtime_dashboard(inputs: RealtimeScreeningInput):
         ),
     )
     screening = produce_realtime_screening(inputs)
+    # Per-ticker outcome (G102 A2, Nov 7): members screening could not compute are left out of every Dashboard
+    # list (overview, scanners, setups, context, references) and listed as unavailable, instead of failing the
+    # Dashboard, and with it the window, for every member.
+    unavailable = sorted(item["ticker"] for item in screening.manifest.get("source_unavailable_members") or ())
     delay = timedelta(minutes=15 if inputs.provider_tier is ProviderTier.MASSIVE_DEVELOPER else 0)
     indexed = {str(row["bar_revision_id"]): row for row in inputs.bars}
 
@@ -153,6 +157,9 @@ def produce_realtime_dashboard(inputs: RealtimeScreeningInput):
            for action in inputs.actions):
         raise ValueError("Dashboard non-split corporate action requires reviewed history")
     frames, raw = dashboard_frames(inputs)
+    for ticker in unavailable:
+        frames.pop(ticker, None)
+        raw.pop(ticker, None)
     tickers = sorted(frames)
     scope_note = f"Selected realtime cohort: {len(tickers)} tickers; not full-market or sector coverage."
     scanner_snapshots = compute_default_scanner_snapshots(
@@ -161,7 +168,9 @@ def produce_realtime_dashboard(inputs: RealtimeScreeningInput):
     )
     scan = scanner_snapshots["SCAN_ALL_1D_5"]
     missing = dict(MISSING_PRODUCERS)
-    setup_rows, setup_evidence, missing_confirmations = produce_daily_setup_summary(inputs)
+    setup_rows, setup_evidence, missing_confirmations = produce_daily_setup_summary(
+        inputs, excluded_tickers=frozenset(unavailable),
+    )
     if missing_confirmations:
         missing["setup_confirmation_1h"] = "EXACT_20_SESSION_1H_CONFIRMATION_UNAVAILABLE"
     if "SPY" not in frames or "QQQ" not in frames:
@@ -169,6 +178,8 @@ def produce_realtime_dashboard(inputs: RealtimeScreeningInput):
         scan["market_regime"] = None
     context_rows = []
     for row in screening.rows:
+        if row.ticker in unavailable:
+            continue
         values = row.payload["values"]
         context_rows.append(dict(
             security_id=str(row.security_id), ticker=row.ticker, sector=None,
@@ -182,7 +193,10 @@ def produce_realtime_dashboard(inputs: RealtimeScreeningInput):
         ))
     member_lists = dict(
         tickers=tickers,
-        references=[dict(member) for member in sorted(inputs.members, key=lambda row: row["ticker"])],
+        references=[
+            dict(member) for member in sorted(inputs.members, key=lambda row: row["ticker"])
+            if member["ticker"] not in unavailable
+        ],
         setup_evidence=setup_evidence, missing_setup_confirmations=missing_confirmations,
     )
     manifest = dict(
@@ -217,7 +231,7 @@ def produce_realtime_dashboard(inputs: RealtimeScreeningInput):
     payload = dict(
         version=DASHBOARD_VERSION, cohort_id=str(inputs.cohort_id), session=str(inputs.session),
         market_time=manifest["market_time"], generated_at=inputs.cutoff.isoformat(),
-        scope_note=scope_note, missing_producers=missing, **member_lists,
+        scope_note=scope_note, missing_producers=missing, **member_lists, unavailable_members=unavailable,
         price_basis=manifest["price_basis"], provider_fetch_performed=False, execution_permission=False,
         overview=[_overview(ticker, frames[ticker], raw[ticker]) for ticker in tickers], scan=scan,
         scanners={key: scanner_snapshots[key] for key in DAILY_SCANNER_CONTRACTS.values()},

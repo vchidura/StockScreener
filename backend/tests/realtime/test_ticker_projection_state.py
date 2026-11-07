@@ -261,7 +261,9 @@ def test_a_changed_derived_bar_rederives_only_its_own_session(primed):
     assert _identity(projection) == _identity(project_realtime_ticker_workspace(same_values_new_revision))
 
 
-def test_warm_state_still_rejects_a_drifted_derived_aggregate_and_survives_the_failure():
+def test_warm_state_marks_a_drifted_derived_aggregate_unavailable_and_survives_it():
+    """G102 A2 (Nov 7): the drifted member gets no workspace this window and is recorded with the reason; the
+    other member publishes, and the warm state is not polluted by the failed member."""
     state = TickerProjectionState()
     inputs = two_names()
     project_realtime_ticker_workspace(inputs, state=state)
@@ -272,11 +274,38 @@ def test_warm_state_still_rejects_a_drifted_derived_aggregate_and_survives_the_f
         _revised(row, close=row["close"] + 1, high=row["high"] + 1) if row is target else row
         for row in inputs.bars
     ))
-    with pytest.raises(ValueError, match="derived interval lineage/aggregate drift: 30m"):
-        project_realtime_ticker_workspace(drifted, state=state)
-    assert len(state) == retained
+    projection = project_realtime_ticker_workspace(drifted, state=state)
+    [entry] = projection.unavailable_members
+    assert entry["ticker"] == "MSFT" and entry["stage"] == "TICKER_WORKSPACE"
+    assert "derived interval lineage/aggregate drift: 30m" in entry["reason"]
+    assert [snapshot.snapshot_key for snapshot in projection.snapshots] == ["AAPL"]
+    assert "MSFT" not in projection.summary_charts
+    # The state keeps only the latest cycle's working set: nothing from the drifted member is kept, and the
+    # member is rebuilt on the next clean cycle.
+    assert len(state) <= retained
     project_realtime_ticker_workspace(inputs, state=state)
-    assert state.stats["fact_built"] == 0 and state.stats["materialization_built"] == 0
+    assert len(state) == retained
+
+
+def test_a_member_without_split_coverage_gets_no_workspace_and_the_others_publish():
+    """G102 A2 (Nov 7), the Nov 6 B4 case: one member's split coverage is missing. Screening lists it as
+    unavailable, it gets no workspace, the other member publishes, the screening generation still matches the
+    workspaces, and the summary lists it as unavailable."""
+    from realtime.ticker_projection import produce_realtime_ticker_workspace_summary
+    from realtime.ticker_repository import _require_workspace_generation
+
+    inputs = two_names()
+    msft = next(str(member["security_id"]) for member in inputs.members if member["ticker"] == "MSFT")
+    broken = replace(inputs, coverage=tuple(row for row in inputs.coverage if str(row["security_id"]) != msft))
+    projection = project_realtime_ticker_workspace(broken)
+    [entry] = projection.unavailable_members
+    assert entry["ticker"] == "MSFT" and entry["stage"] == "SCREENING"
+    assert "Screening split/action evidence unavailable: MSFT" in entry["reason"]
+    assert [snapshot.snapshot_key for snapshot in projection.snapshots] == ["AAPL"]
+    _require_workspace_generation(broken, projection.snapshots, projection.screening_generation)
+    summary = produce_realtime_ticker_workspace_summary(broken, projection.snapshots, projection.summary_charts)
+    assert summary.payload["unavailable_members"] == ["MSFT"]
+    assert [row["ticker"] for row in summary.payload["overview"]] == ["AAPL"]
 
 
 def test_state_holds_only_the_latest_cycles_working_set():

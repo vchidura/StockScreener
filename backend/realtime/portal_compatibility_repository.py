@@ -1396,8 +1396,9 @@ class RealtimeScreeningRepository(_RealtimeCompatibilityRepository):
         generation, row = self._snapshot_row(request, available_by, cohort_id, read_mode)
         if not supported_hourly_contract(generation.get("hourly_contract")):
             raise ValueError("Stored hourly contract is incompatible")
-        lineage = generation["hourly_lineage"][request.security_id]
-        if screening_references.is_compact(generation):
+        # A member listed in source_unavailable_members (G102 A2) has a placeholder row and no bar lineage.
+        lineage = generation["hourly_lineage"].get(request.security_id)
+        if lineage is not None and screening_references.is_compact(generation):
             lineage = self._compose_hourly_lineage(generation, request.security_id, available_by, cohort_id)
         return dict(generation=request.generation, security_id=request.security_id, source=generation["hourly_source"],
                     values=row["hourly"]["values"], missing=row["hourly"]["missing"], lineage=lineage)

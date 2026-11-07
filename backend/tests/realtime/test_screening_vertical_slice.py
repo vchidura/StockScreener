@@ -191,6 +191,38 @@ def _scale_official_close(inputs, session_date, factor, ticker="AMZN"):
     return replace(inputs, bars=tuple(bars))
 
 
+def assert_member_unavailable(generation, expected=None, match=None):
+    """G102 A2 (Nov 7): a member whose inputs fail a check is listed in source_unavailable_members with a
+    full-shape placeholder row (ineligible, every value missing, no bar lineage); the other members publish with
+    their lineage and the row count still equals the expected members. Returns the unavailable tickers."""
+    import re
+
+    unavailable = {item["ticker"]: item for item in generation.manifest["source_unavailable_members"]}
+    if expected is None:
+        assert unavailable
+    else:
+        assert set(unavailable) == set(expected)
+    if match is not None:
+        assert all(re.search(match, item["reason"]) for item in unavailable.values()), unavailable
+    assert all(item["status"] == "UNAVAILABLE" for item in unavailable.values())
+    assert len(generation.rows) == generation.expected_members
+    assert generation.manifest["source_selected_members"] == generation.expected_members - len(unavailable)
+    lineage, hourly = generation.manifest["lineage"], generation.manifest["hourly_lineage"]
+    available = 0
+    for row in generation.rows:
+        if row.ticker in unavailable:
+            assert row.eligible is False
+            assert row.payload["quality"] == ["MEMBER_UNAVAILABLE"]
+            # Only the reference identity (instrument type) is kept; every market value is missing.
+            assert {name for name, value in row.payload["values"].items() if value is not None} <= {"instrument_type"}
+            assert str(row.security_id) not in lineage and str(row.security_id) not in hourly
+        else:
+            available += 1
+            assert str(row.security_id) in lineage
+    assert available > 0
+    return set(unavailable)
+
+
 # G82: AMZN 0.119% on Nov 5 and MSFT 0.29% on Oct 28 are closing-auction moves; 1.011 is just over the
 # 1% endpoint tolerance; 1.5 and 0.5 are what a 3:2 or 2:1 split does to the scale.
 @pytest.mark.parametrize("factor,accepted", [(1 / 1.00119, True), (1 / 1.0029, True), (1.011, False), (1.5, False), (0.5, False)])
@@ -209,8 +241,10 @@ def test_endpoint_scale_check_accepts_closing_auction_moves_and_rejects_splits(f
         assert generation.status == "COMPLETE"
         assert len(generation.rows) == len(inputs.members)
     else:
-        with pytest.raises(ValueError, match="Screening current adjusted/raw scale drift: AMZN"):
-            produce_realtime_screening(scaled)
+        # G102 A2 (Nov 7): the drifted member is unavailable; the others still publish.
+        assert_member_unavailable(
+            produce_realtime_screening(scaled), {"AMZN"}, match="Screening current adjusted/raw scale drift: AMZN",
+        )
 
 
 def test_endpoint_tolerance_stays_out_of_the_published_screening_basis():
@@ -467,7 +501,9 @@ def test_retained_screening_survives_lag_and_live_lineage_advance():
 
 
 @pytest.mark.parametrize("drift", ["history", "basis", "cohort", "identity", "coverage", "actions", "split", "quote", "hourly_lineage", "reference"])
-def test_producer_fails_closed_on_missing_history_basis_action_and_identity(drift):
+def test_producer_marks_a_member_with_missing_history_basis_action_or_identity_unavailable(drift):
+    """G102 A2 (Nov 7): the drifted member is listed as unavailable and the others publish; with no member
+    left (coverage removed for all), the producer still fails."""
     inputs = screening_fixture()
     bars = [dict(b) for b in inputs.bars]
     member = inputs.members[0]
@@ -499,8 +535,13 @@ def test_producer_fails_closed_on_missing_history_basis_action_and_identity(drif
                       and b["adjustment_basis"] == "ADJUSTED" and b["session_date"] >= split["effective_date"])
         inputs = replace(inputs, actions=(dict(split, effective_date=target["session_date"]),))
         target.update(close=10., open=10., high=11., low=9.)
-    with pytest.raises(ValueError):
-        produce_realtime_screening(replace(inputs, bars=tuple(bars)))
+    if drift == "coverage":
+        with pytest.raises(ValueError, match="Screening has no available member"):
+            produce_realtime_screening(replace(inputs, bars=tuple(bars)))
+        return
+    generation = produce_realtime_screening(replace(inputs, bars=tuple(bars)))
+    expected = None if drift == "actions" else {"NFLX"} if drift == "split" else {member["ticker"]}
+    assert_member_unavailable(generation, expected)
 
 
 def test_api_fails_closed_on_hash_corruption_wrong_cohort_and_invalid_requests():
