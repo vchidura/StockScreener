@@ -1336,3 +1336,80 @@ def test_stop_at_the_authority_end_still_seals(monkeypatch, tmp_path):
 
     assert run()["status"] == "COMPLETE"
     assert len(effects["sealed"]) == 1
+
+
+def test_b14a_end_stale_sessions_targets_other_options_sessions_with_old_heartbeat():
+    class Cursor:
+        rowcount = 1
+
+        def __init__(self):
+            self.calls = []
+
+        def execute(self, sql, params):
+            self.calls.append((sql, params))
+
+    cursor = Cursor()
+    acquisition = SimpleNamespace(stream_session_id=UUID(int=10))
+    checked_at = datetime(2026, 11, 9, 14, 31, 30, tzinfo=timezone.utc)
+
+    ended = roles_module._end_stale_v3_stream_sessions_cursor(
+        cursor,
+        acquisition,
+        checked_at=checked_at,
+    )
+
+    assert ended == 1
+    sql, params = cursor.calls[0]
+    assert sql.startswith("UPDATE rt.stream_sessions SET status='STOPPED'")
+    assert "feed='OPTIONS'" in sql and "session_id<>%s" in sql
+    assert "ended_at IS NULL" in sql and "NOT IN ('STOPPED','FAILED')" in sql
+    assert params == (
+        str(UUID(int=10)),
+        checked_at - timedelta(seconds=roles_module.STALE_STREAM_SESSION_SECONDS),
+    )
+
+
+def test_b14a_new_session_ends_stale_sessions_before_registering(
+    monkeypatch,
+    tmp_path,
+):
+    run, stop, _effects = _observer(
+        monkeypatch,
+        tmp_path,
+        {"state": "CAPTURING", "socket_state": "LIVE"},
+    )
+    generation = json.loads(
+        (tmp_path / "status.json").read_text(encoding="utf-8")
+    )["journal_generation"]
+    registration = SimpleNamespace(
+        status="WRITING",
+        owner_epoch=1,
+        journal_generation=generation,
+        shard_ids=(0,),
+        shard_map_sha256="a" * 64,
+        raw_committed_offset=0,
+        normalized_committed_offset=0,
+    )
+    order = []
+    for name, value in {
+        "_registration": lambda *_args: None,
+        "build_advanced_journal_registration": lambda **_kwargs: registration,
+        "register_advanced_journal_cursor": (
+            lambda *_args, **_kwargs: order.append("register")
+        ),
+        "mark_advanced_journal_writing_cursor": lambda *_args, **_kwargs: None,
+        "_end_stale_v3_stream_sessions_cursor": (
+            lambda _cursor, _acquisition, **_kwargs: order.append("end_stale") or 1
+        ),
+        "_record_v3_stream_session_cursor": (
+            lambda _cursor, _acquisition, **kwargs: order.append(
+                ("record", kwargs["ended_at"])
+            )
+        ),
+    }.items():
+        monkeypatch.setattr(roles_module, name, value)
+    _stop_soon(stop)
+
+    run()
+
+    assert order[:3] == ["end_stale", ("record", None), "register"]

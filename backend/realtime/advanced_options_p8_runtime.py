@@ -70,6 +70,8 @@ P8_EXECUTION_BUNDLE_SCHEMA = "advanced-options-p8-execution-bundle-v3"
 P8_EXECUTION_BUNDLE_MAX_BYTES = 1_048_576
 P8_HEARTBEAT_INTERVAL_SECONDS = 10
 P8_SERVICE_LEASE_SECONDS = 30
+P8_ROLE_STOP_SECONDS = 60
+P8_ROLE_STOP_POLL_SECONDS = 5
 P8_EFFECT_DENIALS = {
     "dispatch": False,
     "delivery": False,
@@ -2219,7 +2221,25 @@ def run_p8_docker_service(
                 5.0,
                 max(0.0, (window_stop - observed).total_seconds()),
             ))
-        role_thread.join(timeout=10)
+        # B14a (Nov 6): at the 21:05 decision stop all four roles outlived a 10 s join (one ingress pass writes the
+        # session row and snapshots the journal) and restarted with an error. Wait up to P8_ROLE_STOP_SECONDS,
+        # renewing the lease so the role's last writes keep their owner epoch.
+        stop_deadline = time.monotonic() + P8_ROLE_STOP_SECONDS
+        while role_thread.is_alive() and time.monotonic() < stop_deadline:
+            role_thread.join(timeout=P8_ROLE_STOP_POLL_SECONDS)
+            if role_thread.is_alive():
+                with connection:
+                    with connection.cursor() as cursor:
+                        lease = renew_durable_runtime_lease_cursor(
+                            cursor,
+                            lease,
+                            checked_at=_utc(clock(), "clock"),
+                            lease_seconds=P8_SERVICE_LEASE_SECONDS,
+                        )
+                if lease is None:
+                    raise RuntimeError(
+                        f"P8 {kind.value} lease ownership changed"
+                    )
         if role_thread.is_alive():
             raise RuntimeError(
                 f"P8 {kind.value} role did not stop within its bound"

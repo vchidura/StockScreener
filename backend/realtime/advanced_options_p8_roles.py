@@ -7,7 +7,7 @@ import json
 import os
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from threading import Event
@@ -412,6 +412,38 @@ def _record_v3_stream_session_cursor(
             observed_at,
         ),
     )
+
+
+STALE_STREAM_SESSION_SECONDS = 120
+
+
+def _end_stale_v3_stream_sessions_cursor(
+    cursor,
+    acquisition,
+    *,
+    checked_at: datetime,
+) -> int:
+    """B14a (Nov 6): nothing ends an Options stream session at the end of its day.
+
+    At the decision stop the runtime stops the roles, ingress takes the pause path because acquisition's own stop is
+    later, and no loop is left to record the terminal status, so the row stays LIVE. The next day's registration then
+    violates `uq_rt_active_stream_owner` (one active session per provider and feed) and Options cannot start without
+    a manual close (Nov 6, 16:06). A new session ends any other active Options session whose heartbeat stopped more
+    than `STALE_STREAM_SESSION_SECONDS` ago, at its last heartbeat, and records why. A session with a recent
+    heartbeat is left alone, so a live owner is never taken over."""
+    cursor.execute(
+        "UPDATE rt.stream_sessions SET status='STOPPED',"
+        "ended_at=GREATEST(started_at,COALESCE(heartbeat_at,started_at)),"
+        "failure_code='ENDED_BY_NEXT_SESSION' "
+        "WHERE provider='massive' AND feed='OPTIONS' AND session_id<>%s "
+        "AND ended_at IS NULL AND status NOT IN ('STOPPED','FAILED') "
+        "AND COALESCE(heartbeat_at,started_at)<%s",
+        (
+            str(acquisition.stream_session_id),
+            checked_at - timedelta(seconds=STALE_STREAM_SESSION_SECONDS),
+        ),
+    )
+    return max(0, int(getattr(cursor, "rowcount", 0) or 0))
 
 
 def _acquisition_terminal_ended_at(status) -> datetime | None:
@@ -890,6 +922,11 @@ def _run_v3_acquisition_observer(
             shard_map_sha256=shard_map.sha256,
         )
         with provider.transaction(APP_ROLE) as unit:
+            _end_stale_v3_stream_sessions_cursor(
+                unit.cursor,
+                acquisition,
+                checked_at=datetime.now(UTC),
+            )
             _record_v3_stream_session_cursor(
                 unit.cursor,
                 acquisition,
