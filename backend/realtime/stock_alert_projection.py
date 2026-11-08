@@ -580,6 +580,26 @@ def produce_realtime_stock_alerts(
     )
 
 
+CANONICAL_HIT_COVERAGE = "Windows this session in which a rule matched this stock and side"
+
+
+def canonical_hit_observations(rows):
+    """One hit per matched alert row: its window (run), time, side and the rules that matched."""
+    hits = []
+    for row in rows:
+        if row.get("disposition") != "MATCH" or not row.get("direction"):
+            continue
+        models = [row.get("model"), *(item.get("rule") for item in row.get("also_matched") or ())]
+        hits.append({
+            "session": row["session"], "valid": True, "strategy_instance_id": row.get("strategy_instance_id"),
+            "security_id": row["security_id"], "direction": row["direction"], "run_id": row["run_id"],
+            "at": row.get("published_at") or row.get("triggered_at"),
+            "models": sorted({str(model) for model in models if model}),
+            "intervals": sorted({str(row["interval"])} if row.get("interval") else set()),
+        })
+    return hits
+
+
 def _canonical_publication_rows(
     batch,
     evaluations,
@@ -856,6 +876,10 @@ def _produce_canonical_realtime_stock_alerts(
         "deliverable": deliverable,
         "current_disposition": "PENDING_PUBLICATION",
     }
+    # Nov 8 (user): Hits = windows this session in which a rule matched the stock on that side (current and
+    # retained earlier windows), so a repeat shows as a count on the alert instead of only another row.
+    snapshot["observations"] = canonical_hit_observations([*historical_alerts, *alerts])
+    snapshot["hit_coverage"] = CANONICAL_HIT_COVERAGE
     observations = [
         {
             "evaluation_id": row["evaluation_id"],

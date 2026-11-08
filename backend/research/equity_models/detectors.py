@@ -56,11 +56,18 @@ def common(snapshot, policy, checks):
             raise Unavailable("MACRO_CALENDAR_UNCOVERED")
         checks.gate("macro_event_window", blocked, blocked is False)
     if policy.style == "SWING":
-        covered_through, earnings = snapshot.require("events", "earnings_covered_through", "earnings_sessions")
         end = snapshot.data.session_offset(snapshot.session, policy.horizon)
-        if str(covered_through) < end:
-            raise Unavailable("EARNINGS_HORIZON_UNCOVERED")
-        checks.gate("future_earnings", earnings, not any(snapshot.session <= s <= end for s in earnings))
+        try:
+            covered_through, earnings = snapshot.require("events", "earnings_covered_through", "earnings_sessions")
+            if str(covered_through) < end:
+                raise Unavailable("EARNINGS_HORIZON_UNCOVERED")
+        except Unavailable:
+            if policy.earnings_policy == "required":
+                raise
+            # Optional: without covered earnings the gate is recorded as not applicable, never as passed.
+            checks.values.append(dict(name="future_earnings", value=None, threshold=None, status="NOT_APPLICABLE"))
+        else:
+            checks.gate("future_earnings", earnings, not any(snapshot.session <= s <= end for s in earnings))
 
 
 def daily(snapshot, minimum=253):
@@ -536,8 +543,9 @@ def _scalping(snapshot, policy, state, checks):
     return dict(direction=direction, reference=mid, stop=stop, target=target, anchor=snapshot.at.floor("s").isoformat())
 
 
-def evaluate_research(snapshot: Snapshot, model_id: str, previous_state=None, *, macro_policy="required"):
-    policy = research_policy(model_id, macro_policy)
+def evaluate_research(snapshot: Snapshot, model_id: str, previous_state=None, *, macro_policy="required",
+                      earnings_policy="required"):
+    policy = research_policy(model_id, macro_policy, earnings_policy)
     prior = deepcopy(previous_state or {})
     state = deepcopy(prior)
     checks = Checks()

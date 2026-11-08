@@ -124,14 +124,19 @@ def collapse_alert_rows(rows):
     groups = defaultdict(list)
     for row in rows:
         style = row.get("trade_style") or ("SWING" if row["interval"] == "1d" else "INTRADAY")
-        opportunity = row.get("daily_setup_id") if style == "SWING" and row.get("daily_setup_id") else row.get("triggered_at") or row["alert_id"]
+        opportunity = (row.get("episode_group") or (row.get("daily_setup_id") if style == "SWING" and row.get("daily_setup_id")
+                       else row.get("triggered_at") or row["alert_id"]))
         groups[(row.get("strategy_instance_id"), row["security_id"], row["direction"], style, opportunity)].append(row)
     status_priority = {"OPEN": 5, "PENDING": 4, "UNRESOLVED": 3, "CLOSED": 2, "CLOSED_PAPER": 2, "NO_FILL": 1}
     interval_priority = {"30m": 0, "1h": 1, "1d": 2}
     collapsed = []
     for group in groups.values():
-        primary = max(group, key=lambda row: (status_priority.get(row["status"], 0),
-            timestamp_value(row.get("triggered_at")) or float("-inf"), row["alert_id"]))
+        if any(row.get("episode_group") for row in group):
+            # Repeats add to the alert first reported (Nov 8): its trigger, stop and target stay the row's.
+            primary = min(group, key=lambda row: (timestamp_value(row.get("triggered_at")) or float("inf"), row["alert_id"]))
+        else:
+            primary = max(group, key=lambda row: (status_priority.get(row["status"], 0),
+                timestamp_value(row.get("triggered_at")) or float("-inf"), row["alert_id"]))
         merged = dict(primary)
         variants = sorted(group, key=lambda row: (timestamp_value(row.get("triggered_at")) or float("-inf"),
             interval_priority.get(row["interval"], 99), row["model"], row["alert_id"]))

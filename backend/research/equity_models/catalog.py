@@ -23,10 +23,17 @@ class ResearchPolicy:
     variant: str = "combined"
     max_quote_age_seconds: float = 5.0
     macro_policy: str = "required"
+    # Nov 8: live Stock Alerts runs Swing rules with earnings coverage optional (events are optional there since
+    # Nov 5; the earnings calendar is N/A after Nov 9). The default stays "required"; it is left out of the hash so
+    # every existing registration keeps its policy hash, and an "optional" policy hashes differently.
+    earnings_policy: str = "required"
 
     @property
     def policy_hash(self):
-        return digest(asdict(self))
+        values = asdict(self)
+        if values["earnings_policy"] == "required":
+            values.pop("earnings_policy")
+        return digest(values)
 
 
 def _catalog():
@@ -62,10 +69,12 @@ def _catalog():
 CATALOG = _catalog()
 
 
-def research_policy(model_id, macro_policy="required"):
+def research_policy(model_id, macro_policy="required", earnings_policy="required"):
     if macro_policy not in {"required", "none"}:
         raise ValueError("macro_policy must be required or none")
-    return replace(CATALOG[model_id], macro_policy=macro_policy)
+    if earnings_policy not in {"required", "optional"}:
+        raise ValueError("earnings_policy must be required or optional")
+    return replace(CATALOG[model_id], macro_policy=macro_policy, earnings_policy=earnings_policy)
 
 DEFAULT_MODELS = tuple([f"{name}_{interval}_combined" for name in ("R2", "B3", "F2")
                         for interval in ("30m", "1h")] +

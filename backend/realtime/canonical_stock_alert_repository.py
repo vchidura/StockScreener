@@ -379,6 +379,20 @@ def build_canonical_stock_alert_batch_cursor(
     membership, context_members, context_inputs = (
         canonical_stock_alert_detector_inputs_cursor(cursor, inputs)
     )
+    # Nov 8 (docs/EQUITY_MODEL_LAB_DESIGN.md section 6): the research rules replace the placeholder breakout;
+    # REALTIME_V2_STOCK_ALERT_RULES=PLACEHOLDER brings it back without another image.
+    from .canonical_stock_alert_research import (
+        build_research_rule_batch_cursor,
+        stock_alert_rules,
+    )
+
+    if stock_alert_rules() == "RESEARCH":
+        return build_research_rule_batch_cursor(
+            cursor,
+            receipt,
+            context_inputs=context_inputs,
+            membership=membership,
+        )
     market_events, market_event_coverage = (
         _context_reference_rows_cursor(cursor, context_inputs)
     )
