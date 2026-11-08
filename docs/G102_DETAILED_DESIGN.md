@@ -659,3 +659,48 @@ migrations; deploy; run the pre-open data audit.
 - Any ticker failure shows as DEGRADED for that ticker, not a failed window; no page returns 503 for a reference or
   lineage difference.
 - After the close: the close completes; validator on the pages.
+
+### 8.1 Monday runbook (Nov 8): gates, fallbacks, rules
+
+**What Nov 5-6 lost the days to, and what was added to the rehearsal for it.** The Nov 6 register (B1-B25) has three
+triggers: a scope change (Equity 9 to 25, Options 2 to 9; B4, B5, B6, B8, B9, B15, B16), services running over time
+(start, leases, restarts, day boundary; B1-B3, B11, B14, B17) and live load (B20, B23, B24). Monday keeps Friday's scope
+(Equity 25, Options 9). Added on Nov 8 on top of the replays (4.10):
+
+- **Service start run.** A fresh dump of live (04:41 UTC, read-only), Sunday's database steps with r55 (049-052,
+  harden, audit, backfill), then all 19 backend services from `compose.stable.json` on r55 against that copy under
+  live's name, inside the isolated test server (from that network live's database host and the internet are
+  unreachable; checked), with test credentials, copies of the three volumes and no host ports. All 19 started and
+  waited with a status (Options roles READY_WAITING_FOR_SESSION, OS detectors WAITING_FOR_READY_SESSION, Equity
+  activation pending 2026-11-09 14:15 UTC, finalizer DESIRED_SNAPSHOT_UNAVAILABLE as live), no restart, no error; the
+  statistics step ran; all stopped cleanly (exit 0, about 2 s). The Nov 9 Options preparation (`37d20e26`, Options on 9,
+  CATALOG_QUOTE waiting for the provider window) was left as it was by the new reconcile.
+- **Portal routes.** The 153 GET routes of `runner/api_smoke.py` against the test API and against live's API: the same
+  status on every route (131 OK). Bodies differ on 3: the Options discovery catalog lists the built-in screens (G75);
+  Equity preparation (members' states); `/trading-sessions` lists 260 sessions instead of 283 (the route merges each
+  cohort's list; with A4 every cohort reads the same bars, so the merge is exactly the requested 260 latest).
+- **Not rehearsable on a Sunday:** the provider-window and activation steps on Monday's clock, the stream, and live
+  load. They are the same code paths as Friday except the changes replayed above; the pre-open gate covers them.
+
+**Build guard (Nov 8).** `runner/build_candidate.sh` now copies `research/` (Stock Alert and screening rules) and refuses
+an image whose code differs from the worktree in any backend code folder; its old check missed committed changes in
+folders it did not copy (how G81 in `options/` was missed). r55: all 947 worktree files present and identical.
+
+**Gates.** Deploy Sunday after 20:00 UTC. 13:00 UTC Monday: pre-open audit (preparation READY for Equity 25 and
+Options 9, services healthy, no restarts). Not READY by 13:30 UTC: roll back to Friday's images and run Friday's setup.
+
+**Fallbacks, one per new piece** (each a `deploy_candidate.ps1 -Step hotfix` between windows unless noted; live
+images before the deploy are in `rollout/pre-g102-images-20261108.txt`):
+
+| Piece | Switch off | Effect |
+| --- | --- | --- |
+| G75 breadth | Options scheduler onto `sha256:69a8801dfee1…` (`stable-nov8-r55-fallback-nobreadth`, branch `fallback/breadth-off-nov9`: one function returns DISABLED) | Screener serves published rows only; windows unchanged |
+| G81 OS detectors | `docker stop stock-screener-realtime-v2-advanced-detectors` (as since Nov 6) | No OS1/OS2 rows; nothing else reads them in a window |
+| Page reads (labels, G100, screens) | API onto its pre-deploy image | Reads only; compatible with 049-052 |
+| B20 sweep, crash→wait | Bounded and contained; no switch needed | |
+| A4 (whole bundle) | Stop the writers, `runner/g102_a4_rollback_fill.py --since <deploy time>` (plan, then `--apply`), then the pre-deploy images | Rehearsed Nov 7 (500 pointers restored, rerun a no-op) |
+
+**Rules in session.** Switch a misbehaving piece off and keep the rest running; hotfix in hours only when the Equity or
+Options windows themselves are down; everything else is fixed after the close. No heavy tests or copy rehearsals during
+the session (they slow live windows). **Tuesday** (v4 depth, then 23) goes ahead only if Monday's Options windows ran
+clean; otherwise Tuesday repeats Monday's scope with the fixes.
