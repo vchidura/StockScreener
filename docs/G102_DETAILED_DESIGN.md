@@ -383,10 +383,26 @@ detectors start again with the deploy. G75 (`OPTIONS_COVERAGE_TASK.md`): breadth
 beside the provider's on every row, built-in Unusual-activity screens (`options/screens.py`). Rehearsed on a fresh copy
 hardened like live with the r53 image (r54 adds only the breadth read fix): migrations 049-052 in 0.7 s; hardening
 changes only `rt.bar_head` and the two breadth tables; backfill 432,684 rows in 16 s; the validator passes with 052;
-breadth capture of the 9 Options underlyings 15,612 contracts in 71 requests and 29 s; the Options Screener served SPY
+breadth capture of the 9 Options underlyings 16,612 contracts in 71 requests and 29 s; the Options Screener served SPY
 4,750 rows (8 published, 4,742 breadth) and the Unusual-activity screens 15 calls of 35 and 18 puts of 24, ours and the
 provider's IV on every row (breadth: 0.247 vs 0.242, 0.278 vs 0.274). The rehearsal found one bug, fixed in r54: the
 breadth read assumed tuple rows while the API reads with a dict cursor.
+
+**Final Monday image r55 (Nov 8 00:50 UTC).** `stable-nov8-r55-monday-6d4968d8e02f63e2` =
+`sha256:917680732b9d…`, commit `7e83946` = r54 + B20 (a later window redoes a missed window's 5m bars; the close waits
+for every 5m bar; recovery retries up to 4 times, 10 minutes apart) + crash → wait (B3 controller waits on a refused
+plan, B11 Options scheduler reports a failed cycle and retries, 20 in a row still exit; B9c P8 roles print the root
+cause first). The image differs from r54 in exactly those 6 files; migrations unchanged. Whole rehearsal again on a fresh
+copy of the live dump, all with r55's own code: migrations 049-052 in 0.6 s; audit fails after migrate and passes
+after harden, which changes only `rt.bar_head` and the two breadth tables; final owners and grants identical to the r54
+rehearsal; backfill 432,684 rows in 15.8 s; validator passes with 052; Nov 6 windows at 6 cutoffs and the bar readers
+identical to r54, lineage equal to live 25 of 25; OS detectors 3,800 records (OS1 1,900 and OS2 1,900 over 25 tickers,
+same as r54); breadth 16,612 contracts in 71 requests, SPY 4,750 rows, Unusual activity 15 calls and 18 puts, ours and
+the provider's Greeks on every row; B20 on a clone with the Nov 6 14:45 bars removed: 25 requeued and derived with
+identical revision IDs, a second sweep a no-op. One finding, not a Monday change: run beside the window replays (CPU
+contention), the OS detector replay failed "detector lease is stale or expired" (a 100-record catch-up slice took over
+the 60 s lease); alone it passed. Live only catches up like this after a mid-session restart, committed slices are
+kept, and the next run retries; after Monday consider `--lease-seconds 180` or smaller slices.
 
 ## 5. A1: onboarding, statistics and the bridge query
 
