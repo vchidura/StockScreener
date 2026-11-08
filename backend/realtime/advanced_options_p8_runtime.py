@@ -2026,6 +2026,15 @@ def _claim_service_lease_cursor(
     )
 
 
+def _failure_reason(error: BaseException) -> str:
+    """The innermost cause of a failure, as one short line."""
+    seen = set()
+    while (error.__cause__ or error.__context__) is not None and id(error) not in seen:
+        seen.add(id(error))
+        error = error.__cause__ or error.__context__
+    return f"{type(error).__name__}: {str(error)[:300]}"
+
+
 def run_p8_docker_service(
     kind: AdvancedOptionsProcessKind,
     package_path: Path,
@@ -2136,6 +2145,12 @@ def run_p8_docker_service(
             role_result.update(result)
         except BaseException as error:
             role_failure.append(error)
+            # B9c (Nov 6): the cause was only at the bottom of a chained traceback under "role failed"; it is now
+            # the first line the role writes when it fails.
+            print(json.dumps({
+                "status": "P8_ROLE_FAILED", "kind": kind.value,
+                "reason": _failure_reason(error),
+            }, sort_keys=True), flush=True)
             stop.set()
 
     role_thread = threading.Thread(
@@ -2215,7 +2230,7 @@ def run_p8_docker_service(
             )
             if role_failure:
                 raise RuntimeError(
-                    f"P8 {kind.value} role failed"
+                    f"P8 {kind.value} role failed: {_failure_reason(role_failure[0])}"
                 ) from role_failure[0]
             stop.wait(min(
                 5.0,
@@ -2246,7 +2261,7 @@ def run_p8_docker_service(
             )
         if role_failure:
             raise RuntimeError(
-                f"P8 {kind.value} role failed"
+                f"P8 {kind.value} role failed: {_failure_reason(role_failure[0])}"
             ) from role_failure[0]
         if (
             role_result.get("status") not in {"COMPLETE", "PAUSED"}

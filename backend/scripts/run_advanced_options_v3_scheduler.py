@@ -48,6 +48,9 @@ def parse_args(argv=None):
     return args
 
 
+MAXIMUM_CONSECUTIVE_CYCLE_FAILURES = 20
+
+
 def main(argv=None):
     args = parse_args(argv)
     api_key = str(
@@ -64,6 +67,7 @@ def main(argv=None):
     planner = AdvancedEquityLifecyclePlanner()
     # G74: Equity windows whose Options snapshot was stale; never retried in this process (bounded, newest kept).
     skipped = deque(maxlen=256)
+    failures = 0
     try:
         while not stop.is_set():
             lifecycle = planner.plan(
@@ -71,10 +75,25 @@ def main(argv=None):
                 finality_delay_seconds=ADVANCED_REALTIME_V3_FINALITY_DELAY_SECONDS,
                 completion_budget_seconds=ADVANCED_REALTIME_V3_COMPLETION_BUDGET_SECONDS,
             )
-            result = run_continuous_options_schedule_cycle(
-                provider, session_date=lifecycle.processing_session_date,
-                api_key=api_key, skipped_receipts=frozenset(skipped),
-            )
+            # B11 (Nov 6): any refusal in a cycle raised out of main and Docker restarted the scheduler into a loop;
+            # the cause was only in the traceback. A failed cycle now reports why, waits (backing off) and tries
+            # again; only a run of failures exits, so a broken connection pool is still restarted.
+            try:
+                result = run_continuous_options_schedule_cycle(
+                    provider, session_date=lifecycle.processing_session_date,
+                    api_key=api_key, skipped_receipts=frozenset(skipped),
+                )
+            except Exception as error:  # noqa: BLE001 - reported, retried, bounded
+                failures += 1
+                print(json.dumps({
+                    "status": "CYCLE_FAILED_WAITING", "consecutive_failures": failures,
+                    "reason": f"{type(error).__name__}: {str(error)[:300]}",
+                }, sort_keys=True), flush=True)
+                if failures >= MAXIMUM_CONSECUTIVE_CYCLE_FAILURES:
+                    raise
+                stop.wait(args.poll_seconds * min(failures, 6))
+                continue
+            failures = 0
             if result.get("status") == STALE_SNAPSHOT_SKIPPED:
                 skipped.append(result["equity_receipt_id"])
             print(json.dumps(result, sort_keys=True), flush=True)

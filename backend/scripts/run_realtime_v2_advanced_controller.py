@@ -71,6 +71,7 @@ from realtime.advanced_ingress_plan import (  # noqa: E402
 )
 from realtime.advanced_ingress_repository import (  # noqa: E402
     AdvancedCohortResolutionError,
+    AdvancedIngressAdmissionError,
     advanced_ingress_controller_status_cursor,
     finish_advanced_ingress_plan_cursor,
     load_pinned_advanced_ingress_plan_cursor,
@@ -1720,6 +1721,17 @@ class _HybridRepairCoordinator:
             self.process.wait(timeout=self.lease_seconds)
 
 
+def _wait_for_admissible_plan(stop, plan_id, error, seconds) -> None:
+    """B3 (Nov 6): a BLOCKED plan raised out of main, and Docker restarted the controller 19 times; the real error was
+    only in the tracebacks. The controller now says why it is waiting, waits and checks again, so a fixed or newly
+    admitted plan is picked up without a restart."""
+    print(json.dumps({
+        "status": "WAITING_FOR_ADMISSIBLE_PLAN", "plan_id": str(plan_id), "reason": str(error)[:300],
+        "checked_at": _now().isoformat(),
+    }, sort_keys=True), flush=True)
+    stop.wait(max(1.0, float(seconds)))
+
+
 def main(argv=None) -> int:
     args = parse_args(argv)
     config = RealtimeV2PipelineConfig.from_mapping(
@@ -2053,13 +2065,17 @@ def main(argv=None) -> int:
                     )
                 )
                 continue
-            with provider.transaction(APP_ROLE, read_only=True) as unit:
-                initial_runtime_scope = (
-                    load_advanced_ingress_runtime_plan_cursor(
-                        unit.cursor,
-                        plan.plan_id,
+            try:
+                with provider.transaction(APP_ROLE, read_only=True) as unit:
+                    initial_runtime_scope = (
+                        load_advanced_ingress_runtime_plan_cursor(
+                            unit.cursor,
+                            plan.plan_id,
+                        )
                     )
-                )
+            except AdvancedIngressAdmissionError as error:
+                _wait_for_admissible_plan(stop, plan.plan_id, error, settings.bridge_poll_interval_seconds)
+                continue
             hybrid = _HybridRepairCoordinator(
                 provider,
                 args,
@@ -2250,11 +2266,15 @@ def main(argv=None) -> int:
                         provider, plan.plan_id, "AUTHORIZATION_EXHAUSTED", now,
                     )
                     break
-                with provider.transaction(APP_ROLE, read_only=True) as unit:
-                    runtime_scope = load_advanced_ingress_runtime_plan_cursor(
-                        unit.cursor,
-                        plan.plan_id,
-                    )
+                try:
+                    with provider.transaction(APP_ROLE, read_only=True) as unit:
+                        runtime_scope = load_advanced_ingress_runtime_plan_cursor(
+                            unit.cursor,
+                            plan.plan_id,
+                        )
+                except AdvancedIngressAdmissionError as error:
+                    _wait_for_admissible_plan(stop, plan.plan_id, error, settings.bridge_poll_interval_seconds)
+                    continue
                 if args.external_ingress:
                     stop.wait(settings.bridge_poll_interval_seconds)
                     continue
