@@ -13,6 +13,7 @@ from .advanced_stream_gap_repair import (
     load_stream_gap_repair_scope_cursor,
 )
 from .database_access_v2 import APP_ROLE
+from .equity_bar_repository import load_bar_range_cursor
 from .session_windows import advanced_session_windows
 
 
@@ -51,6 +52,15 @@ def plan_session_windows(
         )
         daily_members = int(cursor.fetchone()[0])
         final_cutoff = windows[-1].cutoff
+        # B20: the raw daily bar is derived from the session's 5m bars, so the close also waits for all of them.
+        five_minute = load_bar_range_cursor(
+            cursor, instrument_ids=members, interval="5m", basis="RAW_UNADJUSTED",
+            start=windows[0].cutoff - timedelta(minutes=5), end=final_cutoff,
+        )
+        expected_five_minute = {window.cutoff for window in windows}
+        missing_five_minute = sum(
+            len(expected_five_minute - {row["bar_end"] for row in rows}) for rows in five_minute.values()
+        ) + len(set(members) - set(five_minute))
         for window in windows:
             recovery = discover_advanced_window_recovery_cursor(
                 cursor,
@@ -74,17 +84,20 @@ def plan_session_windows(
                 window.cutoff == final_cutoff
                 and daily_members != len(members)
             )
+            needs_five_minute = window.cutoff == final_cutoff and missing_five_minute > 0
             rows.append({
                 "cutoff": window.cutoff,
                 "next_attempt": recovery.next_attempt,
                 "latest_state": recovery.latest_state,
                 "missing_minute_coordinates": missing,
-                "ready": missing == 0 and not needs_daily,
+                "ready": missing == 0 and not needs_daily and not needs_five_minute,
                 "waiting_for": (
                     "MISSING_1M_BARS"
                     if missing
                     else "ADJUSTED_DAILY_BAR"
                     if needs_daily
+                    else "MISSING_5M_BARS"
+                    if needs_five_minute
                     else None
                 ),
             })

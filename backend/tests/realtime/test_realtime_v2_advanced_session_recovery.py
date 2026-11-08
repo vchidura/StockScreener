@@ -118,8 +118,10 @@ def test_closing_window_runs_once_its_inputs_exist(monkeypatch, tmp_path):
     assert "--window-key-suffix=-retry4" in arguments
     assert "--retry-release-now" in arguments
     assert "--continuous-publication" in arguments
-    assert state["next_check_at"] is None
-    assert state["finished"] == SESSION
+    # B20 (Nov 6): one attempt ran before the missed 5m bars were derived and nothing tried again. The session is
+    # finished only when the close is complete or the attempts are spent; retries are spaced.
+    assert state["next_check_at"] == LATE_EVENING + scheduler.COMPLETED_SESSION_RETRY_SPACING
+    assert state.get("finished") != SESSION
 
     ran_again = scheduler._recover_completed_session_window(
         _provider(),
@@ -133,6 +135,29 @@ def test_closing_window_runs_once_its_inputs_exist(monkeypatch, tmp_path):
     )
     assert ran_again is False
     runner.assert_called_once()
+
+
+def test_a_failed_recovery_is_tried_again_after_the_spacing(monkeypatch, tmp_path):
+    cutoff = datetime(2026, 11, 2, 21, 0, tzinfo=UTC)
+    ran, runner, state = _recover(monkeypatch, tmp_path, [_row(cutoff)])
+    assert ran is True
+    monkeypatch.setattr(scheduler, "plan_session_windows", lambda *_a, **_k: [_row(cutoff, attempt=5)])
+    monkeypatch.setattr(
+        scheduler, "discover_advanced_window_recovery_cursor",
+        lambda *_a, **_k: SimpleNamespace(next_attempt=5, input_receipt=None, portal_receipt=None),
+    )
+    again = scheduler._recover_completed_session_window(
+        _provider(), _args(tmp_path), _catalog(), CALENDAR, lifecycle=_lifecycle(),
+        now=LATE_EVENING + scheduler.COMPLETED_SESSION_RETRY_SPACING, state=state, window_runner=runner,
+    )
+    assert again is True and runner.call_count == 2
+    assert "--window-key-suffix=-retry5" in runner.call_args.args[0]
+    monkeypatch.setattr(scheduler, "plan_session_windows", lambda *_a, **_k: [])
+    done = scheduler._recover_completed_session_window(
+        _provider(), _args(tmp_path), _catalog(), CALENDAR, lifecycle=_lifecycle(),
+        now=LATE_EVENING + 2 * scheduler.COMPLETED_SESSION_RETRY_SPACING, state=state, window_runner=runner,
+    )
+    assert done is False and state["finished"] == SESSION
 
 
 def test_waiting_window_does_not_spend_an_attempt(monkeypatch, tmp_path):
@@ -151,11 +176,12 @@ def test_attempts_stay_bounded(monkeypatch, tmp_path):
     ran, runner, _state = _recover(
         monkeypatch,
         tmp_path,
-        [_row(datetime(2026, 11, 2, 21, 0, tzinfo=UTC), attempt=6)],
+        [_row(datetime(2026, 11, 2, 21, 0, tzinfo=UTC), attempt=8)],
     )
 
     assert ran is False
     runner.assert_not_called()
+    assert _state["finished"] == SESSION
 
 
 def test_recovery_waits_until_ordinary_retries_are_exhausted(
@@ -295,3 +321,43 @@ def test_bar_groups_still_bound_the_chain():
                 MAXIMUM_HISTORY_BINDING_DEPTH + 1
             ),
         )
+
+
+def test_the_close_waits_for_every_five_minute_bar(monkeypatch):
+    """B20: the raw daily bar is derived from the session's 5m bars; on Nov 6 the close read ready with a 5m hole."""
+    from contextlib import contextmanager
+
+    from realtime import advanced_session_recovery as recovery
+    session = date(2026, 11, 6)
+    windows = recovery.advanced_session_windows(
+        session, finality_delay_seconds=recovery.ADVANCED_REALTIME_V3_FINALITY_DELAY_SECONDS,
+        completion_budget_seconds=recovery.ADVANCED_REALTIME_V3_COMPLETION_BUDGET_SECONDS, serving_lag_seconds=30)
+    final = windows[-1].cutoff
+    hole = windows[2].cutoff
+
+    class _Cursor:
+        def execute(self, *_a):
+            pass
+
+        def fetchone(self):
+            return (2,)  # both members have their adjusted daily bar
+
+    class _Provider:
+        @contextmanager
+        def transaction(self, *_a, **_k):
+            yield SimpleNamespace(cursor=_Cursor())
+
+    monkeypatch.setattr(recovery, "load_stream_gap_repair_scope_cursor", lambda *_a: SimpleNamespace(
+        members=(SimpleNamespace(instrument_id=1), SimpleNamespace(instrument_id=2))))
+    monkeypatch.setattr(recovery, "discover_advanced_window_recovery_cursor", lambda *_a, cutoff, **_k: SimpleNamespace(
+        complete=cutoff != final, next_attempt=4, latest_state="FAILED"))
+    monkeypatch.setattr(recovery, "load_stored_minutes_cursor", lambda *_a, **_k: tuple(range(10)))
+    bars = {1: [{"bar_end": window.cutoff} for window in windows],
+            2: [{"bar_end": window.cutoff} for window in windows if window.cutoff != hole]}
+    monkeypatch.setattr(recovery, "load_bar_range_cursor", lambda *_a, **_k: bars)
+    scope = {"plan_id": UUID(int=1), "cohort_id": UUID(int=2)}
+    (row,) = recovery.plan_session_windows(_Provider(), scope, session, checked_at=final + timedelta(hours=2))
+    assert row["cutoff"] == final and row["ready"] is False and row["waiting_for"] == "MISSING_5M_BARS"
+    bars[2].append({"bar_end": hole})
+    (row,) = recovery.plan_session_windows(_Provider(), scope, session, checked_at=final + timedelta(hours=2))
+    assert row["ready"] is True and row["waiting_for"] is None

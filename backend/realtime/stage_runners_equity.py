@@ -477,7 +477,8 @@ def finalize_five_minute_inputs(
         claim_limit=min(100, len(instrument_ids)),
     )
     reasons: list[str] = []
-    for _ in range((len(instrument_ids) + config.claim_limit - 1) // config.claim_limit + 1):
+    # Two extra rounds: jobs a sweep enqueued for an earlier window (below) may be claimed before this window's own.
+    for _ in range((len(instrument_ids) + config.claim_limit - 1) // config.claim_limit + 3):
         if context.is_cancelled():
             raise StageCancelled("five-minute finalization was cancelled")
         status = run_five_minute_finalizer_once(
@@ -492,11 +493,93 @@ def finalize_five_minute_inputs(
         raise StageCancelled("five-minute finalization was cancelled")
     with database.transaction() as cursor:
         verdict = evaluate_job_barrier_cursor(cursor, barrier_id)
+    swept = sweep_missed_five_minute_windows(
+        database, cohort_id=plan.cohort_id, cutoff=window.cutoff,
+        instrument_ids=instrument_ids, checked_at=checked_at, build_id=build_id,
+    )
+    if swept:
+        reasons.append(MISSED_FIVE_MINUTE_BARS_REQUEUED)
     if verdict.state == "COMPLETE":
         return "COMPLETE", tuple(dict.fromkeys(reasons))
     if verdict.state == "OPEN":
         return "PENDING", (FINALIZER_INPUT_PENDING, *dict.fromkeys(reasons))
     return "FAILED", (FINALIZER_BARRIER_FAILED, *dict.fromkeys(reasons))
+
+
+MISSED_FIVE_MINUTE_BARS_REQUEUED = "MISSED_FIVE_MINUTE_BARS_REQUEUED"
+# A bar this recent may still be in flight from its own window; older ones are redone.
+MISSED_BAR_SETTLE = timedelta(minutes=10)
+MISSED_BAR_SWEEP_SPAN = timedelta(hours=8)
+MAXIMUM_SWEPT_JOBS = 100
+
+
+def sweep_missed_five_minute_windows(
+    database: V2StageDatabase,
+    *,
+    cohort_id,
+    cutoff: datetime,
+    instrument_ids: tuple[int, ...],
+    checked_at: datetime,
+    build_id: str,
+) -> int:
+    """B20 (Nov 6): a MISSED window never ran its finalization, so its 5m bars were never derived; the raw daily bar
+    is derived from the session's 5m bars, so the close failed until a manual fill. Each window now looks at the
+    session's earlier windows and enqueues the same finalizer jobs for every member whose 5m bar is missing and whose
+    1m inputs are complete (the product's own path, as the Nov 6 fill ran it). The finalizer service, or the next
+    window's claim rounds, derive them. Bounded and contained: it never fails or delays this window."""
+    from .equity_bar_repository import load_bar_range_cursor
+    from .equity_interval_finalizer import FiveMinuteFinalizerInputPending
+
+    latest = cutoff - MISSED_BAR_SETTLE
+    try:
+        with database.transaction(read_only=True) as cursor:
+            # Every window and retry has its own plan, so the session's windows are found by cohort: one regular
+            # window per 5-minute cutoff (its first attempt), not the hybrid repair windows at odd minutes.
+            cursor.execute(
+                "SELECT DISTINCT ON (cutoff) window_id,cutoff FROM rt.window_runs WHERE cohort_id=%s "
+                "AND cutoff<=%s AND cutoff>%s AND window_key LIKE 'advanced-%%' ORDER BY cutoff,updated_at",
+                (str(cohort_id), latest, cutoff - MISSED_BAR_SWEEP_SPAN),
+            )
+            earlier = [
+                (UUID(str(row["window_id"] if isinstance(row, dict) else row[0])),
+                 row["cutoff"] if isinstance(row, dict) else row[1])
+                for row in cursor.fetchall()
+            ]
+            if not earlier:
+                return 0
+            present = load_bar_range_cursor(
+                cursor, instrument_ids=instrument_ids, interval="5m", basis="RAW_UNADJUSTED",
+                start=earlier[0][1] - timedelta(minutes=5), end=latest,
+            )
+    except Exception as error:  # noqa: BLE001 - the sweep never fails the window
+        logger.warning("missed 5m sweep could not read cohort %s: %s", cohort_id, error)
+        return 0
+    ends = {instrument: {row["bar_end"] for row in rows} for instrument, rows in present.items()}
+    enqueued = 0
+    for window_id, window_cutoff in earlier:
+        missing = tuple(instrument for instrument in instrument_ids if window_cutoff not in ends.get(instrument, ()))
+        if not missing:
+            continue
+        missing = missing[: max(0, MAXIMUM_SWEPT_JOBS - enqueued)]
+        if not missing:
+            break
+        try:
+            with database.transaction() as cursor:
+                jobs = enqueue_five_minute_finalizer_jobs_cursor(
+                    cursor, cohort_id=cohort_id, window_id=window_id, instrument_ids=missing,
+                    checked_at=checked_at, policy_sha256=FINALIZER_POLICY_SHA256, build_id=build_id,
+                    barrier_id=None,
+                )
+            enqueued += len(jobs)
+            logger.info(
+                "missed 5m bars requeued cohort=%s window=%s cutoff=%s members=%s",
+                cohort_id, window_id, window_cutoff.isoformat(), len(jobs),
+            )
+        except FiveMinuteFinalizerInputPending:
+            continue  # its 1m inputs are not complete yet; a later window tries again
+        except Exception as error:  # noqa: BLE001
+            logger.warning("missed 5m sweep skipped window %s: %s", window_id, error)
+    return enqueued
 
 
 def _cohort_equity_instrument_ids(cursor, cohort_id) -> tuple[int, ...]:

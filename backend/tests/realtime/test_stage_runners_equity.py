@@ -1334,3 +1334,63 @@ def test_the_runner_factories_cover_every_registered_equity_and_options_stage():
     assert STAGES_V2["STOCK_ALERTS"].lane == "alert"
     assert STAGES_V2["EQUITY_PROJECTION"].lane == STAGES_V2["PORTAL_PUBLISH"].lane == "portal"
     assert isinstance(StageOutcome.complete(), StageOutcome)
+
+
+def test_a_later_window_requeues_a_missed_windows_five_minute_bars(monkeypatch):
+    """B20 (Nov 6): the 14:45 window was MISSED, so its 5m bars were never derived and the close failed."""
+    from contextlib import contextmanager
+    from datetime import datetime, timedelta, timezone
+    from types import SimpleNamespace
+    from uuid import UUID
+
+    from realtime import equity_bar_repository, equity_interval_finalizer, stage_runners_equity as runners
+
+    utc = timezone.utc
+    cutoff = datetime(2026, 11, 6, 15, 30, tzinfo=utc)
+    windows = [
+        (UUID(int=1), datetime(2026, 11, 6, 14, 40, tzinfo=utc)),   # missing for instrument 2
+        (UUID(int=2), datetime(2026, 11, 6, 14, 45, tzinfo=utc)),   # complete
+        (UUID(int=3), datetime(2026, 11, 6, 14, 50, tzinfo=utc)),   # missing, but its 1m inputs are pending
+    ]
+    present = {
+        1: [{"bar_end": end} for end in (windows[0][1], windows[1][1])],
+        2: [{"bar_end": windows[1][1]}],
+    }
+
+    class _Cursor:
+        def execute(self, sql, params):
+            self.params = params
+
+        def fetchall(self):
+            return [{"window_id": str(window_id), "cutoff": end} for window_id, end in windows]
+
+    class _Database:
+        @contextmanager
+        def transaction(self, read_only=False):
+            yield _Cursor()
+
+    calls = []
+
+    def enqueue(_cursor, **kwargs):
+        if kwargs["window_id"] == UUID(int=3):
+            raise equity_interval_finalizer.FiveMinuteFinalizerInputPending("1m inputs incomplete")
+        calls.append(kwargs)
+        return tuple(SimpleNamespace() for _ in kwargs["instrument_ids"])
+
+    monkeypatch.setattr(equity_bar_repository, "load_bar_range_cursor", lambda *_a, **_k: present)
+    monkeypatch.setattr(runners, "enqueue_five_minute_finalizer_jobs_cursor", enqueue)
+    count = runners.sweep_missed_five_minute_windows(
+        _Database(), cohort_id=UUID(int=8), cutoff=cutoff, instrument_ids=(1, 2),
+        checked_at=cutoff, build_id="advanced-equity-window-v2",
+    )
+    assert count == 1
+    assert [(call["window_id"], call["instrument_ids"], call["barrier_id"]) for call in calls] == [
+        (UUID(int=1), (2,), None)]
+
+    monkeypatch.setattr(equity_bar_repository, "load_bar_range_cursor",
+                        lambda *_a, **_k: (_ for _ in ()).throw(RuntimeError("database gone")))
+    assert runners.sweep_missed_five_minute_windows(
+        _Database(), cohort_id=UUID(int=8), cutoff=cutoff, instrument_ids=(1, 2),
+        checked_at=cutoff, build_id="advanced-equity-window-v2",
+    ) == 0
+    assert runners.MISSED_BAR_SETTLE == timedelta(minutes=10)

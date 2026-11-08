@@ -64,7 +64,10 @@ from scripts.run_realtime_v2_advanced_equity_window import (  # noqa: E402
 PROJECTION_ONLY = "projection-only"
 CONTINUOUS_PUBLICATION = "continuous-publication"
 COMPLETED_SESSION_RECOVERY_POLL_SECONDS = 60
-COMPLETED_SESSION_EXTRA_ATTEMPTS = 1
+COMPLETED_SESSION_EXTRA_ATTEMPTS = 4
+# B20 (Nov 6): one recovery attempt ran before the missed 5m bars were derived, failed, and nothing tried again.
+# Attempts now repeat, spaced, while the close is incomplete and its inputs read ready.
+COMPLETED_SESSION_RETRY_SPACING = timedelta(minutes=10)
 # A window can take its whole budget, so stop early enough to be idle by the
 # activation boundary at open minus 15 minutes.
 COMPLETED_SESSION_RECOVERY_LEAD = timedelta(minutes=25)
@@ -338,11 +341,15 @@ def _recover_completed_session_window(
     if row is None:
         state["finished"] = session
         return False
-    recovery_attempt = (
+    first_recovery_attempt = settings.scheduler_window_retry_max_attempts + 1
+    last_recovery_attempt = (
         settings.scheduler_window_retry_max_attempts
         + COMPLETED_SESSION_EXTRA_ATTEMPTS
     )
-    if not row["ready"] or row["next_attempt"] != recovery_attempt:
+    if row["next_attempt"] > last_recovery_attempt:
+        state["finished"] = session
+        return False
+    if not row["ready"] or row["next_attempt"] < first_recovery_attempt:
         return False
     with provider.transaction(APP_ROLE) as unit:
         recovery = discover_advanced_window_recovery_cursor(
@@ -381,8 +388,8 @@ def _recover_completed_session_window(
             retry=retry,
         )
     )
-    state["finished"] = session
-    state["next_check_at"] = None
+    # Finished only when a later check finds the close complete (no row) or the attempts are spent.
+    state["next_check_at"] = now + COMPLETED_SESSION_RETRY_SPACING
     return True
 
 
