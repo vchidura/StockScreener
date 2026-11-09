@@ -26,7 +26,6 @@ from realtime.advanced_options_postgres import (
     PostgresAdvancedOptionsCanonicalRuntimePort as Port,
 )
 from realtime.advanced_options_rolling_producer import (
-    MAXIMUM_TOLERATED_GAP_SECONDS,
     AdvancedOptionsRollingProducerEvidence,
     AdvancedOptionsRollingProducerPreflight,
     RollingProducerStatus,
@@ -41,6 +40,7 @@ from realtime.advanced_options_rolling_repository import (
 )
 from realtime.advanced_options_rolling_state import (
     MAXIMUM_EXCLUDED_CONTRACT_SHARE,
+    TOLERATED_STREAM_GAPS,
     AdvancedOptionsWindowRetryDiverged,
     RollingAvailability,
     build_advanced_options_rolling_state,
@@ -121,11 +121,10 @@ def test_no_gap_keeps_the_empty_digest():
     (
         {"open_ended": True},
         {"status": "WARMING"},
-        {"seconds": MAXIMUM_TOLERATED_GAP_SECONDS + 1},
         {"ends_before": -1.0},
         {"ends_before": 0.0},
     ),
-    ids=("open", "warming", "too-long", "ends-after-barrier", "ends-at-barrier"),
+    ids=("open", "warming", "ends-after-barrier", "ends-at-barrier"),
 )
 def test_gap_still_blocks(changes):
     plan = producer._plan()
@@ -137,54 +136,45 @@ def test_gap_still_blocks(changes):
     assert evidence[-1].reason_codes == ("UNRESOLVED_OR_WARMING_STREAM_GAPS",)
 
 
-def _accepted_gap(**changes):
+def _friday_gap(**changes):
+    """The real Nov 6 Options gap: 181 s, after which no Options window completed."""
     return {
-        "gap_start": datetime(2026, 11, 5, 15, 18, 12, 825000, tzinfo=UTC),
-        "gap_end": datetime(2026, 11, 5, 15, 33, 53, 400000, tzinfo=UTC),
+        "gap_start": datetime(2026, 11, 6, 18, 3, 49, 711000, tzinfo=UTC),
+        "gap_end": datetime(2026, 11, 6, 18, 6, 50, 599000, tzinfo=UTC),
         "reason": "GATEWAY_SESSION_CHANGED",
         "recovery_status": "UNRESOLVED",
         **changes,
     }
 
 
-def test_the_accepted_nov_5_gap_stops_blocking_once_it_is_over():
+def test_an_ended_long_gap_stops_blocking_once_it_is_over():
     assert not advanced_options_gap_blocks(
-        _accepted_gap(), datetime(2026, 11, 5, 15, 35, tzinfo=UTC)
+        _friday_gap(), datetime(2026, 11, 6, 18, 30, tzinfo=UTC)
     )
     assert advanced_options_gap_blocks(
-        _accepted_gap(), datetime(2026, 11, 5, 15, 30, tzinfo=UTC)
+        _friday_gap(), datetime(2026, 11, 6, 18, 5, tzinfo=UTC)
     )
 
 
 @pytest.mark.parametrize(
     "changes",
-    (
-        {
-            "gap_start": datetime(2026, 11, 5, 16, 0, tzinfo=UTC),
-            "gap_end": datetime(2026, 11, 5, 16, 10, tzinfo=UTC),
-        },
-        {
-            "gap_start": datetime(2026, 11, 6, 15, 18, 12, 825000, tzinfo=UTC),
-            "gap_end": datetime(2026, 11, 6, 15, 33, 53, 400000, tzinfo=UTC),
-        },
-        {"gap_end": datetime(2026, 11, 5, 15, 34, tzinfo=UTC)},
-        {"reason": "OTHER"},
-        {"recovery_status": "WARMING"},
-        {"gap_end": None},
-    ),
-    ids=("later-that-day", "next-day", "runs-longer", "other-reason", "warming", "open"),
+    ({"recovery_status": "WARMING"}, {"gap_end": None}),
+    ids=("warming", "open"),
 )
-def test_no_other_long_gap_is_accepted(changes):
+def test_a_long_gap_still_blocks_while_it_is_not_over(changes):
     assert advanced_options_gap_blocks(
-        _accepted_gap(**changes), datetime(2026, 11, 7, tzinfo=UTC)
+        _friday_gap(**changes), datetime(2026, 11, 6, 18, 30, tzinfo=UTC)
     )
 
 
-def test_gap_of_exactly_the_limit_is_tolerated():
+def test_a_long_ended_gap_publishes_and_is_named():
     plan = producer._plan()
-    rows = (_gap(plan, seconds=MAXIMUM_TOLERATED_GAP_SECONDS),)
+    evidence = []
+    rows = (_gap(plan, seconds=941),)
 
-    assert _gaps(_RowsCursor(rows), plan, []) is not None
+    assert _gaps(_RowsCursor(rows), plan, evidence) is not None
+    assert evidence[-1].availability is RollingAvailability.READY
+    assert evidence[-1].reason_codes == (TOLERATED_STREAM_GAPS,)
 
 
 def test_postgres_gap_digest_agrees_with_the_rolling_binding():

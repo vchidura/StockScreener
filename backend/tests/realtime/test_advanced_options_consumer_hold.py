@@ -942,6 +942,65 @@ def test_volume_is_not_compared_with_the_last_retained_flow_event():
     assert evidence[-1].availability.value == "READY"
 
 
+def _volume_rows_with_one_baseline(plan, contracts, baseline):
+    return tuple(
+        {
+            "cohort_id": str(plan.control_plane.cohort_id),
+            "session_date": plan.control_plane.session_date,
+            "contract_ticker": row["contract_ticker"],
+            "cumulative_volume": 7_999,
+            "last_source_seq": 41_000,
+            "last_event_time": plan.known_at - timedelta(seconds=1),
+            "baseline_kind": baseline if index == 0 else "SESSION_COMPLETE",
+            "snapshot_volume": None,
+            "snapshot_watermark_seq": None,
+        }
+        for index, row in enumerate(contracts)
+    )
+
+
+def test_an_incomplete_contract_does_not_stop_the_window():
+    plan = producer._plan()
+    contracts = tuple(
+        {"contract_ticker": row.contract_ticker}
+        for row in plan.enrollment.activity_selection.contracts
+    )
+    evidence = []
+
+    assert _volumes(
+        producer._HeadCursor(
+            _volume_rows_with_one_baseline(plan, contracts, "INCOMPLETE")
+        ),
+        plan,
+        contracts,
+        evidence,
+    ) is not None
+    assert "OPTION_VOLUME_CHECKPOINT_INCOMPLETE" not in (
+        evidence[-1].reason_codes
+    )
+
+
+def test_a_warming_contract_still_stops_the_window():
+    plan = producer._plan()
+    contracts = tuple(
+        {"contract_ticker": row.contract_ticker}
+        for row in plan.enrollment.activity_selection.contracts
+    )
+    evidence = []
+
+    assert _volumes(
+        producer._HeadCursor(
+            _volume_rows_with_one_baseline(plan, contracts, "WARMING")
+        ),
+        plan,
+        contracts,
+        evidence,
+    ) is None
+    assert "OPTION_VOLUME_CHECKPOINT_INCOMPLETE" in (
+        evidence[-1].reason_codes
+    )
+
+
 def test_checkpoint_written_after_the_cutoff_is_still_ready():
     plan = producer._plan()
     generation = str(plan.source_flow.journal_generation)

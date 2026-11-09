@@ -65,17 +65,6 @@ from .option_source_flow import (
 
 ROLLING_PRODUCER_VERSION = "advanced-options-rolling-producer-v1"
 _RETRYABLE_POSTGRES_SQLSTATES = frozenset({"40001", "40P01"})
-# A gap this short that has ended no longer blocks a window. Nothing repairs an
-# Options gap, and the feed has been seen to reconnect within seconds.
-MAXIMUM_TOLERATED_GAP_SECONDS = 120
-# The one long gap the user accepted, Nov 5 2026: publish that session with a labelled
-# hole (G68). Restarting acquisition to fix the feed throttle (G63) discarded its backlog.
-# It matches only this gap, so a new long gap that day and every other day still block.
-ACCEPTED_LONG_GAP_SESSION = date(2026, 11, 5)
-ACCEPTED_LONG_GAP_START_FROM = datetime(2026, 11, 5, 15, 18, 12, tzinfo=timezone.utc)
-ACCEPTED_LONG_GAP_START_BEFORE = datetime(2026, 11, 5, 15, 18, 13, tzinfo=timezone.utc)
-ACCEPTED_LONG_GAP_END_BEFORE = datetime(2026, 11, 5, 15, 33, 54, tzinfo=timezone.utc)
-ACCEPTED_LONG_GAP_REASON = "GATEWAY_SESSION_CHANGED"
 OPTION_EVENT_UNDERLYING_NOT_ALIGNED = "OPTION_EVENT_UNDERLYING_NOT_ALIGNED"
 # These evidence rows can be READY and still name what the window tolerated.
 _TOLERATING_EVIDENCE_KINDS = frozenset({
@@ -799,32 +788,19 @@ def advanced_options_unresolved_gaps_sha256(
     ))
 
 
-def _is_accepted_long_gap(row: Mapping[str, object]) -> bool:
-    return (
-        str(row["reason"]) == ACCEPTED_LONG_GAP_REASON
-        and ACCEPTED_LONG_GAP_START_FROM
-        <= row["gap_start"]
-        < ACCEPTED_LONG_GAP_START_BEFORE
-        and row["gap_end"] < ACCEPTED_LONG_GAP_END_BEFORE
-    )
-
-
 def advanced_options_gap_blocks(
     row: Mapping[str, object],
     known_at: datetime,
 ) -> bool:
-    """A gap still open, longer than the limit, not yet over at this window's
-    barrier, or WARMING blocks. Any other stays in the digest and does not block."""
+    """Only a gap still open at this window's barrier, or WARMING, blocks. An ended gap of
+    any length stays in the digest and the window publishes with TOLERATED_STREAM_GAPS naming
+    the hole (user, Nov 9 2026, G68): nothing repairs an Options gap, so blocking on one
+    would end Options for the session."""
     gap_end = row["gap_end"]
     return not (
         str(row["recovery_status"]) == "UNRESOLVED"
         and gap_end is not None
         and gap_end < known_at
-        and (
-            (gap_end - row["gap_start"]).total_seconds()
-            <= MAXIMUM_TOLERATED_GAP_SECONDS
-            or _is_accepted_long_gap(row)
-        )
     )
 
 
@@ -1895,11 +1871,12 @@ def _volumes(
     for row in rows:
         ticker = str(row["contract_ticker"])
         baseline = BaselineKind(str(row["baseline_kind"]))
-        # The accepted gap left these totals short. Each contract's state still says
-        # VOLUME_INCOMPLETE; it just no longer stops that session's windows (G68).
-        if baseline not in COMPLETE_BASELINES and not (
-            baseline is BaselineKind.INCOMPLETE
-            and plan.control_plane.session_date == ACCEPTED_LONG_GAP_SESSION
+        # A gap or a bad print leaves a total short until the next provider snapshot
+        # re-anchors it (about every 5 minutes). The contract's state says
+        # VOLUME_INCOMPLETE; it does not stop the window (user, Nov 9 2026, G68, G72).
+        if (
+            baseline not in COMPLETE_BASELINES
+            and baseline is not BaselineKind.INCOMPLETE
         ):
             reasons.append("OPTION_VOLUME_CHECKPOINT_INCOMPLETE")
         if (

@@ -263,8 +263,9 @@ With the order above, all 200 groups pick exactly what they were published with 
 
 `persist_realtime_equity_bars_cursor` adds an upsert into `rt.bar_head` in the same transaction:
 `ON CONFLICT (instrument_id, interval, bar_start, session_scope, adjustment_basis) DO UPDATE ... WHERE` the new row
-wins by 4.3 and `bar_end` matches (as today). It keeps the `rt.bar_current` upsert for one week (section 2). The
-"one cohort and tier per batch" check stays; it only concerns provenance now.
+wins by 4.3 and `bar_end` matches (as today). As built, the writer is head-only: the `rt.bar_current` upsert was removed
+before the deploy (user, Nov 7: no writes into old tables), so that table holds no bars written after the Nov 8 20:12 UTC
+migration (open work in 4.11). The "one cohort and tier per batch" check stays; it only concerns provenance now.
 
 ### 4.5 Read functions (in `equity_bar_repository.py`)
 
@@ -403,6 +404,34 @@ identical revision IDs, a second sweep a no-op. One finding, not a Monday change
 contention), the OS detector replay failed "detector lease is stale or expired" (a 100-record catch-up slice took over
 the 60 s lease); alone it passed. Live only catches up like this after a mid-session restart, committed slices are
 kept, and the next run retries; after Monday consider `--lease-seconds 180` or smaller slices.
+
+### 4.11 Follow-ups from the Nov 8 review (bars without the cohort)
+
+**Status.** Live since Nov 8: migrations 049-052 applied at 20:12 UTC, 19 backend services on r55, Stock Alerts on r56,
+frontend f18. No market session has run on it yet. The review of the code found the design sound: corrections add a
+revision, only the current row changes, and the selection rule gives the same result in any arrival order. No live path
+needs a change before Monday. The 13:00 UTC pre-open audit (`preopen_smoke.py`, `audit_sessions.py`, `audit_live.ps1`)
+does not read `rt.bar_current`.
+
+**Monday watch (no code).**
+
+- Stream bridge: serialization errors or restarts (see action 4).
+- Pages after the rollover and after the close: changed bars show the "revised" label, and no page refuses. The strict
+  `current` read used by audits still refuses until the page is republished; that is expected.
+
+**Actions.**
+
+| # | Action | Why | When |
+| --- | --- | --- | --- |
+| 1 | Move the v3 scripts off `rt.bar_current`: `audit_advanced_options_v3_operations.py` (the preflight of `run_advanced_realtime_one_shot.py`), `audit_advanced_realtime_v3_post_close_history_source.py`, `export_advanced_realtime_v3_post_close_history.py`, `audit_advanced_options_input_readiness.py`. `_history_coverage` in the first one looks for one cohort holding the whole history, so it needs redesign, not a table rename. Check whether `advanced_options_v3_deployment.py` or `advanced_options_p8_canary_authorization.py`, which list these scripts by path, pin their content | Once Monday's session is in the required range, the preflight reports `REQUIRES_PROVIDER` for history that is in `rt.bar_head`. No live service runs these scripts, so this is not a hotfix | Before the first v3 one-shot run; at the latest with the P8-or-v3 decision |
+| 2 | Move the operator scripts: `runner/recovery_steps_nov6.py` (line 233 counts `rt.bar_current`) and `runner/os_replay.py`. Retire `runner/fix_aapl_live.ps1`, which corrects a row in the old table | A manual close recovery copied from the Nov 6 script would count no Monday bars | `recovery_steps` before it is reused for a close; the rest after Monday |
+| 3 | Move or retire the remaining scripts that read `rt.bar_current`: `audit_advanced_options_v3_history_membership.py`, `audit_realtime_historical_coverage.py`, `audit_realtime_ticker_history.py`, `audit_realtime_v2_exact_backfill.py`, `audit_realtime_v2_target9_scanner_warmup.py`, `inspect_realtime_v2_stage_failures.py`, `inventory_realtime_v2_backfill_source.py`, `repair_realtime_v2_adjusted_daily_from_v1.py`, `repair_realtime_v2_weekly_lineage.py`, `report_realtime_v2_nine_ticker_status.py`; retire `bind_realtime_v2_advanced_history.py` | They will not see bars written after the migration | After Monday, with 4.10 step 6 |
+| 4 | Add a database test with two writers on one bar, at `READ COMMITTED` and `SERIALIZABLE`, and confirm how the live bridge recovers from a serialization error | `test_bar_head_v2_db.py` writes one after another. The bridge uses `SERIALIZABLE`, so a clash aborts its batch and checkpoint together; nothing is half-written, but `run_bridge` has no retry | After Monday |
+| 5 | Standing rule: no test, replay or validation cohort writes bars to the live database; review any journal replay on live before it runs. Consider a guard in the writer | Every cohort now shares one current row per bar, so such a write changes what production reads | Now (rule); guard after Monday |
+| 6 | Convert or delete the runtime modules not used by the live services that still read the old table: `equity_portal_projection_worker.py` (only `run_realtime_v2_incremental_equity.py` imports it) and `equity_v2_backfill_source.py` | They read a table that no longer receives bars | With 4.10 step 6 |
+| 7 | Write the manual bar correction procedure: a correction wins only with a higher source precedence or a later `observed_at`, and the same `bar_end`; otherwise the revision is saved and the head stays. The procedure reads the head back afterwards | The upsert skips a losing row with no error | Before the first manual correction |
+| 8 | Before adding any cohort or catalog cleanup, handle `ON DELETE CASCADE` on `rt.bar_head`: choose the next-best revision instead of losing the key. Also review `with_sources` reads once `rt.bar_revisions` partitions reach the 15-month retention | Deleting the winning revision's catalog row deletes the head row with no fallback. Nothing deletes catalog rows today | Before that cleanup is built |
+| 9 | Drop `rt.bar_current` only after actions 1-3 and 6, and once the A4 rollback is no longer wanted | `runner/g102_a4_rollback_fill.py` writes to that table to restore the old images | Last |
 
 ## 5. A1: onboarding, statistics and the bridge query
 
@@ -686,8 +715,8 @@ triggers: a scope change (Equity 9 to 25, Options 2 to 9; B4, B5, B6, B8, B9, B1
 an image whose code differs from the worktree in any backend code folder; its old check missed committed changes in
 folders it did not copy (how G81 in `options/` was missed). r55: all 947 worktree files present and identical.
 
-**Gates.** Deploy Sunday after 20:00 UTC. 13:00 UTC Monday: pre-open audit (preparation READY for Equity 25 and
-Options 9, services healthy, no restarts). Not READY by 13:30 UTC: roll back to Friday's images and run Friday's setup.
+**Gates.** Deploy Sunday after 20:00 UTC. Options preparation finishes only after the open, because it captures the chain once the session starts (Nov 6: 14:31-14:34 UTC), so at 13:00 UTC Options is expected to be waiting at CATALOG_QUOTE with "history ready". 13:00 UTC Monday: pre-open audit (preparation READY for Equity 25 and
+Options 9, services healthy, no restarts). Not READY by 13:30 UTC: diagnose and fix forward, and start with the READY members if some are still behind at the 14:15 UTC activation (user, Nov 9: development stage, no whole-platform rollback to Friday's images).
 
 **Fallbacks, one per new piece** (each a `deploy_candidate.ps1 -Step hotfix` between windows unless noted; live
 images before the deploy are in `rollout/pre-g102-images-20261108.txt`):
@@ -700,7 +729,7 @@ images before the deploy are in `rollout/pre-g102-images-20261108.txt`):
 | B20 sweep, crash→wait | Bounded and contained; no switch needed | |
 | A4 (whole bundle) | Stop the writers, `runner/g102_a4_rollback_fill.py --since <deploy time>` (plan, then `--apply`), then the pre-deploy images | Rehearsed Nov 7 (500 pointers restored, rerun a no-op) |
 
-**Rules in session.** Switch a misbehaving piece off and keep the rest running; hotfix in hours only when the Equity or
-Options windows themselves are down; everything else is fixed after the close. No heavy tests or copy rehearsals during
+**Rules in session.** Troubleshoot and fix at any time of day: a fix in any service goes in between windows as soon as it is ready (user, Nov 9), nothing waits for the
+close, and nothing stops a role automatically (the watcher's stop rule is log-only). Switching one piece off is a choice made after diagnosis. No heavy tests or copy rehearsals during
 the session (they slow live windows). **Tuesday** (v4 depth, then 23) goes ahead only if Monday's Options windows ran
 clean; otherwise Tuesday repeats Monday's scope with the fixes.
