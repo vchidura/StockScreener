@@ -1828,6 +1828,15 @@ def test_pattern_publication_presorts_views_and_retains_empty_analysis_receipts(
     missing = [replace(empty[0], payload=missing_payload), *empty[1:]]
     unavailable = produce_realtime_pattern_watch_publication(inputs, missing).payload["views"]["1d"]
     assert unavailable["status"] == "UNAVAILABLE" and unavailable["unavailable_tickers"] == [empty[0].snapshot_key]
+    # G102 A2, found Nov 9: a member the projection dropped does not fail the publication for the others.
+    dropped = produce_realtime_pattern_watch_publication(inputs, empty[1:])
+    daily = dropped.payload["views"]["1d"]
+    assert daily["status"] == "COMPLETE" and daily["unavailable_tickers"] == [empty[0].snapshot_key]
+    assert daily["scanned"] == len(empty) - 1 and len(dropped.payload["workspaces"]) == len(empty) - 1
+    with pytest.raises(ValueError, match="Pattern Watch publication requires"):
+        produce_realtime_pattern_watch_publication(inputs, [])
+    with pytest.raises(ValueError, match="Pattern Watch publication requires"):
+        produce_realtime_pattern_watch_publication(inputs, [empty[1], *empty[1:]])
 
 
 def test_pattern_publication_reader_is_stored_only_and_pinned(monkeypatch):

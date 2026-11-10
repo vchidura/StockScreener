@@ -14,6 +14,7 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 from uuid import UUID, uuid4
 
+from psycopg2 import DatabaseError
 from psycopg2.pool import ThreadedConnectionPool
 
 
@@ -58,6 +59,12 @@ CODE_PATHS = (
     BACKEND_DIR / "realtime" / "advanced_equity_detector_shadow.py",
     BACKEND_DIR / "realtime" / "advanced_options_os1_os2_shadow.py",
 )
+
+
+# Nov 9: a SERIALIZABLE write that lost to another transaction crashed the role. Each scope commits on its own and
+# keeps its cursor, so the next cycle simply repeats the scope that lost. A conflict that never clears still fails.
+_RETRYABLE_POSTGRES_SQLSTATES = frozenset({"40001", "40P01"})
+MAXIMUM_CONSECUTIVE_CONFLICTS = 30
 
 
 @dataclass(frozen=True, slots=True)
@@ -389,6 +396,7 @@ def main(argv=None) -> int:
     signal.signal(signal.SIGTERM, lambda *_: stop.set())
     calendar = OptionExchangeCalendar("XNYS")
     code_sha256 = detector_code_sha256()
+    conflicts = 0
     try:
         while not stop.is_set():
             if args.dynamic_scope:
@@ -417,16 +425,32 @@ def main(argv=None) -> int:
             else:
                 cohort_id = args.cohort_id
                 session_date = args.session_date
-            result = run_detector_cycle(
-                provider,
-                cohort_id=cohort_id,
-                session_date=session_date,
-                session_close=calendar.session_close(session_date),
-                owner_id=owner_id,
-                code_sha256=code_sha256,
-                maximum_records=args.maximum_records,
-                lease_seconds=args.lease_seconds,
-            )
+            try:
+                result = run_detector_cycle(
+                    provider,
+                    cohort_id=cohort_id,
+                    session_date=session_date,
+                    session_close=calendar.session_close(session_date),
+                    owner_id=owner_id,
+                    code_sha256=code_sha256,
+                    maximum_records=args.maximum_records,
+                    lease_seconds=args.lease_seconds,
+                )
+            except DatabaseError as error:
+                conflicts += 1
+                if (
+                    error.pgcode not in _RETRYABLE_POSTGRES_SQLSTATES
+                    or conflicts > MAXIMUM_CONSECUTIVE_CONFLICTS
+                ):
+                    raise
+                print(json.dumps({
+                    "status": "RETRYING_WRITE_CONFLICT",
+                    "sqlstate": error.pgcode,
+                    "consecutive_conflicts": conflicts,
+                }, separators=(",", ":"), sort_keys=True), flush=True)
+                stop.wait(args.poll_seconds)
+                continue
+            conflicts = 0
             print(json.dumps(result, separators=(",", ":"), sort_keys=True))
             stop.wait(args.poll_seconds)
         return 0

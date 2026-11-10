@@ -210,7 +210,7 @@ def alert_page(snapshot, *, session=None, view="latest", run=None, search="", di
         style = original.get("trade_style") or ("SWING" if original["interval"] == "1d" else "INTRADAY")
         if (search and search.casefold() not in (original["ticker"] + " " + (original.get("company_name") or "")).casefold()
                 or direction is not None and original["direction"] != direction
-                or model and original["model"] != model or interval and original["interval"] != interval
+                or model and model not in alert_rule_models(original) or interval and original["interval"] != interval
                 or status and original["status"] != status or lane and original["lane"] != lane
                 or trade_type and style != trade_type):
             continue
@@ -262,7 +262,15 @@ def alert_page(snapshot, *, session=None, view="latest", run=None, search="", di
         next_publication_at=snapshot.get("next_publication_at"),
         publication_mode=snapshot.get("publication_mode"), publication_window_start=snapshot.get("publication_window_start"),
         publication_deadline=snapshot.get("publication_deadline"),
-        outcome_policy=snapshot.get("outcome_policy"), indicators_available=snapshot.get("indicators_available", []))
+        outcome_policy=snapshot.get("outcome_policy"), indicators_available=snapshot.get("indicators_available", []),
+        available_models=sorted({rule for item in snapshot.get("alerts", []) for rule in alert_rule_models(item)}))
+
+
+def alert_rule_models(row):
+    """Nov 10: the research rule set names its rule as the alert's model and lists other rules that matched the same
+    stock and side; a model filter matches either, and the page lists what the retained alerts carry."""
+    rules = {row.get("model"), *((item or {}).get("rule") for item in row.get("also_matched") or ())}
+    return {str(rule) for rule in rules if rule}
 
 
 def price_return_fields(row):

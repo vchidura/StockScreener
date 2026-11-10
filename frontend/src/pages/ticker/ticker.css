@@ -562,6 +562,53 @@
   text-transform: uppercase;
 }
 
+/* Financials (Nov 10): statements with periods as columns */
+.ticker-financials-facts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 18px;
+  margin: 0 0 12px;
+  font-size: 11px;
+}
+
+.ticker-financials-facts dt {
+  color: var(--tm-muted);
+  font-size: 9px;
+  font-weight: 800;
+  text-transform: uppercase;
+}
+
+.ticker-financials-facts dd {
+  margin: 0 8px 0 4px;
+  font-variant-numeric: tabular-nums;
+}
+
+.ticker-table--statement {
+  margin-bottom: 14px;
+}
+
+.ticker-table--statement caption {
+  padding: 6px 0;
+  color: var(--tm-ink);
+  font-size: 11px;
+  font-weight: 800;
+  text-align: left;
+}
+
+.ticker-table--statement tbody th {
+  color: var(--tm-ink);
+  background: transparent;
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0;
+  text-transform: none;
+}
+
+.ticker-table--statement td,
+.ticker-table--statement thead th:not(:first-child) {
+  text-align: right;
+}
+
 /* Price ladder */
 .tk-ladder {
   position: relative;

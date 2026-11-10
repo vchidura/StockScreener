@@ -3,6 +3,21 @@
 Status: open, planned for the weekend of Nov 7-8, 2026. Created Nov 6 at the user's request.
 Tracks gap G37 (fundamentals never loaded) in `docs/agent-context/advanced-realtime-integration-gaps.md`.
 
+**Nov 10 (user: "let's address the financials"): statements only, built and rehearsed; in r66 + f21, planned to go
+live before Tuesday's open. Financials is NOT complete: key stats, float and short interest, and dividends need a
+migration (below).**
+- Fetch and store: `realtime/fundamentals_refresh.py`, in the preparation role's after-close slot beside the earnings
+  refresh. The desired revision's companies, one batched request per endpoint (income, balance sheet, cash flow, filing
+  index). Read-only probe on live: 16 of 16 companies, 1,314 reports in 7.7 s (AAPL FY26 Q4: revenue 114.5B, diluted
+  EPS 2.10, as sampled Nov 6). Writes only report and coverage facts; each report points at the member's current stored
+  security revision (no new security revision, no corporate-action coverage).
+- Window cost (copy rehearsal with the recorded rows): 46 ms to load, 26 ms to project; the workspace keeps the newest
+  filing of 12 quarters, 6 fiscal years and 12 TTM periods (about 38 KB per company).
+- Page: `FinancialsView.tsx` and `financialsModel.ts`: Quarterly (default), Annual and TTM; income statement, balance
+  sheet and cash flow with periods as columns, YoY growth, margins, net cash; ETFs say statements do not apply.
+- Not yet: key stats (ratios), float and short interest, dividends section (sections 1, 5, 6); they need storage
+  (new `ref.*` tables, a migration).
+
 ## Why
 
 The ticker page has a Financials tab (`frontend/src/pages/ticker/FinancialsView.tsx`), but it has never shown data:

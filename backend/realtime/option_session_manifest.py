@@ -15,6 +15,7 @@ from options.domain import (
     OptionContractSnapshot,
 )
 
+from .advanced_options_quiet_contracts import quiet_minority_is_valid
 from .contracts import (
     AssetClass,
     MarketChannel,
@@ -201,13 +202,19 @@ class OptionActivitySelectionRecord:
         ):
             raise ValueError("option activity selection quote ceiling is invalid")
         latest_source = max(row.market_data_time for row in contracts)
-        earliest_expiry = min(
-            row.market_data_time + OPTION_ACTIVITY_SELECTION_MAXIMUM_AGE
-            for row in contracts
-        )
+        # Nov 9: a quiet minority may expire before valid_until (advanced_options_quiet_contracts); with none quiet
+        # this is the old valid_until <= earliest expiry.
         if (
             reviewed_at < latest_source
-            or not reviewed_at < valid_until <= earliest_expiry
+            or not reviewed_at < valid_until
+            or not quiet_minority_is_valid(
+                (
+                    (row.underlyer, row.call_put, row.market_data_time)
+                    for row in contracts
+                ),
+                valid_until=valid_until,
+                maximum_age=OPTION_ACTIVITY_SELECTION_MAXIMUM_AGE,
+            )
         ):
             raise ValueError("option activity selection source clocks are invalid")
         policy_sha256 = _activity_sha256(

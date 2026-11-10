@@ -36,6 +36,7 @@ from .advanced_options_mark_producer import (
     freeze_advanced_options_mark_producer_plan,
 )
 from .advanced_options_package_evidence import (
+    PACKAGE_MARK_UNAVAILABLE,
     AdvancedOptionsThresholdEvidence,
     build_flow_observation,
     build_flow_package_evidence,
@@ -379,12 +380,18 @@ def _flow_runtime_policy_sha256(
 
 
 def _package_mark(package, marks, valuation_policy, cutoff):
+    """The package's mark at the cutoff, or None when it cannot be marked (Nov 10: a package that cannot be marked,
+    for a missing, stale or refused quote, is shown with an UNAVAILABLE mark instead of failing the whole window)."""
     mark_by_instrument = {row.instrument_id: row for row in marks}
     quotes = {}
     for leg in package.legs:
         mark = mark_by_instrument.get(leg.instrument_id)
         if mark is None:
-            raise RuntimeError("P8 package mark evidence is unavailable")
+            _LOGGER.warning(
+                "Options package %s not marked at %s: no mark for instrument %s",
+                package.candidate_id, cutoff.isoformat(), leg.instrument_id,
+            )
+            return None
         quotes[mark.instrument_id] = MaterializedQuote(
             journal_generation=mark.journal_generation,
             stream_session_id=mark.stream_session_id,
@@ -415,10 +422,11 @@ def _package_mark(package, marks, valuation_policy, cutoff):
         policy=valuation_policy,
     )
     if result.mark is None:
-        raise RuntimeError(
-            "P8 package mark materialization blocked: "
-            + ",".join(result.reason_codes)
+        _LOGGER.warning(
+            "Options package %s not marked at %s: %s",
+            package.candidate_id, cutoff.isoformat(), ",".join(result.reason_codes),
         )
+        return None
     return result.mark
 
 
@@ -517,7 +525,22 @@ def _evidence_builder(
                     cutoff,
                 )
             )
-            values.append(build_flow_package_evidence(
+            try:
+                values.append(evidence(evaluation, package_mark))
+            except (ValueError, StopIteration) as error:
+                if evaluation.package is None or package_mark is None:
+                    raise
+                # Nov 10: incomplete leg evidence for one selected package records it unmarked instead of failing
+                # every evaluation in the window.
+                _LOGGER.warning(
+                    "Options package %s evidence incomplete at %s (%s); recorded without a mark",
+                    evaluation.package.candidate_id, cutoff.isoformat(), error,
+                )
+                values.append(evidence(evaluation, None, "PACKAGE_EVIDENCE_INCOMPLETE"))
+        return build_flow_package_evidence_batch(cycle, tuple(values))
+
+    def evidence(evaluation, package_mark, *extra_reasons):
+        return build_flow_package_evidence(
                 evaluation,
                 flow_observations=flow_observations,
                 cluster_observations=(),
@@ -547,9 +570,14 @@ def _evidence_builder(
                 degraded_reason_codes=(
                     *rolling.iv_surface.reason_codes,
                     *rolling.degraded_reason_codes,
+                    *(
+                        (PACKAGE_MARK_UNAVAILABLE,)
+                        if evaluation.package is not None and package_mark is None
+                        else ()
+                    ),
+                    *extra_reasons,
                 ),
-            ))
-        return build_flow_package_evidence_batch(cycle, tuple(values))
+            )
 
     return build
 

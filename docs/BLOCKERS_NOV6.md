@@ -1,5 +1,10 @@
 # Blockers found running live on Nov 6 2026 (25 Equity tickers, Options on 9)
 
+> **Frozen Nov 10, 2026. Do not add or update entries here.** Open items are rows in
+> [`g102/G102_IMPLEMENTATION_MATRIX.md`](g102/G102_IMPLEMENTATION_MATRIX.md), the only tracker; the disposition of each
+> B-number is in [`g102/G102_EVIDENCE.md`](g102/G102_EVIDENCE.md), entry "Nov 10 (05:30 UTC): register triage".
+> Statuses below are as of Nov 6-7 (B3, B9c and B11 say "Open" but were verified fixed on Nov 9).
+
 Purpose (user, Nov 6): run the system far enough to find every blocker, then evaluate which checks the system really
 needs and refactor the rest. Each row is a check that stopped or degraded the live run. "First view" is Claude's
 initial assessment for the user's review, not a decision. Root causes for onboarding are in

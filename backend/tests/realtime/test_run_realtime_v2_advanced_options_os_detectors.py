@@ -285,3 +285,74 @@ def test_scope_query_orders_journals_by_creation():
     cursor.fetchall.return_value = ()
     detectors.load_advanced_options_detector_scopes_cursor(cursor, cohort_id=COHORT, session_date=date(2026, 10, 21))
     assert "ORDER BY registry.created_at,registry.journal_generation" in cursor.execute.call_args.args[0]
+
+
+class _WriteConflict(detectors.DatabaseError):
+    @property
+    def pgcode(self):
+        return "40001"
+
+
+class _OtherDatabaseError(detectors.DatabaseError):
+    @property
+    def pgcode(self):
+        return "42P01"
+
+
+def _run_main_with_cycle(monkeypatch, cycle):
+    args = SimpleNamespace(
+        dynamic_scope=False, cohort_id=COHORT, session_date=date(2026, 10, 21),
+        maximum_records=1, lease_seconds=180, poll_seconds=0,
+    )
+    settings = SimpleNamespace(
+        equity_pipeline=detectors.EquityPipeline.MASSIVE_ADVANCED,
+        options_pipeline=detectors.OptionsPipeline.DISABLED,
+    )
+    monkeypatch.setattr(detectors, "parse_args", lambda _argv: args)
+    monkeypatch.setattr(detectors.RealtimeV2PipelineConfig, "from_mapping", lambda *_a, **_k: settings)
+    monkeypatch.setattr(detectors, "_provider", lambda _config: (_Provider(), MagicMock()))
+    monkeypatch.setattr(detectors, "detector_code_sha256", lambda: "a" * 64)
+    monkeypatch.setattr(detectors, "release_detector_leases", lambda *_a, **_k: 0)
+    monkeypatch.setattr(detectors, "OptionExchangeCalendar", lambda _name: MagicMock())
+    monkeypatch.setattr(detectors.signal, "signal", lambda *_a: None)
+    monkeypatch.setattr(detectors, "run_detector_cycle", cycle)
+    return detectors.main([])
+
+
+def test_a_write_conflict_repeats_the_cycle_instead_of_crashing(monkeypatch, capsys):
+    calls = []
+
+    def cycle(*_args, **_kwargs):
+        calls.append(1)
+        if len(calls) == 1:
+            raise _WriteConflict()
+        raise KeyboardInterrupt
+
+    with pytest.raises(KeyboardInterrupt):
+        _run_main_with_cycle(monkeypatch, cycle)
+    assert len(calls) == 2
+    assert '"status":"RETRYING_WRITE_CONFLICT"' in capsys.readouterr().out
+
+
+def test_a_conflict_that_never_clears_still_fails(monkeypatch):
+    calls = []
+
+    def cycle(*_args, **_kwargs):
+        calls.append(1)
+        raise _WriteConflict()
+
+    with pytest.raises(_WriteConflict):
+        _run_main_with_cycle(monkeypatch, cycle)
+    assert len(calls) == detectors.MAXIMUM_CONSECUTIVE_CONFLICTS + 1
+
+
+def test_other_database_errors_are_not_retried(monkeypatch):
+    calls = []
+
+    def cycle(*_args, **_kwargs):
+        calls.append(1)
+        raise _OtherDatabaseError()
+
+    with pytest.raises(_OtherDatabaseError):
+        _run_main_with_cycle(monkeypatch, cycle)
+    assert len(calls) == 1

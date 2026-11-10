@@ -89,6 +89,7 @@ from .advanced_options_reference_repository import (
     PostgresAdvancedOptionsReferenceStateRepository,
 )
 from .advanced_options_flow_policy import load_advanced_options_flow_policy
+from .equity_bar_repository import KNOWN_BY_OBSERVED, load_known_bar_revisions_cursor
 from .option_flow.conditions import load_default_live_semantics
 from .contracts import MarketChannel
 from .database_access import (
@@ -130,6 +131,10 @@ UTC = timezone.utc
 _LOGGER = logging.getLogger(__name__)
 _FAILED_ATTEMPT_LEASE_SECONDS = 60
 BUILD_ID = "advanced-options-p8-live-canary-v1"
+# Selection spots: the latest 1m bar per underlying. The lookback covers a long weekend before a pre-open selection;
+# the key count covers minutes still being written at the known-by time.
+SPOT_LOOKBACK = timedelta(days=10)
+SPOT_LATEST_KEYS = 5
 P8_PRODUCTION_BINDING_SCHEMA = "advanced-options-p8-production-binding-v3"
 
 
@@ -1334,6 +1339,52 @@ def _required_environment(name: str) -> str:
     return value
 
 
+def load_selection_spot_rows_cursor(
+    cursor, *, underlyings, available_before,
+) -> dict[str, dict]:
+    """The latest 1m RAW bar per underlying known by `available_before`
+    (dict cursor), by ticker; an underlying without one is absent.
+
+    G102 A4: by instrument, whatever cohort wrote it. Nov 10 (review R2):
+    through the central known-by read, so a minute corrected after
+    `available_before` is read as it stood then instead of falling back to
+    the minute before."""
+    cursor.execute(
+        "SELECT DISTINCT instrument.instrument_id "
+        "FROM ref.security_revisions AS security "
+        "JOIN rt.instruments AS instrument "
+        "ON instrument.security_id=security.security_id "
+        "AND instrument.contract_id IS NULL "
+        "WHERE security.ticker=ANY(%s)",
+        (list(underlyings),),
+    )
+    instrument_ids = tuple(
+        int(row["instrument_id"]) for row in cursor.fetchall()
+    )
+    loaded = load_known_bar_revisions_cursor(
+        cursor,
+        instrument_ids=instrument_ids,
+        interval="1m",
+        basis="RAW_UNADJUSTED",
+        known_by=available_before,
+        start=available_before - SPOT_LOOKBACK,
+        scopes=("RTH", "EXTENDED", "FULL_DAY"),
+        latest=SPOT_LATEST_KEYS,
+        clocks=KNOWN_BY_OBSERVED,
+    )
+    latest: dict[str, dict] = {}
+    for row in (row for rows in loaded.values() for row in rows):
+        ticker = str(row["ticker"])
+        if ticker not in underlyings:
+            continue
+        current = latest.get(ticker)
+        if current is None or (
+            row["bar_end"], row["observed_at"]
+        ) > (current["bar_end"], current["observed_at"]):
+            latest[ticker] = row
+    return latest
+
+
 class _PostgresSelectionSpots:
     def __init__(
         self,
@@ -1350,29 +1401,14 @@ class _PostgresSelectionSpots:
             dict_cursor=True,
             isolation_level="REPEATABLE READ",
         ) as unit:
-            unit.cursor.execute(
-                "SELECT DISTINCT ON (revision.ticker) revision.ticker,"
-                "revision.close_price,revision.observed_at "
-                # G102 A4: the current bar by instrument from the head, whatever cohort wrote it.
-                "FROM rt.bar_head AS current "
-                "JOIN rt.bar_revisions AS revision "
-                "ON revision.bar_revision_id=current.bar_revision_id "
-                "AND revision.observed_at=current.observed_at "
-                "WHERE revision.ticker=ANY(%s) "
-                "AND current.interval='1m' "
-                "AND current.adjustment_basis='RAW_UNADJUSTED' "
-                "AND revision.observed_at<=%s "
-                "ORDER BY revision.ticker,revision.bar_end DESC,"
-                "revision.observed_at DESC",
-                (
-                    list(underlyings),
-                    available_before,
-                ),
+            latest = load_selection_spot_rows_cursor(
+                unit.cursor,
+                underlyings=underlyings,
+                available_before=available_before,
             )
-            rows = tuple(unit.cursor.fetchall())
         spots = {
-            str(row["ticker"]): Decimal(str(row["close_price"]))
-            for row in rows
+            ticker: Decimal(str(row["close_price"]))
+            for ticker, row in latest.items()
         }
         if set(spots) != set(underlyings):
             raise RuntimeError("P8 retained spot coverage is incomplete")

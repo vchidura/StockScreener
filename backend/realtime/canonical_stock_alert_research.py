@@ -536,10 +536,44 @@ def load_research_inputs_cursor(cursor, inputs: RealtimeScreeningInput,
     covered = {security: all(coverage.get(security, {}).get(kind) is not None
                              and coverage[security][kind] >= inputs.session for kind in ("SPLIT", "DIVIDEND"))
                for security in securities}
+    earnings = load_research_earnings_cursor(cursor, securities, known_by)
     payload, summary = rri.build_research_payload(members, bars, session=inputs.session, as_of=known_by,
-                                                  splits=splits, covered=covered, cohort_id=str(inputs.cohort_id))
+                                                  splits=splits, covered=covered, cohort_id=str(inputs.cohort_id),
+                                                  earnings=earnings)
     return ResearchInputs(rri.CachedResearchData(payload), members, bar_sha256,
-                          {**summary, "actions_covered": sum(covered.values())})
+                          {**summary, "actions_covered": sum(covered.values()), "earnings_covered": len(earnings)})
+
+
+def load_research_earnings_cursor(cursor, securities, known_by) -> dict[str, dict[str, object]]:
+    """G92 (Nov 10): the stored Finnhub earnings each member has valid coverage for, as of `known_by`: the date the
+    coverage reaches and the event dates inside it. A member without valid coverage is absent, so its swing rules read
+    the earnings gate as N/A and still evaluate (RESEARCH_EARNINGS_POLICY optional)."""
+    cursor.execute(
+        "SELECT security_id::text,max(window_end) AS covered_through,array_agg(coverage_id::text) AS coverage_ids "
+        "FROM ref.market_event_coverage WHERE security_id=ANY(%s::uuid[]) AND event_type='EARNINGS' "
+        "AND verdict IN ('COVERED','KNOWN_NO_EVENT') AND checked_at<=%s AND valid_until>%s GROUP BY 1",
+        (securities, known_by, known_by))
+    covered = {row["security_id"]: row for row in _rows(cursor, ("security_id", "covered_through", "coverage_ids"))}
+    if not covered:
+        return {}
+    cursor.execute(
+        "SELECT DISTINCT ON (source,event_key) security_id::text,event_date FROM ref.market_event_revisions AS event "
+        "WHERE security_id=ANY(%s::uuid[]) AND event_type='EARNINGS' AND observed_at<=%s AND received_at<=%s "
+        "AND valid_until>%s AND NOT EXISTS (SELECT 1 FROM ref.market_event_revisions AS newer "
+        "WHERE newer.supersedes_revision_id=event.revision_id AND newer.observed_at<=%s) "
+        "ORDER BY source,event_key,observed_at DESC,revision_id",
+        (list(covered), known_by, known_by, known_by, known_by))
+    dates: dict[str, list] = {}
+    for row in _rows(cursor, ("security_id", "event_date")):
+        dates.setdefault(row["security_id"], []).append(row["event_date"])
+    return {
+        security: {
+            "covered_through": row["covered_through"],
+            "event_dates": sorted(dates.get(security, ())),
+            "coverage_ids": sorted(str(value) for value in row["coverage_ids"] or ()),
+        }
+        for security, row in covered.items()
+    }
 
 
 def research_prior_states_cursor(cursor, *, detector_sha256: str, cohort_id: UUID) -> dict[str, ResearchPriorState]:

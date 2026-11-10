@@ -72,6 +72,7 @@
 .flow-command__measure > span { color: var(--tm-faint); font-size: 9px; font-weight: 800; text-transform: uppercase; }
 .flow-command__context { min-height: 34px; display: flex; align-items: center; gap: 8px; padding: 5px 8px; color: var(--tm-accent); background: var(--tm-accent-soft); border: 1px solid var(--tm-accent); }
 .flow-command__context > svg { flex: 0 0 auto; }
+.flow-coverage-note { margin: 0; padding: 6px 8px; color: var(--tm-muted); background: var(--tm-surface-sunken); border: 1px solid var(--tm-line); font-size: 10px; }
 .flow-command__context > span { display: grid; gap: 1px; color: var(--tm-muted); font-size: 9px; }
 .flow-command__context strong { color: var(--tm-ink); font-size: 10px; }
 

@@ -13,6 +13,8 @@ Prepared November 8, 2026 (updated 08:00 UTC). Status: design for review; nothin
   they run and what alerts they raise, reviewed on the existing Stock Alerts page. No separate worker or page is built
   for this (section 6). Target: Monday Nov 9 before the open, behind a gate.
 - **Live stock quotes and trades** come later through the same Equity pipeline (section 8); not on Monday.
+  *Revised Nov 10 (user): not needed today; each use starts at its trigger (D1/D2 approved, research value, or manual
+  trade execution), and never through the minute-bar journal (section 8.2).*
 - The legacy database is the primary research source; provider downloads fill gaps (approved).
 - P1/P2 (Position) wait for the 400-ticker stage and point-in-time fundamentals.
 - Alert-only, as in the roadmap: no paper entries, simulated fills, positions or broker orders.
@@ -271,19 +273,51 @@ COMPLETE.
   (`advanced_ingress_runtime_profile.py`) accept only `("STOCKS", ("AM",))`; there is no stock-quote consumer or table.
 - Our account is entitled to stock NBBO quotes and trades in real time (verified Nov 8).
 
-### 8.2 Plan
+### 8.2 Purpose and triggers (revised Nov 10)
 
-| Step | Work |
-| --- | --- |
-| Q1 Capacity | Measure one session of NBBO (and separately trades) for the live names from provider history: events per second at peak, journal bytes per day, CPU to journal and derive. Decide names and channels from the numbers |
-| Q2 Connection | Confirm the account's stock connection allowance; decide same socket as `AM` or a separate stocks connection so quote bursts cannot delay minute bars |
-| Q3 Pipeline | Allow `("STOCKS", ("AM", "Q"))` (then `T`) in the runtime profile and Equity ingress; quotes go to the journal; the bars bridge ignores them; a new consumer derives per-second and per-minute quote features (spread, best sizes and imbalance, quote age) into a new table; each evaluation that uses a quote stores that exact quote as evidence; retention for the new table |
-| Q4 Rehearsal | Replay recorded quotes through the pipeline on a copy; verify minute bars and Equity windows are unaffected |
-| Q5 Live | Enable off-hours for a few names (for example SPY, QQQ and five stocks), measure, then widen |
-| Q6 Consumers | D1/D2 live (quote freshness and spread gates), spread-based costs, C1 research |
+The Nov 8 plan (Q1-Q6: capacity, connection, pipeline, rehearsal, live, consumers) built a quote stream about a week
+after Monday. Reviewed Nov 10 against what each use needs, it is replaced by purpose and triggers: **the platform does
+not need live stock trades or quotes today**; each use below starts only when its trigger arrives.
 
-**Not for Monday.** It changes the Equity ingest path that Monday is testing, and Q1-Q4 are several days of work. No
-rule going live on Monday needs quotes. Estimated about one week after Monday, then a staged enable.
+| Use | Runs on today | Needs live stock quotes or trades? | Trigger |
+| --- | --- | --- | --- |
+| Prices on pages (ticker quote, alert current price, P/L) | 1-minute bars, published every 5 minutes | No: the page changes every 5 minutes anyway | None |
+| Stock Alert rules (swing and session rules) | 30-minute, hourly and daily bars | No | None |
+| Spread cost in alert P/L | Not modelled | A cost model from historical quotes is enough for swing horizons on liquid names | Model Lab research |
+| Options pricing | Underlying price from the provider's real-time chain snapshot (`advanced_options_underlying_snapshot.py`, at most 300 s old); option trades and quotes already streamed | Only to shorten the underlying price's age | None |
+| D1/D2 intraday models | Not live | Yes: a fresh quote at each decision for the freshness and spread gates | D1/D2 validated in Model Lab and approved for live |
+| Order-flow features (signed stock volume, quote imbalance) | None | Only if they improve a model | Research on provider history shows value |
+| C1/C2 scalping | Research only | Event-level quotes and trades, latency measurements | An execution project |
+| Manual trade execution | Not built | Yes: the exact live quote of the instrument being executed, at the moment of execution | `TRADE_EXECUTION_FUTURE_DESIGN.md` |
+
+**Order of work.**
+
+1. **Research first, no live data.** In Model Lab, measure the names' spreads from provider history (a cost model for
+   alert P/L) and test whether D1/D2's quote gates and order-flow features change outcomes. This decides whether
+   continuous live data is ever needed, at no risk to live.
+2. **First live use (trigger: D1/D2 approved).** One quote per candidate name at each decision, stored with the alert
+   as evidence. It scales with candidates, not with the universe. REST or a small latest-quote stream is decided then,
+   from two measurements: one session of NBBO and trades from provider history (events per second at peak, bytes per
+   day, decode CPU), and the account's stocks connection allowance.
+3. **A continuous stream only for a validated model that needs it**, in its own journal and process, never in the
+   minute-bar journal, starting with a few names.
+4. **Event-level trades and quotes only with an execution project.**
+
+**Rules for any quote path.**
+
+- Never in the minute-bar journal. The bars bridge reads every journal record in one numbered sequence and keeps only
+  minute bars (`advanced_equity_journal_bridge.py`), and the ingress stops the journal on any unexpected or quarantined
+  record (`advanced_equity_ingress.py`): quotes there would slow bars and one bad quote would halt them. Volume: Nov 9's
+  stocks stream carried 9,738 messages (2 MB) for 25 names; the Options stream carried 3.25 million for 72 contracts.
+- Known-by clocks on every quote (exchange time, receive time, write time), so a rerun reads the quote as it stood at
+  the cutoff (G102 INV-3). Options' `rt.quote_current` keeps only the latest quote and cannot answer that; a decision
+  stores the quote it used.
+- A missing or stale quote makes that name's gate unavailable and says so; it never fails the window (G102 INV-7,
+  INV-9).
+- Only production writes quotes to live (G102 INV-5); every new table has retention.
+- Confirm the account's stocks connection allowance before anything adds a second stocks socket. The legacy stack
+  shares the provider key and its code can open a real-time stocks socket (`equity/polygon_stream.py`), but since Nov 10
+  its worker services are off and it runs only outside market hours, for Model Lab (user).
 
 ## 9. Implementation path
 
@@ -295,8 +329,9 @@ rule going live on Monday needs quotes. Estimated about one week after Monday, t
 | M1 | Model Lab export, action certification, research input, readiness (5.3 steps 1-4) | After S3 | No | Granted (read-only legacy, provider reference data) |
 | M2 | Protocol, controls, evaluation and report (steps 5-8) | After M1 | No | No |
 | M3 | Your decisions per rule | After M2 | Switching rules | Yours |
-| Q1-Q6 | Live stock quotes (8.2) | From about a week after Monday | Yes, staged | Yes |
+| Q | Live stock quotes (8.2): research first; first live use when D1/D2 are approved | At its trigger | Yes, staged | Yes |
 | Later | Native port (7), SW1 live, D1/D2 live, SW2, P1/P2 | - | - | - |
+| X | Manual trade execution (`TRADE_EXECUTION_FUTURE_DESIGN.md`) | Future | Yes (broker) | Yes |
 
 ## 10. Risks
 

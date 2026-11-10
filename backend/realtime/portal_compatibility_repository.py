@@ -563,14 +563,18 @@ class RealtimeOptionFlowRepository(_RealtimeCompatibilityRepository):
                         )
                         if retained is not None:
                             publication, release = retained
-                            return _retained_options_envelope(
-                                publication.read(
-                                underlyer=symbol,
-                                cohort_id=cohort_id,
-                                provider_tier=publication.provider_tier,
-                                scope_sha256=release["scope_sha256"],
+                            return _flow_with_breadth(
+                                cursor,
+                                _retained_options_envelope(
+                                    publication.read(
+                                    underlyer=symbol,
+                                    cohort_id=cohort_id,
+                                    provider_tier=publication.provider_tier,
+                                    scope_sha256=release["scope_sha256"],
+                                    ),
+                                    release,
                                 ),
-                                release,
+                                cutoff=cutoff,
                             )
                     else:
                         from .forward_reader import (
@@ -623,11 +627,70 @@ class RealtimeOptionFlowRepository(_RealtimeCompatibilityRepository):
         }
 
 
-def _option_breadth(cursor, publication, *, cutoff):
-    """G75: the chain's breadth rows for the Screener at the read time, or None (the published rows alone) when they
-    cannot be read; breadth never fails the page."""
+def _optional_read(read: str, *, served: bool, source: str, fallback_source: str, reason_code: str) -> dict:
+    """INV-9 (Nov 10 review R7): what an optional read served, in the response. AVAILABLE when the read succeeded;
+    FALLBACK with a reason code when it failed and its fallback is served (the error itself goes to the log)."""
+    return {
+        "read": read,
+        "status": "AVAILABLE" if served else "FALLBACK",
+        "reason_code": None if served else reason_code,
+        "serving_source": source if served else fallback_source,
+    }
+
+
+def _with_optional_reads(envelope, *reads: dict):
+    """Adds `data.optional_reads` to a page envelope; an envelope without a data object is returned unchanged."""
+    if not isinstance(envelope, Mapping) or not isinstance(envelope.get("data"), Mapping):
+        return envelope
+    data = envelope["data"]
+    return {**envelope, "data": {**data, "optional_reads": [*(data.get("optional_reads") or ()), *reads]}}
+
+
+def _log_optional_read_failure(message: str) -> None:
     import logging
 
+    logging.getLogger(__name__).warning(message, exc_info=True)
+
+
+def _flow_with_breadth(cursor, envelope, *, cutoff):
+    """Nov 10 (user): Flow and Activity show the full listed chain's volume and open interest from breadth in place of
+    the streamed contracts; any failure serves the release as published and says so (INV-9)."""
+    from .advanced_options_breadth import load_breadth_screener_rows_cursor
+    from .option_flow_breadth import breadth_flow_data
+
+    data = envelope.get("data") if isinstance(envelope, Mapping) else None
+    if not isinstance(data, Mapping) or not data.get("underlyers"):
+        return envelope
+    saved = False
+    try:
+        session_value = data.get("session_date") or envelope.get("retained_session_date")
+        session_date = session_value if isinstance(session_value, date) else date.fromisoformat(str(session_value))
+        underlyings = tuple(str(item["underlying"]) for item in data["underlyers"])
+        cursor.execute("SAVEPOINT options_flow_breadth")
+        saved = True
+        rows, captures = load_breadth_screener_rows_cursor(
+            cursor, session_date=session_date, underlyings=underlyings, available_by=cutoff,
+        )
+        cursor.execute("RELEASE SAVEPOINT options_flow_breadth")
+        served = {**envelope, "data": breadth_flow_data(data, rows, captures)}
+        return _with_optional_reads(served, _optional_read(
+            "flow_breadth", served=True, source="BREADTH", fallback_source="RELEASE_ROWS",
+            reason_code="BREADTH_UNAVAILABLE"))
+    except Exception:  # noqa: BLE001 - breadth never fails the page; the response and the log say it fell back
+        if saved:
+            try:
+                cursor.execute("ROLLBACK TO SAVEPOINT options_flow_breadth")
+            except Exception:  # noqa: BLE001
+                _log_optional_read_failure("Options Flow breadth savepoint rollback failed")
+        _log_optional_read_failure("Options Flow breadth unavailable; serving the release's rows")
+        return _with_optional_reads(envelope, _optional_read(
+            "flow_breadth", served=False, source="BREADTH", fallback_source="RELEASE_ROWS",
+            reason_code="BREADTH_UNAVAILABLE"))
+
+
+def _option_breadth(cursor, publication, *, cutoff):
+    """G75: the chain's breadth rows for the Screener at the read time, or None (the published rows alone) when they
+    cannot be read; breadth never fails the page. The caller reports which one was served (INV-9)."""
     from .advanced_options_breadth import load_breadth_screener_rows_cursor
 
     payload = getattr(publication, "_payload", None) or {}
@@ -635,6 +698,7 @@ def _option_breadth(cursor, publication, *, cutoff):
         session_date = date.fromisoformat(str(payload["session_date"]))
         underlyings = tuple(str(item) for item in payload["underlyers"])
     except (KeyError, TypeError, ValueError):
+        _log_optional_read_failure("Options breadth scope missing from the release; serving the release's rows")
         return None
     saved = False
     try:
@@ -650,8 +714,8 @@ def _option_breadth(cursor, publication, *, cutoff):
             try:
                 cursor.execute("ROLLBACK TO SAVEPOINT options_breadth")
             except Exception:  # noqa: BLE001
-                pass
-        logging.getLogger(__name__).warning("Options breadth unavailable; serving the release's rows")
+                _log_optional_read_failure("Options breadth savepoint rollback failed")
+        _log_optional_read_failure("Options breadth unavailable; serving the release's rows")
         return None
 
 
@@ -736,11 +800,14 @@ class RealtimeOptionScreenerRepository(_RealtimeCompatibilityRepository):
                                 "breadth_rows": breadth[0], "breadth_coverage": breadth[1],
                             }),
                         )
-                        return (
-                            _retained_options_envelope(result, release)
-                            if active["provider_tier"]
-                            == "MASSIVE_ADVANCED"
-                            else result
+                        if active["provider_tier"] != "MASSIVE_ADVANCED":
+                            return result
+                        return _with_optional_reads(
+                            _retained_options_envelope(result, release),
+                            _optional_read(
+                                "screener_breadth", served=breadth is not None, source="BREADTH",
+                                fallback_source="RELEASE_ROWS", reason_code="BREADTH_UNAVAILABLE",
+                            ),
                         )
         requested = [request.underlyer] if request.underlyer else []
         return {
@@ -783,9 +850,8 @@ class RealtimeOptionsAlertsPageRepository(_RealtimeCompatibilityRepository):
     def _advanced_session_alerts(cursor, publication, *, cohort_id, cutoff):
         """G102 A0 (G100): the session's alerts from `rt.alert_current` (one per detector and contract, first
         triggered by the release cutoff). None when they cannot be read: the release's own rows are served then, as
-        before. A savepoint keeps a failed lookup from aborting the read's transaction."""
-        import logging
-
+        before, and the caller says so (INV-9). A savepoint keeps a failed lookup from aborting the read's
+        transaction."""
         from .advanced_options_projection import load_options_session_alert_rows_cursor
 
         saved = False
@@ -802,9 +868,31 @@ class RealtimeOptionsAlertsPageRepository(_RealtimeCompatibilityRepository):
                 try:
                     cursor.execute("ROLLBACK TO SAVEPOINT options_session_alerts")
                 except Exception:  # noqa: BLE001
-                    pass
-            logging.getLogger(__name__).warning("Options session alerts unavailable; serving the release's rows")
+                    _log_optional_read_failure("Options session alerts savepoint rollback failed")
+            _log_optional_read_failure("Options session alerts unavailable; serving the release's rows")
             return None
+
+    def _advanced_current_marks_reported(self, cursor, envelope, *, cutoff):
+        """`_advanced_current_marks` under a savepoint, reporting what was served (INV-9): read-time marks from the
+        stored quotes, or the release's marks when the quote read fails."""
+        saved = False
+        try:
+            cursor.execute("SAVEPOINT options_current_marks")
+            saved = True
+            marked = self._advanced_current_marks(cursor, envelope, cutoff=cutoff)
+            cursor.execute("RELEASE SAVEPOINT options_current_marks")
+            served = True
+        except Exception:  # noqa: BLE001 - marks are optional; never fail the alert list
+            if saved:
+                try:
+                    cursor.execute("ROLLBACK TO SAVEPOINT options_current_marks")
+                except Exception:  # noqa: BLE001
+                    _log_optional_read_failure("Options alert current marks savepoint rollback failed")
+            _log_optional_read_failure("Advanced Options alert current marks unavailable; serving the release's marks")
+            marked, served = envelope, False
+        return _with_optional_reads(marked, _optional_read(
+            "current_marks", served=served, source="STORED_QUOTES", fallback_source="RELEASE_MARKS",
+            reason_code="CURRENT_MARKS_UNAVAILABLE"))
 
     def _advanced_current_marks(self, cursor, envelope, *, cutoff):
         """Options alerts v1 (Nov 6, G78 principle): each alert's current price from the stored Options quotes.
@@ -1037,22 +1125,20 @@ class RealtimeOptionsAlertsPageRepository(_RealtimeCompatibilityRepository):
                             from .option_alert_projection import DetectorRunQuery
                             request = DetectorRunQuery(**(query or {}))
                             if advanced:
-                                envelope = publication.detector_runs(
-                                    request,
-                                    session_rows=self._advanced_session_alerts(
-                                        cursor, publication, cohort_id=cohort_id,
-                                        cutoff=min(cutoff, resolved_release.cutoff),
-                                    ),
-                                    **identity,
+                                session_rows = self._advanced_session_alerts(
+                                    cursor, publication, cohort_id=cohort_id,
+                                    cutoff=min(cutoff, resolved_release.cutoff),
                                 )
+                                envelope = _with_optional_reads(
+                                    publication.detector_runs(request, session_rows=session_rows, **identity),
+                                    _optional_read(
+                                        "session_alerts", served=session_rows is not None, source="SESSION_LIST",
+                                        fallback_source="RELEASE_ROWS", reason_code="SESSION_ALERTS_UNAVAILABLE",
+                                    ),
+                                )
+                                envelope = self._advanced_current_marks_reported(cursor, envelope, cutoff=cutoff)
                             else:
                                 envelope = publication.detector_runs(request, **identity)
-                            if advanced:
-                                try:
-                                    envelope = self._advanced_current_marks(cursor, envelope, cutoff=cutoff)
-                                except Exception:  # noqa: BLE001 - marks are optional; never fail the alert list
-                                    import logging
-                                    logging.getLogger(__name__).warning("Advanced Options alert current marks unavailable")
                             return (
                                 _retained_options_envelope(
                                     envelope,

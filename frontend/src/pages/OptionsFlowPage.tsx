@@ -91,7 +91,7 @@ export function TickerBoard({ rows, selected, onSelect }: {
   return (
     <section className="flow-section flow-board">
       <header className="flow-section__header">
-        <div><Radio size={17} /><div><h2>Tracked universe</h2><p>Latest complete matrix for each configured underlying</p></div></div>
+        <div><Radio size={17} /><div><h2>Tracked universe</h2><p>{rows.some(row => row.coverage_source === 'BREADTH') ? 'Full listed chain for each configured underlying · provider day volume and open interest' : 'Latest complete matrix for each configured underlying'}</p></div></div>
         <span>{rows.length} underlyings</span>
       </header>
       <div className="flow-table-wrap">
@@ -242,8 +242,9 @@ export default function OptionsFlowPage() {
           return next
         })}>{data.underlyers.map(row => <option key={row.underlying} value={row.underlying}>{row.underlying} · {row.asset_type}</option>)}</select></label>
         <div className="flow-command__measure"><span>Chart measure</span><ProfileToggle value={profileMetric} onChange={setProfileMetric} /></div>
-        <div className="flow-command__context"><Radio size={15} /><span><strong>{data.session_date ? formatDate(data.session_date) : 'Latest session'}</strong>Selected ticker · latest complete matrix in this exchange session</span></div>
+        <div className="flow-command__context"><Radio size={15} /><span><strong>{data.session_date ? formatDate(data.session_date) : 'Latest session'}</strong>{data.coverage_source === 'BREADTH' ? `Full listed chain (0-60 DTE, strikes within 20% of spot) · provider day volume and open interest · captured ${formatDateTime(data.breadth?.breadth_observed_at)}` : 'Selected ticker · latest complete matrix in this exchange session'}</span></div>
       </section>
+      {data.coverage_source === 'BREADTH' && <p className="flow-coverage-note" role="note">Volume and open interest cover every listed contract in range. Estimated premium activity uses the current quote midpoint. Flow events and alerts come from the {selected?.streamed_contract_count ?? 'streamed'} streamed contracts per underlying.</p>}
 
       {selected && <>
         <section className="flow-summary" aria-label={`${selected.underlying} activity summary`}>
@@ -251,7 +252,7 @@ export default function OptionsFlowPage() {
           <div><span>Put / call volume</span><strong>{formatRatio(selected.put_call_volume_ratio)}</strong><small>P/C open interest {formatRatio(selected.put_call_open_interest_ratio)}</small></div>
           <div><span>Est. premium activity</span><strong>{formatCurrency(selected.total_premium_activity)}</strong><small>{formatPercent(selected.premium_activity_contract_count / Math.max(selected.contract_count, 1))} mark coverage</small></div>
           <div><span>Matched OI change</span><strong>{oiChange ? formatSigned(oiChange.total_open_interest_change) : 'Pending'}</strong><small>{oiChange ? `${formatPercent(oiChange.matched_coverage_fraction)} matched · ${formatDate(oiChange.settlement_session)}` : 'Two settlements required'}</small></div>
-          <div><span>Matrix coverage</span><strong>{selected.contract_count}</strong><small>{selected.expiration_count} expiries · {selected.strike_count} strikes · {formatPercent(selected.retention_fraction)} retained</small></div>
+          <div><span>{selected.coverage_source === 'BREADTH' ? 'Chain coverage' : 'Matrix coverage'}</span><strong>{selected.contract_count}</strong><small>{selected.expiration_count} expiries · {selected.strike_count} strikes · {formatPercent(selected.retention_fraction)} retained</small></div>
         </section>
 
         <div className="flow-profile-grid">

@@ -5,7 +5,7 @@ import ts from 'typescript'
 
 const source = readFileSync(new URL('../src/pages/stockAlertNavigation.ts', import.meta.url), 'utf8')
 const compiled = ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 } })
-const { resolveAlertRoute, alertCombinedResults, alertSourceParams, alertTabParams, alertTradeFilters, alertSort } = await import(`data:text/javascript;base64,${Buffer.from(compiled.outputText).toString('base64')}`)
+const { resolveAlertRoute, alertCombinedResults, alertModelOptions, alertSourceParams, alertTabParams, alertTradeFilters, alertSort } = await import(`data:text/javascript;base64,${Buffer.from(compiled.outputText).toString('base64')}`)
 const presentationSource = readFileSync(new URL('../src/pages/stockAlertPresentation.ts', import.meta.url), 'utf8')
 const presentation = ts.transpileModule(presentationSource, { compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 } })
 const { alertColumnLayout, alertPlanTiming, alertPublicationFacts, alertRiskAssessment, earliestAlertWindow, unavailableAlertProbability } = await import(`data:text/javascript;base64,${Buffer.from(presentation.outputText).toString('base64')}`)
@@ -141,6 +141,13 @@ test('visible trade filters are preserved without mixing legacy or watch models'
   })
   assert.equal(alertTradeFilters(new URLSearchParams('model=legacy_daily&status=OPEN_PAPER')).model, undefined)
   assert.equal(alertTradeFilters(new URLSearchParams('status=OPEN_PAPER')).status, undefined)
+})
+
+test('research rule models filter the trade lane and fill the model list', () => {
+  assert.equal(alertTradeFilters(new URLSearchParams('model=B3_1h_structure')).model, 'B3_1h_structure')
+  assert.equal(alertTradeFilters(new URLSearchParams('model=bad%20value')).model, undefined)
+  assert.deepEqual(alertModelOptions(['B3_1h_structure', 'discovery', 'R2_30m_structure']), ['B3_1h_structure', 'R2_30m_structure'])
+  assert.deepEqual(alertModelOptions(undefined), ['resumption', 'acceptance', 'failure'])
 })
 
 test('an enrolled forward view keeps Day History in the genuine shadow source', () => {

@@ -939,7 +939,11 @@ test('ticker reference, calendar and financial failures are labeled within their
   const rail = compile('pages/ticker/EntityRail.tsx', {
     './tickerShared': { INTERVAL_NOUN: {}, MARKET_TIME_ZONE: 'America/New_York', money: () => '', relativeAge: () => '' },
   })
-  const Financials = compile('pages/ticker/FinancialsView.tsx', { './EntityRail': { compactMoney: rail.compactMoney } }).default
+  // Nov 10 (G37): the Financials page builds its statements in financialsModel.ts.
+  const Financials = compile('pages/ticker/FinancialsView.tsx', {
+    './EntityRail': { compactMoney: rail.compactMoney },
+    './financialsModel': compile('pages/ticker/financialsModel.ts'),
+  }).default
   for (const availabilityError of [failure, null]) {
     const referenceHtml = renderToStaticMarkup(React.createElement(rail.default, {
       profile: null, loading: false, calendar: null, calendarLoading: false, calendarError: false,
@@ -948,17 +952,17 @@ test('ticker reference, calendar and financial failures are labeled within their
     const financialHtml = renderToStaticMarkup(React.createElement(Financials, { profile: null, loading: false, availabilityError }))
     assert.match(referenceHtml, /Reference data/)
     assert.match(referenceHtml, /Event calendar/)
-    assert.match(financialHtml, /Fundamental reports/)
+    assert.match(financialHtml, /Financials/)
     if (availabilityError) {
       assert.equal((referenceHtml.match(/role="alert"/g) ?? []).length, 2)
       assert.equal((referenceHtml.match(/Ticker reference identity changed/g) ?? []).length, 2)
       assert.match(financialHtml, /role="alert"/)
       assert.match(financialHtml, /Ticker reference identity changed/)
       assert.doesNotMatch(referenceHtml, /No published security reference record/)
-      assert.doesNotMatch(financialHtml, /No fundamental reports are stored/)
+      assert.doesNotMatch(financialHtml, /Financial statements are not available yet/)
     } else {
       assert.match(referenceHtml, /No published security reference record/)
-      assert.match(financialHtml, /No fundamental reports are stored/)
+      assert.match(financialHtml, /Financial statements are not available yet/)
       assert.doesNotMatch(referenceHtml + financialHtml, /role="alert"/)
     }
   }

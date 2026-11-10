@@ -60,8 +60,9 @@ ROLLOVER_RETRY_INITIAL_SECONDS = 60
 ROLLOVER_RETRY_MAXIMUM_SECONDS = 900
 # dividend_reference_window treats coverage as stale after one day.
 DIVIDEND_COVERAGE_VALIDITY = timedelta(days=1)
-# Activation normally follows the open by minutes; cover a late first capture.
-DIVIDEND_COVERAGE_NEEDED_AFTER_OPEN = timedelta(hours=2)
+# Nov 9: every Options window reads the coverage, not only activation. The old 2 h after the open let Sunday 18:19
+# coverage stand and it expired at 18:19 Monday, mid-session; cover the close and its recovery (open + 9 h).
+DIVIDEND_COVERAGE_NEEDED_AFTER_OPEN = timedelta(hours=9)
 # Long enough to renew on a Friday evening what would expire over the weekend.
 IDENTITY_RENEWAL_MARGIN = timedelta(days=3)
 ADJUSTED_INTERVALS = {
@@ -84,14 +85,14 @@ def dividend_coverage_refresh_due(
     checked_at: datetime,
     session_open: datetime,
 ) -> bool:
-    """A refresh is due only when one made now would last through activation."""
+    """Missing coverage is due at once; otherwise a refresh is due only when one made now would last through the
+    session's close."""
+    if received_at is None:
+        return True
     needed_through = session_open + DIVIDEND_COVERAGE_NEEDED_AFTER_OPEN
     if checked_at + DIVIDEND_COVERAGE_VALIDITY <= needed_through:
         return False
-    return (
-        received_at is None
-        or received_at + DIVIDEND_COVERAGE_VALIDITY <= needed_through
-    )
+    return received_at + DIVIDEND_COVERAGE_VALIDITY <= needed_through
 
 
 @dataclass(frozen=True, slots=True)
@@ -661,7 +662,13 @@ def _rollover_claim(
         "history_through_session": plan.completed_session_date.isoformat(),
     }
     if reference:
-        target["window_start"] = plan.completed_session_date.isoformat()
+        # Nov 9: the window started at the completed session, so the adapter fell back to 180 days and each nightly
+        # refresh re-recorded any split from that span (CRWD's July split) under a coverage row too narrow for
+        # screening's 283 sessions; the wide row was then older than the newest split copy and screening dropped the
+        # ticker. Cover the same span as preparation, the first retained adjusted session onward.
+        target["window_start"] = build_realtime_equity_portal_history_plan(
+            plan.completed_session_date,
+        ).adjusted_sessions[0].isoformat()
         target["window_end"] = plan.target_session_date.isoformat()
     else:
         target["interval_sessions"] = {

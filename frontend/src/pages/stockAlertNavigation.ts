@@ -11,6 +11,17 @@ export function alertSort(params: URLSearchParams, view: AlertView) {
 
 export const tradeAlertModels = ['resumption', 'acceptance', 'failure']
 export const tradeAlertStatuses = ['PENDING', 'OPEN', 'CLOSED', 'NO_FILL', 'UNRESOLVED']
+// Nov 10: research rules (e.g. B3_1h_structure) are alert models too; the page lists the ones the retained alerts carry.
+const alertModelPattern = /^[A-Za-z0-9_.-]{1,80}$/
+// Watch and legacy models never filter the trade lane (old links must not silently hide trade alerts).
+const nonTradeModels = ['discovery', 'legacy_daily']
+
+const isTradeModel = (model: string) => alertModelPattern.test(model) && !nonTradeModels.includes(model)
+
+export function alertModelOptions(available?: string[] | null) {
+  const listed = (available || []).filter(isTradeModel)
+  return listed.length ? listed : tradeAlertModels
+}
 
 export function alertTradeFilters(params: URLSearchParams) {
   const direction = params.get('direction')
@@ -19,7 +30,7 @@ export function alertTradeFilters(params: URLSearchParams) {
   return {
     lane: 'TRADE' as const,
     direction: direction === '1' || direction === '-1' ? direction : undefined,
-    model: model && tradeAlertModels.includes(model) ? model : undefined,
+    model: model && isTradeModel(model) ? model : undefined,
     status: status && tradeAlertStatuses.includes(status) ? status : undefined,
   }
 }

@@ -1,7 +1,7 @@
 """Live input for the research equity rules (docs/EQUITY_MODEL_LAB_DESIGN.md section 6).
 
 Builds the `equity_research_dataset_v1` input that `research.equity_models` evaluates, from the realtime database:
-completed 30m and full-hour RAW bars and ADJUSTED daily bars from `rt.bar_head` (point in time), split evidence for
+completed 30m and full-hour RAW bars and ADJUSTED daily bars from the bar head (point in time), split evidence for
 continuity segments, and prior-day facts (eligibility, benchmarks, relative strength). The research code is run
 unchanged, so live decisions are the decisions Model Lab evaluates offline. Read-only; no provider calls.
 """
@@ -194,9 +194,41 @@ def daily_facts(members: Sequence[ResearchMember], daily: Mapping[int, Sequence[
     return facts
 
 
+def earnings_facts(members: Sequence[ResearchMember], earnings: Mapping[str, Mapping[str, object]], *,
+                   session: date, prior_close: datetime, valid_until: datetime, calendar) -> list[dict]:
+    """G92 (Nov 10): an `events` fact for each stock with valid Finnhub coverage: the last date covered and the
+    sessions an earnings date can move (the date itself and the next session, since the stored date does not say
+    whether the report is before the open or after the close). A stock without coverage gets no fact, so its swing
+    rules read the earnings gate as N/A and still evaluate."""
+    facts = []
+    for member in members:
+        record = earnings.get(member.security_id)
+        if not member.is_stock or record is None or record.get("covered_through") is None:
+            continue
+        sessions = set()
+        for value in record.get("event_dates") or ():
+            day = pd.Timestamp(str(value)[:10])
+            if calendar.is_session(day):
+                sessions.add(day.date().isoformat())
+            following = calendar.date_to_session(day, direction="next")
+            if following == day:
+                following = calendar.session_offset(day, 1)
+            sessions.add(following.date().isoformat())
+        facts.append(dict(
+            security_id=member.security_id, source_id=f"events:{member.security_id}:{session.isoformat()}",
+            revision="1", kind="events", market_at=prior_close.isoformat(), available_at=prior_close.isoformat(),
+            received_at=prior_close.isoformat(), valid_until=valid_until.isoformat(), methodology=FACT_METHODOLOGY,
+            input_ids=list(record.get("coverage_ids") or ()) or [member.security_id],
+            values=dict(earnings_covered_through=str(record["covered_through"])[:10],
+                        earnings_sessions=sorted(sessions)),
+        ))
+    return facts
+
+
 def build_research_payload(members: Sequence[ResearchMember], bars: Mapping[str, Mapping[int, Sequence[Mapping]]],
                            *, session: date, as_of: datetime, splits: Mapping[str, list[date]],
-                           covered: Mapping[str, bool], cohort_id: str) -> tuple[dict, dict]:
+                           covered: Mapping[str, bool], cohort_id: str,
+                           earnings: Mapping[str, Mapping[str, object]] | None = None) -> tuple[dict, dict]:
     """The research input for one decision session, and a summary of what was left out."""
     calendar = exchange_calendars.get_calendar("XNYS")
     validator = CachedResearchData({"schema": DATASET_SCHEMA, "availability_mode": "OBSERVED"})
@@ -213,6 +245,8 @@ def build_research_payload(members: Sequence[ResearchMember], bars: Mapping[str,
     valid_until = calendar.session_close(pd.Timestamp(session)).to_pydatetime().astimezone(UTC) + timedelta(hours=1)
     facts = daily_facts(members, bars.get("1d", {}), session=session, prior_close=prior_close,
                         valid_until=valid_until, covered=covered, cohort_id=cohort_id)
+    facts.extend(earnings_facts(members, earnings or {}, session=session, prior_close=prior_close,
+                                valid_until=valid_until, calendar=calendar))
     payload = {
         "schema": DATASET_SCHEMA, "availability_mode": "OBSERVED",
         "evaluation_start": calendar.session_open(pd.Timestamp(session)).isoformat(),

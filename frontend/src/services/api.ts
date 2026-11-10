@@ -2383,6 +2383,9 @@ export interface OptionFlowSummary {
   put_call_volume_ratio: number | null
   put_call_open_interest_ratio: number | null
   open_interest_change: OptionFlowOpenInterestChange | null
+  /** Nov 10: BREADTH when the row covers the full listed chain rather than the streamed contracts. */
+  coverage_source?: 'BREADTH'
+  streamed_contract_count?: number | null
 }
 
 export interface OptionFlowExpiration {
@@ -2438,6 +2441,8 @@ export interface OptionFlowData {
   expirations: OptionFlowExpiration[]
   strikes: OptionFlowStrike[]
   top_contracts: OptionFlowContract[]
+  coverage_source?: 'BREADTH'
+  breadth?: { breadth_state?: string; breadth_observed_at?: string; breadth_contracts?: number }
   directional_flow_available: false
   quote_liquidity: 'NOT_AVAILABLE'
   trade_tape_scope: 'EXCLUDED_FROM_TOTALS_WATCHLIST_BIASED'

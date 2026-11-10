@@ -15,6 +15,7 @@ from realtime.advanced_options_cycle import (
     run_advanced_options_cycle,
 )
 from realtime.advanced_options_package_evidence import (
+    PACKAGE_MARK_UNAVAILABLE,
     AdvancedOptionsThresholdEvidence,
     build_cluster_observation,
     build_flow_observation,
@@ -428,6 +429,29 @@ def test_selected_evidence_rejects_missing_mark_or_threshold_drift():
         )
     with pytest.raises(ValueError, match="threshold verdict"):
         replace(_thresholds(), passed=False)
+
+
+def test_selected_package_that_could_not_be_marked_is_recorded_without_a_mark():
+    """Nov 10: an unmarkable package no longer fails the whole Options window; it claims nothing mark-derived."""
+    reference, rolling, _, flow, cluster = _inputs()
+    package, _, _ = _package_and_mark()
+    evaluation = AdvancedOptionsDetectorEvaluation(
+        EVALUATION, DATASET, EVENT, DetectorFamily.O1, "SPY", "SELECTED", NOW, "f" * 64, {"native": "O1"}, package,
+    )
+    common = dict(
+        flow_observations=(flow,), cluster_observations=(cluster,), threshold_evidence=_thresholds(),
+        reference_state=reference, rolling_state=rolling, package_mark=None,
+    )
+
+    evidence = build_flow_package_evidence(
+        evaluation, **common, degraded_reason_codes=(PACKAGE_MARK_UNAVAILABLE,),
+    )
+
+    assert evidence.selection_status == "SELECTED"
+    assert evidence.package == package
+    assert evidence.package_mark is None and evidence.package_leg_evidence == ()
+    with pytest.raises(ValueError, match="selected package evidence"):
+        build_flow_package_evidence(evaluation, **common)
 
 
 def test_evidence_batch_covers_every_cycle_evaluation_exactly():

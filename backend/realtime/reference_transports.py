@@ -417,11 +417,18 @@ class FinnhubReferenceTransport(_BoundedReferenceTransport):
         self.maximum_window_days = maximum_window_days
         self.sleep = sleep
 
-    def fetch(self, start: object, end: object) -> tuple[Mapping[str, object], ...]:
+    def fetch(
+        self, start: object, end: object, *, symbol: str | None = None,
+    ) -> tuple[Mapping[str, object], ...]:
+        """`symbol` (Nov 10, G92): one company's calendar. The market-wide call returns at most 1,500 rows, newest
+        first, so a busy window silently lost its earliest days; per-symbol calls cannot be cut short that way."""
         window_start = date.fromisoformat(str(start))
         window_end = date.fromisoformat(str(end))
         if window_end < window_start:
             raise ValueError("Finnhub earnings window is invalid")
+        wanted = None if symbol is None else symbol.strip().upper()
+        if wanted is not None and not wanted:
+            raise ValueError("Finnhub earnings symbol is empty")
         rows = []
         chunk_start = window_start
         request_count = 0
@@ -432,16 +439,17 @@ class FinnhubReferenceTransport(_BoundedReferenceTransport):
             )
             if request_count:
                 self.sleep(FINNHUB_REQUEST_INTERVAL_SECONDS)
-            payload = self._json(
-                self.url,
-                {"from": chunk_start.isoformat(), "to": chunk_end.isoformat()},
-                self.headers,
-            )
+            params = {"from": chunk_start.isoformat(), "to": chunk_end.isoformat()}
+            if wanted is not None:
+                params["symbol"] = wanted
+            payload = self._json(self.url, params, self.headers)
             chunk = self._admit_rows(payload.get("earningsCalendar"), "Finnhub earnings")
             for row in chunk:
                 symbol = row.get("symbol")
                 if not isinstance(symbol, str) or not symbol.strip():
                     raise ValueError("Finnhub earnings row has no symbol")
+                if wanted is not None and symbol.strip().upper() != wanted:
+                    raise ValueError("Finnhub earnings row belongs to another symbol")
                 try:
                     report_date = date.fromisoformat(str(row.get("date") or ""))
                 except ValueError as exc:

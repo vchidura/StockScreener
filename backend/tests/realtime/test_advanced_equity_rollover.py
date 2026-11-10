@@ -69,11 +69,25 @@ def test_refresh_waits_when_it_would_expire_before_the_session():
     )
 
 
-def test_refresh_becomes_due_once_it_would_last_through_the_session_start():
+def test_refresh_becomes_due_once_it_would_last_through_the_session_close():
+    # Nov 9: a Sunday 17:00-18:19 refresh expired mid-session Monday, failing an Options window.
+    assert not dividend_coverage_refresh_due(
+        datetime(2026, 11, 6, 21, 6, tzinfo=UTC),
+        checked_at=datetime(2026, 11, 8, 18, 19, tzinfo=UTC),
+        session_open=MONDAY_OPEN,
+    )
     assert dividend_coverage_refresh_due(
         datetime(2026, 11, 6, 21, 6, tzinfo=UTC),
-        checked_at=datetime(2026, 11, 8, 17, 0, tzinfo=UTC),
+        checked_at=datetime(2026, 11, 8, 23, 45, tzinfo=UTC),
         session_open=MONDAY_OPEN,
+    )
+
+
+def test_coverage_that_would_expire_before_the_close_is_refreshed_overnight():
+    assert dividend_coverage_refresh_due(
+        datetime(2026, 11, 9, 18, 19, tzinfo=UTC),
+        checked_at=datetime(2026, 11, 9, 23, 45, tzinfo=UTC),
+        session_open=datetime(2026, 11, 10, 14, 30, tzinfo=UTC),
     )
 
 
@@ -117,6 +131,10 @@ def test_reference_claim_uses_the_completed_session_as_its_as_of():
     assert claim.stage is EquityPreparationStage.REFERENCE
     assert claim.target["history_through_session"] == "2026-11-02"
     assert "interval_sessions" not in claim.target
+    # Nov 9 (CRWD): the refreshed split coverage spans screening's retained history, not the adapter's 180 days.
+    start = date.fromisoformat(claim.target["window_start"])
+    assert start == build_realtime_equity_portal_history_plan(date(2026, 11, 2)).adjusted_sessions[0]
+    assert (date(2026, 11, 2) - start).days > 365
 
 
 def test_rollover_report_keeps_persisted_retry_time_visible():

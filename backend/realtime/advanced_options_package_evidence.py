@@ -52,6 +52,9 @@ def _sha256(value: str, name: str) -> str:
     return value
 
 
+PACKAGE_MARK_UNAVAILABLE = "PACKAGE_MARK_UNAVAILABLE"
+
+
 def _reasons(values: tuple[str, ...]) -> tuple[str, ...]:
     reasons = tuple(sorted({value.strip().upper() for value in values}))
     if any(not value for value in reasons):
@@ -620,7 +623,23 @@ class AdvancedOptionsFlowPackageEvidence:
             ))
         ):
             raise ValueError("flow-package evidence scope or authority is invalid")
-        if status == "SELECTED":
+        if status == "SELECTED" and self.package_mark is None:
+            # Nov 10: a selected package that could not be marked at the cutoff (missing, stale or refused quote)
+            # is recorded with no mark instead of failing the window; nothing mark-derived may be claimed.
+            if (
+                self.package is None
+                or PACKAGE_MARK_UNAVAILABLE not in reasons
+                or not self.threshold_evidence.passed
+                or tuple(row.leg_index for row in self.package.legs)
+                != tuple(range(len(self.package.legs)))
+                or leg_evidence
+                or self.model_version is not None
+                or self.model_bundle_sha256 is not None
+                or self.valuation_policy_sha256 is not None
+                or self.equity_spot_sha256 is not None
+            ):
+                raise ValueError("selected package evidence is incomplete")
+        elif status == "SELECTED":
             if (
                 self.package is None
                 or self.package_mark is None

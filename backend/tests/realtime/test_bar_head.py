@@ -38,7 +38,11 @@ def test_the_writer_writes_the_head_and_not_the_cohort_table():
     revision = fact.revision
     assert row[:6] == (1, revision.interval, revision.bar_start, revision.session_scope.value,
                        "ADJUSTED" if revision.adjusted else "RAW_UNADJUSTED", str(revision.bar_revision_id))
-    assert row[-2:] == (BAR_SELECTION_POLICY, str(fact.cohort_id))
+    assert row[-3:-1] == (BAR_SELECTION_POLICY, str(fact.cohort_id))
+    # Nov 10: the stored revision's write time, for the conflict clause's winner tuple (one lookup fewer to plan).
+    assert row[-1] == revision.system_observed_at + timedelta(seconds=1)
+    assert statement.count("%s") == len(row) and statement.endswith(
+        repository._head_replaces("EXCLUDED", "rt.bar_head", new_created_at="%s::timestamptz"))
     assert row[10] == revision.system_observed_at and row[19] == revision.payload_sha256
     # rt.bar_current is no longer written (the target design runs Monday).
     assert not isinstance(getattr(cursor, "recorded_current_rows", None), tuple)
@@ -52,8 +56,16 @@ def test_the_selection_order_is_precedence_then_observation_then_tier():
     tier = order.index("CASE WHEN r.provider_tier='MASSIVE_ADVANCED'")
     assert precedence < observed < tier < order.index("r.created_at DESC") < order.index("r.bar_revision_id")
     replaces = repository._head_replaces("n", "o")
-    assert replaces.index("CASE WHEN n.adjustment_basis") < replaces.index("o.observed_at < n.observed_at") \
-        < replaces.index("CASE WHEN n.provider_tier")
+    # Nov 10 (review R1): the upsert compares the whole tuple, including the revisions' write times and ids, as one
+    # row comparison with the ids swapped (the lower id wins a full tie; a revision never beats itself).
+    new_row, old_row = replaces.split(")>ROW(")
+    assert new_row.startswith("ROW(CASE WHEN n.adjustment_basis")
+    assert new_row.index("CASE WHEN n.adjustment_basis") < new_row.index("n.observed_at") \
+        < new_row.index("CASE WHEN n.provider_tier") < new_row.index("revision_clock.bar_revision_id=n.bar_revision_id")
+    assert new_row.endswith(",o.bar_revision_id") and old_row.endswith(",n.bar_revision_id)")
+    assert "revision_clock.bar_revision_id=o.bar_revision_id" in old_row
+    passed = repository._head_replaces("n", "o", new_created_at="%s::timestamptz")
+    assert passed.count("revision_clock") == old_row.count("revision_clock") and "%s::timestamptz" in passed
 
 
 def test_the_backfill_chooses_across_cohorts_and_keeps_existing_rows():
@@ -108,6 +120,50 @@ def test_a_rerun_reads_keys_corrected_after_its_cutoff_from_the_revisions():
     assert "WHERE candidate.observed_at>%(as_of)s" in statement
 
 
+def test_the_known_by_read_keeps_a_corrected_key_and_names_its_clocks():
+    """Nov 10 review R2: the Options equity input, P8 spots and the interval derivation read through one known-by
+    read; a key whose head became known after the cutoff falls back to the revisions instead of dropping out."""
+    cursor = MagicMock()
+    cursor.fetchall.return_value = [dict(_row("3", START), ticker="AAPL")]
+    known_by = START + timedelta(minutes=6)
+    result = repository.load_known_bar_revisions_cursor(
+        cursor, instrument_ids=(3, 4), interval="5m", basis="RAW_UNADJUSTED", known_by=known_by,
+        start=START, end=START + timedelta(hours=1))
+    assert [row["bar_start"] for row in result[3]] == [START] and result[4] == []
+    statement, params = cursor.execute.call_args.args
+    assert params["known_by"] == known_by and params["scopes"] == ["RTH"] and params["ids"] == [3, 4]
+    assert "WHERE (candidate.observed_at<=%(known_by)s) UNION ALL" in statement
+    assert "WHERE NOT (candidate.observed_at<=%(known_by)s)" in statement
+    assert "ORDER BY " + repository._selection_order("revision") + " LIMIT 1" in statement
+    assert "head.bar_end<=%(end)s" in statement and "LATERAL (SELECT head.*" not in statement
+    assert "created_at<=" not in statement  # the observed-only set the Options readers use today
+
+    cursor.reset_mock()
+    cursor.fetchall.return_value = []
+    repository.load_known_bar_revisions_cursor(
+        cursor, instrument_ids=(3,), interval="1m", basis="RAW_UNADJUSTED", known_by=known_by, start=START,
+        scopes=("RTH", "EXTENDED"), latest=5, clocks=repository.KNOWN_BY_ALL_CLOCKS)
+    statement, params = cursor.execute.call_args.args
+    assert "ORDER BY head.bar_start DESC LIMIT %(latest)s" in statement and params["latest"] == 5
+    assert "head.bar_end<=" not in statement
+    for clock in ("candidate.created_at<=%(known_by)s", "candidate.replay_available_at IS NULL OR",
+                  "candidate.provider_published_at IS NULL OR"):
+        assert clock in statement
+
+
+def test_the_known_by_read_refuses_unnamed_clocks_and_naive_times():
+    import pytest
+
+    cursor = MagicMock()
+    for bad in (dict(clocks=("observed_at", "created_at")), dict(known_by=START.replace(tzinfo=None)),
+                dict(scopes=("PRE",)), dict(latest=0)):
+        arguments = dict(instrument_ids=(3,), interval="5m", basis="RAW_UNADJUSTED", known_by=START, start=START)
+        arguments.update(bad)
+        with pytest.raises(ValueError):
+            repository.load_known_bar_revisions_cursor(cursor, **arguments)
+    cursor.execute.assert_not_called()
+
+
 def test_range_reads_group_by_instrument():
     cursor = MagicMock()
     rows = [_row("3", START), _row("3", START + timedelta(minutes=5), revision=2)]
@@ -131,8 +187,7 @@ METADATA = {"realtime/relation_registry.py", "realtime/security.py", "realtime/e
 NOT_YET_CONVERTED = {
     "realtime/advanced_equity_detector_consumer.py", "realtime/advanced_equity_preparation.py",
     "realtime/advanced_gap_repair.py", "realtime/advanced_journal_replay.py",
-    "realtime/advanced_options_equity_input.py", "realtime/advanced_options_native_loader.py",
-    "realtime/advanced_options_os1_os2_shadow.py", "realtime/advanced_options_p8_production.py",
+    "realtime/advanced_options_native_loader.py", "realtime/advanced_options_os1_os2_shadow.py",
     "realtime/advanced_options_projection.py", "realtime/advanced_options_reference_producer.py",
     "realtime/advanced_options_v3_history.py", "realtime/advanced_session_recovery.py",
     "realtime/advanced_stream_gap_repair.py", "realtime/canonical_stock_alert_repository.py",

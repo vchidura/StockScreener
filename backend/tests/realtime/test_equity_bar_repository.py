@@ -55,7 +55,8 @@ def _cursor(fact, *, catalog=True, body=True):
     )
     body_row = (
         revision.bar_revision_id, fact.cohort_id, fact.provider_tier.value,
-        fact.instrument_id, revision.payload_sha256,
+        fact.instrument_id, revision.payload_sha256, revision.system_observed_at,
+        revision.system_observed_at + timedelta(seconds=1),  # created_at
     )
 
     def fetchall():
@@ -87,10 +88,13 @@ def test_current_pointer_tie_goes_to_the_later_write():
     )
 
     # G102 A4: the current bar lives in the head; between equal observations (and tiers) the later write wins.
-    assert (
-        "rt.bar_head.observed_at < EXCLUDED.observed_at OR (rt.bar_head.observed_at = EXCLUDED.observed_at"
-        in cursor.recorded_head_statement
-    )
+    # Nov 10 (review R1): "later" is the revision's own write time in rt.bar_revisions, not the order the upserts
+    # arrive in, so a replay of the earlier revision cannot take the head back.
+    statement = cursor.recorded_head_statement
+    assert "rt.bar_head.bar_end=EXCLUDED.bar_end" in statement
+    assert "revision_clock.bar_revision_id=rt.bar_head.bar_revision_id" in statement  # the head's write time
+    assert "%s::timestamptz,rt.bar_head.bar_revision_id)>ROW(" in statement  # the new revision's, from the writer
+    assert statement.endswith(",EXCLUDED.bar_revision_id)")
 
 
 def test_bar_revision_and_current_pointer_commit_atomically_in_batches():
@@ -243,7 +247,7 @@ def test_current_bar_groups_read_one_ticker_through_the_current_pointer_per_line
     assert "revision.observed_at=cur.observed_at" in statement
     assert "revision.instrument_id=cur.instrument_id" in statement and "revision.interval=cur.interval" in statement
     assert "cur.session_scope='RTH'" in statement and "revision.is_final" in statement
-    assert "ORDER BY cur.interval, cur.adjustment_basis, cur.bar_start" in statement
+    assert "ORDER BY cur.interval,cur.adjustment_basis,cur.bar_start," in statement
     assert statement.count("cur.bar_start>=%s AND cur.bar_end<=%s") == 3
     assert parameters[:5] == (str(cohort), "MASSIVE_DEVELOPER", 7, str(security), "AAPL")
     assert parameters[5:9] == ("5m", "RAW_UNADJUSTED", first, last)

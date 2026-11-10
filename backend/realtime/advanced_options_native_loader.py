@@ -8,6 +8,8 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from enum import Enum
+from functools import lru_cache
+from pathlib import Path
 from typing import Callable, Mapping
 from uuid import NAMESPACE_URL, UUID, uuid5
 
@@ -709,12 +711,40 @@ def _packages_for_events(
 
 
 OPTIONS_ALERT_V1_POLICY = "options-alert-v1-single-contract-entry-nbbo-mid-close-at-session-end"
+# Legacy leg stamp: packages built before Nov 10 carried this and the window, which marks under the session's valuation
+# policy, refused them (PACKAGE_ENTRY_VALUATION_POLICY_MISMATCH, Nov 9). Kept only to recognise such packages.
 OPTIONS_ALERT_V1_VALUATION_SHA256 = canonical_sha256({
     "policy": OPTIONS_ALERT_V1_POLICY,
     "mark": "NBBO_MIDPOINT",
     "side": "BUY",
     "ratio": 1,
 })
+SESSION_VALUATION_POLICY_PATH = (
+    Path(__file__).parents[1] / "options" / "policies" / "valuation_advanced_nbbo_v1.json"
+)
+
+
+@lru_cache(maxsize=1)
+def session_valuation_policy_sha256() -> str:
+    """User's decision, Nov 9: O1 packages are valued under the session's policy, the one the window marks with."""
+    from options.config import load_valuation_policy
+
+    return load_valuation_policy(SESSION_VALUATION_POLICY_PATH).policy_sha256
+
+
+def options_alert_v1_candidate_id(cohort_id, event_id) -> UUID:
+    return uuid5(NAMESPACE_URL, f"stockscreener:options-alert-v1:{cohort_id}:{event_id}")
+
+
+def is_options_alert_v1_package(package) -> bool:
+    if len(package.legs) != 1:
+        return False
+    if package.legs[0].valuation_policy_sha256 == OPTIONS_ALERT_V1_VALUATION_SHA256:
+        return True
+    candidate_id = getattr(package, "candidate_id", None)
+    return candidate_id is not None and candidate_id == options_alert_v1_candidate_id(
+        getattr(package, "cohort_id", None), getattr(package, "event_id", None),
+    )
 
 
 def options_alert_v1_event_package(row, *, cohort_id, matrix_id, session_date, unmarked_instrument_ids=()):
@@ -761,7 +791,7 @@ def options_alert_v1_event_package(row, *, cohort_id, matrix_id, session_date, u
     premium = mid * multiplier
     close = OptionExchangeCalendar().session_close(session_date)
     return RealtimeOptionPackage(
-        candidate_id=uuid5(NAMESPACE_URL, f"stockscreener:options-alert-v1:{cohort_id}:{event_id}"),
+        candidate_id=options_alert_v1_candidate_id(cohort_id, event_id),
         event_id=event_id,
         matrix_id=matrix_id,
         candidate_identity_sha256=canonical_sha256(identity),
@@ -786,7 +816,7 @@ def options_alert_v1_event_package(row, *, cohort_id, matrix_id, session_date, u
             contract_type=contract_type,
             entry_mark=mid,
             entry_market_time=leg_time,
-            valuation_policy_sha256=OPTIONS_ALERT_V1_VALUATION_SHA256,
+            valuation_policy_sha256=session_valuation_policy_sha256(),
         ),),
     )
 

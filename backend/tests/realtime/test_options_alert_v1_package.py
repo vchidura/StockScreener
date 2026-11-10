@@ -5,7 +5,9 @@ from uuid import UUID, uuid4
 
 from realtime.advanced_options_native_loader import (
     OPTIONS_ALERT_V1_VALUATION_SHA256,
+    is_options_alert_v1_package,
     options_alert_v1_event_package,
+    session_valuation_policy_sha256,
 )
 
 COHORT = UUID("b096f5b7-2371-5522-925d-cf4db3912b9c")
@@ -48,7 +50,10 @@ def test_single_contract_package_from_event_quote():
     assert leg.entry_mark == Decimal("2.20")
     assert leg.side.value == "BUY" and leg.ratio == 1 and leg.multiplier == 100
     assert leg.contract_type.value == "CALL" and leg.strike == Decimal("345")
-    assert leg.valuation_policy_sha256 == OPTIONS_ALERT_V1_VALUATION_SHA256
+    # Nov 10: valued under the session's policy, the one the window marks with (user's decision, Nov 9).
+    assert leg.valuation_policy_sha256 == session_valuation_policy_sha256()
+    assert leg.valuation_policy_sha256 != OPTIONS_ALERT_V1_VALUATION_SHA256
+    assert is_options_alert_v1_package(package)
     # Debit is negative by the package convention (SELL +, BUY -); capital at risk is the premium paid.
     assert package.entry_net_premium == Decimal("-220.00")
     assert package.capital_at_risk == Decimal("220.00")
@@ -131,6 +136,28 @@ def test_one_alert_per_contract_in_a_window():
     assert by_id["e4"]["hit_count"] == 1 and by_id["e5"]["hit_count"] == 1 and by_id["e7"]["hit_count"] == 1
 
 
+def test_session_policy_packages_still_group_as_v1_alerts():
+    from types import SimpleNamespace
+
+    from realtime.advanced_options_projection import _session_alert_contract
+
+    package = _build(_row())
+    assert _session_alert_contract(SimpleNamespace(package=package)) == 101
+    stored = SimpleNamespace(
+        legs=package.legs, candidate_id=uuid4(), cohort_id=COHORT, event_id=EVENT,
+    )
+    assert _session_alert_contract(SimpleNamespace(package=stored)) is None
+
+
+def test_package_with_no_mark_is_not_marked_instead_of_failing_the_window():
+    from realtime.advanced_options_p8_window import _package_mark
+    from test_option_portal_adapter import _policy
+
+    package = _build(_row())
+    cutoff = datetime(2026, 11, 6, 17, 0, tzinfo=timezone.utc)
+    assert _package_mark(package, (), _policy(), cutoff) is None
+
+
 def test_put_and_unusable_quotes():
     assert _build(_row(call_put="P")).legs[0].contract_type.value == "PUT"
     assert _build(_row(quote_bid=None)) is None
@@ -138,3 +165,35 @@ def test_put_and_unusable_quotes():
     assert _build(_row(quote_ask=Decimal("2.00"))) is None  # crossed
     assert _build(_row(), unmarked=(9001,)) is None
     assert _build(_row(instrument_id=None)) is None
+
+
+def test_current_marks_report_what_they_served():
+    """INV-9 (Nov 10 review R7): a failed quote read serves the release's marks, rolls back its savepoint and says so."""
+    from realtime.portal_compatibility_repository import RealtimeOptionsAlertsPageRepository
+
+    class Recording(_QuoteCursor):
+        def __init__(self, rows, broken=False):
+            super().__init__(rows)
+            self.statements, self.broken = [], broken
+
+        def execute(self, sql, params=None):
+            self.statements.append(sql)
+            if sql.startswith(("SAVEPOINT", "RELEASE", "ROLLBACK TO")):
+                return
+            if self.broken:
+                raise RuntimeError("relation does not exist")
+            super().execute(sql, params)
+
+    cutoff = datetime(2026, 11, 6, 17, 0, tzinfo=timezone.utc)
+    repository = RealtimeOptionsAlertsPageRepository.__new__(RealtimeOptionsAlertsPageRepository)
+    broken = Recording([], broken=True)
+    result = repository._advanced_current_marks_reported(broken, {"data": {"rows": [_alert_row()]}}, cutoff=cutoff)
+    assert result["data"]["rows"][0]["current_mark"]["status"] == "UNAVAILABLE"
+    assert result["data"]["optional_reads"] == [{"read": "current_marks", "status": "FALLBACK",
+                                                 "reason_code": "CURRENT_MARKS_UNAVAILABLE",
+                                                 "serving_source": "RELEASE_MARKS"}]
+    assert broken.statements[-1] == "ROLLBACK TO SAVEPOINT options_current_marks"
+    healthy = Recording([])
+    result = repository._advanced_current_marks_reported(healthy, {"data": {"rows": [_alert_row()]}}, cutoff=cutoff)
+    assert result["data"]["optional_reads"][0]["status"] == "AVAILABLE"
+    assert healthy.statements[-1] == "RELEASE SAVEPOINT options_current_marks"

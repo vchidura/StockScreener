@@ -23,6 +23,7 @@ from .advanced_options_p8_runtime import build_p8_downstream_binding
 from .advanced_options_p8_selection_source import (
     MassiveAdvancedOptionsExactContractSource, combine_exact_contract_captures,
 )
+from .advanced_options_quiet_contracts import quiet_contract_count
 from .advanced_options_session_state import PostgresContinuousSessionStateRepository
 from .advanced_options_control_plane import load_advanced_options_equity_input_binding_cursor
 from .contracts import canonical_sha256
@@ -406,6 +407,11 @@ def _run_schedule_cycle(
         "status": "ATTACHED", "window_id": str(target_window_id),
         "equity_cutoff": receipt[1].isoformat(), "options_cutoff": options_cutoff.isoformat(),
         "contracts": len(acquisition.contract_tickers), "sequence": downstream.sequence,
+        "quiet_contracts": quiet_contract_count(
+            ((row.underlyer, row.option_type, row.market_data_time) for row in capture.selection.selected),
+            valid_until=capture.selection.valid_until,
+            maximum_age=timedelta(seconds=capture.selection.policy.maximum_snapshot_age_seconds),
+        ),
         "breadth": breadth,
     }
 

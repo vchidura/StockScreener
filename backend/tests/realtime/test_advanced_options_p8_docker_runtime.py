@@ -493,6 +493,7 @@ def test_flow_volume_reconciler_uses_latest_authorized_snapshot(
     flushes = []
     consumer = SimpleNamespace(
         fed_offset=5,
+        routes_contract=lambda _contract: True,
         volume_reconcile_required=lambda: True,
         reconcile_snapshot=lambda *args: SimpleNamespace(
             contract_ticker=args[0],
@@ -566,6 +567,7 @@ def test_flow_volume_reconciler_keeps_each_pending_contract_snapshot(
     flushes = []
     consumer = SimpleNamespace(
         fed_offset=0,
+        routes_contract=lambda _contract: True,
         reconcile_snapshot=lambda *args: (
             reconciled.append(args)
             or SimpleNamespace(accepted=True)
@@ -593,6 +595,49 @@ def test_flow_volume_reconciler_keeps_each_pending_contract_snapshot(
         "reason": "SNAPSHOT_RECONCILE",
         "full": True,
     }]
+
+
+def test_flow_volume_reconciler_ignores_contracts_outside_the_scope(monkeypatch):
+    monkeypatch.setattr(
+        roles_module,
+        "RawJournalReader",
+        lambda _path: SimpleNamespace(
+            offsets_at=lambda _cutoff: (5, 4)
+        ),
+    )
+    outside = "O:NFLX261113C00064000"
+    inside = "O:SPY261120C00450000"
+    reconciled = []
+    consumer = SimpleNamespace(
+        fed_offset=5,
+        routes_contract=lambda contract: contract != outside,
+        reconcile_snapshot=lambda *args: (
+            reconciled.append(args)
+            or SimpleNamespace(accepted=True)
+        ),
+        mark_reconciled=lambda: True,
+        flush=lambda **_kwargs: None,
+    )
+    reconciler = roles_module._FlowVolumeBaselineReconciler(
+        session_state=SimpleNamespace(
+            load_preopen_session_binding=lambda _bundle: None,
+        ),
+        bundle={},
+        source=SimpleNamespace(path=object()),
+        refresh_seconds=0,
+    )
+    for ticker in (outside, inside):
+        reconciler._pending[(ticker, START)] = {
+            "contract_ticker": ticker,
+            "snapshot_volume": 7,
+            "snapshot_at": START,
+        }
+
+    results = reconciler.apply(consumer)
+
+    assert len(results) == 1
+    assert [row[0] for row in reconciled] == [inside]
+    assert not reconciler._pending
 
 
 def test_ingress_reconciles_session_without_pending_window(monkeypatch):

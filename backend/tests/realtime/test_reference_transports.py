@@ -330,3 +330,25 @@ def test_transport_request_page_row_and_byte_limits_fail_closed():
     )
     with pytest.raises(ValueError, match="byte limit"):
         byte_limited.fetch()
+
+class _FinnhubSymbolHttp:
+    def __init__(self, rows):
+        self.rows = rows
+        self.calls = []
+
+    def get(self, url, params, headers):
+        self.calls.append(dict(params))
+        return _response({"earningsCalendar": self.rows})
+
+
+def test_finnhub_per_symbol_request_names_the_symbol_and_refuses_other_rows():
+    """G92 (Nov 10): the market-wide call caps at 1,500 rows, so the refresh asks per company."""
+    row = {"symbol": "AAPL", "date": "2026-10-20", "hour": "amc", "quarter": 4, "year": 2026}
+    http = _FinnhubSymbolHttp([row])
+    transport = FinnhubReferenceTransport("finnhub-secret", http, sleep=lambda _seconds: None)
+
+    assert transport.fetch("2026-10-04", "2026-10-30", symbol="aapl") == (row,)
+    assert http.calls == [{"from": "2026-10-04", "to": "2026-10-30", "symbol": "AAPL"}]
+    with pytest.raises(ValueError, match="another symbol"):
+        FinnhubReferenceTransport("finnhub-secret", _FinnhubSymbolHttp([{**row, "symbol": "MSFT"}]),
+                                  sleep=lambda _seconds: None).fetch("2026-10-04", "2026-10-30", symbol="AAPL")

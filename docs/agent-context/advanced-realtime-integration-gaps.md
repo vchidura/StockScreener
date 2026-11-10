@@ -1,5 +1,11 @@
 # Advanced Realtime integration gaps
 
+> **Frozen Nov 10, 2026. Do not add or update entries here.** Every item was triaged against later work and live
+> state; open ones are rows in [`docs/g102/G102_IMPLEMENTATION_MATRIX.md`](../g102/G102_IMPLEMENTATION_MATRIX.md)
+> (section 3, or the rows that name them), which is now the only tracker. The disposition of each G-number is in
+> [`docs/g102/G102_EVIDENCE.md`](../g102/G102_EVIDENCE.md), entry "Nov 10 (05:30 UTC): register triage". Statuses below
+> are as last edited (Nov 5-7) and many are stale.
+
 One register for every gap found in any phase. Status is one of `open`, `fixed`, `proven on copy`, `proven live`.
 "Evidence" says whether the finding was run or only read from code. A passing test or harness run is not evidence of
 integration here.

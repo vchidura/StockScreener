@@ -469,6 +469,9 @@ class OptionFlowConsumer:
             raise RuntimeError("the engine returned no reconcile result")
         return out.reconciles[0]
 
+    def routes_contract(self, contract: str) -> bool:
+        return self._engine.shard_of(contract) is not None
+
     def reconcile_snapshot(
         self,
         contract: str,

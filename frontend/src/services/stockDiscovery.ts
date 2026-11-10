@@ -197,6 +197,7 @@ export interface AlertViewResponse {
   warnings: string[]
   outcome_policy: string | null
   indicators_available: string[]
+  available_models?: string[]
 }
 
 export const getAlertView = async (params: Record<string, string | number | boolean | undefined>) =>

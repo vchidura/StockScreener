@@ -13,10 +13,15 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 from uuid import UUID
 
+from psycopg2 import DatabaseError
 from psycopg2.pool import ThreadedConnectionPool
 
 
 _PUBLICATION_RETRY_SECONDS = 60
+# Nov 9: a SERIALIZABLE batch that lost to another transaction crashed the role. The batch stays due, so the next
+# poll repeats it. A conflict that never clears still fails.
+_RETRYABLE_POSTGRES_SQLSTATES = frozenset({"40001", "40P01"})
+MAXIMUM_CONSECUTIVE_CONFLICTS = 30
 BACKEND_DIR = Path(__file__).resolve().parent.parent
 if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
@@ -61,6 +66,13 @@ from realtime.advanced_realtime_v3_runtime import (  # noqa: E402
 
 
 UTC = timezone.utc
+
+
+def should_retry_conflict(error: DatabaseError, consecutive_conflicts: int) -> bool:
+    return (
+        error.pgcode in _RETRYABLE_POSTGRES_SQLSTATES
+        and consecutive_conflicts <= MAXIMUM_CONSECUTIVE_CONFLICTS
+    )
 
 
 def parse_args(argv=None):
@@ -336,35 +348,50 @@ def main(argv=None) -> int:
         serving = args.operation is AdvancedSessionOperation.PRIMARY_SERVING
         databases = _publication_databases(pool) if serving else None
         next_publication_at = 0.0
+        conflicts = 0
         while not stop.is_set():
             cohort_id, session_date = _runtime_scope(provider, args)
             if cohort_id is None:
                 stop.wait(args.poll_seconds)
                 continue
             reports = []
-            with provider.transaction(
-                APP_ROLE,
-                dict_cursor=True,
-                isolation_level="SERIALIZABLE",
-            ) as unit:
-                receipts = load_due_canonical_stock_alert_receipts_cursor(
-                    unit.cursor,
-                    cohort_id=cohort_id,
-                    session_date=session_date,
-                    limit=args.claim_limit,
-                )
-                for receipt in receipts:
-                    batch = build_canonical_stock_alert_batch_cursor(
+            try:
+                with provider.transaction(
+                    APP_ROLE,
+                    dict_cursor=True,
+                    isolation_level="SERIALIZABLE",
+                ) as unit:
+                    receipts = load_due_canonical_stock_alert_receipts_cursor(
                         unit.cursor,
-                        receipt,
+                        cohort_id=cohort_id,
                         session_date=session_date,
+                        limit=args.claim_limit,
                     )
-                    reports.append(
-                        persist_canonical_stock_alert_batch_cursor(
+                    for receipt in receipts:
+                        batch = build_canonical_stock_alert_batch_cursor(
                             unit.cursor,
-                            batch,
+                            receipt,
+                            session_date=session_date,
                         )
-                    )
+                        reports.append(
+                            persist_canonical_stock_alert_batch_cursor(
+                                unit.cursor,
+                                batch,
+                            )
+                        )
+            except DatabaseError as error:
+                conflicts += 1
+                if not should_retry_conflict(error, conflicts):
+                    raise
+                print(json.dumps({
+                    "status": "RETRYING_WRITE_CONFLICT",
+                    "sqlstate": error.pgcode,
+                    "consecutive_conflicts": conflicts,
+                    "provider_fetch_performed": False,
+                }, sort_keys=True), flush=True)
+                stop.wait(args.poll_seconds)
+                continue
+            conflicts = 0
             if reports:
                 print(json.dumps({
                     "status": "COMPLETE",

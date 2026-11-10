@@ -55,19 +55,41 @@ def _provider_tier_rank(alias: str) -> str:
     return f"CASE WHEN {alias}.provider_tier='MASSIVE_ADVANCED' THEN 2 ELSE 1 END"
 
 
-def _head_replaces(new: str, old: str) -> str:
-    """True when revision `new` wins over `old` for the same key under `bar-selection-v1`. A write is always the
-    later one, so between equal observations and tiers the new write wins, as `rt.bar_current` does."""
+def _revision_created_at(alias: str) -> str:
+    """The write time of the revision a head row (or EXCLUDED) names: one primary-key lookup in the partitioned
+    revisions, since `rt.bar_head` does not copy it."""
     return (
-        f"({_current_source_precedence(new)} > {_current_source_precedence(old)} "
-        f"OR ({_current_source_precedence(new)} = {_current_source_precedence(old)} "
-        f"AND ({old}.observed_at < {new}.observed_at OR ({old}.observed_at = {new}.observed_at "
-        f"AND {_provider_tier_rank(new)} >= {_provider_tier_rank(old)}))))"
+        "(SELECT revision_clock.created_at FROM rt.bar_revisions AS revision_clock "
+        f"WHERE revision_clock.bar_revision_id={alias}.bar_revision_id "
+        f"AND revision_clock.observed_at={alias}.observed_at)"
+    )
+
+
+def _winner_rank(alias: str, created_at: str) -> str:
+    """The `bar-selection-v1` winner tuple before the revision id (target design 4.3), higher wins, as row elements.
+    The same terms as every ORDER BY (`_selection_order`)."""
+    return f"{_current_source_precedence(alias)},{alias}.observed_at,{_provider_tier_rank(alias)},{created_at}"
+
+
+def _head_replaces(new: str, old: str, *, new_created_at: str | None = None) -> str:
+    """True when revision `new` beats the current head `old` on the whole `bar-selection-v1` tuple: precedence,
+    observation, tier, the revision's write time, then the lower revision id. Nov 10 (review R1): the upsert used to
+    let the later write win an exact tie on precedence, observation and tier, so replaying the losing revision could
+    flip the head; now the result is the same in any arrival order (INV-2), and a revision never replaces itself.
+
+    One row comparison: the ids are swapped in the last element, so on a full tie the lower id wins and an equal id
+    (the same revision) never wins. `new_created_at` lets the writer pass the new revision's write time as a value;
+    each lookup in the partitioned revisions costs planning time (Nov 10 copy: 6.4 ms with four, against 0.06 ms)."""
+    created = new_created_at or _revision_created_at(new)
+    return (
+        f"ROW({_winner_rank(new, created)},{old}.bar_revision_id)"
+        f">ROW({_winner_rank(old, _revision_created_at(old))},{new}.bar_revision_id)"
     )
 
 
 def _selection_order(alias: str) -> str:
-    """ORDER BY terms that put the `bar-selection-v1` winner first among revisions of one key."""
+    """ORDER BY terms that put the `bar-selection-v1` winner first among revisions of one key (the same tuple as
+    `_head_replaces`)."""
     return (
         f"{_current_source_precedence(alias)} DESC,{alias}.observed_at DESC,{_provider_tier_rank(alias)} DESC,"
         f"{alias}.created_at DESC,{alias}.bar_revision_id"
@@ -83,7 +105,7 @@ _HEAD_CONFLICT = (
     + ",".join(f"{column}=EXCLUDED.{column}" for column in _HEAD_VALUE_COLUMNS if column != "bar_end")
     + ",selection_policy=EXCLUDED.selection_policy,written_by_cohort_id=EXCLUDED.written_by_cohort_id,"
     "updated_at=clock_timestamp() WHERE rt.bar_head.bar_end=EXCLUDED.bar_end AND "
-    + _head_replaces("EXCLUDED", "rt.bar_head")
+    + _head_replaces("EXCLUDED", "rt.bar_head", new_created_at="%s::timestamptz")
 )
 
 
@@ -230,16 +252,22 @@ def persist_realtime_equity_bars_cursor(
     ]
     cursor.execute(
         "SELECT bar_revision_id, cohort_id, provider_tier, instrument_id, "
-        "payload_sha256 FROM rt.bar_revisions "
+        "payload_sha256, observed_at, created_at FROM rt.bar_revisions "
         "WHERE bar_revision_id=ANY(%s::uuid[]) "
         "AND observed_at BETWEEN %s AND %s",
         (id_values, min(observed_bounds), max(observed_bounds)),
     )
+    fetched = cursor.fetchall()
     stored = {
         str(row[0]): (
             str(row[1]), row[2], row[3], row[4]
         )
-        for row in cursor.fetchall()
+        for row in fetched
+    }
+    # The write time of the revision each head row will name (the one at the catalog's observation), for the winner
+    # tuple; replays read the original row's time.
+    written_at = {
+        str(row[0]): row[6] for row in fetched if row[5] == stored_catalog[str(row[0])][6]
     }
     expected = {
         str(fact.revision.bar_revision_id): (
@@ -252,6 +280,8 @@ def persist_realtime_equity_bars_cursor(
     }
     if stored != expected:
         raise ValueError("persisted realtime bar revision identity conflict")
+    if set(written_at) != set(expected):
+        raise ValueError("persisted realtime bar revision write time is unavailable")
     # G102 A4 (design 4.4): the current bar lives only in the cohort-free head. rt.bar_current is no longer
     # written (user, Nov 7: the target design runs Monday, no entries into old tables).
     batch_executor(
@@ -282,6 +312,7 @@ def persist_realtime_equity_bars_cursor(
                 fact.revision.payload_sha256,
                 BAR_SELECTION_POLICY,
                 str(fact.cohort_id),
+                written_at[str(fact.revision.bar_revision_id)],  # the conflict clause's new write time
             )
             for fact in rows
         ],
@@ -662,5 +693,101 @@ def load_bar_range_cursor(
     for fetched in cursor.fetchall():
         row = dict(fetched) if isinstance(fetched, Mapping) else dict(zip(("key_text", *_HEAD_ROW_COLUMNS), fetched))
         row.pop("key_text")
+        result[int(row["instrument_id"])].append(row)
+    return result
+
+
+# Known-by clock sets (target INV-3). The target is one contract with all four clocks (matrix A4.5). Until then each
+# reader names the set it has always used, so moving it onto this read changes only the as-of fallback: Nov 9's 5m bars
+# were written up to 54 s after they were observed, so the full contract would newly drop a cutoff bar the Options
+# readers accept today.
+KNOWN_BY_OBSERVED = ("observed_at",)
+KNOWN_BY_ALL_CLOCKS = ("observed_at", "created_at", "replay_available_at", "provider_published_at")
+_BAR_SCOPES = frozenset({"RTH", "EXTENDED", "FULL_DAY"})
+
+
+def _known_by(alias: str, clocks: Sequence[str]) -> str:
+    terms = []
+    for clock in clocks:
+        if clock in ("observed_at", "created_at"):
+            terms.append(f"{alias}.{clock}<=%(known_by)s")
+        elif clock in ("replay_available_at", "provider_published_at"):
+            terms.append(f"({alias}.{clock} IS NULL OR {alias}.{clock}<=%(known_by)s)")
+        else:
+            raise ValueError("unknown known-by clock")
+    return "(" + " AND ".join(terms) + ")"
+
+
+def load_known_bar_revisions_cursor(
+    cursor,
+    *,
+    instrument_ids: Sequence[int],
+    interval: str,
+    basis: str,
+    known_by: datetime,
+    start: datetime,
+    end: datetime | None = None,
+    scopes: Sequence[str] = ("RTH",),
+    latest: int | None = None,
+    clocks: Sequence[str] = KNOWN_BY_OBSERVED,
+) -> dict[int, list[dict]]:
+    """Nov 10 review R2 (target 4.5, INV-3): every column of the revision that was current at `known_by` for each key
+    of one interval and basis, per instrument, ordered by bar start.
+
+    Keys are the heads with `start <= bar_start <= known_by` (and `bar_end <= end` when given); with `latest`, only the
+    latest that many keys per instrument. A key whose head revision is known by `known_by` under `clocks` reads the head;
+    a key corrected later reads the best revision known by then (the shared selection order, same `bar_end`) instead of
+    dropping out; a key with no revision known by then is absent. Final and non-final revisions are both returned."""
+    _bar_group(f"{interval}:{basis}")
+    scopes = tuple(scopes)
+    if not scopes or not set(scopes) <= _BAR_SCOPES:
+        raise ValueError("bar session scope is invalid")
+    if tuple(clocks) not in (KNOWN_BY_OBSERVED, KNOWN_BY_ALL_CLOCKS):
+        raise ValueError("known-by clocks must be one of the named sets")
+    for value in (known_by, start, end):
+        if value is not None and (value.tzinfo is None or value.utcoffset() is None):
+            raise ValueError("known-by read clocks must be timezone-aware")
+    if latest is not None and not 1 <= int(latest) <= 1_000:
+        raise ValueError("latest key count must be 1-1000")
+    ids = sorted({int(value) for value in instrument_ids})
+    result: dict[int, list[dict]] = {value: [] for value in ids}
+    if not ids:
+        return result
+    window = (
+        "head.instrument_id=target.instrument_id AND head.interval=%(interval)s "
+        "AND head.adjustment_basis=%(basis)s AND head.session_scope=ANY(%(scopes)s::text[]) "
+        "AND head.bar_start>=%(start)s AND head.bar_start<=%(known_by)s"
+        + (" AND head.bar_end<=%(end)s" if end is not None else "")
+    )
+    targets = "unnest(%(ids)s::bigint[]) AS target(instrument_id)"
+    keys = (
+        "SELECT head.* FROM " + targets + " JOIN rt.bar_head AS head ON " + window
+        if latest is None else
+        "SELECT head.* FROM " + targets + " CROSS JOIN LATERAL (SELECT head.* FROM rt.bar_head AS head WHERE "
+        + window + " ORDER BY head.bar_start DESC LIMIT %(latest)s) AS head"
+    )
+    known_candidate = _known_by("candidate", clocks)
+    cursor.execute(
+        "WITH candidate AS (SELECT revision.* FROM (" + keys + ") AS head "
+        "JOIN rt.bar_revisions AS revision ON revision.bar_revision_id=head.bar_revision_id "
+        "AND revision.observed_at=head.observed_at) "
+        "SELECT chosen.* FROM (SELECT candidate.* FROM candidate WHERE " + known_candidate + " "
+        "UNION ALL SELECT revision.* FROM candidate CROSS JOIN LATERAL (SELECT revision.* FROM rt.bar_revisions "
+        "AS revision WHERE revision.instrument_id=candidate.instrument_id AND revision.interval=candidate.interval "
+        "AND revision.bar_end=candidate.bar_end AND revision.bar_start=candidate.bar_start "
+        "AND revision.session_scope=candidate.session_scope AND revision.adjustment_basis=candidate.adjustment_basis "
+        "AND " + _known_by("revision", clocks) + " ORDER BY " + _selection_order("revision") + " LIMIT 1) "
+        "AS revision WHERE NOT " + known_candidate + ") AS chosen "
+        "ORDER BY chosen.instrument_id,chosen.bar_start,chosen.session_scope",
+        dict(ids=ids, interval=interval, basis=basis, scopes=list(scopes), start=start, end=end, known_by=known_by,
+             latest=latest),
+    )
+    names = None
+    for fetched in cursor.fetchall():
+        if isinstance(fetched, Mapping):
+            row = dict(fetched)
+        else:
+            names = names or [column[0] for column in cursor.description]
+            row = dict(zip(names, fetched))
         result[int(row["instrument_id"])].append(row)
     return result

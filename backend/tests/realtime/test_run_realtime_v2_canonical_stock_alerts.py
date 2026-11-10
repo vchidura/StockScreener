@@ -144,3 +144,16 @@ def test_compose_owns_canonical_service_without_legacy_sources():
     assert "project_stock_alert_results.py" not in block
     assert "stock-ideas-forward" not in block
     assert "stock-ideas-swing" not in block
+
+
+def test_only_a_write_conflict_that_clears_is_retried():
+    class Conflict(cli.DatabaseError):
+        pgcode = "40001"
+
+    class Missing(cli.DatabaseError):
+        pgcode = "42P01"
+
+    assert cli.should_retry_conflict(Conflict(), 1)
+    assert cli.should_retry_conflict(Conflict(), cli.MAXIMUM_CONSECUTIVE_CONFLICTS)
+    assert not cli.should_retry_conflict(Conflict(), cli.MAXIMUM_CONSECUTIVE_CONFLICTS + 1)
+    assert not cli.should_retry_conflict(Missing(), 1)

@@ -750,10 +750,12 @@ class FinnhubReferenceAdapter:
         *,
         etf_tickers: frozenset[str],
         metrics=None,
+        per_symbol: bool = False,
     ) -> None:
         self.fetch = fetch
         self.etf_tickers = etf_tickers
         self.metrics = metrics
+        self.per_symbol = per_symbol
 
     def collect(self, request: ReferenceSeedRequest) -> ReferenceSourceGeneration:
         _begin_metric_generation(self.metrics)
@@ -761,9 +763,21 @@ class FinnhubReferenceAdapter:
         companies = tuple(ticker for ticker in request.universe.equity_tickers if ticker not in self.etf_tickers)
         start = request.session_date - timedelta(days=1)
         end = request.session_date + timedelta(days=45)
-        rows = tuple(self.fetch(start, end))
+        unanswered: dict[str, str] = {}
+        if self.per_symbol:
+            # G92 (Nov 10): one request per company. A company Finnhub does not answer gets no coverage at all, so it
+            # reads N/A downstream and is never recorded as having no earnings; the others are unaffected.
+            collected = []
+            for ticker in companies:
+                try:
+                    collected.extend(self.fetch(start, end, symbol=ticker))
+                except Exception as error:  # noqa: BLE001 - one symbol never blocks another
+                    unanswered[ticker] = f"FINNHUB_SYMBOL_UNAVAILABLE:{type(error).__name__}"
+            rows = tuple(collected)
+        else:
+            rows = tuple(self.fetch(start, end))
         document = build_public_calendar_document(
-            company_tickers=companies,
+            company_tickers=tuple(ticker for ticker in companies if ticker not in unanswered),
             window_start=request.created_at - timedelta(days=1),
             window_end=request.created_at + timedelta(days=45),
             observed_at=request.created_at,
@@ -799,12 +813,12 @@ class FinnhubReferenceAdapter:
                     coverage,
                     request,
                     status=status,
-                    reasons=(() if coverage else ("EARNINGS_COVERAGE_MISSING",)),
+                    reasons=(() if coverage else (unanswered.get(ticker, "EARNINGS_COVERAGE_MISSING"),)),
                 ))
         provider_requests, response_bytes = _measured_counters(
             self.metrics,
             metric_start,
-            1,
+            len(companies) if self.per_symbol else 1,
             _payload_bytes(document),
         )
         return ReferenceSourceGeneration(

@@ -2214,6 +2214,11 @@ class _FlowVolumeBaselineReconciler:
 
     def apply(self, consumer):
         self._refresh()
+        # Nov 9: the baselines name every selected contract, the engine routes only its contract scope. A baseline
+        # for a contract outside the scope has nothing to reconcile; raising on it put the flow role in a crash loop.
+        for key, row in tuple(self._pending.items()):
+            if not consumer.routes_contract(row["contract_ticker"]):
+                self._pending.pop(key)
         if not self._pending:
             return ()
         ready = tuple(

@@ -419,7 +419,28 @@ def _fundamental_projection(security, inputs, fundamental_reports):
         key=lambda row: (row["availability_time"], row["period_end"], row["fundamental_report_id"]),
         reverse=True,
     )
-    return reports
+    return _recent_fundamental_periods(reports)
+
+
+# Nov 10 (G37): the Financials tab shows 8 quarters, 5 fiscal years and 8 TTM periods, each against the year before;
+# keep that much (newest filing per period) so every window's workspace stays small once statements are loaded.
+FUNDAMENTAL_PERIODS_KEPT = {"quarterly": 12, "annual": 6, "trailing_twelve_months": 12}
+
+
+def _recent_fundamental_periods(reports):
+    """`reports` newest availability first: the newest filing per (timeframe, period end), then the most recent periods
+    of each timeframe, in the same order."""
+    newest_filing, seen = [], set()
+    for row in reports:
+        key = (row["timeframe"], row["period_end"])
+        if key not in seen:
+            seen.add(key)
+            newest_filing.append(row)
+    keep = set()
+    for timeframe in {row["timeframe"] for row in newest_filing}:
+        periods = sorted({row["period_end"] for row in newest_filing if row["timeframe"] == timeframe}, reverse=True)
+        keep.update((timeframe, period) for period in periods[:FUNDAMENTAL_PERIODS_KEPT.get(timeframe, 12)])
+    return [row for row in newest_filing if (row["timeframe"], row["period_end"]) in keep]
 
 
 def _has_fundamental_coverage(security, inputs, fundamental_coverage):
@@ -1376,12 +1397,16 @@ def produce_realtime_pattern_watch_publication(
 ):
     _check_cancelled(should_stop)
     snapshots = tuple(sorted(snapshots, key=lambda snapshot: snapshot.snapshot_key))
-    if (len(snapshots) != len(inputs.members)
-            or {snapshot.snapshot_key for snapshot in snapshots} != {member["ticker"] for member in inputs.members}
+    member_tickers = {member["ticker"] for member in inputs.members}
+    snapshot_tickers = {snapshot.snapshot_key for snapshot in snapshots}
+    # Per-ticker outcome (G102 A2): a member without a workspace this window is listed in every view and the other
+    # members publish. Nov 9: this check still required all of them, so one dropped ticker failed every Equity window.
+    if (not snapshots or len(snapshot_tickers) != len(snapshots) or not snapshot_tickers <= member_tickers
             or any(snapshot.snapshot_type != TICKER_WORKSPACE_VERSION or snapshot.cohort_id != inputs.cohort_id
                    or snapshot.provider_tier != inputs.provider_tier or snapshot.source_generation != inputs.source_generation
                    for snapshot in snapshots)):
-        raise ValueError("Pattern Watch publication requires one exact same-generation workspace per member")
+        raise ValueError("Pattern Watch publication requires unique same-generation workspaces of the cycle's members")
+    without_workspace = member_tickers - snapshot_tickers
     views = {}
     for interval in PATTERN_WATCH_INTERVALS:
         _check_cancelled(should_stop)
@@ -1405,7 +1430,8 @@ def produce_realtime_pattern_watch_publication(
                         for pattern in patterns["patterns"])
         sort_pattern_watch_rows(rows)
         views[interval] = dict(
-            interval=interval, status="UNAVAILABLE" if missing else "COMPLETE", unavailable_tickers=missing,
+            interval=interval, status="UNAVAILABLE" if missing else "COMPLETE",
+            unavailable_tickers=sorted(without_workspace.union(missing)),
             scanned=len(snapshots), matched_tickers=len({row["ticker"] for row in rows}),
             results=rows, cross_frame=None, computed_at=inputs.cutoff.isoformat(),
             market_time=min(market_times) if market_times else None, analysis_refs=analysis_refs,

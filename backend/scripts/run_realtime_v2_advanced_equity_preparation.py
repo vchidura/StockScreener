@@ -34,6 +34,7 @@ from realtime.advanced_equity_bootstrap import (  # noqa: E402
 from realtime.advanced_equity_rollover import (  # noqa: E402
     AdvancedEquityRolloverResident,
 )
+from realtime.fundamentals_refresh import run_fundamentals_refresh  # noqa: E402
 from realtime.earnings_calendar_refresh import (  # noqa: E402
     run_earnings_calendar_refresh,
 )
@@ -490,6 +491,11 @@ def main(argv=None):
                 ), flush=True)
                 print(json.dumps(
                     run_earnings_calendar_refresh(provider, clock=_now),
+                    sort_keys=True,
+                ), flush=True)
+                # G37 (Nov 10): the Financials tab's filed statements, once a day after the close.
+                print(json.dumps(
+                    run_fundamentals_refresh(provider, clock=_now, api_key=config.massive_api_key),
                     sort_keys=True,
                 ), flush=True)
                 next_fed_calendar_at = _now() + FED_CALENDAR_CHECK_INTERVAL

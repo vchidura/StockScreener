@@ -31,6 +31,7 @@ class _Cursor:
         self.stored_after_end = stored_after_end
         self.receipt_known_by = receipt_known_by
         self.connection = self
+        self.securities_by_instrument = {}
 
     @contextmanager
     def cursor(self, **_kwargs):
@@ -50,34 +51,34 @@ class _Cursor:
         raise AssertionError(self.query)
 
     def fetchall(self):
-        if "revision.bar_revision_id::text" in self.query:
-            if (
-                self.omit_qqq_context
-                and self.parameters[1]
-                == "44444444-4444-4444-8444-444444444444"
-            ):
-                return []
-            cutoff = self.parameters[-3]
-            known_by = self.parameters[-2]
-            count = self.parameters[-1]
-            interval = self.parameters[2]
-            step = (
-                timedelta(days=1)
-                if interval == "1d"
-                else timedelta(minutes=5)
-            )
-            start = 1 if interval == "1d" else 0
-            late = self.stored_after_end or timedelta(0)
-            rows = [
-                {
-                    "bar_revision_id": str(uuid4()),
-                    "bar_end": cutoff - step * (index + start),
-                    "observed_at": cutoff - step * (index + start) + late,
-                    "payload_sha256": f"{index:064x}",
-                }
-                for index in range(count + 1)
-            ]
-            return [row for row in rows if row["observed_at"] <= known_by][:count]
+        if "FROM rt.instruments" in self.query:
+            security_id = self.parameters[0]
+            instrument_id = len(self.securities_by_instrument) + 1
+            self.securities_by_instrument[instrument_id] = security_id
+            return [{"instrument_id": instrument_id}]
+        if "WITH candidate AS" in self.query:  # the central known-by read (equity_bar_repository)
+            parameters = self.parameters
+            rows = []
+            for instrument_id in parameters["ids"]:
+                security_id = self.securities_by_instrument[instrument_id]
+                if self.omit_qqq_context and security_id == "44444444-4444-4444-8444-444444444444":
+                    continue
+                cutoff, known_by = parameters["end"], parameters["known_by"]
+                step = timedelta(days=1) if parameters["interval"] == "1d" else timedelta(minutes=5)
+                start = 1 if parameters["interval"] == "1d" else 0
+                late = self.stored_after_end or timedelta(0)
+                for index in range(10):
+                    bar_end = cutoff - step * (index + start)
+                    row = {
+                        "instrument_id": instrument_id, "security_id": security_id,
+                        "bar_revision_id": str(uuid4()), "bar_start": bar_end - step, "bar_end": bar_end,
+                        "session_date": bar_end.date(), "observed_at": bar_end + late,
+                        "availability_mode": "LIVE_OBSERVED", "is_final": True,
+                        "payload_sha256": f"{index:064x}",
+                    }
+                    if row["observed_at"] <= known_by and row["bar_start"] >= parameters["start"]:
+                        rows.append(row)
+            return sorted(rows, key=lambda row: (row["instrument_id"], row["bar_start"]))
         raise AssertionError(self.query)
 
 

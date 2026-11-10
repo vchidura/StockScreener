@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, time, timedelta, timezone
 from enum import Enum
 from uuid import UUID
 
@@ -14,6 +14,7 @@ from .advanced_options_control_plane import (
     AdvancedOptionsEquityInputBinding,
 )
 from .contracts import canonical_sha256
+from .equity_bar_repository import KNOWN_BY_OBSERVED, load_known_bar_revisions_cursor
 from .equity_history import equity_history_coordinates, load_equity_history_cursor
 from .preflight import DetectorFamily
 
@@ -239,6 +240,59 @@ def advanced_options_equity_context_requirements_payload(
     }
 
 
+def load_live_equity_context_rows_cursor(
+    cursor,
+    *,
+    security_id: UUID,
+    requirement: AdvancedOptionsEquityContextRequirement,
+    equity_cutoff: datetime,
+    known_by: datetime,
+) -> tuple[dict, ...]:
+    """The last `session_count` final bars of one requirement for one security, ending by the cutoff, as known by
+    `known_by` (dict cursor). G102 A4: the current bars by instrument, whatever cohort wrote them. Nov 10 (review R2):
+    through the central known-by read, so a bar corrected after the known-by time is read as it stood then instead of
+    leaving the context incomplete."""
+    cursor.execute(
+        "SELECT instrument_id FROM rt.instruments "
+        "WHERE security_id=%s AND contract_id IS NULL",
+        (str(security_id),),
+    )
+    instrument_ids = tuple(int(row["instrument_id"]) for row in cursor.fetchall())
+    cutoff_day = datetime.combine(equity_cutoff.date(), time(), timezone.utc)
+    loaded = load_known_bar_revisions_cursor(
+        cursor,
+        instrument_ids=instrument_ids,
+        interval=requirement.interval,
+        basis=requirement.adjustment_basis,
+        known_by=known_by,
+        start=(
+            cutoff_day
+            if requirement.current_session
+            else cutoff_day - timedelta(days=2 * requirement.session_count + 14)
+        ),
+        end=equity_cutoff,
+        scopes=(requirement.session_scope,),
+        clocks=KNOWN_BY_OBSERVED,
+    )
+    eligible = sorted(
+        (
+            row
+            for rows in loaded.values()
+            for row in rows
+            if str(row["security_id"]) == str(security_id)
+            and row["availability_mode"] in requirement.availability_modes
+            and row["is_final"]
+            and (
+                row["session_date"] == equity_cutoff.date()
+                if requirement.current_session
+                else row["session_date"] < equity_cutoff.date()
+            )
+        ),
+        key=lambda row: row["bar_end"],
+    )
+    return tuple(eligible[-requirement.session_count:])
+
+
 def load_advanced_options_equity_context_cursor(
     cursor,
     *,
@@ -358,50 +412,18 @@ def load_advanced_options_equity_context_cursor(
                         for row in rows
                     )
                     continue
-                cursor.execute(
-                    "SELECT revision.bar_revision_id::text,"
-                    "revision.bar_end,revision.observed_at,"
-                    "revision.payload_sha256 "
-                    # G102 A4: the current bar by instrument from the head, whatever cohort wrote it.
-                    "FROM rt.bar_head AS current "
-                    "JOIN rt.bar_revisions AS revision "
-                    "ON revision.bar_revision_id=current.bar_revision_id "
-                    "AND revision.observed_at=current.observed_at "
-                    "WHERE current.instrument_id IN (SELECT instrument_id FROM rt.instruments "
-                    "WHERE security_id=%s AND contract_id IS NULL) "
-                    "AND revision.security_id=%s "
-                    "AND revision.interval=%s "
-                    "AND revision.adjustment_basis=%s "
-                    "AND revision.session_scope=%s "
-                    "AND revision.availability_mode=ANY(%s) "
-                    "AND revision.is_final "
-                    "AND (%s OR revision.session_date=%s) "
-                    "AND (%s OR revision.session_date<%s) "
-                    "AND revision.bar_end<=%s "
-                    "AND revision.observed_at<=%s "
-                    "ORDER BY revision.bar_end DESC LIMIT %s",
-                    (
-                        str(security_ids[ticker]),
-                        str(security_ids[ticker]),
-                        requirement.interval,
-                        requirement.adjustment_basis,
-                        requirement.session_scope,
-                        list(requirement.availability_modes),
-                        not requirement.current_session,
-                        equity_cutoff.date(),
-                        requirement.current_session,
-                        equity_cutoff.date(),
-                        equity_cutoff,
-                        (
-                            live_known_by
-                            if requirement.source
-                            is AdvancedOptionsEquityContextSource.LIVE_EQUITY
-                            else equity_cutoff
-                        ),
-                        requirement.session_count,
+                rows = load_live_equity_context_rows_cursor(
+                    cursor,
+                    security_id=security_ids[ticker],
+                    requirement=requirement,
+                    equity_cutoff=equity_cutoff,
+                    known_by=(
+                        live_known_by
+                        if requirement.source
+                        is AdvancedOptionsEquityContextSource.LIVE_EQUITY
+                        else equity_cutoff
                     ),
                 )
-                rows = tuple(reversed(tuple(cursor.fetchall())))
                 incomplete = len(rows) != requirement.session_count
                 if requirement.current_session:
                     incomplete = incomplete or (

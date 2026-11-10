@@ -221,6 +221,34 @@ def test_o1_adapter_retains_real_stable_detector_output():
     assert result.evaluations[0].package is None
 
 
+def test_o1_lane_survives_one_contract_without_open_interest():
+    gate, receipt = _gate_and_receipt()
+    _, source = _confirmation_inputs()
+    good = AdvancedO1Invocation(source.snapshot_id, source)
+    bad = AdvancedO1Invocation(
+        uuid4(),
+        source.model_copy(update={"open_interest": 0}),
+    )
+    context = AdvancedOptionsDetectorContext(
+        gate,
+        receipt,
+        DetectorFamily.O1,
+        receipt.cutoff,
+    )
+
+    mixed = build_advanced_o1_executor(
+        AdvancedOptionsLaneInputs((bad, good))
+    )(context)
+    assert mixed.state.value == "COMPLETE"
+    assert len(mixed.evaluations) == 1
+
+    none_usable = build_advanced_o1_executor(
+        AdvancedOptionsLaneInputs((bad,))
+    )(context)
+    assert none_usable.state.value == "UNAVAILABLE"
+    assert "POSITIVE_OPEN_INTEREST_REQUIRED" in none_usable.reason_codes
+
+
 def test_o3_adapter_maps_real_qualified_credit_to_selected_package():
     gate, receipt = _gate_and_receipt()
     control = _control_plane()
@@ -288,3 +316,40 @@ def test_o3_invocation_document_round_trip_is_exact():
     assert advanced_o3_invocation_document(decoded) == document
     assert decoded.candidate == candidate
     assert decoded.package == package
+
+
+def _o1_detection(monkeypatch=None, enabled=True):
+    from realtime import advanced_options_native_adapters as adapters
+
+    if monkeypatch is not None:
+        monkeypatch.setattr(adapters, "O1_PACKAGE_SELECTION_ENABLED", enabled)
+    gate, receipt = _gate_and_receipt()
+    _, source = _confirmation_inputs()
+    package = _package(_policy().policy_sha256)
+    detected = source.model_copy(update={"open_interest": 1, "day_volume": 1_000_000})
+    result = build_advanced_o1_executor(
+        AdvancedOptionsLaneInputs((
+            AdvancedO1Invocation(source.snapshot_id, detected, package),
+        ))
+    )(AdvancedOptionsDetectorContext(
+        gate,
+        receipt,
+        DetectorFamily.O1,
+        receipt.cutoff,
+    ))
+    return result, package
+
+
+def test_o1_detection_with_a_package_is_selected_again():
+    result, package = _o1_detection()
+
+    assert result.state.value == "COMPLETE"
+    assert result.evaluations[0].selection_status == "SELECTED"
+    assert result.evaluations[0].package == package
+
+
+def test_o1_hold_switch_still_records_an_observation(monkeypatch):
+    result, _ = _o1_detection(monkeypatch, enabled=False)
+
+    assert result.evaluations[0].selection_status == "OBSERVATION"
+    assert result.evaluations[0].package is None

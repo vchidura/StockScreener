@@ -6,7 +6,7 @@ import { ColumnPicker, useColumnPreferences, type ColumnSpec } from '../layout/P
 import { usePublishPageContext } from '../layout/pageContext'
 import { getAlertView, type AlertPlanRow } from '../services/stockDiscovery'
 import { useLivePrices, useRunningSession, withLiveAlert } from '../services/livePrices'
-import { alertCombinedResults, alertSort, alertSourceParams, alertTabParams, alertTradeFilters, resolveAlertRoute, tradeAlertModels, tradeAlertStatuses, type AlertView } from './stockAlertNavigation'
+import { alertCombinedResults, alertModelOptions, alertSort, alertSourceParams, alertTabParams, alertTradeFilters, resolveAlertRoute, tradeAlertStatuses, type AlertView } from './stockAlertNavigation'
 import { alertColumnLayout, alertPlanTiming, alertPublicationFacts, alertRiskAssessment, earliestAlertWindow, unavailableAlertProbability } from './stockAlertPresentation'
 import StockEodReviewPanel from './StockEodReviewPanel'
 import PatternWatchLink from './PatternWatchLink'
@@ -297,7 +297,7 @@ export default function StockAlertsPage() {
       <label>Stock<input value={params.get('search') || ''} placeholder="Ticker or company" onChange={event => update({ search: event.target.value })} /></label>
       <label>Direction<select value={filters.direction || ''} onChange={event => update({ direction: event.target.value })}><option value="">All</option><option value="1">Long</option><option value="-1">Short</option></select></label>
       <label>Trade type<select aria-label="Trade type" value={tradeType || ''} onChange={event => update({ trade_type: event.target.value || null, run: null })}><option value="">All</option><option value="INTRADAY">Intraday</option><option value="SWING">Swing</option></select></label>
-      <label>Model<select value={filters.model || ''} onChange={event => update({ model: event.target.value })}><option value="">All models</option>{tradeAlertModels.map(key => <option key={key} value={key}>{models[key]}</option>)}</select></label>
+      <label>Model<select value={filters.model || ''} onChange={event => update({ model: event.target.value })}><option value="">All models</option>{alertModelOptions(data?.available_models).map(key => <option key={key} value={key}>{models[key] || readable(key)}</option>)}</select></label>
       <label>Trigger interval<select value={params.get('interval') || ''} onChange={event => update({ interval: event.target.value })}><option value="">All</option>{['30m', '1h', '1d'].map(interval => <option key={interval}>{interval}</option>)}</select></label>
       <label>Status<select value={filters.status || ''} onChange={event => update({ status: event.target.value })}><option value="">All</option>{tradeAlertStatuses.map(state => <option key={state} value={state}>{readable(state)}</option>)}</select></label>
     </section>

@@ -1308,14 +1308,14 @@ def _sealed_current_mark(
 
 def _session_alert_contract(evaluation):
     """The contract a v1 single-contract package alerts on; None for stored multi-leg packages (one row each)."""
-    from .advanced_options_native_loader import OPTIONS_ALERT_V1_VALUATION_SHA256
+    from .advanced_options_native_loader import is_options_alert_v1_package
 
     package = evaluation.package
     if package is None:
         return None
-    legs = package.legs
-    if len(legs) == 1 and legs[0].valuation_policy_sha256 == OPTIONS_ALERT_V1_VALUATION_SHA256:
-        return legs[0].contract_id
+    # Nov 10: v1 legs now carry the session valuation policy, so v1 is recognised by its candidate identity.
+    if is_options_alert_v1_package(package):
+        return package.legs[0].contract_id
     return None
 
 
@@ -2734,15 +2734,22 @@ def load_advanced_options_page_source_cursor(
                 candidate_ids,
             ),
         )
-        marks = tuple(
-            _current_mark_row(row) for row in cursor.fetchall()
-        )
+        rows = tuple(cursor.fetchall())
         if {
-            str(row["candidate_id"]) for row in marks
+            str(row["candidate_id"] if isinstance(row, Mapping) else row[0])
+            for row in rows
         } != set(candidate_ids):
             raise ValueError(
                 "Advanced Options page mark evidence is incomplete"
             )
+        # Nov 10: a selected package that could not be marked at the cutoff keeps its evidence row with no mark; the
+        # page shows its current mark as UNAVAILABLE instead of failing the window.
+        marks = tuple(
+            _current_mark_row(row)
+            for row in rows
+            if (row["package_mark"] if isinstance(row, Mapping) else row[1])
+            is not None
+        )
     # This window's own stored state, so every value is as of the same cutoff.
     cursor.execute(
         "SELECT state_document->'contract_volumes',"

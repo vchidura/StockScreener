@@ -1,85 +1,79 @@
-import type { EquitySecurityProfileResponse, FundamentalReport } from '../../services/api'
+import { useState } from 'react'
+import type { EquitySecurityProfileResponse } from '../../services/api'
 import { compactMoney } from './EntityRail'
+import { formatValue, periodLabel, statementSections, type StatementReport, type Timeframe } from './financialsModel'
 
-const periodLabel = (report: FundamentalReport) => {
-  if (report.fiscal_year === null) return report.period_end ?? '—'
-  const quarter = report.fiscal_quarter ? `Q${report.fiscal_quarter}` : 'FY'
-  return `${report.fiscal_year} ${quarter}`
-}
-
-const eps = (value: number | null | undefined) =>
-  value === null || value === undefined || !Number.isFinite(value) ? '—' : `$${value.toFixed(2)}`
-
-const margin = (numerator: number | string | null, denominator: number | string | null) => {
-  const top = Number(numerator)
-  const bottom = Number(denominator)
-  if (!Number.isFinite(top) || !Number.isFinite(bottom) || bottom === 0) return '—'
-  return `${((top / bottom) * 100).toFixed(1)}%`
-}
+const TIMEFRAMES: { key: Timeframe; label: string }[] = [
+  { key: 'quarterly', label: 'Quarterly' },
+  { key: 'annual', label: 'Annual' },
+  { key: 'trailing_twelve_months', label: 'TTM' },
+]
 
 export default function FinancialsView({ profile, loading, availabilityError }: {
   profile: EquitySecurityProfileResponse | null
   loading: boolean
   availabilityError?: string | null
 }) {
-  const reports = profile?.fundamental_reports ?? []
+  const [timeframe, setTimeframe] = useState<Timeframe>('quarterly')
+  const reports = (profile?.fundamental_reports ?? []) as unknown as StatementReport[]
+  const isEtf = profile?.security?.security_type && profile.security.security_type !== 'CS'
+  const { periods, sections } = statementSections(reports, timeframe)
+  const latest = periods[0]
+  const security = profile?.security
 
   return (
     <section className="ticker-panel">
       <header className="ticker-panel__head">
         <div>
-          <h2>Fundamental reports</h2>
-          <p>Filed statements as published, newest first. Nothing here is estimated or restated.</p>
+          <h2>Financials</h2>
+          <p>Filed statements as published (Massive), newest filing per period. Nothing here is estimated; a later filing that restates a period replaces it.</p>
         </div>
-        {reports.length > 0 && <span className="ticker-panel__count">{reports.length} periods</span>}
+        {reports.length > 0 && <div className="flow-segmented" role="group" aria-label="Statement period">
+          {TIMEFRAMES.map(option => (
+            <button key={option.key} type="button" className={timeframe === option.key ? 'active' : ''}
+              onClick={() => setTimeframe(option.key)}>{option.label}</button>
+          ))}
+        </div>}
       </header>
+
+      {(security || latest) && <dl className="ticker-financials-facts">
+        {security?.market_cap != null && <><dt>Market cap</dt><dd>{compactMoney(security.market_cap)}</dd></>}
+        {security?.free_float_percent != null && <><dt>Free float</dt><dd>{security.free_float_percent.toFixed(1)}%</dd></>}
+        {latest && <><dt>Latest period</dt><dd>{latest.period_end}</dd></>}
+        {latest?.filing_date && <><dt>Filed</dt><dd>{latest.filing_date}</dd></>}
+      </dl>}
 
       {availabilityError && reports.length > 0 && <p role="alert" className="ticker-panel__empty">{availabilityError}</p>}
       {loading && reports.length === 0 ? (
-        <p className="ticker-panel__empty">Loading fundamental reports…</p>
-      ) : reports.length === 0 ? (
-        <p role={availabilityError ? 'alert' : undefined} className="ticker-panel__empty">{availabilityError ?? 'No fundamental reports are stored for this ticker.'}</p>
-      ) : (
-        <div className="ticker-table-wrap">
-          <table className="ticker-table">
+        <p className="ticker-panel__empty">Loading financial statements…</p>
+      ) : isEtf ? (
+        <p className="ticker-panel__empty">Financial statements do not apply to ETFs.</p>
+      ) : periods.length === 0 ? (
+        <p role={availabilityError ? 'alert' : undefined} className="ticker-panel__empty">
+          {availabilityError ?? (reports.length ? `No ${timeframe === 'trailing_twelve_months' ? 'TTM' : timeframe} statements are stored for this ticker.` : 'Financial statements are not available yet for this ticker.')}
+        </p>
+      ) : sections.map(section => (
+        <div className="ticker-table-wrap" key={section.title}>
+          <table className="ticker-table ticker-table--statement">
+            <caption>{section.title}</caption>
             <thead>
               <tr>
-                <th>Period</th>
-                <th>Period end</th>
-                <th>Revenue</th>
-                <th>Gross margin</th>
-                <th>Operating income</th>
-                <th>Net income</th>
-                <th>Diluted EPS</th>
-                <th>Free cash flow</th>
-                <th>Total equity</th>
-                <th>Source</th>
+                <th scope="col">{timeframe === 'annual' ? 'Fiscal year' : 'Period'}</th>
+                {periods.map(report => <th scope="col" key={report.period_end ?? ''} title={`Period end ${report.period_end}; filed ${report.filing_date ?? 'unknown'}`}>{periodLabel(report, timeframe)}</th>)}
               </tr>
             </thead>
             <tbody>
-              {reports.map((report, index) => (
-                <tr key={`${report.period_end ?? index}-${report.timeframe ?? ''}`}>
-                  <td className="is-strong">{periodLabel(report)}</td>
-                  <td>{report.period_end ?? '—'}</td>
-                  <td>{compactMoney(report.revenue)}</td>
-                  <td>{margin(report.gross_profit, report.revenue)}</td>
-                  <td>{compactMoney(report.operating_income)}</td>
-                  <td>{compactMoney(report.net_income)}</td>
-                  <td>{eps(report.diluted_eps)}</td>
-                  <td>{compactMoney(report.free_cash_flow)}</td>
-                  <td>{compactMoney(report.total_equity)}</td>
-                  <td>
-                    {report.source ?? '—'}
-                    {report.quality_codes?.length ? (
-                      <span className="ticker-table__note">{report.quality_codes.join(' · ').toLowerCase()}</span>
-                    ) : null}
-                  </td>
+              {section.rows.map(row => (
+                <tr key={row.label}>
+                  <th scope="row" className={row.emphasis ? 'is-strong' : undefined}>{row.label}</th>
+                  {row.values.map((value, index) => <td key={index} className={row.emphasis ? 'is-strong' : undefined}>{formatValue(value, row.format, row.label)}</td>)}
                 </tr>
               ))}
             </tbody>
           </table>
         </div>
-      )}
+      ))}
+      {periods.length > 0 && <p className="ticker-table__note">Source: Massive financials (SEC filings). Each period shows its newest filing; figures are visible from the filing date.</p>}
     </section>
   )
 }

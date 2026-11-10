@@ -20,6 +20,7 @@ from .advanced_options_p7_selection import (
     P7TransportSelectionStatus,
     select_p7_transport_contracts,
 )
+from .advanced_options_quiet_contracts import quiet_tolerant_valid_until
 from .contracts import canonical_sha256
 
 
@@ -321,10 +322,14 @@ def _select_exact_call_put_contracts(
         )
         for row in selected_rows
     ))
-    valid_until = min(
-        row.market_data_time
-        + timedelta(seconds=policy.maximum_snapshot_age_seconds)
-        for row in selected_rows
+    # Nov 9: a quiet minority no longer bounds the window (advanced_options_quiet_contracts).
+    valid_until = quiet_tolerant_valid_until(
+        (
+            (row.underlyer, row.option_type, row.market_data_time)
+            for row in selected_rows
+        ),
+        reviewed_at=reviewed_at,
+        maximum_age=timedelta(seconds=policy.maximum_snapshot_age_seconds),
     )
     selection_sha256 = canonical_sha256({
         "status": P7TransportSelectionStatus.READY,

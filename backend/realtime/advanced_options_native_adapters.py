@@ -1,6 +1,7 @@
 """Pure Advanced O1/O3 adapters over exact frozen cycle inputs."""
 from __future__ import annotations
 
+import os
 from dataclasses import asdict, dataclass, is_dataclass
 from datetime import date, datetime
 from decimal import Decimal
@@ -395,6 +396,16 @@ def _blocked_or_none(
     return None
 
 
+# Nov 9 hold, lifted Nov 10: O1 packages carried OPTIONS_ALERT_V1_VALUATION_SHA256 while the window marks under the
+# session's valuation policy, so every selected package failed its whole window (PACKAGE_ENTRY_VALUATION_POLICY_MISMATCH).
+# Packages are now stamped with the session policy (user's decision) and one that cannot be marked no longer fails the
+# window (PACKAGE_MARK_UNAVAILABLE). REALTIME_V3_O1_PACKAGE_SELECTION=DISABLED on the window service turns selection
+# off again without a new image: detections become OBSERVATION with no package.
+O1_PACKAGE_SELECTION_ENABLED = (
+    os.environ.get("REALTIME_V3_O1_PACKAGE_SELECTION", "ENABLED").strip().upper() != "DISABLED"
+)
+
+
 def build_advanced_o1_executor(
     inputs: AdvancedOptionsLaneInputs,
 ) -> NativeDetectorExecutor:
@@ -408,6 +419,7 @@ def build_advanced_o1_executor(
         if blocked is not None:
             return blocked
         evaluations = []
+        unavailable_reasons = None
         for invocation in inputs.invocations:
             result = run_o1_adapter(
                 invocation.source,
@@ -419,12 +431,13 @@ def build_advanced_o1_executor(
             )
             finding = result.output
             if finding.disposition == "UNAVAILABLE":
-                return AdvancedOptionsNativeLaneResult(
-                    NativeLaneState.UNAVAILABLE,
-                    tuple(finding.reasons),
-                )
+                # Per-contract outcome, Nov 9: one contract without positive prior-day open interest made
+                # the lane UNAVAILABLE for every contract. The lane is unavailable only if none can be assessed.
+                unavailable_reasons = unavailable_reasons or tuple(finding.reasons)
+                continue
             selected = (
-                finding.disposition == "DETECTED"
+                O1_PACKAGE_SELECTION_ENABLED
+                and finding.disposition == "DETECTED"
                 and invocation.package is not None
             )
             evaluations.append(AdvancedOptionsNativeEvaluation(
@@ -441,6 +454,11 @@ def build_advanced_o1_executor(
                 _plain(finding),
                 invocation.package if selected else None,
             ))
+        if unavailable_reasons is not None and not evaluations:
+            return AdvancedOptionsNativeLaneResult(
+                NativeLaneState.UNAVAILABLE,
+                unavailable_reasons,
+            )
         return AdvancedOptionsNativeLaneResult(
             NativeLaneState.COMPLETE,
             (),

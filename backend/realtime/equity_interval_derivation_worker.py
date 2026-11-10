@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from datetime import date, datetime, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from uuid import NAMESPACE_URL, UUID, uuid5
 
 from .acquisition_ledger import (
@@ -12,7 +12,11 @@ from .acquisition_ledger import (
 )
 from .contracts import canonical_sha256
 from .equity_bar_adapter import RealtimeEquityBarFact
-from .equity_bar_repository import persist_realtime_equity_bars_cursor
+from .equity_bar_repository import (
+    KNOWN_BY_ALL_CLOCKS,
+    load_known_bar_revisions_cursor,
+    persist_realtime_equity_bars_cursor,
+)
 from .equity_interval_derivation import derive_realtime_interval_facts
 from .equity_interval_finalizer import (
     _bar_revision,
@@ -63,35 +67,20 @@ def load_current_five_minute_facts_cursor(
     session_date: date,
     checked_at: datetime,
 ):
-    cursor.execute(
-        # G102 A4: the current bar by instrument from the head, whatever cohort wrote it.
-        "SELECT revision.* FROM rt.bar_head AS current "
-        "JOIN rt.bar_revisions AS revision "
-        "ON revision.bar_revision_id=current.bar_revision_id "
-        "AND revision.observed_at=current.observed_at "
-        "WHERE current.instrument_id=%s "
-        "AND current.interval='5m' AND current.session_scope='RTH' "
-        "AND current.adjustment_basis='RAW_UNADJUSTED' "
-        "AND current.bar_start>=%s::date "
-        "AND current.bar_start<%s::date + INTERVAL '1 day' "
-        "AND revision.session_date=%s AND revision.is_final "
-        "AND revision.observed_at<=%s AND revision.created_at<=%s "
-        "AND (revision.replay_available_at IS NULL "
-        "OR revision.replay_available_at<=%s) "
-        "AND (revision.provider_published_at IS NULL "
-        "OR revision.provider_published_at<=%s) "
-        "ORDER BY revision.bar_start",
-        (
-            instrument_id,
-            session_date,
-            session_date,
-            session_date,
-            checked_at,
-            checked_at,
-            checked_at,
-            checked_at,
-        ),
-    )
+    # G102 A4: the current bar by instrument, whatever cohort wrote it. Nov 10 (review R2): through the central
+    # known-by read, so a 5m bar corrected after `checked_at` is read as it stood then instead of dropping out.
+    day = datetime.combine(session_date, time(), timezone.utc)
+    rows = load_known_bar_revisions_cursor(
+        cursor,
+        instrument_ids=(instrument_id,),
+        interval="5m",
+        basis="RAW_UNADJUSTED",
+        known_by=checked_at,
+        start=day,
+        end=day + timedelta(days=1),  # RTH 5m bars end by 21:00 UTC
+        clocks=KNOWN_BY_ALL_CLOCKS,
+    )[int(instrument_id)]
+    rows = [row for row in rows if row["session_date"] == session_date and row["is_final"]]
     return tuple(
         RealtimeEquityBarFact(
             cohort_id=UUID(str(row["cohort_id"])),
@@ -114,7 +103,7 @@ def load_current_five_minute_facts_cursor(
                 else None
             ),
         )
-        for row in cursor.fetchall()
+        for row in rows
     )
 
 
