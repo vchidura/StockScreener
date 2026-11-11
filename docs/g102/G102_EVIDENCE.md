@@ -1021,3 +1021,184 @@ Regression on the final self-heal code (Options + touched areas, 2,551 tests): 2
 (baseline). Image r84 `sha256:4046b55571da` (refined stale-stream check: the previous session's open stream is
 DEGRADED until the next registration ends it) for read-only check runs only, not deployed; pass at 06:10: 136 Options
 windows past deadline (WOULD_ACT MARK_MISSED), Nov 10 Options stream open (DEGRADED, B14a), nothing else.
+
+### Nov 11 (06:20-06:50 UTC): V3-1 measurement and design
+
+Read-only benchmark in r84 on the Nov 10 Options journal (`options-acquisition/47d62b40.../options.sqlite`, 4.67 GB):
+6,301,830 normalized records (Q 5,849,890, T 451,940), all in shard 0 (72 instruments: the C6 layout had one shard);
+busiest minutes 18:02 31,347, 20:59 31,249, 15:46 30,512 records. Per record (10,000-record batch, one CPU): SQLite row
+3.8 us, full decode 23.0 us, materialize 9.7 us (per-shard and fan-out equal with one shard). Day estimate: ~350 CPU s
+with today's loop (decode twice: consumer and router), ~206 CPU s with one shared read. Against Nov 9's 42% p50 / 86%
+p90 of a core, the data work is small; the role loop runs registration, barrier snapshot, lease renew and two SQLite
+opens on every iteration (~10/s). Design written: `docs/g102/G102_V3_1_DESIGN.md` (Step 0 profile with py-spy, then
+cadence and read-once, capacity replay at 3x, marks at the cutoff offset, shards across processes only if measured
+necessary). The window's mark producer reads the latest `rt.quote_current` head at run time (the R34/R35 exposure).
+
+### Nov 11 (06:55-08:10 UTC): V3-1 Steps 1-2 behind a switch; package r85 built and rehearsed (not deployed)
+
+User (Nov 11): one package for every backend service; V3-1 behind a switch so a live run can fall back; build and rehearse.
+
+Code: `REALTIME_V3_MARKET_STATE_LOOP` (`P8` default, `V3`) on the market-state role (`advanced_options_p8_roles.py`
+`_run_market_state`); V3: registration refresh and barrier snapshot at most once a second (snapshot also when the offset
+moves), lease renewal every 5 s, one shared `read_normalized_after` per pass for the shard consumers and the detector
+router (`plan_slice(records=...)`), `PersistentRawJournalReader` (one read-only SQLite connection kept open; reads go
+through `RawJournalReader._reader_connection`), idle wait 0.1 s growing to 0.5 s. Tests: consumer equivalence (shared
+read = own read, split passes, misaligned records refused, kept-open reader = per-read reader), the loop test
+parametrized over P8 and V3 (the P8 call is unchanged), router batch independence already covered by the restart test.
+
+Replay (r85, read-only, Nov 10 journal 6,301,830 records, live's shard map `85b9dab6`): P8 read path (631 passes of
+10,000, 275 s) and V3 read path (kept-open connection, 1,234 uneven passes, 252 s) both give state `61d34c5a...` = the
+final checkpoint live stored at 21:05 Nov 10 (first run differed only in stream_session_id because the harness skipped
+the journal source's mapping to the registered session b847f3cc; with the mapping, identical).
+
+Full-stack copy rehearsal (runbook 6, `scratchpad/r85/rehearse_r85.sh`): live backup `stocks_db_backup_v3-r85-
+rehearsal-20261111T073034Z.dump` (3.61 GB, 430 s, sha256 B3046D8D...), restore 353 s into `test_realtime_v2_r85`
+(458,483 bar heads, latest window 21:41:29 Nov 10), hardening 11/11 pass, journals 4.4 GB incl. the Nov 10 Options
+folder; isolation proven (host, provider and internet unreachable). 19 services on r85, market-state on V3: after 2
+minutes all running, 0 restarts, 0 error lines; Options roles READY_WAITING_FOR_SESSION (the loop runs only in a
+session). API smoke: 153 routes, 126 OK on both, no route with a different status from live. Stop: 18 exit 0,
+Options acquisition 241 (the known whole-stack-stop pattern). Logs in `scratchpad/r85/r85-evidence`.
+
+### Nov 11 (08:41-09:00 UTC): pre-validation and r85 deploy to every backend service (market-state on P8)
+
+New session (handover `HANDOVER-20261111.md`, user's go for this plan). Pre-validation, read-only: r85 `74e2c255d715`
+and r84 `4046b55571da` present; worktree source hash recomputed 07e0c9782c563d32 (= r85 label); `compose.stable.json`
+market-state has no `REALTIME_V3_MARKET_STATE_LOOP`; clock host `w32tm` +0.25 s, container `clock_offset.py` +0.242 s
+(W32Time syncing; 08:58 after its 08:51 sync +0.20 s); targeted tests 28 passed (consumers, self-heal, lifecycle
+isolation) and 2 passed (`p8_docker_runtime -k market_state`); live images == `rollout/pre-r85-images-20261111.txt`,
+21 containers, 0 restarts. GO.
+
+Deploy: `preflight` 08:44 (no pending migrations, latest 052, audit passed, dry runs PASS, no legacy containers);
+`g102-services -Image sha256:74e2c255d715...` 08:44-08:57 (19 services, exit 0). Verify (runbook 3.7) 08:57-08:59:
+19 backend services on r85, frontend f26 and cloudflared unchanged; 0 restarts (no lease-handover restarts this time);
+0 error lines in any service except the API's Dashboard read (below); 20 leases renewing; Options roles
+READY_WAITING_FOR_SESSION, lifecycle PREPARING at CATALOG_QUOTE (provider window not open, history ready); API smoke
+153 routes, 126 OK before (r78) and after (r85), no route changed status. The 5 portal 503s (`/latest-price-date`,
+`/stocks/context`, `/tickers/overview`, `/tickers/setup-summary`, `/scan/all`: Dashboard retained read "identity/
+checksum/clock drift", G65 pattern) are the same on r78 before the deploy; watched at the first Nov 11 Dashboard
+publication. First fault-collector pass (`--since 6h`, self-heal in r85): WOULD_ACT MARK_MISSED 136 Options windows past
+deadline (R32, known), Nov 10 Options stream b847f3cc open (B14a, known), the API ValueError above, one host SNTP sample
++0.572 s (not repeated: the same function gives +0.195 to +0.229 s a minute later).
+
+### Nov 11 (09:00-09:35 UTC): R39 Dashboard close publication refused (-0.0); page dependency map; r86 on the scheduler
+
+Overnight, five API routes return 503 ("Dashboard stored publication identity/checksum/clock drift"), the same on r78
+before the deploy and on r85 after. Read-only probes (r85): every Dashboard Nov 9 20:35 - Nov 10 20:35 passes its
+payload checksum; both Nov 10 21:00 rows (`7c6afe09`, `c8214049`) fail; setting exactly three `0.0` leaves back to
+`-0.0` (`overview[7].chg_pct`, `scan.fibonacci.results[4].confirmed_legs[0].distance_pct` and its
+`scanners.SCAN_FIBONACCI_1D_5` copy) reproduces the stored `payload_sha256` of both. Postgres numeric has no negative
+zero. The workspace summary already strips it (`_without_negative_zero`); the Dashboard producer did not.
+
+User: the Dashboard page may go without data, but Tickers Overview and every other page must keep working and
+refreshing. Dependency map (frontend f26 realtime build, API r85): the Dashboard is one stored bundle; the API serves
+`/tickers/overview`, `/scan/all`, the six `/scan/<scanner>` routes, `/tickers/setup-summary`, `/stocks/context` without a
+ticker and `/latest-price-date` from it. Realtime pages that read it: Dashboard; Gaps/FVG, MA Crossover, Momentum
+Pullback, Bearish Bounce, Fibonacci (`getDailyScannerPublication`: `/strategies/daily` first, 503 since no strategy
+release was ever produced, G38, then the Dashboard's scanners); Sector Intelligence breadth panel. Tickers Overview
+reads `/tickers/workspace-publication` (per window) plus live prices; ticker pages, Market Regime/Conditions, Options
+and Stock Alerts do not read it. Switching the Dashboard off would break the five strategy pages, so it stays.
+
+Measurements (Nov 10, read-only): intraday Dashboards 14:35-20:35 have byte-identical overview, scan, scanners and
+references (daily bars through the previous session; AAPL shows the Nov 9 close all day); only ids, market times and
+setup evidence ids change. Equity windows: PORTAL_PUBLISH median 95.6 s (max 143.6) with the Dashboard, 0.9 s without;
+window release-to-complete median 170 s vs 44 s (deadline 300 s). The workspace summary's overview refreshes chg% every
+window from the live quote, but its close/OHLC/volume come from the 1d chart's last bar (AAPL 350.69, 46.5 M all day,
+labelled Nov 10): noted for a later row; the realtime Tickers Overview overlays live prices on top.
+
+r86 `alpha-research-realtime-v3:stable-nov5-r86-410fa33bc3c022ba` = `sha256:ae62fbab8c5c8d49d0f6e50ea8b299028f71699dee33da0307b5666b866518c6`,
+differs from r85 in `realtime/dashboard_projection.py` (`without_negative_zero` on member lists and payload before
+identities and checksums), `scripts/run_realtime_v2_advanced_equity_window.py` (`REALTIME_V2_DASHBOARD_REFRESH=SESSION`:
+no hourly rebuild; first window and close still build) and the new test file. Tests: `test_dashboard_refresh_nov11.py`
+9 passed; stage runners, window script, Dashboard/All Tickers/daily scanner vertical slices, manifest bounds, reference
+continuity, screening known-by: 391 passed, 3 failed, identical to the r85 worktree baseline. Rehearsal, read-only, the
+Nov 10 21:00 Dashboard rebuilt from live inputs (known_by 21:41:29; manifest input_sha256 == stored): r85 checksum does
+not survive a jsonb round trip; r86 survives and its payload equals the stored payload. Deploy 09:32-09:33:
+`compose.stable.json` scheduler env `REALTIME_V2_DASHBOARD_REFRESH=SESSION` (backup
+`compose.stable.before-dashboard-session-20261111.json`), `hotfix -Service realtime-v2-advanced-scheduler -Image r86`;
+healthy, 0 restarts, switch in the process environment. Rollback: hotfix the scheduler to r85 (ignores the switch).
+`candidates.txt`'s last line is now r86: pass `-Image` on every hotfix (the V3 flip uses r85 explicitly).
+
+### Nov 11 (09:40-10:00 UTC): per-ticker readiness for the Nov 11 run (R40), read-only
+
+`runner/ticker_readiness.py 2026-11-11` in r85 (report `scratchpad/ev/ticker-readiness-2026-11-11.txt`). 25 members
+(19 EQUITY incl. SPY/QQQ/IWM, 6 SECTOR_ETF), screening window 2025-09-26..2026-11-10 = 283 adjusted sessions. Every
+member: adjusted 1d 283/283; raw 1d 20/20; newest weekly 11-06, monthly 10-30; Nov 10 RTH 1m/5m/15m/30m/1h
+390/78/26/13/7; 1h in 20 of the last 20 sessions; split coverage from 2025-09-26 through Nov 11 and dividend coverage
+through today's close; earnings coverage valid to Nov 13 21:06 for all 16 stocks; Fed coverage valid to Nov 17;
+fundamentals 79-83 reports per stock. Ticker workspaces at the Nov 10 close: 24 of 25.
+
+Gap: CRWD. Intraday holes in the last 20 sessions: only CRWD Nov 9 1m 389/390. Its Nov 9 5m 17:00-17:05 head is DERIVED
+from 4 one-minute bars (17:00, 17:02, 17:03, 17:04; no trade in 17:01, the provider has no bar); 15m 17:00 (3 sources),
+30m 17:00 (6), 1h 16:30 (12) and raw 1d (78) derive from complete 5m. The screening rule requires contiguous sources, so
+CRWD has no screening result and no workspace (summary and Dashboard list it unavailable; the r69 summary stored no
+reason, R15 adds it from r82). The raw intraday window is 90 sessions (2026-07-07..2026-11-10), so Nov 9 stays inside it
+until 2027-03-22. Informational: the 8 funds have no sector/industry in their reference rows. By design (filtered): page
+labels `calendar` and `profile_fields` (static `MISSING_PRODUCERS`, never cleared), fund fundamentals, monthly MA100/MA200.
+Options: 9 underlyings, Nov 11 preparation PREPARING at CATALOG_QUOTE (normal before the open; the 13:31 dry run checks
+captures and candidates).
+
+### Nov 11 (10:00-10:41 UTC): CRWD quiet minute fixed (r88 on the scheduler)
+
+Provider re-check (read-only, 3 requests, 10:05): CRWD Nov 9 1m aggregates 16:58-17:05 have no 17:01 row; 50+ trades in
+17:01 are all odd lots (condition 37, 0-22 shares), excluded by the provider's aggregation; the provider's 5m 17:00 bar
+volume 22,615.04 (n 816) equals our derived 5m. CRWD Nov 10 (read-only): 1m 390/390 (389 stream + 1 REST repair at
+20:21), 5m/15m/30m/1h 78/26/13/7, raw 1d (derived) and adjusted 1d (provider) same OHLC 224.72/230.42/218.41/225.76,
+volume 4.80 M (RTH minute sum) vs 6.15 M (provider daily; the same basis gap on every ticker, AAPL 21.0 M vs 27.9 M);
+no CRWD snapshot on Nov 10 (the Nov 9 minute).
+
+The live stream finalizer already derives a 5m window with no-trade minutes by the sparse policy
+(`derive_advanced_sparse_minute_window`, only with gap-free MASSIVE_ADVANCED coverage; the bar records
+`missing_no_trade_starts`, quality `ADVANCED_NO_TRADE_MINUTES`); two readers refused it: screening (contiguous sources)
+and the ticker workspace (exactly 5 sources, dense re-derivation). r87 `68d306c23d57` (screening only) moved CRWD's
+refusal to the workspace; r88 `sha256:10cba306c446bc295c01b242c5cc628f03177a342565de068301c82d437ddab4` (= r86 +
+`screening_projection.py`, `ticker_projection.py` + 2 tests) accepts them: workspace step on live inputs 25 of 25 (live
+24), Nov 10 close Dashboard rebuilt with 25 tickers. Tests: quiet-minute 7 passed (5 fail on r85), sparse verifier 3
+passed; 29 files 639 passed, 11 failed = r86 baseline. Deploy 10:38-10:40 (`hotfix -Service realtime-v2-advanced-scheduler
+-Image r88`; compose keeps `REALTIME_V2_DASHBOARD_REFRESH=SESSION`): 8 lease-handover restarts
+(`DurableLeaseUnavailable`, known), then running and healthy from 10:39:55. Rollback: scheduler to r86 (CRWD out again)
+or r85. Opening Equity windows for reference: Nov 10 14:35 188 s of 300 (projection 95 s, Dashboard 91 s), Nov 9 14:50
+192 s, Nov 10 15:10 (after a scheduler deploy) 189 s; warm windows 19-31 s.
+
+### Nov 11 (13:31-13:34 UTC): pre-open dry run on the live images: PASS
+
+`runner/preopen_dry_run.sh 2026-11-11` (read-only), images lifecycle/stock-alerts r85 `74e2c255d715`, scheduler r88
+`10cba306c446`; 2 min 37 s; log `ev/preopen-dry-run-20261111.log` (scratchpad). **Clock** WARN +0.355 s (host slow;
+W32Time RUNNING; r85 tolerance 2 s; 0.20 s at 10:30). **Readiness** PASS: desired members EQUITY 19, OPTION_UNDERLYING
+9, SECTOR_ETF 6; Options preparation PREPARING at CATALOG_QUOTE (cohort is created at SESSION_ACTIVATION); capability
+profile valid to 21:01. **Options** PASS: 9 captures OK (43 requests, 9,514 snapshots, 0 rejected rows, 0.4-6.6 s
+each), candidates 9,106 / 0 invalid, allocation 72 contracts (NFLX 3, QQQ/SPY/TSLA 8, others 9). **Stock Alerts** PASS:
+receipt cutoff Nov 10 20:55, 19 evaluations (MATCH 4 - expected after the r85 version reset; NO_MATCH rules evaluated 12;
+benchmark only 3), 42.7 s. **Workspaces** PASS: cutoff Nov 10 20:55, 25 of 25 built, 0 unavailable (live published 24 at
+that cutoff - CRWD, fixed by r88), 77 s; largest INTC 130,926 / NFLX 130,895 / ORCL 130,801 bytes vs the 131,072 bound
+(the Financials fitter trims to the bound, G37; 0 over). **Previous session (Nov 10)**: O1 COMPLETE_SELECTED 11 /
+COMPLETE_ZERO 45; O2 UNAVAILABLE 56 (model not accepted) and O3 BLOCKED 56 (no mark producer) - by design, the 2 WARN
+lines; OS1/OS2 BLOCKED 11 (before r74 at 16:35) / COMPLETE_ZERO 45; windows COMPLETE 56 (max 93%, p90 58% of budget),
+FAILED 2 (R18, R31), MISSED 2 (R35), PENDING 4 and RUNNING 2 past deadline (R32), WARN over 60% in 5 windows - all
+known Nov 10 rows. Nothing to fix before the open.
+
+### Nov 11 (14:27-14:31 UTC): detectors health check failing on a query bug (R42)
+
+Watch 14:27: `realtime-v2-advanced-detectors` `Up 6 hours (unhealthy)` (restarts 0); the health log shows
+`_detector_health` -> `cursor.execute` `IndexError: tuple index out of range`. Cause: the checkpoint count keeps the LIKE
+pattern `'advanced-equity-detector-shadow:ADVANCED_EQUITY_S_:%:0'` as a literal in a parameterized statement (psycopg2
+2.9.9 reads the `%`); the code path runs only when a cohort is active, so the container turns unhealthy every session
+since 583fb1b (Nov 7), unnoticed before the R21 collector. The detectors themselves run normally (logs IDLE before the
+open). Nothing acts on this health (no `depends_on` in `compose.stable.json`, no autoheal). Fix in the worktree: the
+pattern is a parameter. Fixed probe on live (one-off r85 container, worktree script, read-only) 14:30:24: `READY`,
+expected consumers per journal 50, active journals 1, leases 50 of 50, durable checkpoints 0. Tests (r88 image, worktree
+mounted): new placeholder tests 2 passed (2 failed with r85's script), with `test_run_realtime_v2_advanced_options_os_detectors.py`
+15 passed. Deploy after the close (probe-only change; no in-session restart of the detectors).
+
+### Nov 11 (14:35-14:44 UTC): first window on r88 (R39, CRWD): checks
+
+Read-only probe (`first_window_probe.py`, r88 image) 14:42: Equity E:14:35 COMPLETE **174 s of 300** (input gate 0,
+materialize 2, projection 91, PORTAL_PUBLISH 80 with the Dashboard; Nov 10 first window 188 s); E:14:40 COMPLETE 21 s
+(projection 18, PORTAL_PUBLISH 1: no Dashboard, SESSION refresh). **CRWD**: TICKER_WORKSPACE_V1 at 14:35 and 14:40;
+workspace summary 14:35 and 14:40 overview 25, unavailable members none (Nov 10 live: 24). **Dashboard** Nov 11 14:35
+(`58674ec2`, cohort `effad99e`): stored checksum matches the payload after jsonb, overview 25 rows (Nov 10 21:00 rows
+`7c6afe09`/`c8214049` still fail, as recorded for R39; they are no longer the newest). API smoke `r88-first` 14:43
+(`ev/api-smoke-r88-first-live-144351.json`): 131 of 153 routes 200 (08:58: 126); `/tickers/overview`, `/scan/all`,
+`/latest-price-date`, `/stocks/context`, `/tickers/setup-summary` 503 -> 200; the rest as before (13 x 404 legacy paths,
+8 x 422 without parameters, `/strategies/daily` 503 G38). Options attached to E:14:35 and E:14:40 after the first Equity
+window (by design: the Options scheduler waits for a COMPLETE window with EQUITY_MATERIALIZE); first Options window all
+stages COMPLETE. Next: the first hourly :35 window (15:35) should show PORTAL_PUBLISH ~1 s.

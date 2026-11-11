@@ -786,3 +786,54 @@ def test_market_state_slice_cannot_commit_after_state_moves(tmp_path):
 
     with pytest.raises(ValueError, match="does not follow"):
         consumer.commit_slice(planned)
+
+
+def test_v3_shared_read_gives_the_same_market_state_as_reading_per_consumer(tmp_path):
+    """V3-1 (Nov 11): the V3 loop reads the journal once per pass and hands each consumer its records; the states and
+    checkpoints must equal those of a consumer that reads for itself (the P8 loop)."""
+    from realtime.journal import PersistentRawJournalReader, RawJournalReader
+
+    control, source = _source(tmp_path)
+    shard_map = _shard_map()
+
+    def consumer():
+        return AdvancedOptionsMarketStateConsumer(source=source, cohort_id=control.cohort_id, shard_map=shard_map,
+                                                  owner_epoch=1, clock=lambda: NOW)
+
+    own, shared = consumer(), consumer()
+    own_slice = own.plan_slice(maximum_records=10)
+    records = tuple(source.read_normalized_after(0, limit=10_000))
+    shared_slice = shared.plan_slice(maximum_records=10, records=records)
+    assert shared_slice.state_sha256 == own_slice.state_sha256
+    assert shared_slice.checkpoints == own_slice.checkpoints
+    # In two passes (one record, then the rest) the result is the same again.
+    split = consumer()
+    first = split.plan_slice(maximum_records=10, records=records[:1])
+    split.commit_slice(first)
+    second = split.plan_slice(maximum_records=10, records=tuple(r for r in records if r.event_offset > 1))
+    split.commit_slice(second)
+    own.commit_slice(own_slice)
+    assert split.states == own.states
+    # Shared records must start right after the committed offset.
+    with pytest.raises(ValueError, match="do not follow"):
+        consumer().plan_slice(maximum_records=10, records=records[1:])
+    # The kept-open reader returns exactly what a reader per read returns, and reopens after close().
+    persistent = PersistentRawJournalReader(source.path)
+    plain = RawJournalReader(source.path)
+    assert persistent.read_normalized_after(0, limit=100) == plain.read_normalized_after(0, limit=100)
+    assert persistent.read_after(0, limit=100) == plain.read_after(0, limit=100)
+    persistent.close()
+    assert persistent.read_normalized_after(1, limit=100) == plain.read_normalized_after(1, limit=100)
+    persistent.close()
+
+
+def test_market_state_loop_switch_and_shared_slices():
+    from realtime.advanced_options_p8_roles import _records_after, market_state_loop_mode
+
+    assert market_state_loop_mode({}) == "P8" and market_state_loop_mode(None) == "P8"
+    assert market_state_loop_mode({"REALTIME_V3_MARKET_STATE_LOOP": " v3 "}) == "V3"
+    assert market_state_loop_mode({"REALTIME_V3_MARKET_STATE_LOOP": "fast"}) == "P8"
+    rows = tuple(type("R", (), {"event_offset": offset})() for offset in (5, 6, 7))
+    assert _records_after(None, 4) is None
+    assert [row.event_offset for row in _records_after(rows, 5)] == [6, 7]
+    assert _records_after(rows, 9) == ()

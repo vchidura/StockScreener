@@ -1,6 +1,8 @@
 """Bounded production role implementations for the four P8 Docker services."""
 from __future__ import annotations
 
+import logging
+
 import asyncio
 import hashlib
 import json
@@ -118,7 +120,7 @@ from .database_access_v2 import (
     V2ConnectionProvider,
 )
 from .materialization import MaterializerShardMap
-from .journal import RawJournalReader
+from .journal import PersistentRawJournalReader, RawJournalReader
 from .migrations import EXPECTED_V2_DATABASE_NAME
 from .normalizer import InstrumentAdmission, NORMALIZER_VERSION
 from .option_flow.conditions import load_default_live_semantics
@@ -147,6 +149,27 @@ from .advanced_options_service import OPTIONS_LATE_CANARY_V4_STAGE_ORDER
 
 
 UTC = timezone.utc
+_LOGGER = logging.getLogger(__name__)
+# V3-1 market-state loop (docs/g102/G102_V3_1_DESIGN.md, Steps 1-2). Housekeeping (registration refresh, barrier
+# snapshot) at most once a second, lease renewal every 5 s (the lease is 30 s), idle wait 0.1 s growing to 0.5 s.
+MARKET_STATE_LOOP_ENVIRONMENT = "REALTIME_V3_MARKET_STATE_LOOP"
+V3_MARKET_STATE_HOUSEKEEPING_SECONDS = 1.0
+V3_MARKET_STATE_LEASE_RENEW_SECONDS = 5.0
+V3_MARKET_STATE_IDLE_WAIT_SECONDS = (0.1, 0.5)
+
+
+def market_state_loop_mode(environment) -> str:
+    """P8 (today's loop, the default) or V3. Anything else is P8."""
+    value = str((environment or {}).get(MARKET_STATE_LOOP_ENVIRONMENT, "P8")).strip().upper()
+    return "V3" if value == "V3" else "P8"
+
+
+def _records_after(shared, offset):
+    """The shared read's records after `offset` (contiguous from offset + 1), or None when there is no shared read
+    (the caller then reads for itself)."""
+    if shared is None:
+        return None
+    return tuple(record for record in shared if record.event_offset > offset)
 _EFFECTS = {
     "dispatch": False,
     "delivery": False,
@@ -1619,10 +1642,17 @@ def _run_market_state(
         control.source_flow.journal_generation,
         stop_event,
     )
+    # V3-1 (Nov 11, docs/g102/G102_V3_1_DESIGN.md): REALTIME_V3_MARKET_STATE_LOOP=V3 runs the same work with less
+    # fixed cost per iteration (housekeeping on timers, one shared journal read, a kept-open SQLite connection, idle
+    # backoff). P8 (default) is today's loop, unchanged. Both write identical states and checkpoints, so switching back
+    # mid-session (recreate this container) resumes from the same checkpoints.
+    # FUTURE: remove the P8 loop (C9) after the V3 loop has run clean for a few sessions.
+    v3_loop = market_state_loop_mode(environment) == "V3"
     source = AdvancedOptionsJournalSource(
         root=_journal_root(environment),
         registration=registration,
         source_flow=control.source_flow,
+        **({"reader_factory": PersistentRawJournalReader} if v3_loop else {}),
     )
     hold_controller = (
         _ResidentConsumerHoldController(
@@ -1788,12 +1818,25 @@ def _run_market_state(
         return reason
 
     completed_offset = 0
+    # V3 loop state (unused in the P8 loop).
+    snapshot_reader = PersistentRawJournalReader(source.path) if v3_loop else None
+    next_registration_at = 0.0
+    next_snapshot_at = 0.0
+    last_snapshot_offset = -1
+    lease_renewed_at = {shard_id: 0.0 for shard_id in shard_ids}
+    idle_wait = V3_MARKET_STATE_IDLE_WAIT_SECONDS[0]
+    current = None
+    _LOGGER.warning("advanced_options_market_state_loop mode=%s", "V3" if v3_loop else "P8")
     try:
         while True:
-            current = _registration(
-                provider,
-                registration.journal_generation,
-            )
+            if not v3_loop or time.monotonic() >= next_registration_at:
+                current = _registration(
+                    provider,
+                    registration.journal_generation,
+                )
+                next_registration_at = (
+                    time.monotonic() + V3_MARKET_STATE_HOUSEKEEPING_SECONDS
+                )
             if current is not None:
                 source.registration = current
             if hold_controller is not None:
@@ -1815,11 +1858,39 @@ def _run_market_state(
                 raise RuntimeError(
                     "P8 market-state shard lease is unavailable"
                 )
+            # V3: one journal read per pass for every consumer and the router, from the lowest committed offset.
+            # A failed shared read falls back to each consumer reading for itself (the P8 path and its error handling).
+            shared = None
+            if v3_loop:
+                offsets = [item.committed_offset for item in consumers.values()]
+                if (
+                    detector_router is not None
+                    and monotonic_now >= routing_retry_not_before
+                ):
+                    offsets.append(
+                        detector_router.state.committed_event_offset
+                    )
+                if offsets:
+                    try:
+                        shared = tuple(source.read_normalized_after(
+                            min(offsets),
+                            limit=10_000,
+                        ))
+                    except Exception:  # noqa: BLE001 - the per-consumer read reports it
+                        shared = None
             for shard_id, consumer in tuple(consumers.items()):
                 observed_at = datetime.now(UTC)
                 try:
-                    planned = consumer.plan_slice(
-                        maximum_records=10_000
+                    planned = (
+                        consumer.plan_slice(maximum_records=10_000)
+                        if shared is None
+                        else consumer.plan_slice(
+                            maximum_records=10_000,
+                            records=_records_after(
+                                shared,
+                                consumer.committed_offset,
+                            ),
+                        )
                     )
                     last_planned[shard_id] = planned
                     if planned.record_count:
@@ -1848,16 +1919,22 @@ def _run_market_state(
                             consumer.committed_offset
                         )
                         made_progress = True
-                    if not leases.renew(
-                        resources[shard_id],
-                        owner_id,
-                        shard_epochs[shard_id],
-                        lease_seconds=30,
-                        now=datetime.now(UTC),
+                    if (
+                        not v3_loop
+                        or time.monotonic() - lease_renewed_at[shard_id]
+                        >= V3_MARKET_STATE_LEASE_RENEW_SECONDS
                     ):
-                        raise RuntimeError(
-                            "P8 market-state logical shard lease was lost"
-                        )
+                        if not leases.renew(
+                            resources[shard_id],
+                            owner_id,
+                            shard_epochs[shard_id],
+                            lease_seconds=30,
+                            now=datetime.now(UTC),
+                        ):
+                            raise RuntimeError(
+                                "P8 market-state logical shard lease was lost"
+                            )
+                        lease_renewed_at[shard_id] = time.monotonic()
                 except Exception as error:
                     record_shard_failure(
                         shard_id,
@@ -1879,12 +1956,17 @@ def _run_market_state(
                 and monotonic_now >= routing_retry_not_before
             ):
                 try:
-                    routing_records = tuple(
-                        source.read_normalized_after(
-                            detector_router.state.committed_event_offset,
-                            limit=10_000,
-                        )
+                    routing_records = _records_after(
+                        shared,
+                        detector_router.state.committed_event_offset,
                     )
+                    if routing_records is None:
+                        routing_records = tuple(
+                            source.read_normalized_after(
+                                detector_router.state.committed_event_offset,
+                                limit=10_000,
+                            )
+                        )
                     if routing_records:
                         routed = detector_router.process(
                             routing_records
@@ -1915,18 +1997,28 @@ def _run_market_state(
                         time.monotonic() + 1.0
                     )
             completed_offset = min(committed_offsets.values())
-            _snapshot_v3_resident_windows(
-                provider,
-                binding,
-                bundle=bundle,
-                member=ResidentCompletionMember.MARKET_STATE,
-                owner_epoch=owner_epoch,
-                reader=RawJournalReader(source.path),
-                raw_offset=0,
-                normalized_offset=completed_offset,
-                shard_map_sha256_value=layout.shard_map.sha256,
-                shard_ids_value=shard_ids,
-            )
+            # V3: the barrier snapshot when the offset moved, else once a second (a window can become ready later).
+            if (
+                not v3_loop
+                or completed_offset != last_snapshot_offset
+                or time.monotonic() >= next_snapshot_at
+            ):
+                _snapshot_v3_resident_windows(
+                    provider,
+                    binding,
+                    bundle=bundle,
+                    member=ResidentCompletionMember.MARKET_STATE,
+                    owner_epoch=owner_epoch,
+                    reader=snapshot_reader or RawJournalReader(source.path),
+                    raw_offset=0,
+                    normalized_offset=completed_offset,
+                    shard_map_sha256_value=layout.shard_map.sha256,
+                    shard_ids_value=shard_ids,
+                )
+                last_snapshot_offset = completed_offset
+                next_snapshot_at = (
+                    time.monotonic() + V3_MARKET_STATE_HOUSEKEEPING_SECONDS
+                )
             if _stop_pauses_session(bundle, stop_event, current):
                 return _paused_role_evidence(
                     AdvancedOptionsProcessKind.MARKET_STATE,
@@ -1952,8 +2044,17 @@ def _run_market_state(
             if not made_progress:
                 if stop_event.is_set():
                     time.sleep(0.05)
+                elif v3_loop:
+                    # V3: back off while idle (0.1 s growing to 0.5 s); a pass that read records resets it.
+                    stop_event.wait(idle_wait)
+                    idle_wait = min(
+                        V3_MARKET_STATE_IDLE_WAIT_SECONDS[1],
+                        idle_wait * 1.5,
+                    )
                 else:
                     stop_event.wait(0.1)
+            else:
+                idle_wait = V3_MARKET_STATE_IDLE_WAIT_SECONDS[0]
     finally:
         for shard_id, shard_epoch in tuple(shard_epochs.items()):
             leases.release(
@@ -1961,6 +2062,9 @@ def _run_market_state(
                 owner_id,
                 shard_epoch,
             )
+        for reader in (snapshot_reader, getattr(source, "_reader", None)):
+            if isinstance(reader, PersistentRawJournalReader):
+                reader.close()
     if (
         completed_offset <= 0
         or len(last_planned) != layout.shard_map.shard_count

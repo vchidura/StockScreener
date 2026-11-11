@@ -216,8 +216,19 @@ def _validate_bars(rows, member, inputs):
                     all(source["interval"] == "1d" for source in sources)
                     and tuple((source["bar_start"], source["bar_end"]) for source in sources) == expected
                 )
-            if (sources[0]["bar_start"] != row["bar_start"] or sources[-1]["bar_end"] != row["bar_end"]
-                or not contiguous
+            # Quiet minutes (CRWD empty minute, Nov 11): an intraday bar derived from 1m bars may skip a minute the
+            # provider has no bar for (e.g. only odd lots traded, which its aggregation excludes; its own 5m bar then
+            # equals ours). The 1m sources must still be ordered, non-overlapping and inside the bar's window, and the
+            # aggregate check below still holds. FUTURE: accept only minutes recorded as provider-confirmed empty.
+            quiet_minutes = (
+                row["interval"] in {"5m", "15m", "30m", "1h"}
+                and all(source["interval"] == "1m" for source in sources)
+                and sources[0]["bar_start"] >= row["bar_start"] and sources[-1]["bar_end"] <= row["bar_end"]
+                and all(a["bar_end"] <= b["bar_start"] for a, b in zip(sources, sources[1:]))
+            )
+            if (not quiet_minutes and (
+                    sources[0]["bar_start"] != row["bar_start"] or sources[-1]["bar_end"] != row["bar_end"]
+                    or not contiguous)
                 or any(s["adjustment_basis"] != row["adjustment_basis"] for s in sources)):
                 raise ValueError("Derived screening source window/basis drift")
             expected = [sources[0]["open"], max(s["high"] for s in sources),

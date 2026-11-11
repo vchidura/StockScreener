@@ -4,7 +4,7 @@ import hashlib
 import json
 import sqlite3
 import threading
-from contextlib import closing
+from contextlib import closing, contextmanager
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
@@ -742,18 +742,22 @@ class RawJournalReader:
             raise FileNotFoundError(self.path)
         self.timeout_seconds = timeout_seconds
 
-    def read_after(self, raw_offset: int, *, limit: int = 1000) -> tuple[RawJournalRecord, ...]:
-        if type(raw_offset) is not int or raw_offset < 0:
-            raise ValueError("raw_offset must be a nonnegative integer")
-        if type(limit) is not int or not 1 <= limit <= 10_000:
-            raise ValueError("limit must be in [1, 10000]")
-        with closing(
+    def _reader_connection(self):
+        """A read-only connection for one read, closed after it."""
+        return closing(
             _connect(
                 self.path,
                 timeout_seconds=self.timeout_seconds,
                 read_only=True,
             )
-        ) as connection:
+        )
+
+    def read_after(self, raw_offset: int, *, limit: int = 1000) -> tuple[RawJournalRecord, ...]:
+        if type(raw_offset) is not int or raw_offset < 0:
+            raise ValueError("raw_offset must be a nonnegative integer")
+        if type(limit) is not int or not 1 <= limit <= 10_000:
+            raise ValueError("limit must be in [1, 10000]")
+        with self._reader_connection() as connection:
             rows = connection.execute(
                 "SELECT raw_offset, journal_generation, stream_session_id, "
                 "message_number, feed, received_at, received_monotonic_ns, payload, "
@@ -787,13 +791,7 @@ class RawJournalReader:
         version = normalizer_version.strip()
         if not version:
             raise ValueError("normalizer_version cannot be blank")
-        with closing(
-            _connect(
-                self.path,
-                timeout_seconds=self.timeout_seconds,
-                read_only=True,
-            )
-        ) as connection:
+        with self._reader_connection() as connection:
             row = connection.execute(
                 "SELECT journal_generation, normalizer_version, "
                 "committed_raw_offset, committed_event_offset, updated_at "
@@ -817,13 +815,7 @@ class RawJournalReader:
         version = normalizer_version.strip()
         if not version:
             raise ValueError("normalizer_version cannot be blank")
-        with closing(
-            _connect(
-                self.path,
-                timeout_seconds=self.timeout_seconds,
-                read_only=True,
-            )
-        ) as connection:
+        with self._reader_connection() as connection:
             integrity = str(
                 connection.execute("PRAGMA quick_check").fetchone()[0]
             )
@@ -875,13 +867,7 @@ class RawJournalReader:
             raise ValueError("event_offset must be a nonnegative integer")
         if type(limit) is not int or not 1 <= limit <= 10_000:
             raise ValueError("limit must be in [1, 10000]")
-        with closing(
-            _connect(
-                self.path,
-                timeout_seconds=self.timeout_seconds,
-                read_only=True,
-            )
-        ) as connection:
+        with self._reader_connection() as connection:
             rows = connection.execute(
                 "SELECT normalized_events.*, "
                 "raw_messages.journal_generation AS raw_journal_generation, "
@@ -950,13 +936,7 @@ class RawJournalReader:
         epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
         milliseconds = timedelta(milliseconds=1)
         cutoff_ms = (cutoff.astimezone(timezone.utc) - epoch) // milliseconds
-        with closing(
-            _connect(
-                self.path,
-                timeout_seconds=self.timeout_seconds,
-                read_only=True,
-            )
-        ) as connection:
+        with self._reader_connection() as connection:
             newest_frame = connection.execute(
                 "SELECT received_at FROM raw_messages "
                 "ORDER BY raw_offset DESC LIMIT 1"
@@ -1004,13 +984,7 @@ class RawJournalReader:
 
     def latest_event_at(self, *, after_event_offset: int = 0) -> datetime | None:
         """The newest event time past one offset, so a caller can keep a running maximum."""
-        with closing(
-            _connect(
-                self.path,
-                timeout_seconds=self.timeout_seconds,
-                read_only=True,
-            )
-        ) as connection:
+        with self._reader_connection() as connection:
             row = connection.execute(
                 "SELECT max(event_at) AS event_at FROM normalized_events "
                 "WHERE event_offset > ?",
@@ -1030,13 +1004,7 @@ class RawJournalReader:
                 raise ValueError("raw_offset must be a positive integer")
             predicate = "WHERE raw_offset = ?"
             parameters = (raw_offset,)
-        with closing(
-            _connect(
-                self.path,
-                timeout_seconds=self.timeout_seconds,
-                read_only=True,
-            )
-        ) as connection:
+        with self._reader_connection() as connection:
             rows = connection.execute(
                 "SELECT raw_offset, event_index, normalizer_version, reason_code, "
                 "payload_sha256, committed_at FROM quarantined_events "
@@ -1054,3 +1022,30 @@ class RawJournalReader:
             )
             for row in rows
         )
+
+
+class PersistentRawJournalReader(RawJournalReader):
+    """V3-1 (Nov 11): the same reads on one read-only connection kept open for a long-lived role, instead of a new
+    connection (and three PRAGMAs) per read. No transaction is held between reads (every read fetches all its rows),
+    so each read sees the writer's latest commit and WAL checkpoints are not held back. After an SQLite error the
+    connection is dropped and the next read opens a new one. Used only by the V3 market-state loop
+    (REALTIME_V3_MARKET_STATE_LOOP=V3); every other reader keeps a connection per read."""
+
+    def __init__(self, path: str | Path, *, timeout_seconds: float = 5.0) -> None:
+        super().__init__(path, timeout_seconds=timeout_seconds)
+        self._connection: sqlite3.Connection | None = None
+
+    @contextmanager
+    def _reader_connection(self):
+        if self._connection is None:
+            self._connection = _connect(self.path, timeout_seconds=self.timeout_seconds, read_only=True)
+        try:
+            yield self._connection
+        except sqlite3.Error:
+            self.close()
+            raise
+
+    def close(self) -> None:
+        connection, self._connection = self._connection, None
+        if connection is not None:
+            connection.close()

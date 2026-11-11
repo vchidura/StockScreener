@@ -39,6 +39,21 @@ SCANNER_BASIS = dict(
     weekly="DAILY_RESAMPLED_W_FRI_INCLUDES_PARTIAL_CURRENT_WEEK",
     usage="RESEARCH_ONLY_HEURISTIC_GRADES_NOT_PROBABILITIES_OR_RECOMMENDATIONS",
 )
+
+
+def without_negative_zero(value):
+    """R39 (Nov 11): jsonb has no negative zero, so a -0.0 (``round()`` of a tiny negative change) is stored as 0.0
+    and the stored payload no longer matches its checksum; the reader then refuses the whole Dashboard (the Nov 10
+    close publication). Applied to every list and the payload before any identity or checksum is computed."""
+    if isinstance(value, float):
+        return value + 0.0
+    if isinstance(value, dict):
+        return {key: without_negative_zero(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [without_negative_zero(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(without_negative_zero(item) for item in value)
+    return value
 MISSING_PRODUCERS = {
     "market_breadth": "FULL_MARKET_UNIVERSE_NOT_RETAINED_COHORT_ONLY",
     "sectors": "DATED_SECTOR_REFERENCE_PRODUCER_UNAVAILABLE",
@@ -191,14 +206,14 @@ def produce_realtime_dashboard(inputs: RealtimeScreeningInput):
             frames={interval: dict(status="UNAVAILABLE", reason="USE_RETAINED_TICKER_WORKSPACE_PUBLICATION")
                     for interval in ("1d", "1h", "30m")},
         ))
-    member_lists = dict(
+    member_lists = without_negative_zero(dict(
         tickers=tickers,
         references=[
             dict(member) for member in sorted(inputs.members, key=lambda row: row["ticker"])
             if member["ticker"] not in unavailable
         ],
         setup_evidence=setup_evidence, missing_setup_confirmations=missing_confirmations,
-    )
+    ))
     manifest = dict(
         version=DASHBOARD_VERSION, cohort_id=str(inputs.cohort_id), provider_tier=inputs.provider_tier.value,
         source_generation=inputs.source_generation, source_manifest_sha256=inputs.source_manifest_sha256,
@@ -228,7 +243,7 @@ def produce_realtime_dashboard(inputs: RealtimeScreeningInput):
         scanner_basis=SCANNER_BASIS,
     )
     manifest.update(source_manifest_continuity_fields(inputs))
-    payload = dict(
+    payload = without_negative_zero(dict(
         version=DASHBOARD_VERSION, cohort_id=str(inputs.cohort_id), session=str(inputs.session),
         market_time=manifest["market_time"], generated_at=inputs.cutoff.isoformat(),
         scope_note=scope_note, missing_producers=missing, **member_lists, unavailable_members=unavailable,
@@ -252,7 +267,7 @@ def produce_realtime_dashboard(inputs: RealtimeScreeningInput):
                 ranking="SPLIT_ADJUSTED_12_MINUS_1_COHORT_PERCENTILE", scope_note=scope_note,
             ), rows=context_rows, execution_permission=False,
         ),
-    )
+    ))
     require_bounded_manifest(manifest, name="Dashboard")
     return build_portal_snapshot(
         cohort_id=inputs.cohort_id, provider_tier=inputs.provider_tier,

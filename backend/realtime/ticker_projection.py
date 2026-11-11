@@ -9,6 +9,7 @@ from functools import lru_cache
 import json
 from math import isfinite
 from pathlib import Path
+from types import SimpleNamespace
 from uuid import NAMESPACE_URL, UUID, uuid5
 from zoneinfo import ZoneInfo
 
@@ -18,6 +19,7 @@ from equity.domain import (
     BarAvailabilityMode, BarSessionScope, BarSourceKind, EquityBarRevision,
     EvidenceType, SecurityReferenceRevision,
 )
+from equity.derivation import derive_advanced_sparse_minute_window
 from equity.materialization import CHANNEL_VERSION, SETUP_VERSION, _json_safe, bars_to_frame
 from equity.ticker_contracts import (
     PATTERN_WATCH_INTERVALS, PATTERN_WATCH_POLICY, RETIRED_PATTERN_WATCH_INTERVALS,
@@ -579,6 +581,25 @@ class _DerivationVerifier:
         self._derived = {}
         self._slices = {}
 
+    def _sparse_minute_expectation(self, stored, minutes):
+        """CRWD empty minute (Nov 11): the stream finalizer derives a 5m window that had minutes without a trade by the
+        sparse policy (MASSIVE_ADVANCED with gap-free stream coverage; the bar records `missing_no_trade_starts`), so
+        it has fewer than five 1m sources and the dense re-derivation has no bar for it. Verify such a bar with the
+        same sparse policy over the stored minutes of its window; anything else still has no expectation."""
+        bar = stored.revision
+        if not 1 <= len(bar.source_bar_revision_ids) < 5:
+            return None
+        window = tuple(
+            fact.revision for fact in minutes
+            if fact.revision.interval == "1m" and bar.bar_start <= fact.revision.bar_start < bar.bar_end
+        )
+        if not window:
+            return None
+        return SimpleNamespace(revision=derive_advanced_sparse_minute_window(
+            self._security, window, window_start=bar.bar_start, window_end=bar.bar_end,
+            observed_at=self._inputs.cutoff, ingestion_segment_id=self._segment,
+        ))
+
     def _derive(self, interval, sources):
         if not sources:
             return ()
@@ -657,6 +678,8 @@ class _DerivationVerifier:
                     raise ValueError("Ticker interval source windows are duplicated")
                 for fact in rows:
                     expected_fact = by_start.get(fact.revision.bar_start)
+                    if expected_fact is None and interval == "5m":
+                        expected_fact = self._sparse_minute_expectation(fact, source_by.get(session, ()))
                     if (
                         fact.revision.source_kind is not BarSourceKind.DERIVED
                         or expected_fact is None
@@ -998,7 +1021,9 @@ def _project_realtime_ticker_workspace(
                         provider_tier == "MASSIVE_ADVANCED"
                         and fact.provider_tier == inputs.provider_tier
                         and fact.revision.source_kind is BarSourceKind.DERIVED
-                        and len(fact.revision.source_bar_revision_ids) == 5
+                        # CRWD empty minute (Nov 11): a quiet minute (no provider bar) leaves fewer than five
+                        # 1m sources; the verifier below re-derives each session from the stored minutes.
+                        and 1 <= len(fact.revision.source_bar_revision_ids) <= 5
                     )
                     for fact in five
                 ):

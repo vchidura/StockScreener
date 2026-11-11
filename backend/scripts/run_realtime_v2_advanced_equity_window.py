@@ -552,11 +552,22 @@ class _WarmProjection:
 _WARM = _WarmProjection()
 
 
+DASHBOARD_REFRESH_SWITCH = "REALTIME_V2_DASHBOARD_REFRESH"
+
+
 def dashboard_due(cutoff, *, warm: bool) -> bool:
     """The Dashboard is rebuilt on a process's first window for a cohort (session start, restart, retry with a
     fresh pair) and hourly on the :35 windows; PORTAL_PUBLISH adds the session close. In between the previous one
-    is carried forward. The user accepts a stale Dashboard (Nov 6): it is a sample page awaiting a redesign."""
-    return not warm or cutoff.minute == 35
+    is carried forward. The user accepts a stale Dashboard (Nov 6): it is a sample page awaiting a redesign.
+
+    R39 (Nov 11): ``REALTIME_V2_DASHBOARD_REFRESH=SESSION`` drops the hourly rebuild and keeps the first window and
+    the close. Its page content (overview, scan, the six daily scanners the strategy pages read, references) comes
+    from daily bars through the previous session and was byte-identical in all eight Nov 10 intraday publications,
+    while each rebuild cost ~95 s of PORTAL_PUBLISH (median, Nov 10). Unset or HOURLY keeps the hourly rule."""
+    if not warm:
+        return True
+    hourly = os.environ.get(DASHBOARD_REFRESH_SWITCH, "HOURLY").strip().upper() != "SESSION"
+    return hourly and cutoff.minute == 35
 
 
 def main(argv=None) -> int:

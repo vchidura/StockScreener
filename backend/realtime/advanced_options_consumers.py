@@ -768,13 +768,22 @@ class AdvancedOptionsMarketStateConsumer:
         self,
         *,
         maximum_records: int = 1000,
+        records=None,
     ) -> AdvancedOptionsMarketStateSlice:
+        """`records`: V3-1 (Nov 11) shared read: the records after this consumer's committed offset that the role
+        already read once for every consumer and the detector router (same validation, same order). None reads them
+        here, as before. The materializer still requires them to start right after the committed offset."""
         if type(maximum_records) is not int or not 1 <= maximum_records <= 10_000:
             raise ValueError("market-state record bound must be in [1, 10000]")
-        records = tuple(self.source.read_normalized_after(
-            self.committed_offset,
-            limit=maximum_records,
-        ))
+        if records is None:
+            records = tuple(self.source.read_normalized_after(
+                self.committed_offset,
+                limit=maximum_records,
+            ))
+        else:
+            records = tuple(records)[:maximum_records]
+            if records and records[0].event_offset != self.committed_offset + 1:
+                raise ValueError("shared market-state records do not follow the committed offset")
         next_states = (
             materialize_shard_fanout(
                 self._states,

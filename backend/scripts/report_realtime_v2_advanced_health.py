@@ -538,12 +538,13 @@ def _detector_health(cursor, cohort_id):
             datetime.now(UTC),
         ),
     )[0])
+    # R42 (Nov 11): the pattern is a parameter. As a literal its '%' reached psycopg2's placeholder parser
+    # (IndexError: tuple index out of range), so the detectors health check failed whenever a cohort was active.
     checkpoints = int(_one(
         cursor,
         "SELECT count(*) FROM rt.consumer_checkpoints "
-        "WHERE cohort_id=%s AND consumer_name LIKE "
-        "'advanced-equity-detector-shadow:ADVANCED_EQUITY_S_:%:0'",
-        (str(cohort_id),),
+        "WHERE cohort_id=%s AND consumer_name LIKE %s",
+        (str(cohort_id), "advanced-equity-detector-shadow:ADVANCED_EQUITY_S_:%:0"),
     )[0])
     required_leases = expected * active_journals
     state = (

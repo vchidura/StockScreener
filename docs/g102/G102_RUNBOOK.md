@@ -68,6 +68,8 @@ add). After the A4 writer has written, `rt.bar_current` is stale: stop the servi
 | Stock Alerts rules | `REALTIME_V2_STOCK_ALERT_RULES=PLACEHOLDER` on realtime-v2-canonical-stock-alerts | Back to the Nov 5 reference rule |
 | OS detectors | `docker stop stock-screener-realtime-v2-advanced-detectors` | No OS1/OS2 rows; nothing in a window reads them |
 | Breadth | Options scheduler onto the breadth-off image (rebuild on the current code first) | Screener and Flow serve published rows |
+| Dashboard refresh (R39, r86+) | `REALTIME_V2_DASHBOARD_REFRESH=SESSION` (or `HOURLY`, the default) on realtime-v2-advanced-scheduler in `rollout/compose.stable.json`, then `hotfix -Service realtime-v2-advanced-scheduler -Image <same image>` | SESSION: the Dashboard bundle (overview, daily scanners for the strategy pages, momentum ranks) is built at the first window and the close only; its content changes only at the close. HOURLY: also every :35 window (~95 s each). Never switch it off: the strategy pages and Sector Intelligence breadth read it |
+| Market-state loop (V3-1, r85+) | `REALTIME_V3_MARKET_STATE_LOOP=V3` (or `P8`, the default) on realtime-v3-options-p8-market-state in `rollout/compose.stable.json`, then recreate that one container (`hotfix -Service realtime-v3-options-p8-market-state -Image <same image>`) | V3: housekeeping on 1 s timers, one shared journal read, kept-open SQLite connection, idle backoff; P8: today's loop. Same states and checkpoints either way, so it resumes from the other's checkpoints; the fallback during a session is P8 |
 
 ## 6. Rehearsal on a copy (service start run)
 
@@ -100,7 +102,10 @@ internet; prove it each time with a socket probe). Script used Nov 10: scratchpa
 Equity members READY (25); Options preparation PREPARING at CATALOG_QUOTE with "history ready" until just after the
 open; restart counts against the deploy baseline; worker leases renewing; dividend coverage valid through the close and
 no split drift for every member (`runner/coverage_preopen.sql`, members from the desired revision; R9); `runner/g94_coverage_check.py SESSION`;
-`runner/g102_read_flags_check.py`; start `live_watch.ps1 -DryRun` once.
+`runner/g102_read_flags_check.py`; `runner/ticker_readiness.py SESSION` (R40: per ticker, reference, history against the
+screening rule, intraday holes over the last 20 sessions, earnings, fundamentals, what each page lacked at the previous
+close; by-design labels are filtered; any remaining ISSUES line is a gap to fix or accept before the open); start
+`live_watch.ps1 -DryRun` once.
 
 **Pre-open dry run (13:30-14:10, from Nov 11; matrix R20, built after the Nov 10 close).** Read-only, live image, the
 day's provider data: for every Options underlying run the CATALOG_QUOTE capture (the preparation's own query and

@@ -2465,10 +2465,13 @@ def test_production_live_state_uses_the_current_selection_capture():
     )
 
 
+@pytest.mark.parametrize("loop", ["P8", "V3"])
 def test_market_state_retries_only_failed_logical_shard(
     monkeypatch,
     tmp_path,
+    loop,
 ):
+    """V3-1 (Nov 11): the same outcome on the P8 loop and on the V3 loop (shared read, housekeeping on timers)."""
     cohort_id = UUID("11111111-1111-1111-1111-111111111111")
     generation = UUID("22222222-2222-2222-2222-222222222222")
     owner_id = UUID("33333333-3333-3333-3333-333333333333")
@@ -2486,6 +2489,7 @@ def test_market_state_retries_only_failed_logical_shard(
     source = SimpleNamespace(
         registration=registration,
         path=tmp_path / "options.sqlite",
+        read_normalized_after=lambda *_args, **_kwargs: (),
     )
     binding = SimpleNamespace(
         enrollment=SimpleNamespace(
@@ -2542,8 +2546,10 @@ def test_market_state_retries_only_failed_logical_shard(
                 "committed_offset": 0,
             },)
 
-        def plan_slice(self, *, maximum_records):
+        def plan_slice(self, *, maximum_records, **shared):
             assert maximum_records == 10_000
+            # The P8 loop calls exactly as before (no records argument); the V3 loop hands over the shared read.
+            assert ("records" in shared) == (loop == "V3")
             record_count = int(self.committed_offset == 0)
             return SimpleNamespace(
                 record_count=record_count,
@@ -2668,6 +2674,15 @@ def test_market_state_retries_only_failed_logical_shard(
         "RawJournalReader",
         lambda *_args, **_kwargs: object(),
     )
+
+    class KeptOpenReader:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(roles_module, "PersistentRawJournalReader", KeptOpenReader)
     monkeypatch.setattr(
         roles_module.time,
         "monotonic",
@@ -2679,7 +2694,7 @@ def test_market_state_retries_only_failed_logical_shard(
         bundle={"orchestration": {"catalog_version": "test"}},
         binding=binding,
         provider=Provider(),
-        environment={},
+        environment={"REALTIME_V3_MARKET_STATE_LOOP": loop},
         stop_event=threading.Event(),
         session_state=object(),
     )
