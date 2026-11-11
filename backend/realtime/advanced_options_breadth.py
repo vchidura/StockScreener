@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
@@ -122,6 +123,17 @@ def _nanoseconds(value) -> datetime | None:
     return datetime.fromtimestamp(value / 1_000_000_000, tz=UTC)
 
 
+# R14 (Nov 11): since Nov 10 the chain also lists other products under an underlying (`O:B1SPY...`, `O:B1VDA...`); the
+# Options preparation rejects them (R11, NON_STANDARD_ROOT) and breadth now does too: the ticker's root (the letters
+# before the expiry digits) must be the underlying. Index roots that differ from their index (SPXW for SPX) come with G87.
+_TICKER_ROOT = re.compile(r"^O:([A-Z.\-]+)\d")
+
+
+def _standard_root(ticker: str, underlying: str) -> bool:
+    match = _TICKER_ROOT.match(ticker)
+    return match is not None and match.group(1) == str(underlying).strip().upper()
+
+
 def parse_breadth_page(document: Mapping[str, object], *, underlying: str) -> tuple[list[BreadthRow], int]:
     """Rows of one chain snapshot page and the number of rows that could not be used."""
     results = document.get("results") if isinstance(document, Mapping) else None
@@ -140,7 +152,8 @@ def parse_breadth_page(document: Mapping[str, object], *, underlying: str) -> tu
             expiration = date.fromisoformat(str(details.get("expiration_date")))
         except ValueError:
             expiration = None
-        if not ticker.startswith("O:") or kind not in {"call", "put"} or not strike or expiration is None:
+        if (not ticker.startswith("O:") or not _standard_root(ticker, underlying) or kind not in {"call", "put"}
+                or not strike or expiration is None):
             skipped += 1
             continue
         day = raw.get("day") if isinstance(raw.get("day"), Mapping) else {}

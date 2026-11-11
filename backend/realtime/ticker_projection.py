@@ -1493,15 +1493,27 @@ def _without_negative_zero(row):
     return {key: value + 0.0 if isinstance(value, float) else value for key, value in row.items()}
 
 
+def _unavailable_reasons(details, tickers):
+    by_ticker = {}
+    for item in details or ():
+        ticker = str(item.get("ticker", ""))
+        if ticker in tickers and ticker not in by_ticker:
+            by_ticker[ticker] = dict(ticker=ticker, stage=str(item.get("stage") or "UNKNOWN"),
+                                     reason=str(item.get("reason") or "")[:300])
+    return [by_ticker.get(ticker) or dict(ticker=ticker, stage="UNKNOWN", reason="")
+            for ticker in sorted(tickers)]
+
+
 def produce_realtime_ticker_workspace_summary(
     inputs,
     snapshots,
     charts,
     *,
     should_stop: Callable[[], bool] | None = None,
+    unavailable_details=(),
 ):
     """`charts` is the projection's `summary_charts`: the 1d and 1wk chart points the stored workspaces
-    only reference."""
+    only reference. `unavailable_details` is the projection's `unavailable_members` (ticker, stage, reason)."""
     _check_cancelled(should_stop)
     snapshots = tuple(sorted(snapshots, key=lambda snapshot: snapshot.snapshot_key))
     member_tickers = {member["ticker"] for member in inputs.members}
@@ -1573,6 +1585,11 @@ def produce_realtime_ticker_workspace_summary(
         unavailable_members=sorted(member_tickers - snapshot_tickers),
         provider_fetch_performed=False, execution_permission=False,
     )
+    if member_tickers - snapshot_tickers:
+        # R15 (Nov 11): why each member has no workspace (stage and reason, bounded), so a dropped workspace is
+        # explained by the stored summary instead of a projection rerun (R13 took one on Nov 10). Only when a member
+        # is missing, so a complete summary is unchanged.
+        payload["unavailable_reasons"] = _unavailable_reasons(unavailable_details, member_tickers - snapshot_tickers)
     manifest = dict(
         version=TICKER_WORKSPACE_SUMMARY_VERSION,
         cohort_id=str(inputs.cohort_id), provider_tier=inputs.provider_tier.value,

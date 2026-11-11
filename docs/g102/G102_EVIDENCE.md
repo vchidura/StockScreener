@@ -899,3 +899,97 @@ last publication the 20:55 cutoff (77 today; Nov 9 also ended at 20:55), Pattern
 OPTION, 4 STOCK. Since 20:50: no new restarts; error lines only the R37 stop-bound tracebacks (FLOW, INGRESS, MARKET_STATE,
 2 each at 21:06). All 23 containers up.
 
+### Nov 11 (02:06-02:11 UTC): R20 pre-open dry run built and tested; clock drift
+
+`runner/preopen_dry_run.sh 2026-11-11` (read-only; lifecycle r71, Stock Alerts r72, scheduler r69 images). Clock
+(`clock_offset.py`, SNTP from a container): +3.018 s; Windows `w32tm /stripchart` +3.016 to +3.026 s; W32Time Stopped.
+Drift 0.39 s per hour since 19:47 (+0.55 s). Readiness: 19 EQUITY, 6 SECTOR_ETF, 9 OPTION_UNDERLYING; Nov 11 Options
+preparation `f41f1dea` PREPARING at CATALOG_QUOTE (provider window not open, history ready); cohort not created yet;
+capability profile PASS until Nov 11 21:01. Options: captures AAPL 404, AMZN 322, IWM 1,148, MSFT 578, NFLX 84, NVDA 198,
+QQQ 2,702, SPY 2,568, TSLA 428 snapshots, 0 rejected rows, 39 provider requests in 17 s; 8,432 candidates, 0 invalid;
+allocation `CATALOG_QUOTE_CAPTURE_STALE` for all nine (quotes from the Nov 10 close; expected before the open). Stock Alerts:
+the Nov 10 20:55 receipt rebuilt with the RESEARCH rules, 19 evaluations (16 NO_RULE_DUE, 3 BENCHMARK_ONLY) in 3.1 s.
+Workspace at Nov 10 20:55: 24 of 25 members (CRWD: derived screening source window drift, as live), largest payload INTC
+130,926 bytes of 131,072 (R13 trims to the bound), 83 s. First test run's defects fixed: Docker needs a Windows path for
+the env file; the profile check ends at the 21:00 close; Stock Alerts summary by disposition; the workspace step reads the
+last intraday cutoff and compares with the live count. Found for Nov 11: the Options cohort is new every session (Nov 6
+b096f5b7, Nov 9 d338723a, Nov 10 ccaed5c3) and the lifecycle (r71) does not write its tier binding (r73 does), so the first
+O1 package would fail as at Nov 10 15:35 (R18).
+
+
+### Nov 11 (03:38-04:40 UTC): clock fixed; Options lifecycle and window isolation (r81 code); watch and dry run checks
+
+Clock: the user started the Windows Time service (Running, Automatic, last sync 03:36 UTC, source time.cloudflare.com).
+`clock_offset.py` from a container +0.012 s (OK); `w32tm /stripchart` +0.007, +0.001, -0.001 s.
+
+Lifecycle image check: between r71 (live lifecycle) and r80 the only lifecycle-path change is r73's tier binding at
+activation (`advanced_options_automatic_preparation.py`, `c8_options_tier_binding` + `persist_tier_cohort_binding_cursor`,
+ON CONFLICT DO NOTHING then verified); the other r72-r80 changes are window, mark producer, OS loader, projection, Stock
+Alerts research and portal read code. Lifecycle at 03:42: Nov 11 preparation PREPARING at CATALOG_QUOTE, BEFORE_OPEN, 0
+provider requests, 0 restarts since 01:56.
+
+R31 cause (read-only, `rt.advanced_options_rolling_checkpoints` Nov 10 18:15-18:50 UTC): first checkpoint after the
+18:25-18:33 gap at 18:35 has 64 of 72 contract volume baselines INCOMPLETE, the first one among them; 18:40 4 of 72, 18:45
+and 18:50 none. The window's threshold evidence used the first contract's baseline for every evaluation, so a selected
+package could not pass and the evidence check failed the window (E:18:30).
+
+r81 code (worktree): R16 isolation (`_isolated_activity_candidates`), R19 in-process retry (`_reconcile_with_retry`), R31
+per-package baseline (`threshold_for`, `_baseline_incomplete_instruments`). New tests
+`tests/realtime/test_options_lifecycle_isolation_nov11.py` 5 passed; with `test_c8_options_tier_binding.py`,
+`test_options_alert_v1_package.py`, `test_advanced_options_lifecycle.py`: 41 passed, 1 failed
+(`test_options_preparation_budget_has_local_and_shared_ceilings`, `_capture_after_open_seconds` missing on a test-built
+executor; fails the same on HEAD 6bcc19c, baseline).
+
+Watch and dry run: `session_health.sql` adds `OPT_RUNTIME`, `OPT_RUNTIME_ALARM` (over 60% of the release-to-deadline
+budget in the last 30 minutes) and `OPT_PAST_DEADLINE`. On Nov 10 data: 20:35-21:00 windows 86-132 s (29-44%); 1 of 11
+windows in 19:50-20:20 over 60%; 4 PENDING (from 18:15) and 2 RUNNING (from 19:54) past deadline. Live rows past
+deadline Nov 9-10: 7 PENDING, 2 RUNNING. The dry run adds `runner/preopen_prev_session.sql` (previous session's lanes per
+detector with WARN for a lane not evaluated in most windows, Options window run time max and p90); test against Nov 9:
+O1 COMPLETE_ZERO 50 / UNAVAILABLE 3, O2 UNAVAILABLE 53, O3, OS1, OS2 BLOCKED 53 each (4 WARN lines), COMPLETE windows max
+45% / p90 38% of budget.
+
+### Nov 11 (04:09-05:00 UTC): r81 built and rehearsed; deploy blocked by the session's permission check; open items R8-G60
+
+Tests before the build: Options unit tests (107 files, no DB) on the r81 worktree 1,774 passed, 36 failed, 2 skipped;
+on HEAD 6bcc19c 1,769 passed, the same 36 failed (P7/P8 canary and deployment fixtures, baseline). r81
+`alpha-research-realtime-v3:stable-nov5-r81-1f914c95b980ca5c` = `sha256:4440d08d475fb6ce6e8bcc66c993d62c3dea429156dd962c0a52dc05ecaed7ec`
+(image code == worktree, 952 files).
+
+Rehearsal 1, R31 (`runner/r31_replay.py` in r81, read-only on stored windows): Nov 10, 62 windows, incomplete baselines
+in 2 (18:35 UTC 64 of 72, first contract INCOMPLETE; 18:40 4 of 72), 348 stored SELECTED packages: old rule 348 pass, r81
+unpackages 0 and 348 pass. Nov 9: 55 windows, 1 with an incomplete baseline (1 of 72), 0 SELECTED. PASS: r81 changes no
+stored window; it only acts where the old rule failed the window.
+
+Rehearsal 2, the pre-open dry run with every step in r81 (`DRYRUN_IMAGE`, 04:17-04:19): clock +0.068 s OK; readiness PASS
+(Options preparation PREPARING at CATALOG_QUOTE, cohort not yet created); Options 9/9 captures, 39 requests, 8,432
+candidates, 0 invalid, allocation stale before the open (expected); Stock Alerts 19 evaluations PASS; workspaces 24 of
+25 (CRWD by design), largest 130,926 bytes PASS; previous-session lanes printed. Report
+`data-audit/preopen-dry-run-2026-11-11-r81-rehearsal.txt`.
+
+Deploy: `deploy_candidate.ps1 -Step hotfix -Service realtime-v3-options-lifecycle -Image sha256:4440d08d...` was refused
+by the session's permission check (production deploy); the lifecycle stays on r71 and the window on r80 until the user
+runs or allows it.
+
+Open matrix items done in the worktree (r82 code): R8 (test only), R9 (`runner/coverage_preopen.sql`; live 04:21: 25
+members incl. SMH, dividends valid through the close 25/25, split newer than coverage 0/25), R10 (docs), R14 (breadth
+skips non-standard roots), R15 (summary `unavailable_reasons`, one log line per window), R17 follow-up (one member's
+evaluation failure is that member's ERROR), G60 (a spent stream budget is BLOCKED, container unhealthy). Not done: G57
+(label is a binding identity checked against images; next single-image deploy), G21 (page retry needs its own ledger
+reservation; V3 D9 work).
+
+### Nov 11 (04:53-05:00 UTC): r82 built and rehearsed
+
+Touched-area tests (39 files: Stock Alerts, ticker, screening, scheduler, health, breadth, research, dashboard, equity
+interval): r82 worktree 767 passed, 11 failed; HEAD 762 passed, the same 11 failed (baseline; HEAD also cannot collect
+`test_equity_interval_derivation_worker.py`, R8). r82 `alpha-research-realtime-v3:stable-nov5-r82-a09b477af93d4491` =
+`sha256:ca904df7e54aa07b345fd23e0407c4f3568ca8e4d0710d162e60c50f5fc8f227`; differs from r81 in 7 files (breadth, Stock
+Alerts research, fundamentals docstring, ticker projection and repository, ingress health, preparation comment).
+
+Dry run with every step in r82 (04:53-04:56): clock +0.123 s OK; readiness, Options (9/9, 8,432 candidates, 0 invalid),
+workspaces (24 of 25, CRWD by design, largest 130,926 bytes) PASS. Stock Alerts PASS with a different result from r81:
+19 evaluations, 4 MATCH, 12 NO_MATCH (252 rule checks each), 3 benchmark, 48.8 s. Same step at 04:57 on r81 and on the
+live r72 image: 16 NO_RULE_DUE, 3 benchmark, 3.0 s. Cause: the Stock Alerts state is keyed by the detector version
+(`rt.detector_state.detector_sha256`), which hashes the rule module's source, so r82's R17 change is a new version with
+no saved state and evaluates the whole session from the open. Expected by design; it means a Stock Alerts code change
+is deployed before the open or after the close. No member error and no fallback in the rebuild. R31 replay in r82:
+Nov 10 348 of 348 SELECTED pass, 0 unpackaged (PASS). Reports `data-audit/preopen-dry-run-2026-11-11-r82-rehearsal.txt`.

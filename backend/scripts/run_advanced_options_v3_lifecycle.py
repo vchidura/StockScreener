@@ -66,6 +66,52 @@ GENERALIZED_PROVIDER_REQUESTS_PER_UNDERLYING = 12
 EXACT_FOUR_PROVIDER_REQUESTS_PER_UNDERLYING = 4
 CAPTURE_POLICY_AT_OPEN = "AT_OPEN"
 CAPTURE_POLICY_EARLIEST = "EARLIEST"
+# R19 (Nov 10, V3 D9): a SERIALIZABLE conflict in the reconcile is transient;
+# retry it in-process a bounded number of times instead of exiting and relying
+# on the container restart (3 restarts 15:43:50-15:44:01).
+RECONCILE_CONFLICT_ATTEMPTS = 5
+RECONCILE_CONFLICT_BACKOFF_SECONDS = 0.1
+_TRANSIENT_PGCODES = frozenset({"40001", "40P01"})
+
+
+def _transient_conflict(error: BaseException) -> bool:
+    return str(getattr(error, "pgcode", "") or "") in _TRANSIENT_PGCODES
+
+
+def _reconcile_with_retry(provider, *, target_session_date, wait=None):
+    """One SERIALIZABLE reconcile, retried on serialization failure or
+    deadlock with a short growing backoff; any other error, or the last
+    conflict, is raised as before."""
+    wait = threading.Event().wait if wait is None else wait
+    for attempt in range(RECONCILE_CONFLICT_ATTEMPTS):
+        try:
+            with provider.transaction(
+                APP_ROLE,
+                isolation_level="SERIALIZABLE",
+            ) as unit:
+                return reconcile_advanced_options_lifecycle_cursor(
+                    unit.cursor,
+                    target_session_date=target_session_date,
+                    checked_at=datetime.now(UTC),
+                )
+        except Exception as error:  # noqa: BLE001 - re-raised unless transient
+            if (
+                not _transient_conflict(error)
+                or attempt + 1 >= RECONCILE_CONFLICT_ATTEMPTS
+            ):
+                raise
+            print(
+                json.dumps({
+                    "contract": "advanced-options-v3-lifecycle-retry-v1",
+                    "operation": "reconcile",
+                    "attempt": attempt + 1,
+                    "pgcode": str(getattr(error, "pgcode", "")),
+                }),
+                file=sys.stderr,
+                flush=True,
+            )
+            wait(RECONCILE_CONFLICT_BACKOFF_SECONDS * (2 ** attempt))
+    raise AssertionError("unreachable")
 
 
 def parse_args(argv=None):
@@ -356,34 +402,22 @@ def main(argv=None) -> int:
                 ),
             )
             treasury_status = treasury.tick(lifecycle.preparation_session_date)
-            with provider.transaction(
-                APP_ROLE,
-                isolation_level="SERIALIZABLE",
-            ) as unit:
-                status = reconcile_advanced_options_lifecycle_cursor(
-                    unit.cursor,
-                    target_session_date=(
-                        lifecycle.preparation_session_date
-                    ),
-                    checked_at=datetime.now(UTC),
-                )
+            status = _reconcile_with_retry(
+                provider,
+                target_session_date=lifecycle.preparation_session_date,
+                wait=stop.wait,
+            )
             cycle = run_advanced_options_preparation_cycle(
                 provider,
                 executor,
                 owner_id=owner_id,
                 checked_at=datetime.now(UTC),
             )
-            with provider.transaction(
-                APP_ROLE,
-                isolation_level="SERIALIZABLE",
-            ) as unit:
-                status = reconcile_advanced_options_lifecycle_cursor(
-                    unit.cursor,
-                    target_session_date=(
-                        lifecycle.preparation_session_date
-                    ),
-                    checked_at=datetime.now(UTC),
-                )
+            status = _reconcile_with_retry(
+                provider,
+                target_session_date=lifecycle.preparation_session_date,
+                wait=stop.wait,
+            )
             payload = _status_payload(status, lifecycle)
             payload["stage_cycle"] = cycle
             payload["treasury_refresh"] = treasury_status

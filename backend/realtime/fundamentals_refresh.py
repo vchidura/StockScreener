@@ -1,5 +1,11 @@
-"""Financials tab data (G37, docs/FINANCIALS_TAB_TASK.md part 2): filed statements from Massive, refreshed once a day
-after the close in the preparation role's idle slot, for the current desired revision's companies.
+"""Financials tab data (G37, docs/FINANCIALS_TAB_TASK.md part 2): filed statements from Massive for the current desired
+revision's companies.
+
+When (R10, Nov 11): the preparation role checks in its first idle slot after a start and then every 30 minutes
+(`FED_CALENDAR_CHECK_INTERVAL`); it fetches only when due (`fundamentals_refresh_due_cursor`: a company without valid
+coverage, or whose newest check predates the last completed close), and a failed fetch waits
+`FUNDAMENTALS_RETRY_BACKOFF` (1 hour). So it normally runs once after each close, but a start or deploy before the open
+whose coverage predates the last close fetches statements at once (about 4 provider requests).
 
 The reader, normalizer, storage (`ref.fundamental_reports`, `ref.fundamental_report_coverage`), ticker projection and
 Financials table already existed and were switched off. This turns them on without touching anything else: only report

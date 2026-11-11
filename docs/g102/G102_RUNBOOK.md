@@ -99,7 +99,7 @@ internet; prove it each time with a socket probe). Script used Nov 10: scratchpa
 
 Equity members READY (25); Options preparation PREPARING at CATALOG_QUOTE with "history ready" until just after the
 open; restart counts against the deploy baseline; worker leases renewing; dividend coverage valid through the close and
-no split drift for every member (`coverage_after.sql`); `runner/g94_coverage_check.py SESSION`;
+no split drift for every member (`runner/coverage_preopen.sql`, members from the desired revision; R9); `runner/g94_coverage_check.py SESSION`;
 `runner/g102_read_flags_check.py`; start `live_watch.ps1 -DryRun` once.
 
 **Pre-open dry run (13:30-14:10, from Nov 11; matrix R20, built after the Nov 10 close).** Read-only, live image, the

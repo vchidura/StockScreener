@@ -317,3 +317,20 @@ def test_state_holds_only_the_latest_cycles_working_set():
     assert len(state) == steady
     project_realtime_ticker_workspace(_revise_monthly(inputs, "AAPL"), state=state)
     assert len(state) == steady
+
+
+def test_unavailable_workspace_reasons_are_bounded_and_cover_every_missing_member():
+    """R15 (Nov 11): the summary says why a member has no workspace."""
+    from realtime.ticker_projection import _unavailable_reasons
+
+    details = (
+        {"ticker": "CRWD", "stage": "SCREENING", "reason": "Derived screening source window/basis drift"},
+        {"ticker": "AMD", "stage": "TICKER_WORKSPACE", "reason": "x" * 400},
+        {"ticker": "AMD", "stage": "LATER", "reason": "second entry ignored"},
+        {"ticker": "AAPL", "stage": "TICKER_WORKSPACE", "reason": "not missing from this summary"},
+    )
+    rows = _unavailable_reasons(details, {"CRWD", "AMD", "MU"})
+    assert [row["ticker"] for row in rows] == ["AMD", "CRWD", "MU"]
+    assert rows[0]["stage"] == "TICKER_WORKSPACE" and len(rows[0]["reason"]) == 300
+    assert rows[1] == {"ticker": "CRWD", "stage": "SCREENING", "reason": "Derived screening source window/basis drift"}
+    assert rows[2] == {"ticker": "MU", "stage": "UNKNOWN", "reason": ""}

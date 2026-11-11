@@ -8,6 +8,7 @@ requires every member to be evaluated. Only a MATCH becomes an alert row; UNAVAI
 """
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -63,6 +64,7 @@ from .portal_projection import build_alert_projection
 from .screening_projection import RealtimeScreeningInput
 
 UTC = timezone.utc
+_LOGGER = logging.getLogger(__name__)
 RESEARCH_STATE_SCHEMA = "research_rule_state_v1"
 RESEARCH_CONTEXT_CONTRACT = "research-rule-context-v1"
 RESEARCH_VERSION = "3-research"
@@ -330,12 +332,26 @@ def produce_research_rule_batch(
                 entry["research_state"] = state
                 rules_state[rule] = entry
         changed = bool(results) or rules_state != {rule: dict(value) for rule, value in prior_rules.items()}
-        evaluations.append(_member_evaluation(
-            inputs, research, member, row, results, rules_state, key=key,
-            revision=(prior.revision if prior else 0) + (1 if changed else 0),
+        common = dict(
+            key=key, revision=(prior.revision if prior else 0) + (1 if changed else 0),
             context=_context(member, research.data, session, inputs.recorded_by), version=version,
             window_id=window_id, input_receipt_id=input_receipt_id, receipt_input_sha256=receipt_input_sha256,
-            membership=membership, is_late=is_late, changed=changed))
+            membership=membership, is_late=is_late, changed=changed)
+        try:
+            evaluation = _member_evaluation(inputs, research, member, row, results, rules_state, **common)
+        except Exception as failure:  # noqa: BLE001 - one member never fails the batch
+            # R17 follow-up (Nov 11, INV-7): building one member's evaluation (its state hash on Nov 10) failed the
+            # whole batch and restarted the service every cycle. That member's rules are now recorded as ERROR and its
+            # saved state stays as it was before this window; every other member is evaluated as usual.
+            error = f"MEMBER_EVALUATION_ERROR:{type(failure).__name__}"
+            _LOGGER.warning("Stock Alerts member %s evaluation failed at %s: %s: %s", member.ticker,
+                            inputs.cutoff.isoformat(), type(failure).__name__, str(failure)[:200])
+            failed = [(rule, {"status": "ERROR", "reasons": [], "gates": [], "input_ids": [], "state": None}, at, error)
+                      for rule, _result, at, _error in results]
+            evaluation = _member_evaluation(
+                inputs, research, member, row, failed, {rule: dict(value) for rule, value in prior_rules.items()},
+                **common)
+        evaluations.append(evaluation)
     return CanonicalStockAlertBatch(
         cohort_id=inputs.cohort_id, window_id=window_id, input_receipt_id=input_receipt_id,
         session_date=inputs.session, cutoff=inputs.cutoff, receipt_input_sha256=receipt_input_sha256,

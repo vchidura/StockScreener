@@ -315,3 +315,15 @@ def test_breadth_reads_work_with_the_apis_dict_cursor_and_with_tuple_cursors():
         )
         assert [row["contract_ticker"] for row in rows] == ["O:SPY251120C00760000"]
         assert captures["SPY"]["breadth_state"] == "COMPLETE" and captures["SPY"]["breadth_contracts"] == 1
+
+
+def test_other_products_listed_under_the_underlying_are_skipped():
+    """R14 (Nov 11): `O:B1SPY...` rows (another product under SPY since Nov 10) are not SPY options; R11 rejects them
+    in the preparation and breadth now skips them too."""
+    rows, skipped = breadth.parse_breadth_page({"results": [
+        _contract("O:SPY261120C00735000"),
+        _contract("O:B1SPY261113C00735000", expiration="2026-11-13"),
+        _contract("O:QQQ261120C00600000", strike=600.0),
+    ]}, underlying="SPY")
+    assert skipped == 2 and [row.contract_ticker for row in rows] == ["O:SPY261120C00735000"]
+    assert breadth._standard_root("O:SPY261120C00735000", "spy") and not breadth._standard_root("O:B1VDA2611", "NVDA")

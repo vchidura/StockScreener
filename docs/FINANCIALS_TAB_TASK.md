@@ -6,8 +6,9 @@ Tracks gap G37 (fundamentals never loaded) in `docs/agent-context/advanced-realt
 **Nov 10 (user: "let's address the financials"): statements only, built and rehearsed; in r66 + f21, planned to go
 live before Tuesday's open. Financials is NOT complete: key stats, float and short interest, and dividends need a
 migration (below).**
-- Fetch and store: `realtime/fundamentals_refresh.py`, in the preparation role's after-close slot beside the earnings
-  refresh. The desired revision's companies, one batched request per endpoint (income, balance sheet, cash flow, filing
+- Fetch and store: `realtime/fundamentals_refresh.py`, in the preparation role's idle slot beside the earnings refresh (R10, Nov 11:
+  checked in the first idle slot after a start and every 30 minutes, fetched when coverage predates the last close, so a
+  pre-open start or deploy fetches at once; a failed fetch waits 1 hour). The desired revision's companies, one batched request per endpoint (income, balance sheet, cash flow, filing
   index). Read-only probe on live: 16 of 16 companies, 1,314 reports in 7.7 s (AAPL FY26 Q4: revenue 114.5B, diluted
   EPS 2.10, as sampled Nov 6). Writes only report and coverage facts; each report points at the member's current stored
   security revision (no new security revision, no corporate-action coverage).

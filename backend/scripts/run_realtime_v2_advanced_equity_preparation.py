@@ -493,7 +493,8 @@ def main(argv=None):
                     run_earnings_calendar_refresh(provider, clock=_now),
                     sort_keys=True,
                 ), flush=True)
-                # G37 (Nov 10): the Financials tab's filed statements, once a day after the close.
+                # G37 (Nov 10): the Financials tab's filed statements when due (R10: first idle slot after a start,
+                # then every 30 minutes; due once per completed close), see fundamentals_refresh.py.
                 print(json.dumps(
                     run_fundamentals_refresh(provider, clock=_now, api_key=config.massive_api_key),
                     sort_keys=True,

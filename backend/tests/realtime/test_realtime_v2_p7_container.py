@@ -523,6 +523,8 @@ def test_continuous_health_reports_no_current_plan(monkeypatch):
         ("ACTIVE", None, "LIVE", "READY"),
         ("FAILED", "FAILED_INFRASTRUCTURE", None, "DEGRADED"),
         ("COMPLETE", "SESSION_COMPLETE", "STOPPED", "TERMINAL"),
+        # G60 (Nov 11): every connection attempt spent and no live stream is BLOCKED (unhealthy), not DEGRADED.
+        ("ACTIVE", None, "FAILED", "BLOCKED"),
     ),
 )
 def test_continuous_provider_health_distinguishes_runtime_states(
@@ -544,7 +546,7 @@ def test_continuous_provider_health_distinguishes_runtime_states(
         "READY",
         plan_status,
         terminal,
-        1,
+        12 if expected == "BLOCKED" else 1,
         12,
         stream_status,
         None,
@@ -555,6 +557,8 @@ def test_continuous_provider_health_distinguishes_runtime_states(
         None,
         "journal",
         date(2026, 11, 2),
+        3,
+        12,
     )
 
     state, _detail = health._provider_plan_health(

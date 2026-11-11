@@ -1,6 +1,8 @@
 """Automatic C8 Options preparation using stored Equity context."""
 from __future__ import annotations
 
+import json
+import logging
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -183,6 +185,54 @@ def c8_options_tier_binding(*, cohort_id, profile_id, manifest_sha256, effective
         options_tier=tier,
         options_enabled=True,
     )
+
+
+_LOGGER = logging.getLogger(__name__)
+
+
+def _isolated_activity_candidates(
+    rows,
+    snapshots,
+    *,
+    session_date,
+    observed_at,
+    flow_policy,
+    build=None,
+):
+    """R16 follow-up (INV-7): a contract the activity candidate refuses
+    (Nov 10: a provider delta of 1.0000000000047) is left out of the
+    allocation and logged with its reason, instead of failing every
+    underlying's CAPACITY_SHARDS and restarting the lifecycle. Returns the
+    kept candidates in row order."""
+    build = _activity_candidate if build is None else build
+    candidates = []
+    rejected: dict[str, int] = {}
+    examples: list[str] = []
+    for row in rows:
+        try:
+            candidates.append(build(
+                row,
+                snapshots[row.contract_ticker],
+                session_date=session_date,
+                observed_at=observed_at,
+                flow_policy=flow_policy,
+            ))
+        except (ArithmeticError, KeyError, TypeError, ValueError) as error:
+            reason = type(error).__name__ + ": " + str(error)[:120]
+            rejected[reason] = rejected.get(reason, 0) + 1
+            if len(examples) < 10:
+                examples.append(str(row.contract_ticker))
+    if rejected:
+        _LOGGER.warning(
+            "advanced_options_activity_candidates_rejected session=%s "
+            "kept=%d rejected=%d reasons=%s examples=%s",
+            session_date,
+            len(candidates),
+            sum(rejected.values()),
+            json.dumps(rejected, sort_keys=True),
+            ",".join(examples),
+        )
+    return tuple(candidates)
 
 
 def _utc(value: datetime, name: str) -> datetime:
@@ -1014,17 +1064,12 @@ class PostgresAutomaticOptionsPreparationExecutor(
             version=self._admission_profile_version,
         )
         flow_policy = load_advanced_options_flow_policy()
-        candidates = tuple(
-            _activity_candidate(
-                row,
-                selection.selected_snapshots[
-                    row.contract_ticker
-                ],
-                session_date=claim.session_date,
-                observed_at=selection.selection.reviewed_at,
-                flow_policy=flow_policy,
-            )
-            for row in selection.selection.selected
+        candidates = _isolated_activity_candidates(
+            selection.selection.selected,
+            selection.selected_snapshots,
+            session_date=claim.session_date,
+            observed_at=selection.selection.reviewed_at,
+            flow_policy=flow_policy,
         )
         refresh_underlyings = []
         for underlying in claim.option_underlyings:

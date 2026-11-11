@@ -295,7 +295,8 @@ def _provider_plan_health(
         "session.failure_code,session.heartbeat_at,"
         "session.event_time_watermark,session.ended_at,"
         "registry.status,registry.quarantine_reason,"
-        "registry.relative_path,plan.session_date "
+        "registry.relative_path,plan.session_date,"
+        "usage.stream_session_count,plan.maximum_stream_sessions "
         "FROM rt.advanced_ingress_plans AS plan "
         "JOIN rt.advanced_stream_authorizations AS auth "
         "USING(authorization_id) "
@@ -325,7 +326,8 @@ def _provider_plan_health(
         quarantine_reason,
         journal_relative_path,
         session_date,
-    ) = row
+    ) = row[:14]
+    sessions, maximum_sessions = (tuple(row[14:16]) + (None, None))[:2]
     stale_seconds = int(
         os.getenv("REALTIME_V2_ADVANCED_HEALTH_STALE_SECONDS") or 60
     )
@@ -338,10 +340,18 @@ def _provider_plan_health(
             - timedelta(seconds=stale_seconds)
         )
     )
+    # G60 (Nov 11): after the day's stream sessions or connection attempts are spent the feed stays down for the rest
+    # of the session; that read DEGRADED (exit 0, container healthy). It is now BLOCKED, so the container turns unhealthy.
+    budget_spent = session_status not in ACTIVE_STREAM_STATUSES and (
+        (attempts is not None and ceiling is not None and int(attempts) >= int(ceiling))
+        or (sessions is not None and maximum_sessions is not None and int(sessions) >= int(maximum_sessions))
+    )
     if plan_status in {"BLOCKED", "FAILED"} or quarantine_reason:
         state = "DEGRADED"
     elif terminal_outcome is not None or plan_status == "COMPLETE":
         state = "TERMINAL"
+    elif budget_spent:
+        state = "BLOCKED"
     elif stale:
         state = "STALE"
     elif session_status in ACTIVE_STREAM_STATUSES:
@@ -350,7 +360,9 @@ def _provider_plan_health(
         state = "DEGRADED"
     return state, {
         "reason": (
-            "STREAM_HEARTBEAT_STALE"
+            "STREAM_BUDGET_EXHAUSTED"
+            if state == "BLOCKED"
+            else "STREAM_HEARTBEAT_STALE"
             if stale
             else "STREAM_NOT_ACTIVE"
             if state == "DEGRADED" and session_status is None

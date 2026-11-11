@@ -462,55 +462,30 @@ def _evidence_builder(
         if rolling.contract_volumes
         else BaselineKind.WARMING
     )
-    threshold = AdvancedOptionsThresholdEvidence(
-        minimum_cumulative_volume=1,
-        observed_cumulative_volume=volume,
-        minimum_volume_oi_ratio=Decimal("0"),
-        observed_volume_oi_ratio=(
-            None if observed is None else Decimal("1")
-        ),
-        minimum_premium=Decimal("1"),
-        observed_premium=(
-            Decimal("0") if observed is None else observed.premium
-        ),
-        accepted_side_classes=(
-            () if observed is None else (observed.side_class,)
-        ),
-        accepted_confidences=(
-            () if observed is None else (observed.side_confidence,)
-        ),
-        observed_side_class=(
-            "NO_QUALIFYING_FLOW_EVENT"
-            if observed is None
-            else observed.side_class
-        ),
-        observed_confidence=(
-            "NO_QUALIFYING_FLOW_EVENT"
-            if observed is None
-            else observed.side_confidence
-        ),
-        minimum_cluster_prints=0,
-        observed_cluster_prints=0,
-        minimum_distinct_exchanges=0,
-        observed_distinct_exchanges=0,
-        minimum_cluster_premium=Decimal("0"),
-        observed_cluster_premium=Decimal("0"),
-        liquidity_policy_sha256=canonical_sha256(
-            (BUILD_ID, "liquidity-policy")
-        ),
-        liquidity_evidence_sha256=canonical_sha256(
-            (BUILD_ID, "liquidity-evidence", volume)
-        ),
-        liquidity_passed=True,
-        maximum_freshness_ms=1000,
-        observed_freshness_ms=0,
-        completeness=completeness,
-        passed=(
-            observed is not None
-            and volume >= 1
-            and completeness in COMPLETE_BASELINES
-        ),
-    )
+    threshold = _threshold_evidence(observed, volume, completeness)
+    # R31 (Nov 10): the threshold's volume baseline came from the first contract in the rolling state, whichever it
+    # was. After the 18:25-18:33 stream gap 64 of 72 baselines were INCOMPLETE (the first among them), every selected
+    # package failed its evidence check and E:18:30 FAILED. A package is now judged by its own contracts' baselines;
+    # the window drops packages on an incomplete baseline before detection (`_baseline_incomplete_instruments`).
+    volume_completeness = {
+        row.checkpoint.contract_ticker: row.completeness
+        for row in rolling.contract_volumes
+    }
+    thresholds = {completeness: threshold}
+
+    def threshold_for(evaluation):
+        package = evaluation.package
+        kinds = (
+            ()
+            if package is None
+            else tuple(volume_completeness.get(leg.contract_ticker) for leg in package.legs)
+        )
+        if not kinds or any(kind is None for kind in kinds):
+            return threshold
+        own = next((kind for kind in kinds if kind not in COMPLETE_BASELINES), kinds[0])
+        if own not in thresholds:
+            thresholds[own] = _threshold_evidence(observed, volume, own)
+        return thresholds[own]
 
     # R35 (Nov 10): every evaluation's evidence carried every flow observation the window read (up to 10,000 for the
     # session, ~650 KB compressed per evidence by 19:00), so the window's run time grew from ~100 s to ~250 s through
@@ -569,7 +544,7 @@ def _evidence_builder(
                 evaluation,
                 flow_observations=observations_for(evaluation),
                 cluster_observations=(),
-                threshold_evidence=threshold,
+                threshold_evidence=threshold_for(evaluation),
                 reference_state=reference,
                 rolling_state=rolling,
                 package_mark=package_mark,
@@ -605,6 +580,74 @@ def _evidence_builder(
             )
 
     return build
+
+
+def _baseline_incomplete_instruments(rolling, contracts, packageable):
+    """R31: instruments whose flow-volume baseline is not complete at the cutoff (a stream gap leaves it INCOMPLETE
+    until the snapshot reconciles it). A package on one cannot carry passing threshold evidence, so the window treats
+    it like an unmarked contract: the detection stays an OBSERVATION instead of failing the window."""
+    incomplete = {
+        row.checkpoint.contract_ticker
+        for row in rolling.contract_volumes
+        if row.completeness not in COMPLETE_BASELINES
+    }
+    return tuple(sorted(
+        row.instrument_id
+        for row in contracts
+        if row.contract_ticker in incomplete and row.instrument_id in packageable
+    ))
+
+
+def _threshold_evidence(observed, volume, completeness):
+    return AdvancedOptionsThresholdEvidence(
+        minimum_cumulative_volume=1,
+        observed_cumulative_volume=volume,
+        minimum_volume_oi_ratio=Decimal("0"),
+        observed_volume_oi_ratio=(
+            None if observed is None else Decimal("1")
+        ),
+        minimum_premium=Decimal("1"),
+        observed_premium=(
+            Decimal("0") if observed is None else observed.premium
+        ),
+        accepted_side_classes=(
+            () if observed is None else (observed.side_class,)
+        ),
+        accepted_confidences=(
+            () if observed is None else (observed.side_confidence,)
+        ),
+        observed_side_class=(
+            "NO_QUALIFYING_FLOW_EVENT"
+            if observed is None
+            else observed.side_class
+        ),
+        observed_confidence=(
+            "NO_QUALIFYING_FLOW_EVENT"
+            if observed is None
+            else observed.side_confidence
+        ),
+        minimum_cluster_prints=0,
+        observed_cluster_prints=0,
+        minimum_distinct_exchanges=0,
+        observed_distinct_exchanges=0,
+        minimum_cluster_premium=Decimal("0"),
+        observed_cluster_premium=Decimal("0"),
+        liquidity_policy_sha256=canonical_sha256(
+            (BUILD_ID, "liquidity-policy")
+        ),
+        liquidity_evidence_sha256=canonical_sha256(
+            (BUILD_ID, "liquidity-evidence", volume)
+        ),
+        liquidity_passed=True,
+        maximum_freshness_ms=1000,
+        observed_freshness_ms=0,
+        completeness=completeness,
+        passed=(
+            observed is not None
+            and volume >= 1
+            and completeness in COMPLETE_BASELINES
+        ),
+    )
 
 
 def build_and_run_p8_serial_window(
@@ -767,6 +810,19 @@ def build_and_run_p8_serial_window(
         for row in binding.enrollment.activity_selection.contracts
         if row.instrument_id not in marked
     ))
+    baseline_incomplete = _baseline_incomplete_instruments(
+        rolling,
+        binding.enrollment.activity_selection.contracts,
+        marked,
+    )
+    if baseline_incomplete:
+        _LOGGER.warning(
+            "advanced_options_window_unpackaged window_id=%s cutoff=%s volume_baseline_incomplete=%d",
+            binding.window_id,
+            cutoff.isoformat(),
+            len(baseline_incomplete),
+        )
+        unmarked_instrument_ids = tuple(sorted({*unmarked_instrument_ids, *baseline_incomplete}))
     if rolling.degraded_reason_codes:
         _LOGGER.warning(
             "advanced_options_window_degraded window_id=%s reasons=%s "

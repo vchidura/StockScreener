@@ -313,11 +313,23 @@ def _project_ticker_cycle(
         )
         _projection_checkpoint(should_stop)
         snapshots = projection.snapshots
+        if projection.unavailable_members:
+            # R15 (Nov 11): once per window, which members got no workspace and why.
+            logging.getLogger(__name__).warning(
+                "ticker_workspaces_unavailable cutoff=%s count=%d members=%s",
+                inputs.cutoff.isoformat(),
+                len(projection.unavailable_members),
+                "; ".join(
+                    f"{item.get('ticker')}:{item.get('stage')}:{str(item.get('reason'))[:160]}"
+                    for item in projection.unavailable_members
+                ),
+            )
         summary = produce_realtime_ticker_workspace_summary(
             inputs,
             snapshots,
             projection.summary_charts,
             should_stop=should_stop,
+            unavailable_details=projection.unavailable_members,
         )
         pattern_publication = produce_realtime_pattern_watch_publication(
             inputs,
