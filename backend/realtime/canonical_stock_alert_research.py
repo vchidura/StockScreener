@@ -60,6 +60,7 @@ from .detector_evidence import (
     build_detector_version,
 )
 from .lineage_head import inputs_sha256
+from .fault_journal import emit_fault
 from .portal_projection import build_alert_projection
 from .screening_projection import RealtimeScreeningInput
 
@@ -346,6 +347,10 @@ def produce_research_rule_batch(
             error = f"MEMBER_EVALUATION_ERROR:{type(failure).__name__}"
             _LOGGER.warning("Stock Alerts member %s evaluation failed at %s: %s: %s", member.ticker,
                             inputs.cutoff.isoformat(), type(failure).__name__, str(failure)[:200])
+            emit_fault(kind="ITEM_REJECTED", severity="DEGRADED", recoverable=True, action="MEMBER_RECORDED_ERROR",
+                       service="stock-alerts", key=f"member-evaluation|{type(failure).__name__}",
+                       message=f"{member.ticker} evaluation failed: {type(failure).__name__}: {failure}",
+                       context={"ticker": member.ticker, "cutoff": inputs.cutoff.isoformat()})
             failed = [(rule, {"status": "ERROR", "reasons": [], "gates": [], "input_ids": [], "state": None}, at, error)
                       for rule, _result, at, _error in results]
             evaluation = _member_evaluation(

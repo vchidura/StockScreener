@@ -24,6 +24,7 @@ from .advanced_options_equity_input import (
     initial_advanced_options_equity_context_requirements,
 )
 from .advanced_options_cycle import AdvancedOptionsDatasetFlowIdentity
+from .fault_journal import emit_fault
 from .advanced_options_loaders import (
     build_canonical_advanced_options_runtime_binding,
 )
@@ -536,6 +537,10 @@ def _evidence_builder(
                     "Options package %s evidence incomplete at %s (%s); recorded without a mark",
                     evaluation.package.candidate_id, cutoff.isoformat(), error,
                 )
+                emit_fault(kind="ITEM_REJECTED", severity="RECOVERED", recoverable=True, action="RECORDED_UNMARKED",
+                           service="options-window", key="package-evidence-incomplete",
+                           message=f"package {evaluation.package.candidate_id} evidence incomplete: {error}",
+                           context={"cutoff": cutoff.isoformat()})
                 values.append(evidence(evaluation, None, "PACKAGE_EVIDENCE_INCOMPLETE"))
         return build_flow_package_evidence_batch(cycle, tuple(values))
 
@@ -796,6 +801,14 @@ def build_and_run_p8_serial_window(
         len(mark_preflight.marks),
         json.dumps(unmarked_reasons, sort_keys=True),
     )
+    if not mark_preflight.marks and unmarked_reasons:
+        # R21 (Nov 11): no contract marked is how the Nov 10 clock skew (R34) showed; O1 then selects nothing.
+        # FUTURE: compare with the window's contract count and alarm on a large drop, not only on zero.
+        emit_fault(kind="MARKS_UNAVAILABLE", severity="DEGRADED", recoverable=True, action="NONE",
+                   service="options-window", key="no-marks|" + ",".join(sorted(unmarked_reasons)),
+                   message=f"no contract marked at {cutoff.isoformat()}: {json.dumps(unmarked_reasons, sort_keys=True)}",
+                   context={"window_id": str(binding.window_id), "reasons": unmarked_reasons,
+                            "hint": "check the host clock first (R34)"})
     mark_plan = freeze_advanced_options_mark_producer_plan(
         mark_candidate,
         mark_preflight,
@@ -822,6 +835,11 @@ def build_and_run_p8_serial_window(
             cutoff.isoformat(),
             len(baseline_incomplete),
         )
+        emit_fault(kind="ITEM_REJECTED", severity="DEGRADED", recoverable=True, action="UNPACKAGED",
+                   service="options-window", key="volume-baseline-incomplete",
+                   message=f"{len(baseline_incomplete)} contracts with an incomplete volume baseline left unpackaged",
+                   context={"window_id": str(binding.window_id), "cutoff": cutoff.isoformat(),
+                            "count": len(baseline_incomplete)})
         unmarked_instrument_ids = tuple(sorted({*unmarked_instrument_ids, *baseline_incomplete}))
     if rolling.degraded_reason_codes:
         _LOGGER.warning(

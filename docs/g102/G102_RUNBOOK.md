@@ -127,6 +127,22 @@ hang or return 500; the API port times out; `monitor.log` under `%LOCALAPPDATA%\
 Recovery: `docker desktop restart` (database on the host; volumes and containers come back by their restart policy);
 then check leases, errors and the API. Restart the isolated test server separately (`docker start g102-test-pg`).
 
+**Fault journal and self-heal checks (R21, Nov 11; record-only).** One collector writes every fault the platform
+reports, plus what it finds, to `data-audit/faults/faults-YYYY-MM-DD.jsonl` (one line per occurrence, UTC day) and
+`faults-YYYY-MM-DD.md` (one row per fault: worst severity, count, first/last seen, recovered or not, action taken or
+proposed, the matrix row it is known as, or NEW). Sources: `FAULT {json}` lines and tracebacks in every
+`stock-screener-realtime-*` container's log, container restarts/health, the self-heal checks (read-only, in a backend
+image that has `scripts/run_realtime_v2_self_heal.py`, r83 or later) and host checks (clock, disk, Docker answering).
+- During the next sessions (watcher still monitors and fixes): run one pass with each 10-minute check,
+  `python -B runnerault_collector.py --once --self-heal-image sha256:<r83+>`; the first pass of a day can take
+  `--since 6h`.
+- Offline: read the day's `.md`; every row not RECOVERED and marked NEW becomes a matrix row.
+- Unattended (only on the user's go): `runner\install_fault_collector.ps1 -SelfHealImage sha256:<image>` registers a
+  scheduled task (`--follow`, every 60 s, self-heal every 5 minutes). Remove with
+  `Unregister-ScheduledTask -TaskName StockScreener-FaultCollector`.
+- Acting: nothing acts until R38 (the user's go after one or two record-only sessions); WOULD_ACT rows show what would
+  have been done.
+
 ## 10. Public entry: alpha-screener-pro.com (Cloudflare Tunnel, since Nov 10)
 
 - **Route:** Cloudflare dashboard (Zero Trust, Networks, Tunnels): the realtime stack's own tunnel; public hostname

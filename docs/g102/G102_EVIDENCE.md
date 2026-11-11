@@ -993,3 +993,31 @@ live r72 image: 16 NO_RULE_DUE, 3 benchmark, 3.0 s. Cause: the Stock Alerts stat
 no saved state and evaluates the whole session from the open. Expected by design; it means a Stock Alerts code change
 is deployed before the open or after the close. No member error and no fallback in the rebuild. R31 replay in r82:
 Nov 10 348 of 348 SELECTED pass, 0 unpackaged (PASS). Reports `data-audit/preopen-dry-run-2026-11-11-r82-rehearsal.txt`.
+
+### Nov 11 (05:20-06:10 UTC): R21 fault journal and record-only self-heal built (not deployed)
+
+User (Nov 11): implement self-heal and a single fault journal, record-only for the first one or two sessions, then act;
+comment where future changes are needed; do not deploy; the watcher keeps monitoring and fixing during the next sessions.
+
+Built: `realtime/fault_journal.py`, `realtime/transient_retry.py`, `realtime/self_heal.py`,
+`scripts/run_realtime_v2_self_heal.py`, fault lines at the R15/R16/R17/R19/R31 isolation points and on zero marks;
+host `runner/fault_collector.py` and `runner/install_fault_collector.ps1` (not installed). Design choice: crash and
+restart detection lives in the collector (Docker state and logs), because the service wrapper `exec`s the service on
+Linux and never sees its exit; changing that to a parent process would change signal handling for every service.
+Image r83 `sha256:60118b8dc80b` (worktree at 05:50; for the read-only check run only, not deployed).
+
+Collector rehearsal, read-only, scratch output: logs since Nov 10 14:00 of the 21 `stock-screener-realtime-*` containers
+-> 24 records, 8 distinct: R19 SerializationFailure x3 (lifecycle 15:43-15:44), R28 BufferFull and GatewayOverload
+(acquisition 18:34), R37 x3 (FLOW, INGRESS, MARKET_STATE 21:06), and the lease handovers after the 15:43 and 20:14
+deploys (8 each, RECOVERED, "after a deploy"). The window's own Nov 10 failures are not in any log (container recreated
+at 20:15); the self-heal checks cover them from the database. Legacy stack containers are excluded.
+
+Self-heal pass in r83 (record-only, read-only, 05:50): WINDOW_PAST_DEADLINE 136 Options windows PENDING/RUNNING past
+deadline since Nov 4 (WOULD_ACT MARK_MISSED; R32 is wider than the 9 counted on Nov 10); STREAM_STALE Options stream
+b847f3cc open since Nov 10 21:05 (refined to DEGRADED: the next session's registration ends it, B14a); leases, lanes,
+preparation and run time clean before the open. Tests: `test_fault_journal_self_heal.py` 10 passed; with the lifecycle,
+window package, Stock Alerts and ticker tests 36 passed.
+Regression on the final self-heal code (Options + touched areas, 2,551 tests): 2,502 passed, 47 failed, identical to r82
+(baseline). Image r84 `sha256:4046b55571da` (refined stale-stream check: the previous session's open stream is
+DEGRADED until the next registration ends it) for read-only check runs only, not deployed; pass at 06:10: 136 Options
+windows past deadline (WOULD_ACT MARK_MISSED), Nov 10 Options stream open (DEGRADED, B14a), nothing else.

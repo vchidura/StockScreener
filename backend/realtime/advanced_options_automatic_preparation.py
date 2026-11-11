@@ -124,6 +124,7 @@ from .advanced_options_v3_authority import (
     prospective_opening_admission_payload,
 )
 from .contracts import UniverseManifest, canonical_sha256
+from .fault_journal import emit_fault
 from .preflight import ProviderTier, TierState
 from .tier_cohort import (
     TierCohortBinding,
@@ -232,6 +233,11 @@ def _isolated_activity_candidates(
             json.dumps(rejected, sort_keys=True),
             ",".join(examples),
         )
+        # R21 (Nov 11): the fault journal records the isolated rows for offline follow-up.
+        emit_fault(kind="ITEM_REJECTED", severity="RECOVERED", recoverable=True, action="LEFT_OUT_OF_ALLOCATION",
+                   service="options-lifecycle", key="activity-candidate|" + ",".join(sorted(rejected)),
+                   message=f"{sum(rejected.values())} activity candidates refused, {len(candidates)} kept",
+                   context={"session": str(session_date), "reasons": rejected, "examples": examples})
     return tuple(candidates)
 
 

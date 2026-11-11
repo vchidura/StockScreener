@@ -41,6 +41,7 @@ from realtime.advanced_options_activity_momentum_c6 import (  # noqa: E402
     LEGACY_ACTIVITY_MOMENTUM_PROFILE_VERSION,
 )
 from realtime.contracts import canonical_sha256  # noqa: E402
+from realtime.fault_journal import emit_fault  # noqa: E402
 from realtime.database_access_v2 import (  # noqa: E402
     APP_ROLE,
     V2AccessConfig,
@@ -81,7 +82,10 @@ def _transient_conflict(error: BaseException) -> bool:
 def _reconcile_with_retry(provider, *, target_session_date, wait=None):
     """One SERIALIZABLE reconcile, retried on serialization failure or
     deadlock with a short growing backoff; any other error, or the last
-    conflict, is raised as before."""
+    conflict, is raised as before.
+
+    FUTURE: the same as `realtime.transient_retry.retry_transient`; fold it
+    in at the next lifecycle image (kept as rehearsed in r82 for now)."""
     wait = threading.Event().wait if wait is None else wait
     for attempt in range(RECONCILE_CONFLICT_ATTEMPTS):
         try:
@@ -99,17 +103,17 @@ def _reconcile_with_retry(provider, *, target_session_date, wait=None):
                 not _transient_conflict(error)
                 or attempt + 1 >= RECONCILE_CONFLICT_ATTEMPTS
             ):
+                if _transient_conflict(error):
+                    emit_fault(kind="RETRY_EXHAUSTED", severity="FATAL",
+                               recoverable=False, action="RAISED",
+                               service="options-lifecycle", key="reconcile",
+                               message=f"reconcile: {RECONCILE_CONFLICT_ATTEMPTS} conflicts in a row",
+                               context={"pgcode": str(getattr(error, "pgcode", ""))})
                 raise
-            print(
-                json.dumps({
-                    "contract": "advanced-options-v3-lifecycle-retry-v1",
-                    "operation": "reconcile",
-                    "attempt": attempt + 1,
-                    "pgcode": str(getattr(error, "pgcode", "")),
-                }),
-                file=sys.stderr,
-                flush=True,
-            )
+            emit_fault(kind="RETRY", severity="RECOVERED", recoverable=True,
+                       action="RETRIED", service="options-lifecycle", key="reconcile",
+                       message=f"reconcile conflict, retry {attempt + 1}",
+                       context={"pgcode": str(getattr(error, "pgcode", ""))})
             wait(RECONCILE_CONFLICT_BACKOFF_SECONDS * (2 ** attempt))
     raise AssertionError("unreachable")
 

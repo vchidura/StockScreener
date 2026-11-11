@@ -324,6 +324,15 @@ def _project_ticker_cycle(
                     for item in projection.unavailable_members
                 ),
             )
+            from .fault_journal import emit_fault
+
+            emit_fault(kind="ITEM_REJECTED", severity="DEGRADED", recoverable=True, action="WORKSPACE_SKIPPED",
+                       service="equity-scheduler", key="ticker-workspace|" + ",".join(sorted(
+                           str(item.get("ticker")) for item in projection.unavailable_members)),
+                       message=f"{len(projection.unavailable_members)} members without a workspace",
+                       context={"cutoff": inputs.cutoff.isoformat(), "members": [
+                           f"{item.get('ticker')}:{item.get('stage')}:{str(item.get('reason'))[:120]}"
+                           for item in projection.unavailable_members]})
         summary = produce_realtime_ticker_workspace_summary(
             inputs,
             snapshots,
