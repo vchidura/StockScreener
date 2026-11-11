@@ -27,7 +27,7 @@ from equity.ticker_contracts import (
 from research.forming_patterns import summarize_cross_frame_patterns
 from research.price_channels import detect_price_channel
 
-from .contracts import canonical_sha256
+from .contracts import canonical_json, canonical_sha256
 from .equity_bar_adapter import RealtimeEquityBarFact
 from .equity_interval_derivation import derive_realtime_interval_facts
 from .equity_materialization_adapter import (
@@ -36,7 +36,8 @@ from .equity_materialization_adapter import (
 )
 from .equity_portal_history import build_realtime_equity_portal_history_plan
 from .lineage_head import (
-    assemble_lineage_head, group_head, reference_set, require_bounded_manifest, require_bounded_payload,
+    BOUNDED_WORKSPACE_PAYLOAD_BYTES, assemble_lineage_head, group_head, reference_set, require_bounded_manifest,
+    require_bounded_payload,
     revision_chain_sha256, rows_identity, workspace_set,
 )
 from .reference_continuity import source_manifest_continuity_fields
@@ -441,6 +442,31 @@ def _recent_fundamental_periods(reports):
         periods = sorted({row["period_end"] for row in newest_filing if row["timeframe"] == timeframe}, reverse=True)
         keep.update((timeframe, period) for period in periods[:FUNDAMENTAL_PERIODS_KEPT.get(timeframe, 12)])
     return [row for row in newest_filing if (row["timeframe"], row["period_end"]) in keep]
+
+
+def _fit_fundamentals_to_bound(payload, *, name, limit=BOUNDED_WORKSPACE_PAYLOAD_BYTES):
+    """Nov 10 (G37 on live): with Financials loaded, 15 of 16 stock workspaces measured 134-149 KB against the
+    128 KiB by-reference bound and every window dropped them. The bound stays (it guards against embedded bar and
+    evidence bodies); a workspace over it keeps the newest Financials periods that fit and says so (INV-8). Any
+    other oversize still fails the ticker as before."""
+    size = len(canonical_json(payload).encode("ascii"))
+    reports = payload["profile"]["fundamental_reports"]
+    if size <= limit or not reports:
+        return require_bounded_payload(payload, name=name, limit=limit)
+    label = dict(fundamental_reports_status="TRIMMED_TO_WORKSPACE_BOUND", fundamental_reports_available=len(reports))
+    excess = size - limit + len(canonical_json(label).encode("ascii")) + 2
+    by_age = sorted(range(len(reports)), key=lambda index: (reports[index]["period_end"], -index))
+    dropped = set()
+    for index in by_age:
+        if excess <= 0:
+            break
+        dropped.add(index)
+        excess -= len(canonical_json(reports[index]).encode("ascii")) + 1
+    trimmed = dict(payload, profile=dict(
+        payload["profile"], **label,
+        fundamental_reports=[row for index, row in enumerate(reports) if index not in dropped],
+    ))
+    return require_bounded_payload(trimmed, name=name, limit=limit)
 
 
 def _has_fundamental_coverage(security, inputs, fundamental_coverage):
@@ -1350,7 +1376,7 @@ def _project_realtime_ticker_workspace(
                 )
             source_manifest.update(source_manifest_continuity_fields(inputs))
             require_bounded_manifest(source_manifest, name=f"Ticker workspace {security.ticker}")
-            require_bounded_payload(payload, name=f"Ticker workspace {security.ticker}")
+            payload = _fit_fundamentals_to_bound(payload, name=f"Ticker workspace {security.ticker}")
             snapshots.append(build_portal_snapshot(
                 cohort_id=inputs.cohort_id, provider_tier=inputs.provider_tier,
                 snapshot_type=TICKER_WORKSPACE_VERSION, snapshot_key=security.ticker,

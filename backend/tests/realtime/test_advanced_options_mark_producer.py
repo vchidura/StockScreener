@@ -255,3 +255,30 @@ def test_mark_producer_retries_serialization_rollback(monkeypatch):
     assert producer.produce() == ()
     assert provider.attempts == 2
     assert waits == [0.01]
+
+
+def test_quote_stamped_received_before_its_event_by_clock_skew_is_marked():
+    """R34 (Nov 10 live): the host clock was 0.4-0.6 s behind the exchange, so quotes were received "before" their
+    event and every contract was left out as NONCAUSAL; O1 built no package for the rest of the session. Up to 2 s of
+    skew is taken as received at the event time; more is still noncausal."""
+    plan = _plan()
+    skewed = assemble_advanced_options_marks_cursor(
+        _QuoteCursor(_quote_rows(
+            plan,
+            event_at=NOW - timedelta(milliseconds=100),
+            received_at=NOW - timedelta(milliseconds=550),
+        )),
+        plan,
+    )
+    assert _noncausal_rows(skewed) == []
+    assert all(mark.observed_time == mark.market_time == NOW - timedelta(milliseconds=100) for mark in skewed.marks)
+    far = assemble_advanced_options_marks_cursor(
+        _QuoteCursor(_quote_rows(
+            plan,
+            event_at=NOW - timedelta(milliseconds=100),
+            received_at=NOW - timedelta(seconds=3),
+        )),
+        plan,
+    )
+    assert _noncausal_rows(far)
+

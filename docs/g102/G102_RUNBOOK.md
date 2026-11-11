@@ -102,6 +102,13 @@ open; restart counts against the deploy baseline; worker leases renewing; divide
 no split drift for every member (`coverage_after.sql`); `runner/g94_coverage_check.py SESSION`;
 `runner/g102_read_flags_check.py`; start `live_watch.ps1 -DryRun` once.
 
+**Pre-open dry run (13:30-14:10, from Nov 11; matrix R20, built after the Nov 10 close).** Read-only, live image, the
+day's provider data: for every Options underlying run the CATALOG_QUOTE capture (the preparation's own query and
+validation), then the combined candidate build and the CAPACITY_SHARDS allocation; one Stock Alerts batch and one ticker
+workspace projection against the latest cutoff (payload sizes against the 128 KiB bound). Report per step: rows,
+rejections by reason, invalid items, sizes. Anything that would fail at the open is fixed before 14:15 (the deploy tool
+allows it then). Nov 10 would have shown R11 (`O:B1...` rows) and R16 (delta float noise) here, two hours early.
+
 ## 8. Manual bar correction
 
 Only after the INV-2 fix (the full winner tuple in the upsert) is live.

@@ -1,4 +1,4 @@
-import type { EligibleChainRow, OptionDiscoveryCatalog, OptionScreenDefinitionSummary } from '../services/api'
+import type { EligibleChainRow, OptionDiscoveryCatalog, OptionScreenDefinitionSummary, OptionScreenOverrides } from '../services/api'
 
 export const OPTIONS_LIBRARY_KEY = 'options-screen-library-v1'
 export type OptionsView = 'contracts' | 'packages' | 'chain'
@@ -137,7 +137,8 @@ export function validateScreenQuery(input: Record<string, string>, catalog: Opti
   const query: Record<string, string> = {}
   for (const key of Object.keys(input).sort()) {
     const rangeKey = input.view === 'chain' && Object.keys(catalog.contract_filters || {}).some(field => key === `range_${field}_min` || key === `range_${field}_max`)
-    if (!(allowedKeys.has(key) || rangeKey || input.view === 'chain' && key === 'descending') || typeof input[key] !== 'string' || input[key].length > 2000) throw new Error(`Unsupported screen field: ${key}`)
+    const screenKey = input.view === 'chain' && (isScreenFieldKey(key) || key === SCREEN_EDIT_KEY)
+    if (!(allowedKeys.has(key) || rangeKey || screenKey || input.view === 'chain' && key === 'descending') || typeof input[key] !== 'string' || input[key].length > 2000) throw new Error(`Unsupported screen field: ${key}`)
     if (input[key] !== '') query[key] = input[key]
   }
   const view = query.view || 'contracts'
@@ -165,6 +166,7 @@ export function validateScreenQuery(input: Record<string, string>, catalog: Opti
     if (['category', 'model', 'scope', 'preset', 'min_dte', 'max_dte', 'min_volume', 'min_oi', 'min_ratio', 'max_capital'].some(key => key in query)) throw new Error('Detection or package filters cannot be applied to the eligible chain')
     if (query.descending && !['0', '1'].includes(query.descending)) throw new Error('Invalid sort direction')
     chainFilterRanges(query, catalog)
+    validateScreenFields(query)
   }
   if (view === 'packages') {
     if (model?.output_kind === 'OBSERVATION') throw new Error('Observation models do not produce packages')
@@ -242,11 +244,126 @@ export function makeOptionsScreen(name: string, query: Record<string, string>, c
 
 export type OptionTemplate = { id: string; name: string; query: Record<string, string>; summary: string; unavailable?: string; serverScreen?: OptionScreenDefinitionSummary }
 
-/** A backend-defined built-in screen (options-screen-v1): the API applies it by id; the page only passes the id. */
-export function serverScreenTemplate(screen: OptionScreenDefinitionSummary): OptionTemplate {
-  return { id: screen.id, name: screen.name, summary: screen.summary, serverScreen: screen,
-    query: { view: 'chain', ...(screen.contract_type ? { type: screen.contract_type } : {}), sort: screen.sort } }
+/** Nov 10: fields of a built-in server screen beyond plain ranges, carried in the URL like any filter. */
+export const SCREEN_EDIT_KEY = 'screen_edit'
+export const isScreenFieldKey = (key: string) => /^tier_[a-z_]+_[A-Z_]+$/.test(key) || key === 'exclude_calendar_dte' || key === 'cap_per_underlying' || key === 'cap_total'
+export const parseDteList = (raw: string) => raw.split(',').map(value => value.trim()).filter(Boolean).map(Number)
+
+function validateScreenFields(query: Record<string, string>) {
+  for (const [key, raw] of Object.entries(query)) {
+    if (key.startsWith('tier_')) {
+      const value = Number(raw)
+      if (!raw.trim() || !Number.isFinite(value) || value < 0 || value > 1e12) throw new Error('A tier minimum must be a number of 0 or more')
+    } else if (key === 'exclude_calendar_dte') {
+      if (parseDteList(raw).some(value => !Number.isInteger(value) || value < 0 || value > 365)) throw new Error('Excluded DTE must be whole days from 0 to 365, separated by commas')
+    } else if (key === 'cap_per_underlying' || key === 'cap_total') {
+      const value = Number(raw)
+      if (!Number.isInteger(value) || value < 1 || value > 500) throw new Error('A result limit must be a whole number from 1 to 500')
+    }
+  }
 }
+
+/** The URL fields that reproduce a built-in server screen: fixed minimums as Min ranges, per-tier minimums, the DTE
+ * exclusion and the caps. Without criteria (older API) the tab runs the built-in unchanged. */
+export function serverScreenDefaults(screen: OptionScreenDefinitionSummary, catalog?: OptionDiscoveryCatalog): Record<string, string> {
+  if (!screen.criteria) return {}
+  const query: Record<string, string> = { [SCREEN_EDIT_KEY]: '1' }
+  for (const item of screen.criteria) {
+    const field = catalog?.contract_filters?.[item.field]
+    if (item.values_by_tier) {
+      for (const [tier, value] of Object.entries(item.values_by_tier)) query[`tier_${item.field}_${tier}`] = String(value)
+    } else if (item.field === 'calendar_dte' && item.negated && item.op === 'in' && Array.isArray(item.value)) {
+      query.exclude_calendar_dte = item.value.join(', ')
+    } else if (!item.negated && (item.op === '>=' || item.op === '>') && typeof item.value === 'number' && field) {
+      query[`range_${item.field}_min`] = String(Number((item.value * (field.unit === 'fraction' ? 100 : 1)).toPrecision(12)))
+    }
+  }
+  if (screen.caps?.per_underlying) query.cap_per_underlying = String(screen.caps.per_underlying)
+  if (screen.caps?.total) query.cap_total = String(screen.caps.total)
+  return query
+}
+
+/** The page's fields as edits to the built-in screen. Only a tab opened with the screen's fields (SCREEN_EDIT_KEY)
+ * sends edits; a cleared field removes its criterion (a tier minimum becomes 0, a limit becomes none). */
+export function serverScreenOverrides(query: Record<string, string>, screen: OptionScreenDefinitionSummary, catalog?: OptionDiscoveryCatalog): OptionScreenOverrides | undefined {
+  if (query[SCREEN_EDIT_KEY] !== '1' || !screen.criteria) return undefined
+  const overrides: OptionScreenOverrides = { minimums: {}, tier_minimums: {}, caps: { per_underlying: null, total: null } }
+  for (const item of screen.criteria) {
+    const field = catalog?.contract_filters?.[item.field]
+    if (item.values_by_tier) {
+      overrides.tier_minimums[item.field] = Object.fromEntries(Object.keys(item.values_by_tier).map(tier => {
+        const raw = query[`tier_${item.field}_${tier}`]
+        return [tier, raw == null || raw === '' ? 0 : Number(raw)]
+      }))
+    } else if (item.field === 'calendar_dte' && item.negated && item.op === 'in' && Array.isArray(item.value)) {
+      overrides.exclude_calendar_dte = parseDteList(query.exclude_calendar_dte || '')
+    } else if (!item.negated && (item.op === '>=' || item.op === '>') && typeof item.value === 'number' && field) {
+      const raw = query[`range_${item.field}_min`]
+      overrides.minimums[item.field] = raw == null || raw === '' ? null : Number(raw) / (field.unit === 'fraction' ? 100 : 1)
+    }
+  }
+  if (query.cap_per_underlying) overrides.caps.per_underlying = Number(query.cap_per_underlying)
+  if (query.cap_total) overrides.caps.total = Number(query.cap_total)
+  return overrides
+}
+
+/** Which fields a server screen fills, for the panel's controls and its Built-in marks. */
+export function serverScreenFields(screen: OptionScreenDefinitionSummary) {
+  const tiers: Record<string, string[]> = {}
+  const minimums = new Set<string>()
+  let excludeDte = false
+  for (const item of screen.criteria || []) {
+    if (item.values_by_tier) tiers[item.field] = Object.keys(item.values_by_tier)
+    else if (item.field === 'calendar_dte' && item.negated && item.op === 'in') excludeDte = true
+    else if (!item.negated && (item.op === '>=' || item.op === '>') && typeof item.value === 'number') minimums.add(item.field)
+  }
+  return { tiers, minimums, excludeDte, caps: !!(screen.caps?.per_underlying || screen.caps?.total) }
+}
+
+export const screenTierLabel = (tier: string) => tierLabel(tier)
+
+/** What the user changed from the built-in screen, for the line above the results. */
+export function screenChangeLabels(query: Record<string, string>, defaults: Record<string, string>, catalog?: OptionDiscoveryCatalog): string[] {
+  const labels: string[] = []
+  const keys = new Set([...Object.keys(defaults), ...Object.keys(query)].filter(key => key.startsWith('range_') || isScreenFieldKey(key) || key === 'underlyer' || key === 'type'))
+  for (const key of [...keys].sort()) {
+    if ((query[key] ?? '') === (defaults[key] ?? '')) continue
+    const value = query[key] || 'none'
+    const range = key.match(/^range_(.+)_(min|max)$/)
+    const tier = key.match(/^tier_(.+)_([A-Z_]+)$/)
+    const label = range ? `${catalog?.contract_filters?.[range[1]]?.label || range[1]} ${range[2]}`
+      : tier ? `${catalog?.contract_filters?.[tier[1]]?.label || (tier[1] === 'day_premium' ? 'Day premium' : tier[1])} min (${tierLabel(tier[2])})`
+      : key === 'exclude_calendar_dte' ? 'Excluded DTE' : key === 'cap_per_underlying' ? 'Limit per underlying' : key === 'cap_total' ? 'Limit in all'
+      : key === 'underlyer' ? 'Underlying' : 'Type'
+    labels.push(`${label}: ${value}`)
+  }
+  return labels
+}
+
+/** A backend-defined built-in screen (options-screen-v1): the API applies it by id with the page's edits. */
+export function serverScreenTemplate(screen: OptionScreenDefinitionSummary, catalog?: OptionDiscoveryCatalog): OptionTemplate {
+  return { id: screen.id, name: screen.name, summary: screen.summary, serverScreen: screen,
+    query: { view: 'chain', ...(screen.contract_type ? { type: screen.contract_type } : {}), sort: screen.sort, ...serverScreenDefaults(screen, catalog) } }
+}
+
+/** What a built-in (server) screen applies, for display: its rules as published, its caps, and the underlying tiers its
+ * tier-sized rules use. Nov 10: an opened built-in tab showed only "Calls" because these are applied on the server by id. */
+export function builtinScreenRuleLabels(screen: OptionScreenDefinitionSummary): string[] {
+  const labels = [...(screen.rules || [])]
+  if (screen.caps?.per_underlying) labels.push(`At most ${screen.caps.per_underlying} per underlying`)
+  if (screen.caps?.total) labels.push(`At most ${screen.caps.total} in all`)
+  if (screen.tiers && Object.keys(screen.tiers).length) {
+    const byTier: Record<string, string[]> = {}
+    for (const [ticker, tier] of Object.entries(screen.tiers)) (byTier[tier] ||= []).push(ticker)
+    labels.push(`Tiers: ${Object.entries(byTier).map(([tier, tickers]) => `${tier} ${tickers.sort().join(', ')}`).join('; ')}`)
+  }
+  return labels
+}
+
+const TIER_LABELS: Record<string, string> = { ETF: 'ETF', CORE_MEGA_CAP: 'Core mega-cap', HIGH_BETA_HIGH_PREMIUM: 'High beta' }
+const tierLabel = (tier: string) => TIER_LABELS[tier] || tier
+
+
 
 export function serverScreenFor(builtin: string | null, catalog?: OptionDiscoveryCatalog): OptionScreenDefinitionSummary | undefined {
   return builtin ? catalog?.screens?.find(screen => screen.id === builtin) : undefined
@@ -254,7 +371,7 @@ export function serverScreenFor(builtin: string | null, catalog?: OptionDiscover
 
 export function optionTemplates(catalog?: OptionDiscoveryCatalog): OptionTemplate[] {
   const missing = catalog?.contract_filters ? undefined : 'Contract screening fields are unavailable.'
-  const server = (catalog?.screens || []).map(serverScreenTemplate)
+  const server = (catalog?.screens || []).map(screen => serverScreenTemplate(screen, catalog))
   const local = localOptionTemplates(missing)
   // The backend's Unusual-activity screens replace the old single-rule Vol/OI templates when it publishes them.
   return server.length ? [local[0], ...server, ...local.filter(item => !['all', 'unusual-calls', 'unusual-puts'].includes(item.id))] : local

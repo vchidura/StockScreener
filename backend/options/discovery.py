@@ -54,6 +54,16 @@ class ContractRange(BaseModel):
         return self
 
 
+class ScreenOverrides(BaseModel):
+    """Nov 10: the page's edits to a built-in screen, applied to that screen on the server (options.screens
+    .customize_screen). Only criteria the screen already has can be changed; `None` removes a criterion."""
+    model_config = ConfigDict(extra="forbid")
+    minimums: dict[str, float | None] = Field(default_factory=dict, max_length=32)
+    tier_minimums: dict[str, dict[str, float]] = Field(default_factory=dict, max_length=8)
+    exclude_calendar_dte: tuple[int, ...] | None = Field(default=None, max_length=32)
+    caps: dict[Literal["per_underlying", "total"], int | None] | None = None
+
+
 class EligibleChainQuery(BaseModel):
     model_config = ConfigDict(extra="forbid")
     session_date: date | None = None
@@ -66,11 +76,14 @@ class EligibleChainQuery(BaseModel):
     offset: int = Field(default=0, ge=0)
     # A built-in screen (options/policies/option_screens_v1.json) applied before these filters.
     screen_id: str | None = Field(default=None, pattern=r"^[a-z0-9][a-z0-9-]{0,63}$")
+    screen_overrides: ScreenOverrides | None = None
 
     @model_validator(mode="after")
     def unique_filters(self):
         if len({item.field for item in self.filters}) != len(self.filters):
             raise ValueError("duplicate filter field")
+        if self.screen_overrides is not None and self.screen_id is None:
+            raise ValueError("screen overrides need a built-in screen")
         return self
 
 

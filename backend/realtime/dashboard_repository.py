@@ -164,8 +164,11 @@ class RealtimeDashboardRepository(_RealtimeCompatibilityRepository):
                 or manifest["generated_at"] != stored["generated_at"].isoformat()
                 or payload["generated_at"] != manifest["generated_at"]
                 or payload["session"] != manifest["session"] or payload["market_time"] != manifest["market_time"]
-                or manifest["expected_members"] != stored["stock_count"]
-                or len(tickers) != stored["stock_count"] or len(set(tickers)) != len(tickers)
+                # G65 (Nov 10): a member without a screening result (CRWD since Nov 9 17:35) leaves the
+                # publication with fewer members than the cohort; that is labelled below (INV-8), not refused.
+                # More members than the cohort, or a manifest that disagrees with its own payload, still refuses.
+                or manifest["expected_members"] != len(tickers)
+                or not 0 < len(tickers) <= stored["stock_count"] or len(set(tickers)) != len(tickers)
                 or [row["ticker"] for row in payload["overview"]] != tickers
                 or [row["ticker"] for row in payload["context"]["rows"]] != tickers
                 or [row["ticker"] for row in references] != tickers
@@ -352,6 +355,15 @@ class RealtimeDashboardRepository(_RealtimeCompatibilityRepository):
         if labels is not None:
             publication.update(labels)
             publication["scope_note"] = " ".join((publication["scope_note"], *labels["section_warnings"].values()))
+        if len(tickers) < stored["stock_count"]:
+            publication.update(
+                members_published=len(tickers), cohort_members=stored["stock_count"],
+                member_status="PARTIAL",
+            )
+            publication["scope_note"] = (
+                f"{publication['scope_note']} {stored['stock_count'] - len(tickers)} of {stored['stock_count']} "
+                "cohort members have no screening result in this publication and are not shown."
+            )
         if scanner_key:
             return dict(result["scanners"][scanner_key], publication=publication,
                         scanner_basis=deepcopy(payload["scanner_basis"]))

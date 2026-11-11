@@ -5,7 +5,7 @@ import { Copy, Download, Eye, FolderOpen, Pencil, Plus, Save, Search, Trash2, Up
 import { ColumnPicker } from '../layout/PageChrome'
 import { optionsDataTierLabel, queryEligibleChain, type EligibleChainRow, type EligibleChainRequest, type OptionDiscoveryCatalog } from '../services/api'
 import { Modal } from './ScreenLibrary'
-import { chainFilterRanges, columnsForView, independentScreenQuery, makeOptionsScreen, optionColumnPresets, optionContractDetailSections, optionRuleLabels, optionTemplates, OPTIONS_LIBRARY_KEY, serverScreenFor, readOptionsLibrary, screenQuery, visibleOptionsColumns, writeOptionsLibrary, type OptionsLibrary, type OptionsScreen, type OptionsView } from './optionsScreenLibrary'
+import { builtinScreenRuleLabels, chainFilterRanges, serverScreenOverrides, columnsForView, independentScreenQuery, makeOptionsScreen, optionColumnPresets, optionContractDetailSections, optionRuleLabels, optionTemplates, OPTIONS_LIBRARY_KEY, serverScreenFor, readOptionsLibrary, screenQuery, visibleOptionsColumns, writeOptionsLibrary, type OptionsLibrary, type OptionsScreen, type OptionsView } from './optionsScreenLibrary'
 import { optionAlertMoney, optionAlertPercent, optionAlertTime } from './optionsAlertPresentation'
 import { publicationPath } from './publicationNavigation'
 import './StockScreeningPage.css'
@@ -223,7 +223,7 @@ export function OptionsScreenLibrary({ catalog, params, setParams, filterControl
       {error && <p role="alert" className="sw-error">{error}</p>}
       <div className="sw-library-browser"><div className="sw-choice-list" aria-label="Screen choices">{visibleChoices.map(item => <button type="button" key={item.key} className="sw-choice" aria-pressed={preview === item.key} aria-label={`Preview ${item.name}`} onClick={() => setPreview(item.key)}><span><strong>{item.name}</strong><small>{item.kind === 'SAVED' ? 'Saved' : 'Recipe'} / Options{item.unavailable ? ' / unavailable' : ''}</small></span>{tabKeys.includes(item.key) && <Check size={14} aria-label="Open tab" />}</button>)}{!visibleChoices.length && <p className="sw-library-empty">No matching screeners</p>}</div>
       <section className="sw-choice-detail" aria-label="Selected screener">{selectedChoice ? <><div className="sw-choice-title"><span className="sw-choice-kind">{selectedChoice.kind === 'SAVED' ? 'Your screen' : 'Built-in'}</span><h3>{selectedChoice.name}</h3><p>{selectedChoice.summary}</p></div>{selectedChoice.unavailable && <p className="sw-warning">{selectedChoice.unavailable}</p>}<ul className="sw-rule-list">{!selectedChoice.unavailable && catalog && ('serverScreen' in selectedChoice && selectedChoice.serverScreen
-        ? [...selectedChoice.serverScreen.rules, ...(selectedChoice.serverScreen.caps.per_underlying ? [`At most ${selectedChoice.serverScreen.caps.per_underlying} per underlying`] : []), ...(selectedChoice.serverScreen.caps.total ? [`At most ${selectedChoice.serverScreen.caps.total} in all`] : [])]
+        ? builtinScreenRuleLabels(selectedChoice.serverScreen)
         : optionRuleLabels(selectedChoice.query, catalog)).map(label => <li key={label}>{label}</li>)}</ul><dl className="sw-screen-facts"><div><dt>Sort</dt><dd>{catalog?.contract_filters?.[selectedChoice.query.sort || 'day_volume']?.label || 'Volume'} / {selectedChoice.query.descending === '0' ? 'ascending' : 'descending'}</dd></div><div><dt>Source</dt><dd>Retained contract facts / selected options session</dd></div></dl>
       {selectedChoice.saved && <div className="sw-row-tools" aria-label="Manage selected screen"><button type="button" className="sw-icon" title="Rename screen" aria-label="Rename selected screen" onClick={() => startNaming('RENAME', selectedChoice.saved)}><Pencil size={15} /></button><button type="button" className="sw-icon" title="Duplicate screen" aria-label="Duplicate selected screen" onClick={() => startNaming('COPY', selectedChoice.saved)}><Copy size={15} /></button><button type="button" className="sw-icon" title="Export definition" aria-label="Export selected screen" onClick={() => download(JSON.stringify({ schema_version: 1, screens: [selectedChoice.saved] }, null, 2), 'options-screen.json', 'application/json')}><Download size={15} /></button><button type="button" className="sw-icon" title="Delete local definition" aria-label="Delete selected screen" onClick={() => setDeleting(selectedChoice.saved!)}><Trash2 size={15} /></button></div>}</> : <p className="sw-library-empty">Select a screener</p>}</section></div>
       <footer className="sw-library-footer"><small>Browser-local / {window.location.host}</small>{collection === 'SAVED' && <button type="button" disabled={!catalog} onClick={() => { newScreenAfterLoad.current = true; select({ view: 'chain' }) }}><Plus size={15} />New screen</button>}<button type="button" className="sw-primary" disabled={!selectedChoice || !!selectedChoice.unavailable} onClick={() => selectedChoice && openChoice(selectedChoice)}><FolderOpen size={15} />{selectedChoice && tabKeys.includes(selectedChoice.key) ? 'Go to tab' : 'Open tab'}</button></footer>
@@ -289,13 +289,15 @@ export function OptionsChainResults({ catalog, params, setParams, sessionDate, r
   try { if (catalog) ranges = chainFilterRanges(independentScreenQuery(params, catalog), catalog) } catch (failure) { invalid = failure instanceof Error ? failure.message : 'Invalid filters' }
   // A backend-defined built-in screen runs on the server; the page only names it.
   const serverScreen = serverScreenFor(params.get('builtin'), catalog)
+  // Nov 10: the fields of the opened built-in screen, as edits the server applies to it.
+  const screenOverrides = serverScreen && !invalid ? serverScreenOverrides(Object.fromEntries(params), serverScreen, catalog) : undefined
   const rawOffset = Number(params.get('offset') || 0)
   const offset = Number.isInteger(rawOffset) && rawOffset >= 0 ? rawOffset : 0
   const request: EligibleChainRequest = {
     session_date: sessionDate, underlyer: params.get('underlyer') || undefined,
     contract_type: params.get('type') === 'CALL' ? 'CALL' : params.get('type') === 'PUT' ? 'PUT' : undefined,
     filters: ranges, sort: params.get('sort') || serverScreen?.sort || 'day_volume', descending: params.get('descending') !== '0', limit: 100, offset,
-    ...(serverScreen ? { screen_id: serverScreen.id } : {}),
+    ...(serverScreen ? { screen_id: serverScreen.id, ...(screenOverrides ? { screen_overrides: screenOverrides } : {}) } : {}),
   }
   const query = useQuery({ queryKey: ['options', 'eligible-chain', request], queryFn: () => queryEligibleChain(request), enabled: !!catalog?.contract_filters && !invalid, refetchInterval: 60_000 })
   const data = query.data?.data

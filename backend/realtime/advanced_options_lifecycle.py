@@ -1186,9 +1186,15 @@ def _reserve_stage_provider_budget(
     if budget.underlying_request_ceiling is not None:
         # Slot digests repeat across attempts, so this counts the share this
         # underlying already holds; no attempt counter is involved.
+        # R12 (Nov 10, user-approved): a slot closed as RESERVATION_NOT_USED
+        # was never sent and no longer holds share; reserved (in-flight) and
+        # sent slots still do. Each attempt reserves the full slot set, so
+        # counting unused slots let three failed attempts exhaust the share
+        # after 3-9 real requests. Scope and account ceilings are unchanged.
         cursor.execute(
             "SELECT count(*) FROM rt.provider_request_ledger "
-            "WHERE budget_scope_sha256=%s AND request_sha256=ANY(%s)",
+            "WHERE budget_scope_sha256=%s AND request_sha256=ANY(%s) "
+            "AND failure_code IS DISTINCT FROM 'RESERVATION_NOT_USED'",
             (
                 budget.scope.sha256,
                 [request.request_sha256 for request in budget.requests],

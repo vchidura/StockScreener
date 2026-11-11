@@ -302,6 +302,12 @@ export const fetchScreeningMaterializationStatus = async (): Promise<Materializa
   return response.data
 }
 
+// Nov 10 (live): Options releases come every 5 minutes and a window takes up to about 2 minutes to publish, with
+// cutoffs sometimes 6 minutes apart, so a current release is normally up to about 8 minutes old. The page used 5
+// minutes and showed STALE for part of every cycle. 10 minutes still flags one missed window. The server's own
+// `stale` flag only turns after the release's valid_until (session close + 35 min), so the age check stays.
+export const OPTIONS_RELEASE_STALE_AFTER_MS = 10 * 60 * 1000
+
 export const fetchOptionsMaterializationStatus = async (
   expectedSession: string,
   checkedAt: string,
@@ -320,7 +326,7 @@ export const fetchOptionsMaterializationStatus = async (
       max_serveable_stale_sessions: 5,
       staleness_sessions: 0,
       last_market_time: marketTime,
-      oldest_stale_market_time: envelope.valid_until || marketTime,
+      oldest_stale_market_time: marketTime,
       stale_intervals: ['options'],
       pipeline_active: false,
       active_intervals: [],
@@ -343,7 +349,7 @@ export const fetchOptionsMaterializationStatus = async (
   const sessionsBehind = retainedSession < expectedSession ? 1 : 0
   const status: MaterializationStatus['status'] = sessionsBehind
     ? 'EXPIRED'
-    : envelope.stale === true || age > 5 * 60 * 1000
+    : envelope.stale === true || age > OPTIONS_RELEASE_STALE_AFTER_MS
       ? 'STALE'
       : 'READY'
   return {
@@ -352,9 +358,8 @@ export const fetchOptionsMaterializationStatus = async (
     max_serveable_stale_sessions: 5,
     staleness_sessions: sessionsBehind,
     last_market_time: marketTime,
-    oldest_stale_market_time: status === 'READY'
-      ? null
-      : envelope.valid_until || marketTime,
+    // The last published market time; valid_until is the release's expiry, not a publication time.
+    oldest_stale_market_time: status === 'READY' ? null : marketTime,
     stale_intervals: status === 'READY' ? [] : ['options'],
     pipeline_active: false,
     active_intervals: [],
@@ -2926,8 +2931,18 @@ export interface OptionScreenDefinitionSummary {
   descending: boolean
   caps: { per_underlying: number | null; total: number | null }
   rules: string[]
+  /** Nov 10: the rule as flat criteria, for prefilling the filter fields; null when the rule is not flat. */
+  criteria?: OptionScreenCriterion[] | null
   tiers: Record<string, string> | null
   source: string
+}
+
+export interface OptionScreenCriterion {
+  field: string
+  op: string
+  negated: boolean
+  value?: number | number[]
+  values_by_tier?: Record<string, number>
 }
 
 export interface EligibleChainRow {
@@ -3017,6 +3032,15 @@ export interface EligibleChainRequest {
   limit: number
   offset: number
   screen_id?: string
+  /** Nov 10: the page's edits to the built-in screen named by screen_id. */
+  screen_overrides?: OptionScreenOverrides
+}
+
+export interface OptionScreenOverrides {
+  minimums: Record<string, number | null>
+  tier_minimums: Record<string, Record<string, number>>
+  exclude_calendar_dte?: number[]
+  caps: { per_underlying: number | null; total: number | null }
 }
 
 export interface EligibleChainData {

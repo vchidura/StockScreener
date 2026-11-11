@@ -179,6 +179,16 @@ def _snapshot_rejection_reason(row: Mapping[str, object]) -> str | None:
         or details.get("strike_price") is None
     ):
         return "INCOMPLETE_DETAILS"
+    # Nov 10: the chain started listing other products under the same
+    # underlying (O:B1SPY..., O:B1VDA... expiring 11-13). A root that is not
+    # the underlying is not a standard option; it rejects only its own row.
+    root = _OPTION_TICKER.fullmatch(
+        str(details.get("ticker", row.get("ticker", ""))).strip().upper()
+    )
+    if root is None or root.group(1) != str(
+        underlying.get("ticker", "")
+    ).strip().upper():
+        return "NON_STANDARD_ROOT"
     if quote_row.get("bid") is None or quote_row.get("ask") is None:
         return "INCOMPLETE_QUOTE"
     bid = _decimal(quote_row["bid"], "last_quote.bid")

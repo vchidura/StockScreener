@@ -512,3 +512,23 @@ test('contract expiration is conservative and uses the New York session date', (
   assert.equal(model.optionContractExpired('2026-09-26', '2026-09-25T21:00:00Z'), false)
   assert.equal(model.optionContractExpired(null, '2026-09-25T21:00:00Z'), false)
 })
+
+test('Day History current price is per share and signed like the trigger price (R33, Nov 10)', () => {
+  const legs = [{ multiplier: 100 }]
+  // Debit package (a bought call): the window's mark -193.50 per package is a $1.935 debit per share.
+  assert.deepEqual(model.optionCurrentPackagePrice({ signed_package_mark: '-193.50', package_price: '193.50' }, legs, '-199.50'), { amount: -193.5, price: -1.935 })
+  assert.match(model.optionPackagePremium(-1.935), / debit$/)
+  // An older mark without the signed amount takes the sign of the original package.
+  assert.deepEqual(model.optionCurrentPackagePrice({ package_price: '645' }, legs, '-640'), { amount: -645, price: -6.45 })
+  assert.deepEqual(model.optionCurrentPackagePrice({ package_price: '120' }, legs, '150'), { amount: 120, price: 1.2 })
+  // Mixed multipliers give the package amount only.
+  assert.equal(model.optionCurrentPackagePrice({ signed_package_mark: '-10' }, [{ multiplier: 100 }, { multiplier: 10 }], '-12').price, null)
+  assert.equal(model.optionCurrentPackagePrice(null, legs, '-1').amount, null)
+  assert.equal(model.optionMarkAge(2), '0 min old')
+  assert.equal(model.optionMarkAge(3900), '1.1 hours old')
+  assert.equal(model.optionMarkAge(null), 'Age unavailable')
+  const page = readFileSync(new URL('../src/pages/OptionsAlertsPage.tsx', import.meta.url), 'utf8')
+  assert.match(page, /optionCurrentPackagePrice\(mark, legs, originalNetPremium\)/)
+  assert.match(page, />Not set<small>No stop \/ target rule<\/small>/)
+  assert.doesNotMatch(page, /-Number\(mark\.package_price\)/)
+})

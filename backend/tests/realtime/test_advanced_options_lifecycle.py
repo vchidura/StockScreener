@@ -765,3 +765,29 @@ def test_failed_attempt_outcome_follows_its_real_response(
     attempt = AdvancedOptionsProviderRequestAttempt(http_status, 10)
 
     assert attempt.outcome.value == outcome
+
+
+def test_unused_reservations_do_not_hold_the_underlying_share():
+    """R12 (Nov 10): every attempt reserves the full slot set; three failed attempts that sent 3-9 requests left
+    96 ledger rows and exhausted the share. Slots closed RESERVATION_NOT_USED are no longer counted."""
+    from types import SimpleNamespace
+
+    class Cursor:
+        def __init__(self, held):
+            self.held, self.statements = held, []
+
+        def execute(self, sql, params=None):
+            self.statements.append(sql)
+
+        def fetchone(self):
+            return (self.held,)
+
+    budget = SimpleNamespace(
+        underlying_request_ceiling=96,
+        requests=tuple(SimpleNamespace(request_sha256=f"{index:064x}") for index in range(32)),
+        scope=SimpleNamespace(sha256="a" * 64),
+    )
+    cursor = Cursor(held=65)
+    with pytest.raises(ProviderBudgetExceeded):
+        lifecycle_module._reserve_stage_provider_budget(cursor, None, budget, checked_at=CHECKED)
+    assert "failure_code IS DISTINCT FROM 'RESERVATION_NOT_USED'" in cursor.statements[0]

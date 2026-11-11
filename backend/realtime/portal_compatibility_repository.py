@@ -119,6 +119,73 @@ class BoundedCache:
             return len(self._items)
 
 
+# R33 (Nov 10): a read-time Options alert mark older than this reads STALE (after the close every mark ages past it).
+ADVANCED_CURRENT_MARK_STALE_SECONDS = 900
+# R33: an alert's market facts at its trigger never change; once complete they are kept by evaluation id.
+_ALERT_SOURCE_FACTS = BoundedCache(4096)
+
+
+def _mark_market_time(value) -> datetime | None:
+    if isinstance(value, datetime):
+        return _utc(value, "mark market_time") if value.tzinfo else None
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed.astimezone(timezone.utc) if parsed.tzinfo else None
+
+
+def _age_stored_mark(row, cutoff: datetime) -> None:
+    """R33: a kept mark's age is measured at the read, not left as it was when the window stored it."""
+    mark = row.get("current_mark")
+    if not isinstance(mark, Mapping) or mark.get("status") not in ("FRESH", "STALE"):
+        return
+    market_time = _mark_market_time(mark.get("market_time"))
+    if market_time is None:
+        return
+    age = max(0, int((cutoff - market_time).total_seconds()))
+    stale = age > ADVANCED_CURRENT_MARK_STALE_SECONDS
+    row["current_mark"] = {
+        **mark,
+        "age_seconds": age,
+        "maximum_age_seconds": ADVANCED_CURRENT_MARK_STALE_SECONDS,
+        "status": "STALE" if stale else mark.get("status"),
+        "reason": "CURRENT_MARK_OLDER_THAN_15_MINUTES" if stale else mark.get("reason"),
+    }
+
+
+def _fill_calendar_dte(row, original) -> None:
+    """R33: the alert's calendar days to expiration from its session, when the package does not carry it."""
+    if original.get("calendar_dte") is not None:
+        return
+    try:
+        expiration = date.fromisoformat(str(original.get("expiration_date")))
+        session = date.fromisoformat(str(row.get("session_date")))
+    except ValueError:
+        return
+    if expiration >= session:
+        original["calendar_dte"] = (expiration - session).days
+
+
+def _apply_source_facts(legs, facts) -> None:
+    for leg in legs:
+        if not isinstance(leg, dict):
+            continue
+        if leg.get("spot") is None and facts.get("spot") is not None:
+            leg["spot"] = facts["spot"]
+            leg["spot_market_data_time"] = facts["spot_time"]
+        contract = facts["contracts"].get(str(leg.get("contract_ticker")))
+        if contract is not None:
+            if leg.get("day_volume") is None and contract["day_volume"] is not None:
+                leg["day_volume"] = contract["day_volume"]
+            if leg.get("open_interest") is None and contract["open_interest"] is not None:
+                leg["open_interest"] = contract["open_interest"]
+            leg.setdefault("source_event_time", contract["event_time"])
+        leg["market_facts_basis"] = "TRIGGER_FLOW_EVENT_AND_1M_CLOSE"
+
+
 @dataclass(frozen=True, slots=True)
 class ReleaseView:
     release_id: UUID
@@ -898,10 +965,15 @@ class RealtimeOptionsAlertsPageRepository(_RealtimeCompatibilityRepository):
         """Options alerts v1 (Nov 6, G78 principle): each alert's current price from the stored Options quotes.
 
         Advanced has no package-mark producer, so every Advanced alert showed its current mark as unavailable. For
-        each row with an original package and no fresh mark, the exit premium is the sum of the legs' latest stored
-        NBBO midpoints (`rt.quote_current`, recorded by the read time) with the package sign rule (SELL +, BUY -);
-        gross P/L is entry minus exit premium and Price P/L is gross over capital at risk, in the same fields a
-        persisted mark carries. A failed or incomplete lookup leaves the row's mark as it was."""
+        each row with an original package, the exit premium is the sum of the legs' latest stored NBBO midpoints
+        (`rt.quote_current`, recorded by the read time) with the package sign rule (SELL +, BUY -); gross P/L is entry
+        minus exit premium and Price P/L is gross over capital at risk, in the same fields a persisted mark carries.
+
+        R33 (Nov 10): a mark the window stored (the session list keeps the one from the window that selected the
+        alert) is replaced whenever the stored quotes are newer; before, a stored FRESH mark was never refreshed and
+        read "0.0 hours old" an hour later. Age is from the quote's market time at the read; older than 15 minutes is
+        STALE. The window's estimated cost is kept, so net P/L follows the new gross. A failed or incomplete lookup
+        leaves the row's mark as it was, aged at the read."""
         from decimal import Decimal, InvalidOperation
 
         rows = (envelope.get("data") or {}).get("rows") or []
@@ -910,7 +982,7 @@ class RealtimeOptionsAlertsPageRepository(_RealtimeCompatibilityRepository):
         for row in rows:
             original = row.get("original_package") or {}
             legs = original.get("legs") or []
-            if not legs or (row.get("current_mark") or {}).get("status") == "FRESH":
+            if not legs:
                 continue
             pending.append((row, original, legs))
             contract_ids.update(int(leg["contract_id"]) for leg in legs)
@@ -947,30 +1019,181 @@ class RealtimeOptionsAlertsPageRepository(_RealtimeCompatibilityRepository):
                 if capital <= 0:
                     raise InvalidOperation("capital at risk")
             except (InvalidOperation, KeyError, TypeError, ValueError):
+                _age_stored_mark(row, cutoff)
+                continue
+            stored = row.get("current_mark") if isinstance(row.get("current_mark"), Mapping) else {}
+            market_time, observed_time = min(market_times), max(observed_times)
+            stored_time = _mark_market_time(stored.get("market_time"))
+            if stored.get("status") in ("FRESH", "STALE") and stored_time is not None and stored_time >= market_time:
+                _age_stored_mark(row, cutoff)
                 continue
             gross = entry_premium - exit_premium
-            market_time, observed_time = min(market_times), max(observed_times)
-            row["current_mark"] = {
-                **(row.get("current_mark") or {}),
-                "status": "FRESH",
-                "reason": None,
+            try:
+                cost = None if stored.get("estimated_cost") is None else Decimal(str(stored["estimated_cost"]))
+            except InvalidOperation:
+                cost = None
+            net = None if cost is None else gross - cost
+            age = max(0, int((cutoff - market_time).total_seconds()))
+            stale = age > ADVANCED_CURRENT_MARK_STALE_SECONDS
+            mark = {
+                **stored,
+                "status": "STALE" if stale else "FRESH",
+                "reason": "CURRENT_MARK_OLDER_THAN_15_MINUTES" if stale else None,
                 "market_time": market_time.isoformat(),
                 "observed_time": observed_time.isoformat(),
                 "oldest_leg_market_time": market_time.isoformat(),
-                "age_seconds": max(0, int((cutoff - observed_time).total_seconds())),
+                "age_seconds": age,
+                "maximum_age_seconds": ADVANCED_CURRENT_MARK_STALE_SECONDS,
                 "signed_package_mark": str(exit_premium),
                 "package_price": str(abs(exit_premium)),
                 "gross_pnl": str(gross),
                 "price_return": str(gross / capital),
-                "estimated_cost": None,
-                "net_pnl": None,
-                "net_return": None,
+                "estimated_cost": None if cost is None else str(cost),
+                "net_pnl": None if net is None else str(net),
+                "net_return": None if net is None else str(net / capital),
                 "basis": "STORED_NBBO_MIDPOINT",
                 "price_return_basis": "GROSS_PNL_OVER_CAPITAL_AT_RISK",
-                "net_return_basis": None,
+                "net_return_basis": None if net is None else (stored.get("net_return_basis") or "NET_PNL_OVER_CAPITAL_AT_RISK"),
                 "source": "PERSISTED_ADVANCED_QUOTE_CURRENT",
             }
+            # The window's mark evidence ids name the older quotes, not these.
+            mark.pop("source_snapshot_ids", None)
+            row["current_mark"] = mark
         return envelope
+
+    def _advanced_source_facts_reported(self, cursor, envelope, *, cutoff):
+        """`_advanced_source_facts` under a savepoint, reporting what was served (INV-9)."""
+        saved = False
+        try:
+            cursor.execute("SAVEPOINT options_source_facts")
+            saved = True
+            filled = self._advanced_source_facts(cursor, envelope, cutoff=cutoff)
+            cursor.execute("RELEASE SAVEPOINT options_source_facts")
+            served = True
+        except Exception:  # noqa: BLE001 - source facts are optional; never fail the alert list
+            if saved:
+                try:
+                    cursor.execute("ROLLBACK TO SAVEPOINT options_source_facts")
+                except Exception:  # noqa: BLE001
+                    _log_optional_read_failure("Options alert source facts savepoint rollback failed")
+            _log_optional_read_failure("Advanced Options alert source facts unavailable; serving the alert rows")
+            filled, served = envelope, False
+        return _with_optional_reads(filled, _optional_read(
+            "source_facts", served=served, source="TRIGGER_EVENTS", fallback_source="ALERT_ROWS",
+            reason_code="SOURCE_FACTS_UNAVAILABLE"))
+
+    def _advanced_source_facts(self, cursor, envelope, *, cutoff):
+        """R33 (Nov 10): the market facts at each alert's trigger that its package legs do not carry.
+
+        O1 packages carry the contract and its entry mark only, so Stock at source, % OTM, Volume and OI read
+        Unavailable. Each comes from what was stored at the trigger: the contract's day volume and prior open
+        interest from the alert's own flow event at or before the trigger (`rt.option_flow_events`), and the stock
+        from the last realtime 1-minute close at or before the trigger, known by then (`rt.bar_revisions`). DTE is
+        the calendar days from the alert's session to expiration. Values the legs already carry are kept; a value
+        not found stays unavailable. Complete facts are kept by evaluation id (they never change)."""
+        rows = (envelope.get("data") or {}).get("rows") or []
+        wanted = []
+        for row in rows:
+            original = row.get("original_package")
+            if not isinstance(original, dict) or not original.get("legs"):
+                continue
+            _fill_calendar_dte(row, original)
+            if all(
+                isinstance(leg, Mapping) and leg.get("spot") is not None and leg.get("day_volume") is not None
+                and leg.get("open_interest") is not None
+                for leg in original["legs"]
+            ):
+                continue
+            wanted.append(row)
+        if not wanted:
+            return envelope
+        facts, missing = {}, []
+        for row in wanted:
+            key = str(row.get("evaluation_id") or "")
+            cached = _ALERT_SOURCE_FACTS.get(key) if key else None
+            if cached is None:
+                missing.append(row)
+            else:
+                facts[key] = cached
+        if missing:
+            for key, value in self._load_source_facts(cursor, missing, cutoff=cutoff).items():
+                facts[key] = value
+                if value["complete"]:
+                    _ALERT_SOURCE_FACTS.put(key, value)
+        for row in wanted:
+            value = facts.get(str(row.get("evaluation_id") or ""))
+            if value is not None:
+                _apply_source_facts(row["original_package"]["legs"], value)
+        return envelope
+
+    def _load_source_facts(self, cursor, rows, *, cutoff):
+        triggers = {}
+        for row in rows:
+            at = _mark_market_time(row.get("triggered_at"))
+            if at is not None and row.get("evaluation_id") and row.get("underlyer"):
+                triggers[str(row["evaluation_id"])] = (row, at)
+        if not triggers:
+            return {}
+        event_ids = sorted({
+            str(event_id) for row, _ in triggers.values() for event_id in (row.get("event_ids") or ())
+        })
+        events = {}
+        if event_ids:
+            earliest = min(at for _, at in triggers.values()) - timedelta(days=1)
+            cursor.execute(
+                "SELECT event_id,contract_ticker,event_time,cumulative_volume_after,prior_open_interest "
+                "FROM rt.option_flow_events "
+                "WHERE event_id=ANY(%s::uuid[]) AND event_time>=%s AND event_time<=%s",
+                (event_ids, earliest, cutoff),
+            )
+            for item in (_row(value) for value in cursor.fetchall()):
+                events[str(item["event_id"])] = item
+        keys = sorted({(str(row["underlyer"]), at) for row, at in triggers.values()}, key=lambda item: (item[0], item[1]))
+        cursor.execute(
+            "SELECT t.ticker,t.at,b.close_price,b.bar_end "
+            "FROM unnest(%s::text[],%s::timestamptz[]) AS t(ticker,at) "
+            "CROSS JOIN LATERAL (SELECT close_price,bar_end FROM rt.bar_revisions AS r "
+            "WHERE r.ticker=t.ticker AND r.interval='1m' AND r.source_kind='REALTIME_STREAM' "
+            "AND r.bar_end<=t.at AND r.bar_end>t.at-interval '15 minutes' "
+            "AND r.observed_at<=t.at AND r.observed_at>t.at-interval '1 hour' "
+            "ORDER BY r.bar_end DESC,r.observed_at DESC LIMIT 1) AS b",
+            ([ticker for ticker, _ in keys], [at for _, at in keys]),
+        )
+        spots = {}
+        for item in (_row(value) for value in cursor.fetchall()):
+            spots[(str(item["ticker"]), _utc(item["at"], "spot at"))] = item
+        result = {}
+        for key, (row, at) in triggers.items():
+            contracts = {}
+            for event_id in row.get("event_ids") or ():
+                event = events.get(str(event_id))
+                if event is None:
+                    continue
+                event_time = _utc(event["event_time"], "flow event_time")
+                if event_time > at:
+                    continue
+                ticker = str(event["contract_ticker"])
+                if ticker in contracts and contracts[ticker]["event_time"] >= event_time.isoformat():
+                    continue
+                contracts[ticker] = {
+                    "event_time": event_time.isoformat(),
+                    "day_volume": None if event["cumulative_volume_after"] is None else int(event["cumulative_volume_after"]),
+                    "open_interest": None if event["prior_open_interest"] is None else int(event["prior_open_interest"]),
+                }
+            spot = spots.get((str(row["underlyer"]), at))
+            legs = (row.get("original_package") or {}).get("legs") or ()
+            result[key] = {
+                "spot": None if spot is None else format(spot["close_price"], "f"),
+                "spot_time": None if spot is None else _utc(spot["bar_end"], "spot bar_end").isoformat(),
+                "contracts": contracts,
+                "complete": spot is not None and all(
+                    isinstance(leg, Mapping) and str(leg.get("contract_ticker")) in contracts
+                    and contracts[str(leg.get("contract_ticker"))]["day_volume"] is not None
+                    and contracts[str(leg.get("contract_ticker"))]["open_interest"] is not None
+                    for leg in legs
+                ),
+            }
+        return result
 
     def _retained_marks(self, cursor, publication, envelope, *, cutoff, cohort_id):
         import json
@@ -1137,6 +1360,7 @@ class RealtimeOptionsAlertsPageRepository(_RealtimeCompatibilityRepository):
                                     ),
                                 )
                                 envelope = self._advanced_current_marks_reported(cursor, envelope, cutoff=cutoff)
+                                envelope = self._advanced_source_facts_reported(cursor, envelope, cutoff=cutoff)
                             else:
                                 envelope = publication.detector_runs(request, **identity)
                             return (

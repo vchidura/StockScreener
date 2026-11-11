@@ -212,3 +212,30 @@ def test_a_failed_session_lookup_serves_the_release_rows():
         healthy, publication, cohort_id=COHORT, cutoff=CLOSE) == []
     assert healthy.statements[0] == "SAVEPOINT options_session_alerts"
     assert healthy.statements[-1] == "RELEASE SAVEPOINT options_session_alerts" and len(healthy.statements) == 3
+
+
+def test_a_later_runs_repeat_folds_into_its_alert_and_o1_direction_follows_the_package():
+    """Nov 10 (live): TSLA 372.5 PUT was listed twice, the 18:05 session alert and the 18:10 run's row for the same
+    candidate, with 0 repeat hits; and the bought put read Bullish (O1 has no direction, the row defaulted to +1)."""
+    put = {"legs": [{"side": "BUY", "contract_type": "PUT", "ratio": 1}]}
+    call = {"legs": [{"side": "BUY", "contract_type": "CALL", "ratio": 1}]}
+    session = [
+        dict(evaluation_id="e1", evaluation_ids=["e1"], candidate_id="tsla", detector_id="O1", underlyer="TSLA",
+             hit_count=1, repeat_count=0, triggered_at="2026-11-06T16:41:52+00:00",
+             last_seen_at="2026-11-06T16:41:52+00:00", scheduled_cycle="c1", direction=1, original_package=put),
+        dict(evaluation_id="e2", evaluation_ids=["e2", "e3"], candidate_id="nvda", detector_id="O1",
+             underlyer="NVDA", hit_count=2, repeat_count=1, triggered_at="2026-11-06T16:36:40+00:00",
+             last_seen_at="2026-11-06T16:40:00+00:00", scheduled_cycle="c1", direction=1, original_package=call),
+    ]
+    later = dict(evaluation_id="e9", candidate_id="tsla", detector_id="O1", underlyer="TSLA", scheduled_cycle="c2",
+                 triggered_at="2026-11-06T16:45:00+00:00", direction=1, original_package=put)
+    multi_leg = dict(evaluation_id="multi", detector_id="O3", underlyer="SPY", scheduled_cycle="c2")
+    publication, identity = _page([later, multi_leg])
+    data = publication.detector_runs(DetectorRunQuery(dataset_id="d1"), session_rows=session, **identity)["data"]
+    by_candidate = {row.get("candidate_id", row["evaluation_id"]): row for row in data["rows"]}
+    assert sorted(by_candidate) == ["multi", "nvda", "tsla"]
+    assert (by_candidate["tsla"]["hit_count"], by_candidate["tsla"]["repeat_count"]) == (2, 1)
+    assert by_candidate["tsla"]["last_seen_at"] == "2026-11-06T16:45:00+00:00"
+    assert (data["new_alerts"], data["repeat_hits"]) == (3, 2)
+    assert by_candidate["tsla"]["direction"] == -1 and by_candidate["nvda"]["direction"] == 1
+    assert session[0]["hit_count"] == 1  # the caller's rows are not changed

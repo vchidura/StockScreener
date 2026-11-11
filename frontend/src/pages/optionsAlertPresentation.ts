@@ -310,6 +310,27 @@ function marketNumber(value: unknown): number | null {
   return Number.isFinite(numeric) ? numeric : null
 }
 
+/** R33 (Nov 10): the current package price, signed like the trigger price (debit negative, credit positive), as an
+ * amount per package and a price per share. Day History showed the package amount negated ("-$645.00"). */
+export function optionCurrentPackagePrice(mark: { signed_package_mark?: unknown; package_price?: unknown } | null | undefined,
+  legs: readonly { multiplier?: unknown }[], originalNetPremium: unknown): { amount: number | null; price: number | null } {
+  let amount = marketNumber(mark?.signed_package_mark)
+  if (amount == null) {
+    const size = marketNumber(mark?.package_price)
+    const original = marketNumber(originalNetPremium)
+    amount = size == null || original == null || original === 0 ? null : original > 0 ? Math.abs(size) : -Math.abs(size)
+  }
+  const multipliers = new Set(legs.map(leg => marketNumber(leg.multiplier)))
+  const [multiplier] = [...multipliers]
+  const price = amount != null && multipliers.size === 1 && multiplier != null && multiplier > 0 ? amount / multiplier : null
+  return { amount, price }
+}
+
+export function optionMarkAge(seconds: number | null | undefined): string {
+  if (seconds == null || !Number.isFinite(seconds) || seconds < 0) return 'Age unavailable'
+  return seconds < 3600 ? `${Math.round(seconds / 60)} min old` : `${(seconds / 3600).toFixed(1)} hours old`
+}
+
 export function optionPackagePremium(value: unknown): string {
   const numeric = marketNumber(value)
   return numeric == null ? 'Unavailable' : `${optionAlertMoney(Math.abs(numeric))} ${numeric < 0 ? 'debit' : numeric > 0 ? 'credit' : 'net'}`

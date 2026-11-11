@@ -132,4 +132,20 @@
 .screener-state { display: flex; align-items: center; gap: 8px; padding: 20px; color: var(--tm-muted); background: var(--tm-surface); border: 1px solid var(--tm-line); font-size: 10px; }
 .screener-state.is-warning { color: var(--tm-neg); }
 @media (max-width: 1180px) { .screener-terminal-bar { display: grid; } .screener-actions { justify-content: flex-end; border-top: 1px solid var(--tm-line); } .screener-filters { grid-template-columns: repeat(4, minmax(0, 1fr)); } .screener-filter-heading { grid-column: 1 / -1; } }
-@media (max-width: 650px) { .screener-actions > span { display: none; } .screener-actions { justify-content: flex-start; } .screener-filters { grid-template-columns: repeat(2, minmax(0, 1fr)); } .screener-filter-heading { grid-column: 1 / -1; } .screener-table-wrap { max-height: none; min-height: 420px; } .screener-table-panel > header { align-items: flex-start; } }
+@media (max-width: 650px) { .screener-actions > span { display: none; } .screener-actions { justify-content: flex-start; } .screener-filters { grid-template-columns: repeat(2, minmax(0, 1fr)); } .screener-filter-heading { grid-column: 1 / -1; } .screener-table-wrap { max-height: none; min-height: 420px; } .screener-table-panel > header { align-items: flex-start; } }/* Nov 10: rules a built-in server screen applies, shown on the opened tab (not removable; edit filters to narrow further). */
+.sw-chips > .os-builtin-rule { display: inline-flex; align-items: center; max-width: 100%; overflow-wrap: anywhere; border: 1px dashed var(--tm-line); background: var(--tm-surface); padding: 2px 6px; border-radius: 3px; font-size: 10px; color: var(--tm-ink); }
+.os-builtin-rules .sw-hint { margin: 6px 0 0; font-size: 10px; color: var(--tm-muted); }
+.os-builtin-rules .sw-rule-list { margin: 8px 0; }
+.os-builtin-tag { margin-left: 6px; padding: 0 5px; border: 1px solid var(--tm-line); border-radius: 3px; font-size: 9px; font-weight: 600; color: var(--tm-accent, var(--tm-ink)); background: var(--tm-accent-soft); vertical-align: middle; }
+.sw-range input[data-builtin="true"] { font-weight: 600; background: var(--tm-accent-soft); }
+.os-builtin-note { margin: 4px 0 0; font-size: 10px; color: var(--tm-muted); overflow-wrap: anywhere; }
+/* Nov 10: built-in screen fields in the filter panel. */
+.os-builtin-rules { display: grid; gap: 6px; padding: 10px 12px; border-bottom: 1px solid var(--tm-line); background: var(--tm-accent-soft); }
+.os-builtin-rules strong { font-size: 12px; }
+.os-builtin-rules button { justify-self: start; display: inline-flex; align-items: center; gap: 5px; font-size: 11px; }
+.os-tier-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 6px; margin-top: 6px; }
+.os-tier-grid label { display: grid; gap: 3px; font-size: 10px; color: var(--tm-muted); }
+.os-tier-grid input { width: 100%; min-width: 0; }
+.os-builtin-extra { display: grid; gap: 3px; margin-top: 6px; font-size: 10px; color: var(--tm-muted); }
+.os-screen-purpose { margin: 0 0 8px; font-size: 12px; line-height: 1.5; color: var(--tm-ink); }
+.os-screen-purpose strong { margin-right: 6px; }

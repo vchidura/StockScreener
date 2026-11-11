@@ -65,7 +65,7 @@ class DashboardStore(TickerStore):
                     row,
                     cohort_manifest_id=None,
                     cohort_manifest_sha256="a" * 64,
-                    stock_count=9,
+                    stock_count=getattr(self, "stock_count", 9),
                     history_binding_sha256=getattr(
                         self,
                         "history_binding_sha256",
@@ -450,3 +450,30 @@ def test_dashboard_cli_plan_performs_zero_io_and_requires_target_confirmation(mo
     reject.assert_not_called()
     with pytest.raises(SystemExit):
         cli.parse_args([*args, "--execute"])
+
+
+def test_a_member_without_a_screening_result_is_labelled_not_refused():
+    """G65 (Nov 10): CRWD had no screening result after its Nov 9 17:01 provider-empty minute, so every Dashboard
+    held 24 of the cohort's 25 members and every Dashboard read refused. The shortfall is labelled (INV-8)."""
+    def read(store, contract="latest"):
+        return RealtimeDashboardRepository(store.cursor).read(contract, available_by=OBSERVED_AT, cohort_id=COHORT_ID)
+
+    clean = read(dashboard_app()[1])
+    _app, store = dashboard_app()
+    store.stock_count = 10
+    partial = read(store)
+    publication, before = partial["publication"], clean["publication"]
+    assert partial["latest_date"] == clean["latest_date"] and publication["status"] == before["status"]
+    assert (publication["members_published"], publication["cohort_members"], publication["member_status"]) == (
+        9, 10, "PARTIAL")
+    assert publication["scope_note"].startswith(before["scope_note"]) and "1 of 10 cohort members" in publication[
+        "scope_note"]
+    assert "member_status" not in before
+    assert read(store, "overview") == read(dashboard_app()[1], "overview")
+
+
+def test_more_published_members_than_the_cohort_still_fails_closed():
+    app, store = dashboard_app()
+    store.stock_count = 8
+    with TestClient(app) as client:
+        assert client.get("/api/latest-price-date", params={"cohort_id": str(COHORT_ID)}).status_code == 503

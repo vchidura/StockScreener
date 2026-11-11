@@ -75,3 +75,32 @@ def test_the_workspace_keeps_the_newest_filing_and_recent_periods():
     kept = _recent_fundamental_periods(rows + [restated])
     assert len(kept) == FUNDAMENTAL_PERIODS_KEPT["quarterly"]
     assert kept[0]["period_end"] == "2026-09-26" and kept[0]["revenue"] == 0
+
+
+def test_workspace_over_the_bound_keeps_the_newest_financials_that_fit():
+    """Nov 10 (live): Financials pushed 15 stock workspaces to 134-149 KB, over the 128 KiB bound, and every
+    window dropped them. The workspace now keeps the newest periods that fit and labels the trim."""
+    import pytest
+    from realtime.contracts import canonical_json
+    from realtime.ticker_projection import _fit_fundamentals_to_bound
+
+    def report(period, timeframe="quarterly"):
+        return dict(period_end=period, timeframe=timeframe, revenue=1.0, notes="x" * 900)
+
+    reports = [report(f"20{year}-{month:02d}-28") for year in range(26, 20, -1) for month in (12, 9, 6, 3)]
+    payload = dict(ticker="AMZN", charts="c" * 5000, profile=dict(ticker="AMZN", fundamental_reports=reports))
+    full = len(canonical_json(payload).encode("ascii"))
+    limit = full - 6000
+
+    fitted = _fit_fundamentals_to_bound(payload, name="Ticker workspace AMZN", limit=limit)
+
+    kept = fitted["profile"]["fundamental_reports"]
+    assert len(canonical_json(fitted).encode("ascii")) <= limit
+    assert 0 < len(kept) < len(reports) and kept == reports[:len(kept)]
+    assert fitted["profile"]["fundamental_reports_status"] == "TRIMMED_TO_WORKSPACE_BOUND"
+    assert fitted["profile"]["fundamental_reports_available"] == len(reports)
+    assert fitted["charts"] == payload["charts"] and payload["profile"]["fundamental_reports"] is reports
+    assert _fit_fundamentals_to_bound(payload, name="x", limit=full) is payload
+    with pytest.raises(ValueError, match="by-reference payload"):
+        _fit_fundamentals_to_bound(dict(payload, profile=dict(payload["profile"], fundamental_reports=[])),
+                                   name="x", limit=1000)

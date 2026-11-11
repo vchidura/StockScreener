@@ -161,8 +161,11 @@ def test_option_screener_catalog_matches_the_pure_original_contract_without_io()
         })
         assert client.get("/api/options/discovery-catalog").status_code == 422
     assert response.status_code == 200
+    from options.screens import builtin_screen_catalog
+
+    # The built-in screens (with their criteria, Nov 10) are served with the catalog, still without I/O.
     assert response.json() == {
-        **build_discovery_catalog(), "contract_filters": CONTRACT_FILTERS,
+        **build_discovery_catalog(), "contract_filters": CONTRACT_FILTERS, "screens": builtin_screen_catalog(),
     }
     assert store.statements == []
 

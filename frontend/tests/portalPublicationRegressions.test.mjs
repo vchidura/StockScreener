@@ -464,9 +464,43 @@ test('enabled Options freshness preserves the retained release and reports its a
     )
     assert.equal(status.status, 'STALE')
     assert.equal(status.serving_latest_available, true)
-    assert.equal(status.oldest_stale_market_time, '2026-10-09T14:50:00Z')
+    assert.equal(status.oldest_stale_market_time, '2026-10-09T14:45:00Z')
     assert.equal(status.retained_setup_generated_at, '2026-10-09T14:46:00Z')
     assert.deepEqual(calls, [['/options/flow', { underlyer: undefined, session_date: undefined, cohort_id: 'options-cohort' }]])
+  } finally {
+    globalThis.__regressionEnvironment = previous
+  }
+})
+
+test('Options freshness allows one release cycle plus processing before STALE (Nov 10)', async () => {
+  const previous = globalThis.__regressionEnvironment
+  globalThis.__regressionEnvironment = { VITE_REALTIME_ONLY: 'true' }
+  try {
+    const envelope = {
+      available: true, reason: null, data_tier: 'REAL-TIME ADVANCED RESEARCH DATA',
+      generated_at: '2026-11-10T17:15:00Z', as_of: '2026-11-10T17:15:00Z',
+      observed_at: '2026-11-10T17:16:30Z', policy_sha256: 'a'.repeat(64),
+      retained_session_date: '2026-11-10', valid_until: '2026-11-10T21:35:00Z',
+      stale: false, staleness_seconds: 0, serving_latest_available: false,
+      model_version: 'v1', data: { underlyers: [], selected: 'SPY' },
+    }
+    const api = compile('services/api.ts', {
+      axios: { default: {
+        isAxiosError: () => false,
+        create: () => ({ get: async () => ({ data: envelope }) }),
+      } },
+      './portalIdentity': {
+        realtimeCohortId: () => 'equity-cohort',
+        realtimeOptionsCohortId: () => 'options-cohort',
+        realtimeOptionsReadsEnabled: () => true,
+      },
+    })
+    const inCycle = await api.fetchOptionsMaterializationStatus('2026-11-10', '2026-11-10T17:23:00Z')
+    assert.equal(inCycle.status, 'READY')
+    assert.equal(inCycle.oldest_stale_market_time, null)
+    const missed = await api.fetchOptionsMaterializationStatus('2026-11-10', '2026-11-10T17:26:00Z')
+    assert.equal(missed.status, 'STALE')
+    assert.equal(missed.oldest_stale_market_time, '2026-11-10T17:15:00Z')
   } finally {
     globalThis.__regressionEnvironment = previous
   }

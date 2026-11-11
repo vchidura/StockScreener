@@ -614,3 +614,288 @@ CATALOG_QUOTE, 20 leases renewing. Financials: the preparation role (idle) ran t
 16 companies, 1,314 reports, none missing; `ref.fundamental_reports` 1,314 rows, 16 coverage rows. Bridge and
 finalizer: no writer errors (no bar writes before the session). Tunnel: 4 connections, no errors since the deploy;
 `alpha-screener-pro.com` and `/api/realtime/health` 302 to Access.
+
+### Nov 10 (13:03-13:08 UTC): pre-open audit (runbook 7), read-only
+
+All 20 containers on r66 `81e236e83b9e` / f21 `b4d3c1210837`. Restart counts the same as at 09:34 (Equity scheduler 8,
+Stock Alerts 8, every other service 0). 25 Equity members READY (19 EQUITY + 6 SECTOR_ETF); 9 OPTION_UNDERLYING WARMING.
+Options preparation PREPARING at CATALOG_QUOTE, "target-session provider window is not open; history ready", failure
+streak 0; work rows CATALOG_QUOTE RETRY 9 and the later stages PENDING. 20 leases renewing; the only lease released today
+is the rollover's (08:32). Desired members (scratchpad `ready3.sql`): dividend and split coverage for 25 of 25 refreshed
+01:00-08:31, dividends valid to 2027-11-09, no split drift; earnings covered for the 19 stocks to 11-11/11-12 (NVDA
+11-17, CRWD 12-01, AVGO 12-09, ORCL 12-14, MU 12-15), Fed calendar valid to 11-16. `g94_coverage_check.py 2026-11-10`
+PASS 25 of 25. `g102_read_flags_check.py` with r66 on the Nov 9 cohort (no portal cohort is current before activation):
+charts 195 OK, 5 refused (4 RETAINED_INTERVAL_UNAVAILABLE, 1 NATIVE_1M_HISTORY_INCOMPLETE); screener 24 rows DEGRADED,
+CRWD unavailable (its 389-of-390 Nov 9 minute bars, known); hourly lineage VERIFIED 24; Dashboard still refuses with the
+stored publication drift (G65); Stock Alerts OK. `optional_reads` on live `/options/flow`: `flow_breadth` AVAILABLE.
+Financials: `REFRESHED` once at 09:17 (16 companies, 1,314 reports), `CURRENT` at every idle slot since;
+`ref.fundamental_reports` 16 companies, 1,314 rows. Errors since 09:35: only the API's four Dashboard drift tracebacks
+(portal opened 09:57-09:58). `alpha-screener-pro.com` 302. `live_watch.ps1 -DryRun` started detached 13:07:59.
+
+### Nov 10 (14:15-15:05 UTC): activation, first windows, three fixes forward
+
+**Activation (check at 14:22).** Cohort `38dbea9f` created 14:15:05, effective 14:30; Nov 10 ingress plan READY 14:15;
+20 leases renewing; no new restarts; no error line in any service since 13:08. Stocks stream `93feee57` LIVE from
+14:30:02 (WARMING 14:30:24, LIVE 14:31:26 in the watcher log); bars for all 25 members from 14:30.
+
+**First windows (G13, G40).** 14:35 COMPLETE on its first attempt (188 s), 14:40 COMPLETE (23 s), 14:45 and 14:50
+COMPLETE. SPY 1m and 5m charts 0 minutes behind the cutoff at 14:35 and 14:40; no workspace lacked an interval
+(`runner/q_lag2.py`); 5m bars stored 16-17 s after they closed. Both rows closed as not reproduced. Bridge and finalizer:
+no writer error (the r66 head upsert), bars persisted each cycle. Stock Alerts published every cutoff (19 NO_MATCH).
+`optional_reads` live: Flow `flow_breadth` and Screener `screener_breadth` AVAILABLE; Alerts none (no Options session).
+
+**R11, Options CATALOG_QUOTE (r67, lifecycle, 14:43:04).** At the provider window (14:31-14:32) AAPL, AMZN, MSFT, NFLX,
+QQQ completed; IWM, NVDA, SPY, TSLA failed `ValueError: P7 transport candidate is invalid`. Read-only probe with the live
+code and the same query (`scratchpad/p7_probe.py`): every rejected row is a new product listed under the underlying
+(`O:B1VDA261113C00160000` underlying NVDA, bid 0.89 / ask 0.92; NVDA 36 rows, SPY 96, IWM 60, TSLA 90, AAPL 0), whose
+root fails the candidate's root-equals-underlying check and with it the whole capture. r67 (`0e7e4f78d954`) rejects such
+a row alone (`NON_STANDARD_ROOT`); tests pass (8 failures, all in the morning baseline); NVDA probe on r67: capture OK.
+`hotfix -Service realtime-v3-options-lifecycle`, no other service changed.
+
+**R12, Options share exhausted (open, needs the user's yes).** The four names' next attempts (14:46:47-14:47:35) found
+the per-underlying share (32 x 3 = 96 slots) used up by their three failed attempts: `PROVIDER_BUDGET_EXHAUSTED`, retry
+21:05, preparation DEGRADED. Ledger since 14:25 (`OPTIONS_CHAIN_SNAPSHOT`): 20 COMPLETE OK, 21 FAILED on R11 rows,
+503 FAILED `RESERVATION_NOT_USED` (never sent). Options has no Nov 10 authorization; the Nov 9 Options stream `22a41c6b`
+is still LIVE (B14a ends it when the Nov 10 stream starts).
+
+**G65, Dashboard refusal (r68, API, 14:53:40).** Read-only probe of the stored 14:35 Dashboard (`scratchpad/dash_probe.py`):
+every identity check passes except the member count: 24 tickers, `expected_members` 24, cohort `stock_count` 25. CRWD is
+missing from every Dashboard since Nov 9 17:35 (25 through 17:10, 24 from 17:35), after its 17:01 provider-empty minute
+(screening "Derived screening source window/basis drift"). r68 (`a2dad713a1eb`) accepts fewer members than the cohort
+and labels it (`member_status` PARTIAL, 24 of 25); tests 42 passed. Live 14:53: `/latest-price-date`, `/stocks/context`,
+`/tickers/overview`, `/scan/all`, `/tickers/setup-summary` all 200 with 24 rows, status STALE between the hourly
+Dashboard publications (no refresh added; the user, 14:5x: skipping the Dashboard refresh is fine).
+
+**R13, workspaces over the bound (r69, Equity scheduler).** Today's windows published 10 ticker workspaces per cutoff
+(AAPL, IWM, QQQ, SPY and the 6 sector ETFs) against 25 on Nov 9. Read-only rerun of the 14:50 projection
+(`scratchpad/ws_probe.py`, live code): 15 stocks `payload is 133,917-149,057 bytes; a by-reference payload must stay
+within 131072`, CRWD at SCREENING. The Financials loaded at 09:17 add about 39 KB per stock (30 reports, 39 fields; AAPL
+131,700 bytes with them, 116,819 on Nov 9). r69 (`c18bd575f40d`) keeps the bound and, for a workspace over it, keeps
+the newest Financials periods that fit with `fundamental_reports_status` TRIMMED_TO_WORKSPACE_BOUND; unit test added,
+tests pass (5 failures, all baseline). The same rerun on r69: 24 workspaces, CRWD only. Financials on AAPL's 14:50
+workspace: 30 reports, latest period 2026-09-26 (filed 11-03); ETFs labelled `REALTIME_FUNDAMENTAL_REPORT_PRODUCER_UNAVAILABLE`.
+
+### Nov 10 (15:07-15:36 UTC): Options unblocked (user yes), R16, Options live
+
+User, ~15:07: "yes, lets unblock options". **R12:** r70 (`459c3db1f1ac`) on the Options lifecycle 15:13:02 (the share
+query skips `RESERVATION_NOT_USED` slots; unit test; lifecycle tests 57 passed, 1 baseline failure). Then
+`runner/r12_live.ps1` (guarded `r12_requeue_options_catalog.sql`: exactly the four rows RETRY / PROVIDER_BUDGET_EXHAUSTED /
+due 21:05) moved IWM, NVDA, SPY, TSLA to 15:13:55 (UPDATE 4). CATALOG_QUOTE COMPLETE 15:14:06 (IWM, 12 requests),
+15:14:10 (NVDA, 4), 15:14:31 (SPY, 21), 15:14:36 (TSLA, 6): the r67 root filter verified on live data.
+
+**R13 verified.** Equity scheduler on r69 15:08:02 (no restarts). 15:10 window: projection 97 s (cold cache), publish
+89 s (the day's evidence for the 14 stocks missing since the open), 189 s in all, 24 workspaces; 15:15, 15:20, 15:25 at
+19-22 s.
+
+**R16, CAPACITY_SHARDS (r71, lifecycle, 15:28:03).** From 15:15 every attempt failed `ValueError: activity/momentum
+candidate is invalid` and the lifecycle restarted (3 times). Read-only rebuild of the combined capture from the stored
+CATALOG_QUOTE evidence (`scratchpad/cap_probe.py`; capture times 14:31-14:32 and 15:14, 9,002 selected contracts): 4
+invalid, AMZN 3 and NFLX 1, all deep in-the-money calls with IV near 0.001 and provider delta 1.0000000000004-1.0000000000047.
+r71 (`b735a1cee3ab`) treats a delta within 1e-6 of the bound as the bound and drops an out-of-range delta or IV; tests
+(79 passed); rebuild on r71: 0 invalid. Live: CAPACITY_SHARDS 9 COMPLETE and SESSION_ACTIVATION COMPLETE by 15:32:47,
+preparation ACTIVE, Nov 10 authorization 15:32:47, Options stream `b847f3cc` LIVE 15:32:50, the Nov 9 stream `22a41c6b`
+STOPPED `ENDED_BY_NEXT_SESSION` (B14a), first Options window E:15:30 COMPLETE 15:35:51.
+
+Images now: API r68, Equity scheduler r69, Options lifecycle r71, all other services r66, frontend f21.
+
+### Nov 10 (15:36-15:56 UTC): R17 Stock Alerts, R18 O1 packages
+
+**R17 (r72, Stock Alerts, 15:44:03).** From 15:30:30 every batch failed `TypeError: unsupported canonical value: bool_`
+in `canonical_stock_alert_research._member_evaluation` (hash of the research-rule state), 29 restarts, no publication for
+15:30-15:40. A rule's saved state carried a `numpy.bool_` (the 15:30 batch held the day's first MATCH). r72
+(`09a7bf3a07a9`) converts rule results to plain Python values at the rule boundary; new unit test; Stock Alerts tests 47
+passed, 1 baseline failure. After 8 lease-handover restarts (expected), 15:45:00-15:45:03 published the missed cutoffs:
+15:30 MATCH 1 / NO_MATCH 18, 15:35 and 15:40 NO_MATCH 19.
+
+**R18 (switch, Options window service, 15:48:03).** E:15:35 FAILED in OPTIONS_CYCLE: `ForeignKeyViolation` on
+`option_packages_cohort_id_provider_tier_fkey`, key (ccaed5c3 = the Nov 10 Options cohort, MASSIVE_ADVANCED) not in
+`rt.provider_tier_cohorts`. `rt.option_packages` has never held a row and no Options-session cohort (Nov 6 b096f5b7,
+Nov 9 d338723a, Nov 10 ccaed5c3) is registered there; Nov 9 never selected a package (2,711 NOT_SELECTED, 82
+OBSERVATION), so the first SELECTED package today was the first insert. Runbook switch (section 5):
+`REALTIME_V3_O1_PACKAGE_SELECTION=DISABLED` on realtime-v3-options-p8-window in `rollout/compose.stable.json` (backup
+`compose.stable.before-o1-off-20261110.json`; only that service's environment differs), `hotfix` with the same r66
+image, 15:48:03, no restarts. Options windows E:15:44 COMPLETE (O1 COMPLETE_ZERO, 150 evaluations), E:15:50 COMPLETE (219),
+the same lane pattern as 50 of 53 Nov 9 windows; Equity 15:45-15:55 COMPLETE in 27-34 s; no traceback in any service
+since 15:46.
+
+### Nov 10 (16:20-16:35 UTC): R18, R22, O3 (user: fix, test, deploy)
+
+**R18.** The V3 activation creates the Options cohort (mode LIVE, `advanced_options_automatic_preparation` ~1662) but
+never its tier binding, which the P8 enrollment wrote; `rt.option_packages` references `rt.provider_tier_cohorts`. r73
+writes `c8_options_tier_binding` at activation (unit test). Today: `runner/r18_register_options_cohort.py ccaed5c3...`
+dry run 16:27 (binding `2c9a0174d097`, MASSIVE_ADVANCED / ADVANCED_READY / options MASSIVE_ADVANCED, effective
+14:29:59.999999, rolled back); the `--apply` run was held by the session permission check and applied at 16:30:06 on
+the user's go. No view reads the table; FKs to it: option_packages, portal_cohort_current, tier activations. O1
+selection set back to ENABLED in `compose.stable.json` and the window service recreated on r73.
+
+**R22.** r73 (`6e559f3325c1`) on the Options window service 16:28:04 with a membership diagnostic; first window 16:30:
+OS1 members 153, rows 154, missing 0; OS2 members 162, rows 163, missing 0. Duplicate ids in `rt.bar_revisions`
+(`(bar_revision_id, observed_at)` key): AAPL 1d 2026-10-19 `5c8495ce` and 2026-10-20 `785a6b5d`, cohort d1baee6f,
+each stored at Oct 21 11:01 and 11:05. r74 (`927f2a1a641d`) reads members by id and observed_at; read-only check on
+the 16:25 cutoff: old query 154 / 163 rows, new 153 / 162.
+
+**O3.** BLOCKED `CANONICAL_MARKS_UNAVAILABLE`: 29 of the 72 slot contracts have an ADVANCED_NBBO mark today, 43 none;
+525 mark rows in all since Nov 9. O3 needs a mark per contract per cycle, which no service produces: market-state work
+(V3-1), not a hotfix.
+
+**16:33-16:37.** Options window service: r73 with O1 selection ENABLED 16:33:04, then r74 (`927f2a1a641d`) 16:34:02,
+no restarts. First window on r74, E:16:35 COMPLETE (89 s): O1 COMPLETE_ZERO (111 evaluations), **OS1 COMPLETE_ZERO,
+OS2 COMPLETE_ZERO** (BLOCKED in every window since Nov 6), O2 UNAVAILABLE (model not accepted), O3 BLOCKED
+(CANONICAL_MARKS_UNAVAILABLE; no producer). R22 verified; R18 waits for the first SELECTED O1 package to be stored.
+
+### Nov 10 (17:00 UTC): OS1/OS2 rule review (user request)
+
+Rules (`options/stock_bar_detection.py`, policy `canonical_stock_bar_signal_v2`): band = prior daily close +/- 0.5 x ATR14
+(15 RAW daily bars); OS1 previous 5m close inside, latest outside; OS2 outside, pullback on the same side, resume beyond
+the band; valid 30 min; an OS invocation needs an O1 flow event on the same underlying and side (CALL up, PUT down), and
+the decision needs that contract's participation above baseline. Read-only replay with the live code over today's bars
+(`scratchpad/os_replay.py`): 252 cutoff evaluations, no error; 5m bars `DERIVED_FROM_ADVANCED_AM_1M` (28) and
+`DERIVED_FROM_CANONICAL_1M` (1), both accepted; 19 stock signals (OS1 up 1, down 7; OS2 down 11). Live evaluations since
+r74: OS2 IWM 10 (window 16:35), NVDA 23 (16:45), OS1 SPY 3 (16:55), matching the replay's 16:30, 16:40 and 16:50
+signals; all NOT_SELECTED, disposition UNMATCHED, reason `PARTICIPATION_BELOW_BASELINE` (volume/OI about 0.09). No
+fault in the rules; one design point recorded as R24 (policy precedence 1h-30m-15m-5m, lane context 5m only).
+
+### Nov 10 (17:19-17:25 UTC): R25 Options STALE banner (user report)
+
+Banner text: "STALE DATA ... 0 sessions behind. Oldest published timestamp: Nov 10, 01:35 PM. Affected timeframes:
+options. Retained setup age: 8m." Live `/api/options/flow` at 17:19:47: available, `stale` false, `as_of` and
+`generated_at` 17:15, `valid_until` 21:35 UTC (= 01:35 PM PT), `retained_session_date` 2026-11-10. The page
+(`fetchOptionsMaterializationStatus`) marks Options STALE when `as_of` is over 5 minutes old and prints `valid_until` as
+the oldest published time; with 5-minute releases, cutoffs sometimes 6 minutes apart and 85-106 s windows, every cycle
+had 1.5-3 minutes over the threshold. f22 (`2ae2a6a36cb2`): 10-minute threshold, `as_of` shown; frontend build and tests
+288 / 243 pass / 40 fail, the identical failure set to f21; the changed and the new test pass.
+
+**R26 (17:27-17:34).** Options Screener built-in tab "Unusual activity: calls" opened with only "Calls" as applied
+filters: server screens are applied by id, and the page's query carried only `type` and `sort`; `/api/options/
+discovery-catalog` already publishes each screen's `rules`, `caps` and `tiers`. f23 (`7a6f1b8a5657`) shows them in the
+Filters side panel (read-only "Built-in screen" section, open) and as chips in the applied-filters row; frontend tests 289
+/ 244 pass / 40 fail (the same set as f22); deployed 17:33:02, public domain 302.
+
+**R26 batch deployed on the user's go (17:43-17:4x).** API r75 (`bf21c7faee64`) 17:43:17, no restarts; the catalog
+serves `criteria` for both Unusual-activity screens (open_interest >= 500, volume_open_interest_ratio >= 3, calendar_dte
+not in 3, 4, day_volume and day_premium by tier); `/latest-price-date`, `/options/flow`, `/stocks/screening/catalog`
+200. Frontend f24 (`e9086e71d136`) next. Stock built-ins already fill their fields from the predicate; no change.
+
+### Nov 10 (17:56-18:15 UTC): R27 editable built-in screens deployed; R18 verified with the first Options alerts
+
+User 17:56: every built-in criterion in a field, the tab's purpose above the table; 18:00: "once changes are done deploy
+and validate, I authorize". r76 API (`619ead7aa4f0`, `screen_overrides`, `customize_screen`) 18:08:42; on live data:
+built-in 62 matched / 20 shown, with its own values as edits identical (same sha256, `customized` true), loosened
+128 / 61, unknown field 422. f25 frontend (`cdd9d65f0a31`) 18:13:42; served bundle contains the new panel; public domain
+302. **R18 verified:** O1 lane COMPLETE_SELECTED from the 18:05 dataset; 29 SELECTED evaluations, 29 rows in
+`rt.option_packages`; the first OPTION rows in `rt.alert_current` (NVDA 17:59, TSLA 18:01, NVDA 18:09, NVDA 18:10). One
+breadth capture request timed out at 18:08:36 (7 s, `Timeout`, BREADTH lane); 80 breadth requests then completed
+18:11-18:12; window E:18:05 started 18:13:15 instead of about 18:10:30 (its stages took 84 s) and completed.
+
+### Nov 10 (18:08-18:35 UTC): R28 network outage, Options stream backlog, reconnect
+
+Options breadth captures 18:08-18:18 failed (`Timeout`, `ConnectionError`: "Remote end closed connection",
+`NameResolutionError` for api.massive.com); DNS and HTTPS from the scheduler worked again by 18:22. Options acquisition
+logged `advanced_gateway_pong_late` (pong 60 s late) from 18:16. Options windows E:18:10, 18:15, 18:20, 18:25 stayed
+PENDING: `RESIDENT_ROLE_NOT_COMPLETE` for INGRESS, MARKET_STATE, FLOW. Consumers were at the journal head (market-state
+3,873,069 / journal 3,873,272; flow 2,150,306 / 2,150,410), but the Options `event_time_watermark` was 461, 457, 470,
+464 s behind the clock (18:28-18:30): a fixed backlog on the websocket. Targets need the watermark past the cutoff before
+the window deadline (cutoff + 10 min). Reconnect: acquisition hotfix on its r66 image 18:33:28; Options stream LIVE,
+connection attempt 3, lag 49 s at 18:34:24 and 0 s at 18:34:45; gap 18:25:35-18:33:33 per contract, ended
+(GATEWAY_SESSION_CHANGED); one start-up overload restart 18:34:16.
+After the reconnect: E:18:30 FAILED (OPTIONS_CYCLE `ValueError: selected package evidence is incomplete`, the window over
+the gap; R31), **E:18:35 COMPLETE 18:42:54**; E:18:10-18:25 still PENDING past their deadlines (R32).
+
+**R29, R30 (r77 API, 18:43:43).** User 18:35: the Options Alerts page showed TSLA 372.5 PUT twice. `/options/alerts/
+detector-runs` returned the 18:05 session alert and the 18:10 run's row for the same candidate `0cf47c93`; `repeat_hits` was
+hard-coded 0; the stored alert direction was 1 (Bullish) for a bought put (O1 has no direction; `_alert_run_row` defaulted to
++1). r77 (`4629cb87d4ca`): later-run rows fold into the session alert by candidate, real repeat count, O1 direction from the
+package legs. Tests: Options alert tests 31 passed. Live 18:44: 4 alerts, no duplicate, repeat_hits 31, TSLA PUT -1, NVDA
+CALLs +1. The window writer keeps the old default until the r77 window deploy after the close (the read corrects it).
+
+### Nov 10 (19:10-19:40 UTC): R33 Day History current price and source facts (r78 API, f26 frontend)
+
+User ~19:05: Day History does not fetch the current contract price for P/L and several fields are Unavailable. At 19:10
+`/options/alerts/detector-runs` (HISTORY, session rollup) served NVDA 261111C170 with `current_mark` FRESH, market time
+18:04:59, age 0: the session list keeps the mark of the window that selected the alert, and `_advanced_current_marks`
+skipped every row whose stored mark was FRESH, so it never refreshed. The page showed `-package_price` ("-$645.00").
+`original_package.calendar_dte` null for all 4 alerts; legs carry `model_mark` only (no spot, day volume, OI). Source
+values exist: `rt.option_flow_events` for the alert's event 39532f87 (NVDA 261111C170, 17:57:58.28): cumulative volume
+96,208, prior OI 1,586 (= the O1 volume/OI 60.66); NVDA 1m close 167.81 (bar end 17:57). Lookup cost: flow events 5 ms,
+1m close ~35 ms per alert (time-bounded on `observed_at`).
+r78 (`9fecfdc35397`): stored mark replaced when the stored quotes are newer, window estimated cost kept (net P/L follows),
+age from quote market time, STALE past 900 s; trigger facts (spot, day volume, prior OI) and DTE filled at read, cached by
+evaluation id when complete, `source_facts` optional read (INV-9). f26 (`432cd64c2133`): current price per share signed
+like the trigger price with the package amount below, age in minutes, O1 stop/target "Not set", management Not applicable.
+Tests: Options alert/portal/flow/session suites 177 passed + the stale catalog test updated (`screens` served since
+21936b7, failing before this change); new R33 tests pass; frontend 291 tests, 40 failing = the same 40 as f25.
+Live 19:38:55: reads session_alerts / current_marks / source_facts AVAILABLE; first read 1.36 s, cached 0.15 s.
+NVDA 261111C170 mark 19:38:54 age 1, -171.00 (return -14.3%), spot 167.81, vol 96,208, OI 1,586, DTE 1; TSLA 261120P372.5
+-920.00, spot 375.795, vol 5,994, OI 589, DTE 10; NVDA 261120C170 and C175 filled likewise. Frontend served 19:39:55
+(Options Alerts chunk has the new labels); public domain 302 (Access).
+
+### Nov 10 (19:40-20:18 UTC): R34 host clock skew unmarked every Options contract; R35 window evidence size (r79, r80 window)
+
+**R34.** O1 SELECTED last at 18:14; after the R28 reconnect every DETECTED evaluation was OBSERVATION (no package): the
+package builder refuses an instrument the window's mark producer left unmarked. `rt.option_mark_evidence` per window:
+46 (18:05), 40 (18:35), 6 (19:05), 0 after. Slot quotes in `rt.quote_current`: 81 of 86 today's quotes had
+`received_at < event_at` (event minus receive median +0.39 s, max +0.49 s), so the producer marked them
+`OPTION_NBBO_STALE_OR_NONCAUSAL` (`valuation_advanced_nbbo_v1`: max age 1 s, event must not follow receipt). SNTP from a
+container: +0.55 to +0.57 s (time.cloudflare.com, time.google.com); Windows `w32tm /stripchart` +0.55 to +0.58 s;
+`w32tm /query /status`: service not started (0x80070426); this session is not an administrator. r79 (`04fd8e69b915`, window
+19:59-20:00): skew up to 2 s is taken as received at the event time; the window logs `advanced_options_window_marks`
+(marked, unmarked reasons). Tests: mark producer, window, loader, adapter suites 205 passed (3 need the repo-root compose
+file, not mounted). Live: 20:00 cutoff marked 33 (39 not fresh), 20:05 marked 35.
+**R35.** The first windows with marks again, E:19:55 and E:20:00, FAILED: OPTIONS_CYCLE STAGE_TIMEOUT at 313 s (E:19:50 was
+interrupted by the r79 restart; both then MISSED). Window release-to-complete through the day: 78-131 s 16:00-17:15,
+158-251 s 17:45-19:49; average evidence document 85 KB (15h), 226 (16h), 413 (17h), 538 (18h), 633 (19h) compressed,
+50-90 per window; the window was CPU-bound with no slow query. Each evaluation's evidence embedded every flow observation
+the window read (up to 10,000, the session). r80 (`68247aa0720a`, window 20:14-20:15): each evidence carries its own
+event's contract observations (underlyer's when the event is not a flow event) plus the package's event. Tests 122
+passed. Live: E:20:10 COMPLETE in 138 s (cold start) at 20:17:45; evidence 80-106 KB; 25 SELECTED evaluations
+(NVDA 261120C170, NVDA 261111C175, NVDA 261111C170, QQQ 261110P670), 0 selected not stored; OPTION alerts 4 -> 6 (QQQ 670
+PUT 0DTE Bearish, NVDA 11/11 175 CALL Bullish). Window restarts 8 on each deploy = start-up `DurableLeaseUnavailable`
+until the old lease ends. E:19:50 and E:20:05 stay RUNNING after their owners were replaced (R32).
+
+### Nov 10 (20:17-20:23 UTC): R36 provider disconnect blip, self-recovered
+
+Breadth captures failed: QQQ 20:17:58 `RemoteDisconnected`, SPY 20:19:26 snapshot interval deadline expired, AMZN 20:21:49
+`RemoteDisconnected` (ledger ConnectionError 2 -> 4, Timeout 3 -> 4); other underlyers completed in the same cycles. Stocks
+stream 93feee57 FAILED 20:22:17 (`ConnectionClosedError`: keepalive ping timeout, 1011, no close frame); new session
+0541ceff LIVE 20:22:34; gap 20:22:00-20:22:34 REPAIRED. Options stream LIVE throughout, lag 51 s at 20:22:39, 13 s at
+20:23:35. Options windows under r80: E:20:10 138 s, E:20:15 106 s COMPLETE; O1 COMPLETE_SELECTED at 20:20; SELECTED 114,
+packages 92, 0 selected not stored. api.massive.com reachable 20:23:58 (1.6 s).
+R36 follow-up (20:32): six per-member Stocks AM gaps 20:21:00-20:22:00 on session 0541ceff and the session gap 20:22:00-20:22:34
+all REPAIRED by six `ADVANCED_HISTORICAL_1M` requests at 20:25:04-20:25:08 (no operator alert); one more breadth Timeout at
+20:23:58 (ledger Timeout 5). Options windows E:20:20 108 s, E:20:25 99 s COMPLETE; O1 SELECTED 163, packages 112, 0 not stored.
+
+### Nov 10 (21:13 UTC): close check, read-only
+
+**Equity.** 77 of 78 cutoffs COMPLETE (0 failed before the close). The close window `advanced-20261110T210000Z` and
+retries 1-3 FAILED at 21:00:35, 21:01:17, 21:02:27, 21:04:36: EQUITY_MATERIALIZE `CLOSING_DAILY_INPUTS_PENDING` (projection
+and publish blocked behind it), the same path as Nov 9 (COMPLETE at retry4, 22:01). Daily bars at 21:13: RAW_UNADJUSTED
+final 25 of 25 (21:00); ADJUSTED final 6 of 25 (AAPL, AMD, AMZN, AVGO, CRWD, GOOGL; latest 21:11). Nov 9's ADJUSTED bars
+arrived 21:05-21:56. Close completion is read at 22:06.
+**Options.** Windows: 56 COMPLETE, 2 FAILED (15:35 R18, 18:30 R31), 2 MISSED (E:19:55, E:20:00, R35), 4 PENDING past
+deadline (E:18:10-18:25, R32), 2 RUNNING with replaced owners (E:19:50, E:20:05, R32). Lanes from 20:20 to the close: O1
+COMPLETE_SELECTED, OS1/OS2 COMPLETE_ZERO, O2 UNAVAILABLE (model not accepted), O3 BLOCKED (input evidence absent). O1:
+140 packages, 0 selected not stored. Alerts: 9 OPTION (NVDA 261111C170, TSLA 261120P372.5, NVDA 261120C170 149 hits,
+NVDA 261120C175 75 hits, QQQ 261110P670 0DTE, NVDA 261111C175, NVDA 261111C172.5, SPY 261110C752 0DTE, TSLA 261111C380),
+4 STOCK. Read-time marks at 21:13 from the last quotes (20:59:59, age 845 s, FRESH under 900 s); the two 0DTE packages
+ended -87% and -83% gross.
+**Streams.** STOCKS 93feee57 14:30-20:22 FAILED (`ConnectionClosedError`, R36), 0541ceff 20:22-21:00 STOPPED; OPTIONS
+b847f3cc 15:32, still LIVE at 21:13. Gaps today: 18 Options UNRESOLVED (R28), 7 Stocks REPAIRED (R36).
+**After the close.** Fundamentals refresh in the preparation idle slot 21:07: 16 of 16 companies (also 09:xx). Capability
+profile `cd7ee87a` PASS, checked 21:01, expires Nov 11 21:01 (previous `1b29f901` expired 21:01).
+**Restarts and errors since 14:30.** Stock Alerts 8 (baseline), Options lifecycle 3 (baseline), Options acquisition 1
+(18:34 R28), Options window 8 (start-up lease waits after the r79 and r80 deploys), Options FLOW, INGRESS, MARKET_STATE 1
+each at 21:06 (R37: role did not stop within its bound at the 21:05 stop). Error lines: scheduler 3 (breadth captures,
+R36), acquisition 2, lifecycle 3, the three roles 2 each (R37 traceback). Every other service 0 restarts, 0 errors.
+**Matrix.** VERIFIED from this session: A0, A0.1 (session policy), A4.3 (live), A4.6 (three readers live), R7 (live),
+G37; header lists the live images per service (r66, r69, r71, r72, r78, r80, f26). New rows R33-R37.
+
+### Nov 10 (22:06 UTC): close completion, read-only
+
+Close `advanced-20261110T210000Z-retry4` COMPLETE 21:41:29 (Nov 9: 22:01); Equity 78 of 78 cutoffs. Daily 1d final for 25
+of 25 on both bases (RAW_UNADJUSTED by 21:00, ADJUSTED by 21:36). Options: last windows E:20:40-20:55 COMPLETE (20:46-21:02);
+day totals 56 COMPLETE, 2 FAILED (R18, R31), 2 MISSED (R35), 4 PENDING and 2 RUNNING past deadline (R32); Options session
+b847f3cc watermark 21:05:00 (row closes when the next session starts, as Nov 9's `ENDED_BY_NEXT_SESSION`). Stock Alerts
+last publication the 20:55 cutoff (77 today; Nov 9 also ended at 20:55), Pattern Watch and Dashboard at 21:00. Alerts: 9
+OPTION, 4 STOCK. Since 20:50: no new restarts; error lines only the R37 stop-bound tracebacks (FLOW, INGRESS, MARKET_STATE,
+2 each at 21:06). All 23 containers up.
+

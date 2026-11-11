@@ -275,3 +275,62 @@ test('publication identity remains in navigation but outside saved screen defini
   assert.equal(switched.get('snapshot_id'), 'snapshot')
   assert.throws(() => model.validateScreenQuery({ view: 'chain', cohort_id: 'cohort' }, catalog), /Unsupported screen field/)
 })
+test('an opened built-in server screen lists the rules it applies, its caps and its tiers (Nov 10)', () => {
+  const screen = { id: 'unusual-activity-calls', version: 1, sha256: 'a'.repeat(64), name: 'Unusual activity: calls',
+    summary: 'Calls trading at least 3 times their prior open interest', contract_type: 'CALL', sort: 'day_premium', descending: true,
+    caps: { per_underlying: 3, total: 20 }, rules: ['Open interest >= 500', 'Volume / OI >= 3', 'not (DTE in 3, 4)'],
+    tiers: { SPY: 'ETF', QQQ: 'ETF', AAPL: 'CORE_MEGA_CAP' }, source: 'policy' }
+  assert.deepEqual(model.builtinScreenRuleLabels(screen), [
+    'Open interest >= 500', 'Volume / OI >= 3', 'not (DTE in 3, 4)', 'At most 3 per underlying', 'At most 20 in all',
+    'Tiers: ETF QQQ, SPY; CORE_MEGA_CAP AAPL',
+  ])
+  const library = readFileSync(new URL('../src/pages/OptionsScreenLibrary.tsx', import.meta.url), 'utf8')
+  assert.match(library, /builtinScreenRuleLabels\(selectedChoice\.serverScreen\)/)
+})
+
+test('every criterion of a built-in server screen fills a field, and the fields go back as edits (Nov 10)', () => {
+  const fields = { ...catalog, contract_filters: { ...catalog.contract_filters, open_interest: { label: 'Open interest', unit: 'contracts', minimum: 0, integer: true } } }
+  const screen = { id: 'unusual-activity-calls', version: 1, sha256: 'a'.repeat(64), name: 'Unusual activity: calls', summary: 'Calls trading at least 3 times their prior open interest',
+    contract_type: 'CALL', sort: 'day_volume', descending: true, caps: { per_underlying: 3, total: 20 }, rules: ['text'],
+    criteria: [
+      { field: 'open_interest', op: '>=', negated: false, value: 500 },
+      { field: 'volume_open_interest_ratio', op: '>=', negated: false, value: 3 },
+      { field: 'calendar_dte', op: 'in', negated: true, value: [3, 4] },
+      { field: 'day_volume', op: '>=', negated: false, values_by_tier: { ETF: 5000, CORE_MEGA_CAP: 1500 } },
+      { field: 'day_premium', op: '>=', negated: false, values_by_tier: { ETF: 1000000, CORE_MEGA_CAP: 500000 } },
+    ], tiers: { SPY: 'ETF', AAPL: 'CORE_MEGA_CAP' }, source: 'policy' }
+  const defaults = model.serverScreenDefaults(screen, fields)
+  assert.deepEqual(defaults, {
+    screen_edit: '1', range_open_interest_min: '500', range_volume_open_interest_ratio_min: '3', exclude_calendar_dte: '3, 4',
+    tier_day_volume_ETF: '5000', tier_day_volume_CORE_MEGA_CAP: '1500', tier_day_premium_ETF: '1000000', tier_day_premium_CORE_MEGA_CAP: '500000',
+    cap_per_underlying: '3', cap_total: '20',
+  })
+  const template = model.optionTemplates(fields).find(item => item.id === screen.id)
+  assert.equal(template, undefined)
+  const templated = model.serverScreenTemplate(screen, fields)
+  assert.equal(templated.query.tier_day_volume_ETF, '5000')
+  assert.ok(model.validateScreenQuery(templated.query, fields))
+  assert.deepEqual(model.serverScreenOverrides(defaults, screen, fields), {
+    minimums: { open_interest: 500, volume_open_interest_ratio: 3 },
+    tier_minimums: { day_volume: { ETF: 5000, CORE_MEGA_CAP: 1500 }, day_premium: { ETF: 1000000, CORE_MEGA_CAP: 500000 } },
+    exclude_calendar_dte: [3, 4], caps: { per_underlying: 3, total: 20 },
+  })
+  const edited = { ...defaults, range_open_interest_min: '100', exclude_calendar_dte: '' , tier_day_volume_ETF: '9000' }
+  delete edited.range_volume_open_interest_ratio_min
+  delete edited.cap_total
+  const overrides = model.serverScreenOverrides(edited, screen, fields)
+  assert.deepEqual(overrides.minimums, { open_interest: 100, volume_open_interest_ratio: null })
+  assert.deepEqual(overrides.exclude_calendar_dte, [])
+  assert.equal(overrides.tier_minimums.day_volume.ETF, 9000)
+  assert.deepEqual(overrides.caps, { per_underlying: 3, total: null })
+  assert.equal(model.serverScreenOverrides({ type: 'CALL' }, screen, fields), undefined)
+  assert.throws(() => model.validateScreenQuery({ ...templated.query, exclude_calendar_dte: '3, x' }, fields), /Excluded DTE/)
+  assert.throws(() => model.validateScreenQuery({ ...templated.query, cap_total: '0' }, fields), /result limit/)
+  assert.deepEqual(model.screenChangeLabels({ ...defaults, range_open_interest_min: '1000' }, defaults, fields), ['Open interest min: 1000'])
+  assert.deepEqual(model.serverScreenFields(screen).tiers, { day_volume: ['ETF', 'CORE_MEGA_CAP'], day_premium: ['ETF', 'CORE_MEGA_CAP'] })
+  const workspace = readFileSync(new URL('../src/pages/OptionsScreeningWorkspace.tsx', import.meta.url), 'utf8')
+  assert.match(workspace, /<TierMinimums field=\{key\}/)
+  assert.match(workspace, /aria-label="Exclude DTE"/)
+  assert.match(workspace, /className="os-screen-purpose"/)
+  assert.doesNotMatch(workspace, /builtinRules\.map/)
+})

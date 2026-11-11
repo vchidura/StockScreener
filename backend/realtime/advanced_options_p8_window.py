@@ -512,6 +512,31 @@ def _evidence_builder(
         ),
     )
 
+    # R35 (Nov 10): every evaluation's evidence carried every flow observation the window read (up to 10,000 for the
+    # session, ~650 KB compressed per evidence by 19:00), so the window's run time grew from ~100 s to ~250 s through
+    # the day and crossed its 300 s deadline (E:19:55 OPTIONS_CYCLE STAGE_TIMEOUT). Each evidence now carries the
+    # observations of its own event's contract; an evaluation whose event is not a flow event carries its underlyer's.
+    observations_by_event = {row.event_id: row for row in flow_observations}
+    observations_by_contract: dict[str, list] = {}
+    observations_by_underlyer: dict[str, list] = {}
+    for row in flow_observations:
+        observations_by_contract.setdefault(row.contract_ticker, []).append(row)
+        observations_by_underlyer.setdefault(str(row.underlyer).upper(), []).append(row)
+
+    def observations_for(evaluation):
+        own = observations_by_event.get(evaluation.event_id)
+        rows = (
+            observations_by_contract[own.contract_ticker]
+            if own is not None
+            else observations_by_underlyer.get(str(evaluation.underlyer).upper(), [])
+        )
+        package = evaluation.package
+        if package is not None and package.event_id in observations_by_event and not any(
+            row.event_id == package.event_id for row in rows
+        ):
+            rows = [*rows, observations_by_event[package.event_id]]
+        return tuple(rows)
+
     def build(cycle):
         values = []
         for evaluation in cycle.evaluations:
@@ -542,7 +567,7 @@ def _evidence_builder(
     def evidence(evaluation, package_mark, *extra_reasons):
         return build_flow_package_evidence(
                 evaluation,
-                flow_observations=flow_observations,
+                flow_observations=observations_for(evaluation),
                 cluster_observations=(),
                 threshold_evidence=threshold,
                 reference_state=reference,
@@ -716,6 +741,18 @@ def build_and_run_p8_serial_window(
         provider,
         mark_candidate,
     ).preflight()
+    # R34 (Nov 10): what the marks left out and why, per window; zero marks had no trace in the logs.
+    unmarked_reasons: dict[str, int] = {}
+    for row in mark_preflight.evidence:
+        for reason in row.reason_codes:
+            unmarked_reasons[reason] = unmarked_reasons.get(reason, 0) + 1
+    _LOGGER.warning(
+        "advanced_options_window_marks window_id=%s cutoff=%s marked=%d unmarked_reasons=%s",
+        binding.window_id,
+        cutoff.isoformat(),
+        len(mark_preflight.marks),
+        json.dumps(unmarked_reasons, sort_keys=True),
+    )
     mark_plan = freeze_advanced_options_mark_producer_plan(
         mark_candidate,
         mark_preflight,

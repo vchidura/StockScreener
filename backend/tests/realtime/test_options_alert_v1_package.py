@@ -102,9 +102,10 @@ def test_read_time_current_mark_from_stored_quotes():
     assert Decimal(mark["signed_package_mark"]) == Decimal("-260.00")
     assert Decimal(mark["gross_pnl"]) == Decimal("40.00")
     assert abs(Decimal(mark["price_return"]) - Decimal("0.181818")) < Decimal("0.000001")
-    assert mark["age_seconds"] == 29
-    # An existing fresh mark is never replaced; a missing quote leaves the row as it was.
-    assert result["data"]["rows"][1]["current_mark"]["price_return"] == "0.5"
+    # R33: age is from the quote's market time at the read.
+    assert mark["age_seconds"] == 30 and mark["maximum_age_seconds"] == 900
+    # A stored mark with no market time is replaced by the read-time mark; a missing quote leaves the row as it was.
+    assert result["data"]["rows"][1]["current_mark"]["price_return"] != "0.5"
     missing = repository._advanced_current_marks(_QuoteCursor([]), {"data": {"rows": [_alert_row()]}}, cutoff=cutoff)
     assert missing["data"]["rows"][0]["current_mark"]["status"] == "UNAVAILABLE"
 
@@ -197,3 +198,125 @@ def test_current_marks_report_what_they_served():
     result = repository._advanced_current_marks_reported(healthy, {"data": {"rows": [_alert_row()]}}, cutoff=cutoff)
     assert result["data"]["optional_reads"][0]["status"] == "AVAILABLE"
     assert healthy.statements[-1] == "RELEASE SAVEPOINT options_current_marks"
+
+
+def test_stored_window_mark_is_refreshed_from_newer_quotes():
+    """R33 (Nov 10 live): the session list kept the 18:05 window mark as FRESH, so at 19:10 Day History still showed
+    the 18:05 price and "0.0 hours old". A newer stored quote now replaces it, keeping the window's cost; a stored
+    mark at least as new as the quotes is kept and aged at the read; past 15 minutes it reads STALE."""
+    from realtime.portal_compatibility_repository import RealtimeOptionsAlertsPageRepository
+
+    repository = RealtimeOptionsAlertsPageRepository.__new__(RealtimeOptionsAlertsPageRepository)
+    window_mark = {
+        "status": "FRESH", "reason": None, "market_time": "2026-11-10T18:04:59.856000+00:00", "age_seconds": 0,
+        "signed_package_mark": "-193.50", "package_price": "193.50", "gross_pnl": "-6.00", "price_return": "-0.03",
+        "estimated_cost": "1.30", "net_pnl": "-7.30", "net_return": "-0.0366", "net_return_basis": "NET_PNL_OVER_CAPITAL_AT_RISK",
+        "source_snapshot_ids": ["26164a30-db79-57a1-a45d-2d81e5a6f19d"],
+    }
+    cutoff = datetime(2026, 11, 10, 19, 10, tzinfo=timezone.utc)
+    newer = {"contract_id": 101, "bid": Decimal("2.40"), "ask": Decimal("2.50"),
+             "event_at": datetime(2026, 11, 10, 19, 9, 58, tzinfo=timezone.utc),
+             "received_at": datetime(2026, 11, 10, 19, 9, 58, tzinfo=timezone.utc)}
+    result = repository._advanced_current_marks(_QuoteCursor([newer]), {"data": {"rows": [_alert_row(dict(window_mark))]}}, cutoff=cutoff)
+    mark = result["data"]["rows"][0]["current_mark"]
+    assert mark["status"] == "FRESH" and mark["market_time"] == "2026-11-10T19:09:58+00:00" and mark["age_seconds"] == 2
+    assert Decimal(mark["signed_package_mark"]) == Decimal("-245.00") and Decimal(mark["gross_pnl"]) == Decimal("25.00")
+    assert Decimal(mark["estimated_cost"]) == Decimal("1.30") and Decimal(mark["net_pnl"]) == Decimal("23.70")
+    assert mark["net_return_basis"] == "NET_PNL_OVER_CAPITAL_AT_RISK" and "source_snapshot_ids" not in mark
+    # The quotes are no newer than the stored mark: it is kept, aged at the read (65 minutes: STALE).
+    older = dict(newer, event_at=datetime(2026, 11, 10, 18, 0, tzinfo=timezone.utc),
+                 received_at=datetime(2026, 11, 10, 18, 0, tzinfo=timezone.utc))
+    kept = repository._advanced_current_marks(_QuoteCursor([older]), {"data": {"rows": [_alert_row(dict(window_mark))]}}, cutoff=cutoff)
+    mark = kept["data"]["rows"][0]["current_mark"]
+    assert mark["signed_package_mark"] == "-193.50" and mark["age_seconds"] == 3900
+    assert mark["status"] == "STALE" and mark["reason"] == "CURRENT_MARK_OLDER_THAN_15_MINUTES"
+    # No quote at all: the stored mark is kept and aged too.
+    aged = repository._advanced_current_marks(_QuoteCursor([]), {"data": {"rows": [_alert_row(dict(window_mark))]}}, cutoff=cutoff)
+    assert aged["data"]["rows"][0]["current_mark"]["status"] == "STALE"
+
+
+class _FactsCursor:
+    """The two trigger-time reads: the alert's flow events, then the stock's 1-minute close at the trigger."""
+
+    def __init__(self, events, spots, broken=False):
+        self.events, self.spots, self.broken, self.statements = events, spots, broken, []
+
+    def execute(self, sql, params=None):
+        self.statements.append(sql)
+        if sql.startswith(("SAVEPOINT", "RELEASE", "ROLLBACK TO")):
+            return
+        if self.broken:
+            raise RuntimeError("canceling statement due to statement timeout")
+        if "rt.option_flow_events" in sql:
+            wanted = set(params[0])
+            self.result = [row for row in self.events if row["event_id"] in wanted]
+        else:
+            assert "rt.bar_revisions" in sql
+            self.result = [row for row in self.spots if (row["ticker"], row["at"]) in set(zip(*params))]
+
+    def fetchall(self):
+        return self.result
+
+
+def _facts_row(evaluation_id):
+    return {
+        "evaluation_id": evaluation_id, "underlyer": "NVDA", "session_date": "2026-11-10",
+        "triggered_at": "2026-11-10T17:57:58.826525+00:00",
+        "event_ids": ["322b985f-1114-53ee-a15d-9f39670591dc", "39532f87-a155-5e19-82a1-9d9ed6ec4e83"],
+        "original_package": {
+            "calendar_dte": None, "expiration_date": "2026-11-11",
+            "legs": [{"contract_ticker": "O:NVDA261111C00170000", "contract_type": "CALL", "strike": "170", "side": "BUY"}],
+        },
+    }
+
+
+def test_source_facts_fill_stock_volume_oi_and_dte_from_the_trigger():
+    """R33 (Nov 10 live): O1 Day History showed Stock at source, % OTM, Volume, OI and DTE as Unavailable. They come
+    from the alert's own flow event at the trigger and the stock's last 1-minute close by then."""
+    from realtime.portal_compatibility_repository import RealtimeOptionsAlertsPageRepository
+
+    trigger = datetime(2026, 11, 10, 17, 57, 58, 826525, tzinfo=timezone.utc)
+    events = [
+        {"event_id": "39532f87-a155-5e19-82a1-9d9ed6ec4e83", "contract_ticker": "O:NVDA261111C00170000",
+         "event_time": datetime(2026, 11, 10, 17, 57, 58, 280000, tzinfo=timezone.utc),
+         "cumulative_volume_after": 96208, "prior_open_interest": 1586},
+        # A later repeat of the same alert: not the value at the trigger.
+        {"event_id": "322b985f-1114-53ee-a15d-9f39670591dc", "contract_ticker": "O:NVDA261111C00170000",
+         "event_time": datetime(2026, 11, 10, 17, 59, 52, tzinfo=timezone.utc),
+         "cumulative_volume_after": 97298, "prior_open_interest": 1586},
+    ]
+    spots = [{"ticker": "NVDA", "at": trigger, "close_price": Decimal("167.81000000"),
+              "bar_end": datetime(2026, 11, 10, 17, 57, tzinfo=timezone.utc)}]
+    repository = RealtimeOptionsAlertsPageRepository.__new__(RealtimeOptionsAlertsPageRepository)
+    cutoff = datetime(2026, 11, 10, 19, 10, tzinfo=timezone.utc)
+    evaluation_id = str(uuid4())
+    cursor = _FactsCursor(events, spots)
+    result = repository._advanced_source_facts_reported(cursor, {"data": {"rows": [_facts_row(evaluation_id)]}}, cutoff=cutoff)
+    package = result["data"]["rows"][0]["original_package"]
+    (leg,) = package["legs"]
+    assert package["calendar_dte"] == 1
+    assert leg["day_volume"] == 96208 and leg["open_interest"] == 1586
+    assert leg["spot"] == "167.81000000" and leg["spot_market_data_time"] == "2026-11-10T17:57:00+00:00"
+    assert leg["market_facts_basis"] == "TRIGGER_FLOW_EVENT_AND_1M_CLOSE"
+    assert result["data"]["optional_reads"] == [{"read": "source_facts", "status": "AVAILABLE", "reason_code": None,
+                                                 "serving_source": "TRIGGER_EVENTS"}]
+    # Complete facts are kept: the next read makes no queries.
+    again = _FactsCursor([], [])
+    repeat = repository._advanced_source_facts_reported(again, {"data": {"rows": [_facts_row(evaluation_id)]}}, cutoff=cutoff)
+    assert repeat["data"]["rows"][0]["original_package"]["legs"][0]["day_volume"] == 96208
+    assert not [sql for sql in again.statements if "rt." in sql]
+    # A failed read serves the rows as they were and says so; DTE needs no read.
+    broken = _FactsCursor([], [], broken=True)
+    failed = repository._advanced_source_facts_reported(broken, {"data": {"rows": [_facts_row(str(uuid4()))]}}, cutoff=cutoff)
+    assert failed["data"]["optional_reads"][0]["status"] == "FALLBACK"
+    assert failed["data"]["optional_reads"][0]["reason_code"] == "SOURCE_FACTS_UNAVAILABLE"
+    assert "day_volume" not in failed["data"]["rows"][0]["original_package"]["legs"][0]
+    assert broken.statements[-1] == "ROLLBACK TO SAVEPOINT options_source_facts"
+    # An incomplete lookup (no stock bar) fills what it found and is read again next time.
+    partial_id = str(uuid4())
+    partial = repository._advanced_source_facts(_FactsCursor(events, []), {"data": {"rows": [_facts_row(partial_id)]}}, cutoff=cutoff)
+    leg = partial["data"]["rows"][0]["original_package"]["legs"][0]
+    assert leg["day_volume"] == 96208 and "spot" not in leg
+    retry = _FactsCursor(events, spots)
+    repository._advanced_source_facts(retry, {"data": {"rows": [_facts_row(partial_id)]}}, cutoff=cutoff)
+    assert [sql for sql in retry.statements if "rt.bar_revisions" in sql]

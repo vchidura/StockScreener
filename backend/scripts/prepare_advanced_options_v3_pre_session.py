@@ -513,6 +513,36 @@ def _expiry_calendar_evidence(
     return tuple(values)
 
 
+# R16 (Nov 10, live): the provider reports delta 1.0000000000047 for deep in-the-money calls (float noise), which the
+# candidate's [-1, 1] check rejected, and one rejected candidate failed the whole CAPACITY_SHARDS allocation. Within
+# this tolerance the value is the bound; a delta or IV further out of range is not used (the Greeks are then absent).
+_GREEK_BOUND_TOLERANCE = Decimal("0.000001")
+
+
+def _provider_delta(value):
+    try:
+        delta = None if value is None else Decimal(str(value))
+    except (ArithmeticError, TypeError, ValueError):
+        return None
+    if delta is None or not delta.is_finite():
+        return None
+    if abs(delta) <= 1:
+        return delta
+    if abs(delta) - 1 <= _GREEK_BOUND_TOLERANCE:
+        return Decimal(1).copy_sign(delta)
+    return None
+
+
+def _provider_implied_volatility(value):
+    try:
+        volatility = None if value is None else Decimal(str(value))
+    except (ArithmeticError, TypeError, ValueError):
+        return None
+    if volatility is None or not volatility.is_finite() or volatility < 0:
+        return None
+    return volatility
+
+
 def _activity_candidate(
     row,
     raw_snapshot,
@@ -547,8 +577,10 @@ def _activity_candidate(
     })
     open_interest = raw.get("open_interest")
     volume = day_row.get("volume")
-    delta = greeks.get("delta")
-    implied_volatility = raw.get("implied_volatility")
+    delta = _provider_delta(greeks.get("delta"))
+    implied_volatility = _provider_implied_volatility(
+        raw.get("implied_volatility")
+    )
     return ActivityMomentumCandidate(
         contract_id=int(identity[:15], 16) + 1,
         contract_ticker=row.contract_ticker,
@@ -591,16 +623,12 @@ def _activity_candidate(
             and open_interest >= 0
             else None
         ),
-        delta=(
-            None if delta is None else Decimal(str(delta))
-        ),
-        implied_volatility=(
-            None
-            if implied_volatility is None
-            else Decimal(str(implied_volatility))
-        ),
+        delta=delta,
+        implied_volatility=implied_volatility,
         greeks_as_of=(
-            row.market_data_time if greeks else None
+            row.market_data_time
+            if delta is not None or implied_volatility is not None
+            else None
         ),
         source_evidence_references=(digest,),
         flow_eligible=flow_eligible,

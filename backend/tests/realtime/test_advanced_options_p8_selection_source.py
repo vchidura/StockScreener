@@ -983,6 +983,16 @@ def _rejectable_row():
             lambda row: row["underlying_asset"].pop("price"),
             "MISSING_UNDERLYING_PRICE",
         ),
+        (
+            lambda row: row["details"].update(
+                ticker="O:B1QQQ261021C00600000"
+            ),
+            "NON_STANDARD_ROOT",
+        ),
+        (
+            lambda row: row["underlying_asset"].pop("ticker"),
+            "NON_STANDARD_ROOT",
+        ),
     ),
 )
 def test_absent_optional_snapshot_field_rejects_only_its_row(mutate, reason):
@@ -1096,3 +1106,25 @@ def test_failed_transport_and_http_error_are_still_accounted():
     assert rejected.provider_attempts == (
         P8SelectionProviderAttempt(502, len(b"bad gateway")),
     )
+
+
+def test_other_product_root_in_the_chain_rejects_only_its_rows():
+    """Nov 10: the provider listed O:B1SPY..., O:B1VDA... under the same
+    underlyings; they must not fail the underlying's whole capture."""
+    other = _rejectable_row()
+    other["details"]["ticker"] = "O:B1QQQ261021C00600000"
+    zero_quote = _rejectable_row()
+    zero_quote["last_quote"].update(bid=0, ask=0)
+    source = MassiveAdvancedOptionsSelectionSource(
+        _Transport([_payload("QQQ", [other, zero_quote])]),
+        _Spots(),
+        clock=lambda: REVIEWED,
+    )
+
+    with pytest.raises(P8SelectionNoUsableContracts) as raised:
+        source.capture(reviewed_at=REVIEWED, session_date=SESSION)
+
+    assert raised.value.rejections == {
+        "NON_STANDARD_ROOT": 1,
+        "NON_POSITIVE_ASK": 1,
+    }

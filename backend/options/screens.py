@@ -244,6 +244,83 @@ def rule_labels(rule, parameters: TierParameters | None = None) -> list[str]:
     return [label(rule)]
 
 
+def customize_screen(definition: ScreenDefinition, overrides) -> ScreenDefinition:
+    """A built-in screen with the page's edits applied (Nov 10): fixed minimums replaced or removed, tier minimums
+    replaced, the DTE exclusion replaced or removed, caps replaced. Only a flat all-of screen can be edited, and only
+    the criteria it has; the result is validated as a screen like any other."""
+    leaves = definition.rule.all if isinstance(definition.rule, AllOf) else (definition.rule,)
+    rule_fields = set()
+    kept = []
+    tier_parameters = {}
+    for leaf in leaves:
+        negated = isinstance(leaf, NotOf)
+        node = leaf.not_ if negated else leaf
+        if not isinstance(node, Comparison):
+            raise ValueError("this screen cannot be edited field by field")
+        document = leaf.model_dump(mode="json", by_alias=True)
+        if negated and node.op == "in" and node.field == "calendar_dte":
+            rule_fields.add("exclude_calendar_dte")
+            if overrides.exclude_calendar_dte is not None:
+                if not overrides.exclude_calendar_dte:
+                    continue
+                document = {"not": {**document["not"], "value": [float(value) for value in overrides.exclude_calendar_dte]}}
+        elif not negated and node.parameter is not None:
+            tier_parameters[node.field] = node.parameter
+        elif not negated and node.op in (">=", ">") and node.value is not None and not isinstance(node.value, tuple):
+            rule_fields.add(node.field)
+            if node.field in overrides.minimums:
+                minimum = overrides.minimums[node.field]
+                if minimum is None:
+                    continue
+                document = {**document, "value": float(minimum)}
+        kept.append(document)
+    unknown = set(overrides.minimums) - rule_fields
+    unknown |= set(overrides.tier_minimums) - set(tier_parameters)
+    if overrides.exclude_calendar_dte is not None and "exclude_calendar_dte" not in rule_fields:
+        unknown.add("exclude_calendar_dte")
+    if unknown:
+        raise ValueError(f"screen {definition.id} has no editable criterion for: {sorted(unknown)}")
+    if not kept:
+        raise ValueError("a screen needs at least one criterion")
+    body = definition.model_dump(mode="json", by_alias=True)
+    body["rule"] = {"all": kept}
+    if overrides.tier_minimums:
+        values = {tier: dict(items) for tier, items in body["parameters"]["values"].items()}
+        for field, by_tier in overrides.tier_minimums.items():
+            if set(by_tier) - set(values):
+                raise ValueError(f"unknown tiers for {field}: {sorted(set(by_tier) - set(values))}")
+            for tier, value in by_tier.items():
+                if value < 0:
+                    raise ValueError("a tier minimum cannot be negative")
+                values[tier][tier_parameters[field]] = float(value)
+        body["parameters"]["values"] = values
+    if overrides.caps is not None:
+        body["caps"] = {**body["caps"], **overrides.caps}
+    return ScreenDefinition.model_validate(body)
+
+
+def screen_criteria(rule, parameters: TierParameters | None) -> list[dict[str, object]] | None:
+    """The rule as flat criteria for the page to prefill its filter fields (Nov 10): one item per comparison of a
+    top-level all-of (or a single comparison), with `negated` for a `not`, `value` for a fixed operand and
+    `values_by_tier` for a tier parameter. None when the rule is not that flat shape (the page then shows `rules`)."""
+    leaves = rule.all if isinstance(rule, AllOf) else (rule,)
+    criteria = []
+    for leaf in leaves:
+        negated = isinstance(leaf, NotOf)
+        node = leaf.not_ if negated else leaf
+        if not isinstance(node, Comparison):
+            return None
+        item: dict[str, object] = {"field": node.field, "op": node.op, "negated": negated}
+        if node.parameter is not None:
+            if parameters is None:
+                return None
+            item["values_by_tier"] = {tier: values[node.parameter] for tier, values in parameters.values.items()}
+        else:
+            item["value"] = list(node.value) if isinstance(node.value, tuple) else node.value
+        criteria.append(item)
+    return criteria
+
+
 def builtin_screen_catalog() -> list[dict[str, object]]:
     return [
         {
@@ -251,6 +328,7 @@ def builtin_screen_catalog() -> list[dict[str, object]]:
             "summary": screen.summary, "contract_type": screen.contract_type, "sort": screen.sort,
             "descending": screen.descending, "caps": screen.caps.model_dump(),
             "rules": rule_labels(screen.rule, screen.parameters),
+            "criteria": screen_criteria(screen.rule, screen.parameters),
             "tiers": None if screen.parameters is None else screen.parameters.underlying_tiers,
             "source": screen.source,
         }

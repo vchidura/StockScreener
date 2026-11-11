@@ -13,7 +13,7 @@ import {
 } from '../services/api'
 import { Modal } from './ScreenLibrary'
 import { optionContractExpired, optionDetectorSort, optionDetectorSortChange, optionPackageStrategyName, detectorAlertColumns, detectorAlertColumnsForView, detectorObservationFieldStates, detectorColumnPresets, detectorViewPreset, readDetectorPresets, writeDetectorPresets, type DetectorViewPreset } from './optionsAlertPresentation'
-import { emptyOptionAlertForm, optionAlertTabParams, optionCandidateBoardFacts, optionContractSummary, optionLegMarketValues, optionMarketColumns, optionPackagePremium, optionPackagePrice, optionPlanTerms, optionAlertLabel as label, optionAlertMoney as money, optionAlertPercent, optionAlertPreviewRequest, optionAlertTime as time, optionEntryWindow, optionGateTimeframe, optionGateValue, type OptionAlertForm, type OptionAlertView } from './optionsAlertPresentation'
+import { emptyOptionAlertForm, optionAlertTabParams, optionCandidateBoardFacts, optionContractSummary, optionCurrentPackagePrice, optionLegMarketValues, optionMarketColumns, optionMarkAge, optionPackagePremium, optionPackagePrice, optionPlanTerms, optionAlertLabel as label, optionAlertMoney as money, optionAlertPercent, optionAlertPreviewRequest, optionAlertTime as time, optionEntryWindow, optionGateTimeframe, optionGateValue, type OptionAlertForm, type OptionAlertView } from './optionsAlertPresentation'
 import './StockDiscoveryPage.css'
 import './StockScreeningPage.css'
 import './OptionsAlertsPage.css'
@@ -44,6 +44,11 @@ function PackagePrice({ netPremium, legs }: { netPremium: unknown; legs: Paramet
 
 function detectorThresholdCells(netPremium: unknown, legs: Parameters<typeof optionPackagePrice>[1], management: Record<string, unknown> | undefined,
   options: Parameters<typeof optionPlanTerms>[3]): Record<'technical_stop' | 'technical_target', ReactNode> {
+  // R33 (Nov 10): a detector with no management policy (O1) sets no stop or target; that is not a missing value.
+  if (!options?.version) {
+    const none = <span className="oa-muted" title="This detector's alerts carry no stop or target rule">Not set<small>No stop / target rule</small></span>
+    return { technical_stop: none, technical_target: none }
+  }
   const plan = optionPlanTerms(netPremium, legs, management, options)
   const threshold = (value: number | null, tone: string) => <span className={tone} title={`${label(plan.basis)} / ${label(plan.closeKind)} / Per share / Not a guaranteed fill`}>
     {value == null ? 'Unavailable' : money(value)}<small>Option package / share</small>
@@ -52,14 +57,13 @@ function detectorThresholdCells(netPremium: unknown, legs: Parameters<typeof opt
 }
 
 function detectorCurrentMarkCells(mark: OptionCurrentMark | null, originalNetPremium: unknown,
-  expirationDate?: string | null, asOf?: string | null): Record<string, ReactNode> {
+  expirationDate?: string | null, asOf?: string | null, legs: readonly { multiplier?: unknown }[] = []): Record<string, ReactNode> {
   const valid = mark && mark.status !== 'UNAVAILABLE'
   const expired = optionContractExpired(expirationDate, asOf)
-  const shareValue = valid && mark.package_price != null ? -Number(mark.package_price) : null
-  const credit = Number(originalNetPremium) > 0
-  const amount = (value: number | null) => value == null || !Number.isFinite(value) ? 'Unavailable' : money(credit ? -value : value)
+  const current = valid ? optionCurrentPackagePrice(mark, legs, originalNetPremium) : { amount: null, price: null }
   return {
-    current_price: <span className={markTone(valid ? mark.price_return : null)}>{amount(shareValue)}<small>{mark?.market_time ? `As of ${time(mark.market_time)} ET` : 'Timestamp unavailable'}</small></span>,
+    current_price: <span className={markTone(valid ? mark.price_return : null)} title="Package price per share from the latest stored quote midpoints, signed like the trigger price; not a quote or fill">
+      {current.price == null ? 'Unavailable' : optionPackagePremium(current.price)}{current.amount != null && <small>{optionPackagePremium(current.amount)} / package</small>}<small>{mark?.market_time ? `As of ${time(mark.market_time)} ET` : 'Timestamp unavailable'}</small></span>,
     price_pnl: <span className={markTone(valid ? mark.price_return : null)} title="Gross marked P/L / absolute original net premium; no fills or stop/target exit simulation">
       {optionAlertPercent(valid ? mark.price_return : null)}<small>{valid ? expired ? 'At last retained mark / Gross' : 'From trigger, gross' : label(mark?.reason || 'CURRENT_MARK_UNAVAILABLE')}</small>
     </span>,
@@ -67,7 +71,7 @@ function detectorCurrentMarkCells(mark: OptionCurrentMark | null, originalNetPre
     net_pnl: <span className={markTone(valid ? mark.net_pnl : null)}>{money(valid ? mark.net_pnl : null)}</span>,
     estimated_cost: money(valid ? mark.estimated_cost : null),
     net_return: <span className={markTone(valid ? mark.net_return : null)}>{optionAlertPercent(valid ? mark.net_return : null)}</span>,
-    current_mark_time: <>{time(mark?.market_time)}<small>{mark?.age_seconds == null ? 'Age unavailable' : `${(mark.age_seconds / 3600).toFixed(1)} hours old`}</small></>,
+    current_mark_time: <>{time(mark?.market_time)}<small>{optionMarkAge(mark?.age_seconds)}</small></>,
     current_mark_status: <><Status value={expired ? 'EXPIRED' : mark?.status || 'UNAVAILABLE'} />{expired && <small>Expiration date passed / Not settlement value</small>}{expired && mark?.status && <small>Last mark freshness: {label(mark.status)}</small>}{mark?.reason && <small>{label(mark.reason)}</small>}{mark?.after_exit_deadline && <small>After planned exit deadline</small>}</>,
   }
 }
@@ -387,7 +391,7 @@ function DetectorAlertSidecar({ row, asOf, dataTier, close, openCandidate }: { r
   const surface = detectorSurfaceObservation(row)
   const visibleManagement = Object.fromEntries(Object.entries(row.management_policy || {}).filter(([key]) => key !== 'technical_exit'))
   const expired = optionContractExpired(original.expiration_date, asOf)
-  const marks = detectorCurrentMarkCells(row.current_mark, original.net_premium, original.expiration_date, asOf)
+  const marks = detectorCurrentMarkCells(row.current_mark, original.net_premium, original.expiration_date, asOf, legs)
   const thresholds = detectorThresholdCells(original.net_premium, legs, row.management_policy, {
     version: String(row.management_policy?.policy_version || ''), source: credit ? 'O3_MODEL_MARK_CREDIT' : 'EXPLICIT_ALERT_POLICY',
     entryLimit: row.entry_limit, entryKind: credit ? 'MINIMUM_CREDIT' : 'MAXIMUM_DEBIT', exitDeadline: row.exit_deadline,
@@ -622,14 +626,14 @@ function DetectorAlertsPanel({ view, params, update, offset, onSessionContext, t
               contracts: legs.length ? <>{label(original?.structure_type || '')}{legs.map(leg => <small key={leg.leg_index}>{leg.side} {leg.ratio} {leg.contract_ticker}</small>)}</> : 'Unavailable',
               expiry: original?.expiration_date ? <>{original.expiration_date}<small>{original.calendar_dte ?? 'Unavailable'} DTE at source</small></> : 'Unavailable',
               ...marketCells(legs), option_price: <span className="oa-trigger-price"><PackagePrice netPremium={original?.net_premium} legs={legs} /></span>,
-              ...detectorCurrentMarkCells(row.current_mark, original?.net_premium, original?.expiration_date, data?.as_of),
+              ...detectorCurrentMarkCells(row.current_mark, original?.net_premium, original?.expiration_date, data?.as_of, legs),
               ...thresholds,
               capital: money(original?.capital_at_risk), maximum_loss: money(original?.maximum_loss), maximum_profit: money(original?.maximum_profit),
               breakevens: original?.breakevens?.length ? original.breakevens.map(money).join(', ') : 'Unavailable',
               outcome_status: 'Not connected',
               run: time(row.scheduled_cycle), entry_limit: <>{money(row.entry_limit)}<small>Debit / Not a fill</small></>,
               hit_count: <span title={`Last observed ${time(row.last_seen_at)} ET`}>{row.hit_count}<small>{row.repeat_count} repeats{row.confirmation_timeframes?.length ? ` / ${row.confirmation_timeframes.join(', ')}` : ''}</small></span>,
-              management_status: <ManagementStatus value={row.management_status} />,
+              management_status: <ManagementStatus value={row.management_status === 'UNAVAILABLE' && !row.management_policy?.policy_version ? 'NOT_APPLICABLE' : row.management_status} />,
               entry_window: <><Status value={optionEntryWindow(row.entry_deadline)} /><small>{time(row.entry_deadline)} ET</small></>,
               fitted_iv: 'Not applicable', residual: 'Not applicable', robust_z: 'Not applicable',
               source_cutoff: 'Not applicable', analyzed_at: 'Not applicable',

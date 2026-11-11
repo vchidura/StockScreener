@@ -39,6 +39,11 @@ from .option_source_flow import OptionSourceFlowIdentity
 
 ADVANCED_NBBO_MARK_PLAN_VERSION = "advanced-options-nbbo-mark-plan-v1"
 ADVANCED_NBBO_MAXIMUM_AGE_SECONDS = 1
+# R34 (Nov 10): this host's clock ran 0.4-0.6 s behind the exchange (the Windows Time service was stopped), so most
+# quotes were received "before" their own event time and every contract was left unmarked as NONCAUSAL from about
+# 18:40; O1 then built no package. A quote whose event time is at most this far past its receive time is taken as
+# received at its event time; a larger difference is still noncausal.
+ADVANCED_NBBO_CLOCK_SKEW_TOLERANCE_SECONDS = 2
 _RETRYABLE_POSTGRES_SQLSTATES = frozenset({"40001", "40P01"})
 # A contract left out for these has a good quote that is not fresh enough to value
 # at this moment. That is a quiet contract, so it costs that contract its mark and
@@ -543,13 +548,22 @@ def assemble_advanced_options_marks_cursor(
             reasons.append("OPTION_NBBO_SOURCE_DATE_MISMATCH")
         elif int(row["source_offset"]) > head_offset_limit:
             reasons.append("OPTION_NBBO_AHEAD_OF_ROLLING_CHECKPOINT")
+        received_at = row["received_at"]
+        if (
+            row["event_at"] is not None
+            and received_at is not None
+            and row["event_at"] > received_at
+            and (row["event_at"] - received_at).total_seconds()
+            <= ADVANCED_NBBO_CLOCK_SKEW_TOLERANCE_SECONDS
+        ):
+            received_at = row["event_at"]
         # A quote from at or before the cutoff can arrive just after it, so the
         # event time decides whether it belongs to this window.
         if row["event_at"] is not None and (
-            row["event_at"] > row["received_at"]
+            row["event_at"] > received_at
             or row["event_at"] > plan.cutoff
             or (
-                plan.cutoff - row["received_at"]
+                plan.cutoff - received_at
             ).total_seconds() > plan.maximum_source_age_seconds
         ):
             reasons.append("OPTION_NBBO_STALE_OR_NONCAUSAL")
@@ -625,7 +639,7 @@ def assemble_advanced_options_marks_cursor(
             "event_time_raw": row["event_time_raw"],
             "event_time_unit": row["event_time_unit"],
             "market_time": row["event_at"],
-            "observed_time": row["received_at"],
+            "observed_time": received_at,
             "bid": row["bid"],
             "ask": row["ask"],
             "midpoint": midpoint,
@@ -660,7 +674,7 @@ def assemble_advanced_options_marks_cursor(
             stream_session_id=UUID(str(row["session_id"])),
             source_offset=int(row["source_offset"]),
             market_time=row["event_at"],
-            observed_time=row["received_at"],
+            observed_time=received_at,
             bid=row["bid"],
             ask=row["ask"],
             midpoint=midpoint,

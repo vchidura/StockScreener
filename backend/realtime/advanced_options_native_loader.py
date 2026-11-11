@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import sys
+from collections import Counter
 import time
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
@@ -1208,6 +1209,49 @@ def _equity_bar(row) -> EquityBarRevision:
     )
 
 
+def _report_os_membership_gap(cursor, *, detector, plan, known_by, members, rows) -> None:
+    """R22 (Nov 10): OS1/OS2 have been BLOCKED with BAR_MEMBERSHIP_UNAVAILABLE in every window since Nov 6, while a
+    read-only rebuild of the same membership passes. Say which members fail and why, once per lane and window;
+    diagnostics only, the lane outcome is unchanged."""
+    cursor.execute("SAVEPOINT os_membership_gap")
+    try:
+        found = {UUID(str(row["bar_revision_id"])) for row in rows}
+        counts = Counter(member.bar_revision_id for member in members)
+        missing = [member for member in members if member.bar_revision_id not in found]
+        cursor.execute(
+            "SELECT bar_revision_id::text AS id,observed_at,created_at,interval,session_date "
+            "FROM rt.bar_revisions WHERE bar_revision_id=ANY(%s::uuid[])",
+            ([str(member.bar_revision_id) for member in missing[:200]],),
+        )
+        stored = {row["id"]: row for row in cursor.fetchall()}
+        samples = []
+        for member in missing[:6]:
+            row = stored.get(str(member.bar_revision_id))
+            samples.append({
+                "ticker": member.ticker, "bar_end": member.bar_end.isoformat(),
+                "member_observed_at": member.observed_at.isoformat(),
+                "source_cohort_id": str(member.source_cohort_id),
+                "stored": None if row is None else {
+                    "observed_at": row["observed_at"].isoformat(), "created_at": row["created_at"].isoformat(),
+                    "interval": row["interval"], "session_date": str(row["session_date"]),
+                },
+            })
+        print(json.dumps({
+            "event": "advanced_options_os_membership_gap", "detector": detector.value,
+            "cutoff": plan.cutoff.isoformat(), "equity_cutoff": plan.equity_input_receipt.cutoff.isoformat(),
+            "known_by": known_by.isoformat(), "members": len(members), "distinct_members": len(counts),
+            "duplicates": sum(1 for value in counts.values() if value > 1), "rows": len(rows),
+            "missing": len(missing), "missing_not_stored": sum(1 for member in missing[:200]
+                                                               if str(member.bar_revision_id) not in stored),
+            "samples": samples,
+        }, default=str), file=sys.stderr, flush=True)
+        cursor.execute("RELEASE SAVEPOINT os_membership_gap")
+    except Exception as error:  # noqa: BLE001 - diagnostics never change the lane outcome
+        cursor.execute("ROLLBACK TO SAVEPOINT os_membership_gap")
+        print(json.dumps({"event": "advanced_options_os_membership_gap_report_failed",
+                          "error": f"{type(error).__name__}: {error}"[:300]}), file=sys.stderr, flush=True)
+
+
 def _load_os(
     cursor,
     plan: AdvancedOptionsNativeInputPlan,
@@ -1249,13 +1293,21 @@ def _load_os(
             else receipt["known_by"]
         ),
     )
+    # R22 (Nov 10): rt.bar_revisions is keyed (bar_revision_id, observed_at), and two AAPL daily
+    # bars (Oct 19, Oct 20) are stored twice under one id with different observed_at (Oct 21 11:01 and
+    # 11:05). Read by id alone, the history window returned one row too many and both OS lanes were
+    # BLOCKED in every window since Nov 6. Each member names its observed_at, so read that exact row.
     cursor.execute(
-        "SELECT * FROM rt.bar_revisions "
-        "WHERE bar_revision_id=ANY(%s::uuid[]) "
-        "AND observed_at<=%s AND created_at<=%s "
-        "ORDER BY ticker,interval,bar_end,bar_revision_id",
+        "SELECT revision.* FROM rt.bar_revisions AS revision "
+        "JOIN unnest(%s::uuid[],%s::timestamptz[]) AS member(bar_revision_id,observed_at) "
+        "ON revision.bar_revision_id=member.bar_revision_id "
+        "AND revision.observed_at=member.observed_at "
+        "WHERE revision.observed_at<=%s AND revision.created_at<=%s "
+        "ORDER BY revision.ticker,revision.interval,revision.bar_end,"
+        "revision.bar_revision_id",
         (
-            [str(value) for value in member_ids],
+            [str(row.bar_revision_id) for row in context.members],
+            [row.observed_at for row in context.members],
             known_by,
             known_by,
         ),
@@ -1267,6 +1319,10 @@ def _load_os(
         != set(member_ids)
     ):
         reasons = (f"{detector.value}_BAR_MEMBERSHIP_UNAVAILABLE",)
+        _report_os_membership_gap(
+            cursor, detector=detector, plan=plan, known_by=known_by,
+            members=context.members, rows=rows,
+        )
         return (
             AdvancedOptionsLaneInputs(blocked_reason_codes=reasons),
             {"blocked_reason_codes": reasons},

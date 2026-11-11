@@ -1346,6 +1346,38 @@ def _one_alert_per_contract(pairs):
     return rows
 
 
+def _legs_direction(legs) -> int | None:
+    """R30 (Nov 10): the direction a package expresses, from its legs: a long call or a short put is +1, a long put or
+    a short call is -1, legs add by ratio. O1 records no direction of its own (it observes activity), and the alert row
+    defaulted to +1, so a bought put read Bullish. None when the legs cancel or are unreadable."""
+    total = 0
+    for leg in legs or ():
+        if isinstance(leg, Mapping):
+            side, kind, ratio = leg.get("side"), leg.get("contract_type"), leg.get("ratio", 1)
+        else:
+            side = getattr(getattr(leg, "side", None), "value", None)
+            kind = getattr(getattr(leg, "contract_type", None), "value", None)
+            ratio = getattr(leg, "ratio", 1)
+        if side not in ("BUY", "SELL") or kind not in ("CALL", "PUT"):
+            return None
+        try:
+            weight = int(ratio)
+        except (TypeError, ValueError):
+            return None
+        total += (1 if side == "BUY" else -1) * (1 if kind == "CALL" else -1) * weight
+    return 1 if total > 0 else -1 if total < 0 else None
+
+
+def _with_package_direction(row):
+    """An O1 row's direction from its package (see `_legs_direction`), for rows stored before R30."""
+    if row.get("detector_id") == "O1":
+        legs = ((row.get("original_package") or {}).get("legs")) if isinstance(row.get("original_package"), Mapping) else None
+        direction = _legs_direction(legs) if legs else None
+        if direction is not None:
+            row["direction"] = direction
+    return row
+
+
 def _alert_run_row(
     evaluation,
     cutoff: datetime,
@@ -1357,7 +1389,7 @@ def _alert_run_row(
         return None
     direction = row["direction"]
     if direction not in (-1, 1):
-        direction = 1
+        direction = _legs_direction(package.legs) or 1
     return {
         "evaluation_id": row["evaluation_id"],
         "candidate_id": row["candidate_id"],
@@ -1890,7 +1922,7 @@ class AdvancedOptionsScreenerPagePublication:
             provider_tier=provider_tier,
             scope_sha256=scope_sha256,
         )
-        from options.screens import builtin_screens, derive_screen_fields, evaluate_screen
+        from options.screens import builtin_screens, customize_screen, derive_screen_fields, evaluate_screen
 
         published = tuple(self._payload["rows"])
         known = {str(row.get("contract_ticker")) for row in published}
@@ -1905,7 +1937,12 @@ class AdvancedOptionsScreenerPagePublication:
             definition = builtin_screens().get(request.screen_id)
             if definition is None:
                 raise ValueError(f"Unknown Options screen: {request.screen_id}")
+            overrides = getattr(request, "screen_overrides", None)
+            if overrides is not None:
+                definition = customize_screen(definition, overrides)
             selected, screen_note = evaluate_screen(definition, rows)
+            if overrides is not None:
+                screen_note = {**screen_note, "customized": True}
             rows = tuple(selected)
         coverage = tuple(
             {**row, **((breadth_coverage or {}).get(str(row["underlying"])) or {
@@ -2132,18 +2169,37 @@ class AdvancedOptionsAlertsPagePublication:
                 reason="DETECTOR_DATASET_UNAVAILABLE",
             )
         source = stored["alert_rows"]
+        folded_repeats = 0
         if session_rows is not None:
             covered = {
                 evaluation_id
                 for row in session_rows
                 for evaluation_id in row.get("evaluation_ids", ())
             }
-            source = [
-                *session_rows,
-                *(row for row in source if row["evaluation_id"] not in covered),
-            ]
+            # R29 (Nov 10): a later run's row for a candidate the session list already holds is a repeat hit on
+            # that alert, not a new alert. The list folds it in once its writer has run; until then it was shown
+            # twice (TSLA 372.5 PUT). Counting it here matches what the writer will record.
+            alerts = [deepcopy(row) for row in session_rows]
+            by_candidate = {
+                str(row["candidate_id"]): row for row in alerts if row.get("candidate_id")
+            }
+            others = []
+            for row in source:
+                if row["evaluation_id"] in covered:
+                    continue
+                alert = by_candidate.get(str(row.get("candidate_id"))) if row.get("candidate_id") else None
+                if alert is None:
+                    others.append(row)
+                    continue
+                folded_repeats += 1
+                alert["hit_count"] = int(alert.get("hit_count") or 1) + 1
+                alert["repeat_count"] = int(alert.get("repeat_count") or 0) + 1
+                alert["evaluation_ids"] = [*alert.get("evaluation_ids", ()), row["evaluation_id"]]
+                if row.get("triggered_at"):
+                    alert["last_seen_at"] = max(str(alert.get("last_seen_at") or ""), str(row["triggered_at"]))
+            source = [*alerts, *others]
         rows = [
-            deepcopy(row) for row in source
+            _with_package_direction(deepcopy(row)) for row in source
             if (
                 request.detector is None
                 or row["detector_id"] == request.detector
@@ -2191,7 +2247,8 @@ class AdvancedOptionsAlertsPagePublication:
             "detected_observations": len(
                 stored["evaluation_rows"]
             ),
-            "repeat_hits": 0,
+            # Repeats recorded on the alerts (hit_count beyond the first) plus this window's folded repeats.
+            "repeat_hits": sum(max(int(row.get("hit_count") or 1) - 1, 0) for row in rows),
             "maximum_new_alerts": 20,
             "outcome_status": "NOT_BOUND_TO_PROSPECTIVE_OUTCOMES",
             "execution_permission": False,

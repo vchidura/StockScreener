@@ -18,6 +18,7 @@ from typing import Mapping, Sequence
 from uuid import NAMESPACE_URL, UUID, uuid5
 
 import exchange_calendars
+import numpy as np
 import pandas as pd
 
 from equity.model_detection.contracts import (
@@ -319,7 +320,7 @@ def produce_research_rule_batch(
                     if bar_session != session:
                         continue
                     try:
-                        result, error = rri.evaluate_rule(research.data, member, rule, at, bar_session, state), None
+                        result, error = _plain(rri.evaluate_rule(research.data, member, rule, at, bar_session, state)), None
                     except Exception as failure:  # noqa: BLE001 - one rule never blocks another
                         result = {"status": "ERROR", "reasons": [], "gates": [], "input_ids": [], "state": state}
                         error = f"RESEARCH_RULE_ERROR:{type(failure).__name__}"
@@ -367,6 +368,21 @@ def _payload(inputs, member, rule, decision, *, window_id, input_receipt_id, rec
 def _trigger_bar(research, member, interval, decided_at):
     return max((bar for bar in research.data.bars_for(member.security_id, interval)
                 if bar["received_at"] <= decided_at), key=lambda bar: bar["market_at"])
+
+
+def _plain(value):
+    """R17 (Nov 10, live): the research rules run on pandas/numpy, and from 15:30 one rule's saved state carried a
+    numpy.bool_, which the canonical hash rejects; the batch then failed for every member and the service restarted
+    each cycle. Rule results are converted to plain Python values where they enter the product."""
+    if isinstance(value, dict):
+        return {key: _plain(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_plain(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_plain(item) for item in value)
+    if isinstance(value, np.generic):
+        return value.item()
+    return value
 
 
 def _rule_summary(rule, result, at, error):

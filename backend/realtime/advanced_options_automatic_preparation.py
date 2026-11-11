@@ -122,7 +122,13 @@ from .advanced_options_v3_authority import (
     prospective_opening_admission_payload,
 )
 from .contracts import UniverseManifest, canonical_sha256
-from .preflight import ProviderTier
+from .preflight import ProviderTier, TierState
+from .tier_cohort import (
+    TierCohortBinding,
+    persist_tier_cohort_binding_cursor,
+    product_capabilities,
+    product_disabled_detectors,
+)
 from .database_access_v2 import APP_ROLE, V2ConnectionProvider
 from .option_source_flow import persist_option_flow_policy_cursor
 from .provider_budget import (
@@ -158,6 +164,25 @@ _C8_VALUATION_POLICY_SHA256 = load_valuation_policy(
     Path(__file__).resolve().parents[1]
     / "options" / "policies" / "valuation_advanced_nbbo_v1.json"
 ).policy_sha256
+
+
+def c8_options_tier_binding(*, cohort_id, profile_id, manifest_sha256, effective_at):
+    """The MASSIVE_ADVANCED tier binding of a V3 Options (C8) cohort."""
+    tier = ProviderTier.MASSIVE_ADVANCED
+    return TierCohortBinding(
+        cohort_id=cohort_id,
+        profile_id=profile_id,
+        provider_tier=tier,
+        ready_state=TierState.ADVANCED_READY,
+        source_manifest_sha256=manifest_sha256,
+        valuation_policy_sha256=_C8_VALUATION_POLICY_SHA256,
+        capabilities=product_capabilities(tier, tier),
+        disabled_detectors=product_disabled_detectors(tier, tier),
+        effective_at=effective_at,
+        stocks_tier=tier,
+        options_tier=tier,
+        options_enabled=True,
+    )
 
 
 def _utc(value: datetime, name: str) -> datetime:
@@ -1676,6 +1701,18 @@ class PostgresAutomaticOptionsPreparationExecutor(
                     _C8_MODEL_BUNDLE_SHA256,
                     _C8_VALUATION_POLICY_SHA256,
                     prepared_at,
+                ),
+            )
+            # R18 (Nov 10): the Options cohort's provider-tier binding, as the
+            # P8 enrollment writes it. rt.option_packages references it, so
+            # without it the first selected O1 package failed its window.
+            persist_tier_cohort_binding_cursor(
+                cursor,
+                c8_options_tier_binding(
+                    cohort_id=options_cohort_id,
+                    profile_id=profile_id,
+                    manifest_sha256=manifest_sha256,
+                    effective_at=prepared_at,
                 ),
             )
             cursor.execute(

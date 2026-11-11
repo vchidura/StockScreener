@@ -110,3 +110,52 @@ def test_the_legacy_sql_screener_refuses_screens_but_filters_day_premium():
         contract_filter_sql(EligibleChainQuery(screen_id="unusual-activity-calls"))
     sql, params = contract_filter_sql(EligibleChainQuery(filters=(ContractRange(field="day_premium", minimum=1),)))
     assert "day_premium >= %s" in sql and params == (1.0,)
+
+
+def test_builtin_catalog_publishes_flat_criteria_for_prefilling_the_page():
+    """Nov 10: the page prefills its filter fields from these instead of showing the rules as text."""
+    from options.screens import builtin_screen_catalog
+
+    calls = next(item for item in builtin_screen_catalog() if item["id"] == "unusual-activity-calls")
+    assert calls["criteria"] == [
+        {"field": "open_interest", "op": ">=", "negated": False, "value": 500},
+        {"field": "volume_open_interest_ratio", "op": ">=", "negated": False, "value": 3},
+        {"field": "calendar_dte", "op": "in", "negated": True, "value": [3, 4]},
+        {"field": "day_volume", "op": ">=", "negated": False,
+         "values_by_tier": {"ETF": 5000, "CORE_MEGA_CAP": 1500, "HIGH_BETA_HIGH_PREMIUM": 750}},
+        {"field": "day_premium", "op": ">=", "negated": False,
+         "values_by_tier": {"ETF": 1000000, "CORE_MEGA_CAP": 500000, "HIGH_BETA_HIGH_PREMIUM": 500000}},
+    ]
+    assert calls["rules"]
+
+
+def test_page_edits_customize_a_builtin_screen_and_unknown_edits_are_refused():
+    """Nov 10: the Options Screener fills its fields from a built-in screen and sends the user's edits back."""
+    from options.discovery import ScreenOverrides
+    from options.screens import customize_screen
+
+    calls = builtin_screens()["unusual-activity-calls"]
+    edited = customize_screen(calls, ScreenOverrides(
+        minimums={"open_interest": 100, "volume_open_interest_ratio": None},
+        tier_minimums={"day_volume": {"ETF": 9000}}, exclude_calendar_dte=(),
+        caps={"per_underlying": 5, "total": 50},
+    ))
+    leaves = edited.model_dump(mode="json", by_alias=True)["rule"]["all"]
+    assert [leaf.get("field") for leaf in leaves] == ["open_interest", "day_volume", "day_premium"]
+    assert leaves[0]["value"] == 100
+    assert edited.parameters.values["ETF"]["minimum_day_volume"] == 9000
+    assert edited.parameters.values["CORE_MEGA_CAP"]["minimum_day_volume"] == 1500
+    assert (edited.caps.per_underlying, edited.caps.total) == (5, 50)
+    assert edited.sha256 != calls.sha256 and edited.id == calls.id
+    unchanged = customize_screen(calls, ScreenOverrides())
+    assert unchanged.sha256 == calls.sha256
+    with pytest.raises(ValueError, match="no editable criterion"):
+        customize_screen(calls, ScreenOverrides(minimums={"local_iv": 0.2}))
+    with pytest.raises(ValueError, match="unknown tiers"):
+        customize_screen(calls, ScreenOverrides(tier_minimums={"day_volume": {"SMALL": 1}}))
+    row = {"contract_ticker": "O:SPY261120C00700000", "underlying": "SPY", "contract_type": "CALL", "open_interest": 200,
+           "volume_open_interest_ratio": 1, "calendar_dte": 3, "day_volume": 9500, "mark": 2.0}
+    assert evaluate_screen(calls, [row])[0] == []
+    assert len(evaluate_screen(edited, [row])[0]) == 1
+    with pytest.raises(ValueError, match="need a built-in screen"):
+        EligibleChainQuery(screen_overrides=ScreenOverrides())
