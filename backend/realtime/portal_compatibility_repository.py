@@ -740,8 +740,10 @@ def _flow_with_breadth(cursor, envelope, *, cutoff):
         )
         cursor.execute("RELEASE SAVEPOINT options_flow_breadth")
         served = {**envelope, "data": breadth_flow_data(data, rows, captures)}
+        # R48: the selected ticker served from the streamed rows (no COMPLETE capture) is reported as the fallback.
+        selected_breadth = not (served["data"].get("breadth_fallback") or {}).get("selected")
         return _with_optional_reads(served, _optional_read(
-            "flow_breadth", served=True, source="BREADTH", fallback_source="RELEASE_ROWS",
+            "flow_breadth", served=selected_breadth, source="BREADTH", fallback_source="RELEASE_ROWS",
             reason_code="BREADTH_UNAVAILABLE"))
     except Exception:  # noqa: BLE001 - breadth never fails the page; the response and the log say it fell back
         if saved:
@@ -1352,8 +1354,15 @@ class RealtimeOptionsAlertsPageRepository(_RealtimeCompatibilityRepository):
                                     cursor, publication, cohort_id=cohort_id,
                                     cutoff=min(cutoff, resolved_release.cutoff),
                                 )
+                                from zoneinfo import ZoneInfo
+
+                                # R45: Day History withholds the latest run only for the current session.
+                                current_session_date = cutoff.astimezone(ZoneInfo("America/New_York")).date().isoformat()
                                 envelope = _with_optional_reads(
-                                    publication.detector_runs(request, session_rows=session_rows, **identity),
+                                    publication.detector_runs(
+                                        request, session_rows=session_rows,
+                                        current_session_date=current_session_date, **identity,
+                                    ),
                                     _optional_read(
                                         "session_alerts", served=session_rows is not None, source="SESSION_LIST",
                                         fallback_source="RELEASE_ROWS", reason_code="SESSION_ALERTS_UNAVAILABLE",

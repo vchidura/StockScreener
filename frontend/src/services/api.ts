@@ -2447,7 +2447,11 @@ export interface OptionFlowData {
   strikes: OptionFlowStrike[]
   top_contracts: OptionFlowContract[]
   coverage_source?: 'BREADTH'
-  breadth?: { breadth_state?: string; breadth_observed_at?: string; breadth_contracts?: number }
+  breadth?: { breadth_state?: string; breadth_observed_at?: string; breadth_contracts?: number; breadth_reason?: string | null
+    /** R48 (Nov 11): a later capture that was not COMPLETE; the chain shown is the last COMPLETE one. */
+    latest_capture_state?: string; latest_capture_at?: string; latest_capture_reason?: string | null }
+  /** R48: tickers served from their streamed contracts; `selected` when the selected ticker is one of them. */
+  breadth_fallback?: { selected: boolean; streamed_only: string[] } | null
   directional_flow_available: false
   quote_liquidity: 'NOT_AVAILABLE'
   trade_tape_scope: 'EXCLUDED_FROM_TOTALS_WATCHLIST_BIASED'
@@ -2881,9 +2885,15 @@ export interface OptionDetectorAlertReview {
   maximum_new_alerts: number
   outcome_status: 'NOT_BOUND_TO_PROSPECTIVE_OUTCOMES'
   execution_permission: false
+  /** R45 (Nov 11): Day History of the current session leaves out the latest run (shown in Latest Run). */
+  withheld_run?: OptionDetectorRunSummary | null
   rows: Array<{
     evaluation_id: string; candidate_id: string; matrix_id: string; run_id: string; scheduled_cycle: string;
     triggered_at: string | null;
+    /** R46 (Nov 11): detectors that triggered this contract and side, first one first; later ones as confirmations. */
+    detectors?: OptionDetectorId[];
+    confirmations?: Array<{ detector_id: OptionDetectorId; triggered_at: string | null; entry_limit: string | null;
+      net_premium: string | null; hit_count: number }>;
     detector_id: OptionDetectorId; origin: 'OPTIONS_FIRST' | 'STOCK_FIRST'; underlyer: string;
     direction: -1 | 1; category: string; strategy_name: string | null; candidate_rank: number | null; first_selected_at: string;
     hit_count: number; repeat_count: number; confirmation_timeframes?: string[]; last_seen_at: string; plan_sha256: string | null;

@@ -1368,6 +1368,72 @@ def _legs_direction(legs) -> int | None:
     return 1 if total > 0 else -1 if total < 0 else None
 
 
+def _contract_side_key(row):
+    """R46: the alert's contract(s) and side: its package legs (contract, side, ratio) and direction."""
+    package = row.get("original_package") if isinstance(row.get("original_package"), Mapping) else None
+    legs = (package or {}).get("legs") or ()
+    if legs:
+        contracts = tuple(sorted(
+            (str(leg.get("contract_id")), str(leg.get("side")), int(leg.get("ratio") or 1)) for leg in legs))
+    elif row.get("contract_id") is not None:
+        contracts = ((str(row["contract_id"]), "", 1),)
+    else:
+        return None
+    return (row.get("underlyer"), contracts, row.get("direction"))
+
+
+def _grouped_by_contract_and_side(rows):
+    """R46 (Nov 11, user): one row per contract and side for the session. The first trigger is the alert; a later
+    detector on the same contract and side is added to it as a confirmation (its own trigger time and price kept),
+    and its hits count on the alert. The caller's rows are copies."""
+    ordered = sorted(rows, key=lambda row: (str(row.get("triggered_at") or "~"), str(row["evaluation_id"])))
+    groups, result = {}, []
+    for row in ordered:
+        key = _contract_side_key(row)
+        primary = groups.get(key) if key is not None else None
+        if primary is None:
+            if key is not None:
+                groups[key] = row
+                row["detectors"] = [row.get("detector_id")]
+                row["confirmations"] = []
+            result.append(row)
+            continue
+        package = row.get("original_package") if isinstance(row.get("original_package"), Mapping) else {}
+        primary["confirmations"].append(dict(
+            detector_id=row.get("detector_id"), candidate_id=row.get("candidate_id"),
+            session_alert_id=row.get("session_alert_id"), evaluation_id=row.get("evaluation_id"),
+            triggered_at=row.get("triggered_at"), entry_limit=row.get("entry_limit"),
+            net_premium=package.get("net_premium"), hit_count=int(row.get("hit_count") or 1),
+        ))
+        if row.get("detector_id") not in primary["detectors"]:
+            primary["detectors"].append(row.get("detector_id"))
+        primary["hit_count"] = int(primary.get("hit_count") or 1) + int(row.get("hit_count") or 1)
+        primary["repeat_count"] = primary["hit_count"] - 1
+        primary["evaluation_ids"] = [
+            *(primary.get("evaluation_ids") or (primary["evaluation_id"],)),
+            *(row.get("evaluation_ids") or (row["evaluation_id"],)),
+        ]
+        seen = [str(value) for value in (primary.get("last_seen_at"), row.get("last_seen_at"), row.get("triggered_at"))
+                if value]
+        if seen:
+            primary["last_seen_at"] = max(seen)
+    return result
+
+
+def _in_latest_run(row, latest_ids, latest_run_id):
+    """R45: the alert was triggered or hit in the latest run."""
+    ids = {str(value) for value in (row.get("evaluation_ids") or (row["evaluation_id"],))}
+    return bool(ids & latest_ids) or (latest_run_id is not None and row.get("run_id") == latest_run_id)
+
+
+def _first_in_latest_run(row, latest_ids, latest_run_id):
+    """R45: the alert was first triggered in the latest run (a window row without a session alert counts)."""
+    if row.get("run_id") is not None and latest_run_id is not None:
+        return row["run_id"] == latest_run_id
+    ids = row.get("evaluation_ids") or (row["evaluation_id"],)
+    return str(ids[0]) in latest_ids
+
+
 def _with_package_direction(row):
     """An O1 row's direction from its package (see `_legs_direction`), for rows stored before R30."""
     if row.get("detector_id") == "O1":
@@ -2158,9 +2224,15 @@ class AdvancedOptionsAlertsPagePublication:
         }
         return self._envelope(stored, available=True, data=data)
 
-    def detector_runs(self, request, *, session_rows=None, **identity):
+    def detector_runs(self, request, *, session_rows=None, current_session_date=None, **identity):
         """`session_rows` (G102 A0): the session's alerts from `rt.alert_current`; they replace this window's v1
-        rows they cover, and the window's other rows (stored multi-leg packages) stay."""
+        rows they cover, and the window's other rows (stored multi-leg packages) stay.
+
+        With the session list (Nov 11, user): R46, one row per contract and side, the first trigger is the alert and
+        later detectors on the same contract and side are added to it (`detectors`, `confirmations`, hits), unless a
+        detector filter asks for that detector's own rows; R45, LATEST is the alerts triggered or hit in the latest
+        run and HISTORY the alerts first triggered before it, the latest run withheld for the current session, as
+        Stock Alerts does."""
         stored = self._stored(identity)
         if request.dataset_id != self.dataset_id:
             return self._envelope(
@@ -2210,6 +2282,18 @@ class AdvancedOptionsAlertsPagePublication:
                 == request.underlyer.strip().upper()
             )
         ]
+        withheld_run = None
+        if session_rows is not None:
+            if request.detector is None:
+                rows = _grouped_by_contract_and_side(rows)
+            latest_ids = {str(row["evaluation_id"]) for row in stored["alert_rows"]}
+            latest_run_id = stored["run"].get("run_id")
+            if request.scope == "HISTORY":
+                if current_session_date is not None and str(stored["session_date"]) == str(current_session_date):
+                    rows = [row for row in rows if not _first_in_latest_run(row, latest_ids, latest_run_id)]
+                    withheld_run = deepcopy(stored["run"])
+            else:
+                rows = [row for row in rows if _in_latest_run(row, latest_ids, latest_run_id)]
         reverse = request.sort_order == "desc"
         sort_key = {
             "triggered_at": "triggered_at",
@@ -2243,7 +2327,12 @@ class AdvancedOptionsAlertsPagePublication:
             "session_date": stored["session_date"],
             "sessions": [stored["session_date"]],
             "total": len(rows),
-            "new_alerts": len(rows),
+            "new_alerts": (
+                sum(1 for row in rows if _first_in_latest_run(
+                    row, {str(item["evaluation_id"]) for item in stored["alert_rows"]}, stored["run"].get("run_id")))
+                if session_rows is not None and request.scope != "HISTORY" else len(rows)
+            ),
+            "withheld_run": withheld_run,
             "detected_observations": len(
                 stored["evaluation_rows"]
             ),

@@ -200,6 +200,32 @@ export function OptionSessionNotice({ session }: { session: string | null | unde
   return <div className="flow-state flow-state--warning" role="status"><AlertTriangle size={20} /><div><strong>Incomplete session</strong><span>{notice}</span></div></div>
 }
 
+/** R48 (Nov 11): say when the full chain is older than the latest capture, or not shown at all. */
+export function breadthCoverageWarning(data: {
+  selected?: string; coverage_source?: string
+  breadth?: { breadth_state?: string; breadth_observed_at?: string; breadth_reason?: string | null
+    latest_capture_state?: string; latest_capture_at?: string; latest_capture_reason?: string | null }
+  breadth_fallback?: { selected: boolean; streamed_only: string[] } | null
+  selected_summary?: { contract_count?: number } | null
+}, format: (value: string | undefined) => string): { title: string; detail: string } | null {
+  const breadth = data.breadth
+  const others = (data.breadth_fallback?.streamed_only || []).filter(ticker => ticker !== data.selected)
+  const othersNote = others.length ? ` Streamed contracts only for ${others.join(', ')}.` : ''
+  if (data.breadth_fallback?.selected) {
+    const state = breadth?.breadth_state && breadth.breadth_state !== 'NOT_CAPTURED'
+      ? `latest chain capture ${breadth.breadth_state.toLowerCase()}${breadth.breadth_observed_at ? ` at ${format(breadth.breadth_observed_at)}` : ''}`
+      : 'no chain capture yet this session'
+    return { title: 'Full chain unavailable',
+      detail: `${data.selected}: ${state}${breadth?.breadth_reason ? ` (${breadth.breadth_reason})` : ''}. Showing the ${data.selected_summary?.contract_count ?? ''} streamed contracts until the next capture.${othersNote}` }
+  }
+  if (data.coverage_source === 'BREADTH' && breadth?.latest_capture_state) {
+    return { title: 'Latest chain capture failed',
+      detail: `${data.selected}: capture at ${format(breadth.latest_capture_at)} ${breadth.latest_capture_state.toLowerCase()}${breadth.latest_capture_reason ? ` (${breadth.latest_capture_reason})` : ''}. Showing the chain captured at ${format(breadth.breadth_observed_at)}.${othersNote}` }
+  }
+  if (others.length) return { title: 'Partial chain coverage', detail: othersNote.trim() }
+  return null
+}
+
 export default function OptionsFlowPage() {
   const [searchParams, setSearchParams] = useSearchParams()
   const ticker = (searchParams.get('underlyer') || 'SPY').toUpperCase()
@@ -244,6 +270,10 @@ export default function OptionsFlowPage() {
         <div className="flow-command__measure"><span>Chart measure</span><ProfileToggle value={profileMetric} onChange={setProfileMetric} /></div>
         <div className="flow-command__context"><Radio size={15} /><span><strong>{data.session_date ? formatDate(data.session_date) : 'Latest session'}</strong>{data.coverage_source === 'BREADTH' ? `Full listed chain (0-60 DTE, strikes within 20% of spot) · provider day volume and open interest · captured ${formatDateTime(data.breadth?.breadth_observed_at)}` : 'Selected ticker · latest complete matrix in this exchange session'}</span></div>
       </section>
+      {(() => {
+        const warning = breadthCoverageWarning(data, value => formatDateTime(value))
+        return warning && <div className="flow-state flow-state--warning" role="status"><AlertTriangle size={20} /><div><strong>{warning.title}</strong><span>{warning.detail}</span></div></div>
+      })()}
       {data.coverage_source === 'BREADTH' && <p className="flow-coverage-note" role="note">Volume and open interest cover every listed contract in range. Estimated premium activity uses the current quote midpoint. Flow events and alerts come from the {selected?.streamed_contract_count ?? 'streamed'} streamed contracts per underlying.</p>}
 
       {selected && <>

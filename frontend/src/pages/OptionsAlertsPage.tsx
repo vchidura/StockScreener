@@ -603,7 +603,8 @@ function DetectorAlertsPanel({ view, params, update, offset, onSessionContext, t
       <div className="sd-metrics"><span>{data?.session_date || 'No completed detector run'}</span>
         {!incompleteAttempt && <><span><strong>{data?.new_alerts ?? 0}</strong> new alerts</span><span><strong>{data?.repeat_hits ?? 0}</strong> repeat hits</span>
         <span><strong>{data?.detected_observations ?? 0}</strong> IV observation groups</span></>}
-        <span>Maximum 20 new alerts / run</span></div>
+        <span>Maximum 20 new alerts / run</span>
+        {data?.withheld_run && <span title="Alerts from the latest run are in Latest Run; they move here after the next run">Latest run {time(data.withheld_run.scheduled_cycle)} ET in Latest Run</span>}</div>
       <div className="sd-table-panel"><div className="sd-table-scroll" tabIndex={0} role="region" aria-label="Detector alerts table">
         <table><thead><tr>{columns.map(column => sortable.has(column.key)
           ? <DetectorSortHeader key={column.key} title={column.label} field={column.key as OptionDetectorSort} params={params} update={update} />
@@ -619,7 +620,7 @@ function DetectorAlertsPanel({ view, params, update, offset, onSessionContext, t
             })
             return <tr key={row.evaluation_id}><ColumnCells columns={columns} values={{
               triggered_at: <span title={row.detector_id === 'O1' || row.detector_id === 'O3' ? 'Original option source time' : 'Original stock trigger-bar time'}>{time(row.triggered_at)}</span>,
-              underlyer: <><button type="button" className="oa-row-link" onClick={() => setPlanDetail(row)}>{row.underlyer}</button><small className={surface ? '' : markTone(row.direction)}>{credit ? `O3 / ${row.direction === 1 ? 'Bullish put credit' : 'Bearish call credit'}` : surface ? 'O2 / IV observation' : `${row.detector_id} / ${row.direction === 1 ? 'Bullish' : 'Bearish'}`}</small></>,
+              underlyer: <><button type="button" className="oa-row-link" onClick={() => setPlanDetail(row)}>{row.underlyer}</button><small className={surface ? '' : markTone(row.direction)}>{credit ? `O3 / ${row.direction === 1 ? 'Bullish put credit' : 'Bearish call credit'}` : surface ? 'O2 / IV observation' : `${row.detectors && row.detectors.length > 1 ? row.detectors.join(' + ') : row.detector_id} / ${row.direction === 1 ? 'Bullish' : 'Bearish'}`}</small></>,
               detector: <>{detectorNames[row.detector_id]}<small>{label(row.origin)}</small></>,
               category: label(row.category), strategy: row.strategy_name ? optionPackageStrategyName(row.strategy_name) : 'Unavailable',
               contract_summary: legs.length ? <>{label(original?.structure_type || '')}<small>{optionContractSummary(row.underlyer, legs)}</small></> : 'Unavailable',

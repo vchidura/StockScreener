@@ -187,7 +187,7 @@ def test_the_page_serves_the_session_list_and_keeps_the_windows_other_rows():
     window_v1 = dict(evaluation_id=str(latest[0].evaluation_id), detector_id="O1", scheduled_cycle="c2")
     multi_leg = dict(evaluation_id="multi", detector_id="O3", scheduled_cycle="c2")
     publication, identity = _page([window_v1, multi_leg])
-    request = DetectorRunQuery(dataset_id="d1")
+    request = DetectorRunQuery(dataset_id="d1", scope="HISTORY")  # a past session's history: every alert (R45)
     rows = publication.detector_runs(request, session_rows=session, **identity)["data"]["rows"]
     # 202 left the window's own rows two windows ago; the session list keeps it. The window's v1 row is covered.
     assert sorted(str(row.get("contract_id", row["evaluation_id"])) for row in rows) == ["101", "202", "multi"]
@@ -231,7 +231,8 @@ def test_a_later_runs_repeat_folds_into_its_alert_and_o1_direction_follows_the_p
                  triggered_at="2026-11-06T16:45:00+00:00", direction=1, original_package=put)
     multi_leg = dict(evaluation_id="multi", detector_id="O3", underlyer="SPY", scheduled_cycle="c2")
     publication, identity = _page([later, multi_leg])
-    data = publication.detector_runs(DetectorRunQuery(dataset_id="d1"), session_rows=session, **identity)["data"]
+    data = publication.detector_runs(
+        DetectorRunQuery(dataset_id="d1", scope="HISTORY"), session_rows=session, **identity)["data"]
     by_candidate = {row.get("candidate_id", row["evaluation_id"]): row for row in data["rows"]}
     assert sorted(by_candidate) == ["multi", "nvda", "tsla"]
     assert (by_candidate["tsla"]["hit_count"], by_candidate["tsla"]["repeat_count"]) == (2, 1)

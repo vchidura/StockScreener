@@ -652,18 +652,42 @@ def load_breadth_screener_rows_cursor(
         breadth_screener_row(dict(values) if isinstance(values, Mapping) else dict(zip(columns, values)))
         for values in cursor.fetchall()
     ]
-    cursor.execute(
-        "SELECT DISTINCT ON (underlying) underlying,state,observed_at,contracts,reason "
-        "FROM rt.option_breadth_captures WHERE session_date=%s AND underlying=ANY(%s) AND observed_at<=%s "
-        "ORDER BY underlying,observed_at DESC",
-        (session_date, list(underlyings), available_by),
-    )
     names = ("underlying", "state", "observed_at", "contracts", "reason")
-    captures = {}
-    for values in cursor.fetchall():
-        item = dict(values) if isinstance(values, Mapping) else dict(zip(names, values))
-        captures[str(item["underlying"])] = {
+
+    def latest(complete_only):
+        cursor.execute(
+            "SELECT DISTINCT ON (underlying) underlying,state,observed_at,contracts,reason "
+            "FROM rt.option_breadth_captures WHERE session_date=%s AND underlying=ANY(%s) AND observed_at<=%s "
+            + ("AND state='COMPLETE' " if complete_only else "")
+            + "ORDER BY underlying,observed_at DESC",
+            (session_date, list(underlyings), available_by),
+        )
+        found = {}
+        for values in cursor.fetchall():
+            item = dict(values) if isinstance(values, Mapping) else dict(zip(names, values))
+            found[str(item["underlying"])] = item
+        return found
+
+    def label(item):
+        return {
             "breadth_state": item["state"], "breadth_observed_at": item["observed_at"].isoformat(),
             "breadth_contracts": int(item["contracts"]), "breadth_reason": item["reason"],
         }
+
+    # R48 (Nov 11): a failed or partial capture writes no rows over the last good ones (`persist_breadth_cursor`), so
+    # the last COMPLETE capture still describes the stored chain; it is served, and a later capture that was not
+    # COMPLETE is named beside it so the page can say so.
+    newest, complete = latest(False), latest(True)
+    captures = {}
+    for underlying, item in newest.items():
+        good = complete.get(underlying)
+        if good is None:
+            captures[underlying] = label(item)
+            continue
+        captures[underlying] = label(good)
+        if item["observed_at"] > good["observed_at"]:
+            captures[underlying].update(
+                latest_capture_state=item["state"], latest_capture_at=item["observed_at"].isoformat(),
+                latest_capture_reason=item["reason"],
+            )
     return rows, captures

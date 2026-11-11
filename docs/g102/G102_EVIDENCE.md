@@ -1201,4 +1201,157 @@ workspace summary 14:35 and 14:40 overview 25, unavailable members none (Nov 10 
 `/latest-price-date`, `/stocks/context`, `/tickers/setup-summary` 503 -> 200; the rest as before (13 x 404 legacy paths,
 8 x 422 without parameters, `/strategies/daily` 503 G38). Options attached to E:14:35 and E:14:40 after the first Equity
 window (by design: the Options scheduler waits for a COMPLETE window with EQUITY_MATERIALIZE); first Options window all
-stages COMPLETE. Next: the first hourly :35 window (15:35) should show PORTAL_PUBLISH ~1 s.
+stages COMPLETE. 15:44 check: E:15:35 (first hourly :35) COMPLETE 37 s, PORTAL_PUBLISH 1 s, no DASHBOARD_V1 after 14:35;
+windows 14:40-15:40 21-68 s (Nov 10 median 170 s with the hourly Dashboard), PORTAL_PUBLISH 1 s each.
+
+### Nov 11 (14:57 UTC): watch - lanes normal; retention restarted once (R43)
+
+Lanes at E:14:55: O1 COMPLETE_SELECTED (10 selected, 0 not stored), OS1 and OS2 COMPLETE_ZERO (OS2 BLOCKED
+`E_CONTEXT_INCOMPLETE` through 14:45 by design: it needs 3 current-session 5m bars, OS1 needs 2), O2 UNAVAILABLE, O3
+BLOCKED `CANONICAL_MARKS_UNAVAILABLE` (design). Options windows 14:40-14:55: 64, 43, 42, 41 s (21%, then 14%), alarms 0;
+Options stream `8c3fe766` LIVE, lag 0. Market-state CPU (P8) 29-34%. `realtime-v2-retention` restarted 14:51:45 (exit
+0, not OOM, healthy after; first cycle 14:51:47 SUCCESS, 0 alarms); R43. Acquisition memory 155 MiB (14:27) -> 472 MiB
+(14:47) -> 651 MiB (14:57): watch the trend.
+
+### Nov 11 (14:49-15:00 UTC): V3-1 Step 0 profile **P8 #1** (market-state on the P8 loop, r85)
+
+`runner/profile_options_roles.sh 180` (py-spy `--nonblocking`, 180 s per role, docker CPU every ~5 s); log
+`ev/profile-p8-1.log` (scratchpad); flamegraph data `p8-<role>-20261111T1449.txt`. Session time 14:49-14:58 (open + 20
+min, busy). **market-state**: 3,855 samples, 3,844 active (idle/sleeping 0.3%): journal read (SQLite) 54.9%, hash/JSON
+25.9%, window stages 7.0%, DB write (state, checkpoints) 3.3%, DB other (psycopg2) 2.9%, record decode 2.9%, materialize
+1.5%, detector routing 0.5%, barrier snapshot 0.4%, registration query 0.3%, lease 0.0%; top leaves `<genexpr>` 27.5%,
+`read_normalized_after` 16.1%, `iterencode` 10.6%, `_canonical_value` 5.8%; docker CPU mean 46.0%, median 37.6%, max
+86.3% (29 samples; 74-86% for ~30 s). **flow**: 960 samples: flow 48.3%, hash/JSON 30.2%, DB other 12.3% (top leaves
+`iterencode` 15.8%, `load_downstream_bindings` 12.9%, `transaction` 11.8%); CPU mean 13.1%, median 9.4%, max 61.0%.
+**window**: 97 samples: DB other 52.1%, window stages 30.2%, hash/JSON 13.5%; CPU mean 1.6%, median 1.0%. Reading:
+market-state never idles on P8, and the SQLite journal read plus hashing take ~81% of its samples (per-iteration
+re-read, the Steps 1-2 target); decode and materialize are small (~4%).
+15:07 watch: OS1 COMPLETE_SELECTED at E:15:05 (first OS1 signal of the day), O1 14 selected / 7 packages / 0 not stored,
+5 OPTION alerts; Options windows 41-50 s (14-17%). Acquisition docker memory 799 MiB is page cache of the journal it
+writes: the acquisition process RSS is 234 MB (no container memory limit); not a leak.
+
+### Nov 11 (15:10 UTC): O3 - not evaluated, two input gates (R44; user question)
+
+Read-only. O3 lane reasons: Nov 9 `CANONICAL_MARKS_UNAVAILABLE` 15:05-15:20 then `O3_ACCEPTED_INPUT_EVIDENCE_ABSENT`
+15:35-20:17; Nov 10 marks 15:35-18:05 (30 windows), accepted-input 18:10-21:00 (26); Nov 11 marks + E context 14:40-14:45,
+marks 14:50-15:10. Marks (`rt.option_mark_evidence`, ADVANCED_NBBO, MASSIVE_ADVANCED): 340 since 14:30, one per contract
+per 5-min cycle at :x4:59/:x9:59 for 43-58 contracts; today's slot set (`566cc5a4`, activated 14:29) 72 contracts, 71
+with a mark, missing `O:AMZN261127P00272500`; Nov 10's slot set: last first-mark 18:09. The accepted-input gate needs
+CONFIRMED `ADVANCED_OPTIONS_O3_INPUT` events at the cutoff; none exist (no producer). O3 has not run on any live day.
+15:30 (user: investigate O3): O3 = `o3_options_first_credit_v2` credit verticals (7-30 DTE, legs OI >= 500 / volume >= 50,
+the activity contract a leg, canonical stock trend confirms). The developer forward path builds and assesses them; in the
+advanced path the only O3 code is the lane's loader (`_load_o3`), fed by `ADVANCED_OPTIONS_O3_INPUT` events that nothing
+writes. Live packages: 263 ever, all one leg (O1). Today's slot set: 0 DTE 17, 1-6 DTE 21, 7-30 DTE 34 (17 C / 17 P).
+
+### Nov 11 (15:20-15:44 UTC): R45/R46 Options Alerts tabs and one row per contract and side (r89 API, f27 frontend)
+
+User 15:20 (screenshot 10:14 ET): TSLA 390 CALL listed three times (O1 09:41, OS1 10:05, OS2 10:14 ET), and Latest Run
+and Day History show the same rows. Causes: `rt.alert_current` keeps one alert per detector and contract (G100; R29
+folds only the same candidate); `AdvancedOptionsPublication.detector_runs` ignored `request.scope`. Change (read side
+only): with the session list, rows are grouped by contract(s), side and direction (first trigger is the alert; later
+detectors become `confirmations`, `detectors` lists them, hits add up) unless a detector filter is set; LATEST = alerts
+triggered or hit in the latest run; HISTORY = alerts first triggered before it, latest run withheld (`withheld_run`) for
+the current session (America/New_York date of the read cutoff), as Stock Alerts does; without the session list the
+release rows are served unchanged. Frontend: the row label lists the detectors (`O1 + OS1 + OS2 / Bullish`); Day History
+names the withheld run. Tests (r88 image, worktree mounted): new `test_options_alert_tabs_nov11.py` 5 + session alert
+tests 12 passed; 17 Options alert/portal files 312 passed, 0 failed. r89
+`alpha-research-realtime-v3:stable-nov5-r89-6dd26e96c72f0472` = `sha256:4d82ad763a4500a90d04ed0e596a88f8e0a028eade467369fcc35bbfbfaa6190`
+(= worktree: r88 + R42 + R45/R46). Shadow API on r89 beside live (no lease; read-only) 15:37: LATEST 2 rows (IWM
+283C; SPY 757C with O1 + OS2 + OS1), HISTORY 4 rows (TSLA 390C O1 + OS1 + OS2 8 hits, NVDA 172.5P, SPY 761C, TSLA 390P),
+latest run `7778c7bf` withheld; live r85 returned the same 10 rows for both. Deploy: `hotfix -Service
+realtime-v2-advanced-api -Image r89` 15:37:54-15:38:40 (healthy); API smoke `r89-api` 131 of 153 (no change); live reads
+match the shadow. f27 `sha256:a639097fefaa5937d7e047013d44f56c0927a2f1fafcf6544ad422aa4aa31307` (frontend tests 291:
+246 pass, 40 fail = f26, same failing tests); `g102-frontend` refused in protected hours, so `hotfix -Service
+realtime-v2-advanced-frontend -Image f27` 15:42:15-15:43:40 (healthy). Domain 302 to Access, tunnel no errors, frontend
+and `/api/` proxy 200. Rollback: API to r85 `74e2c255d715`, frontend to f26 `432cd64c2133`.
+
+### Nov 11 (15:44-15:55 UTC): V3-1 Step 0 profile **P8 #2** (market-state on P8, r85; started 15:44 after the r89/f27 deploys)
+
+`profile_options_roles.sh 180`; log `ev/profile-p8-2.log` (scratchpad). **market-state**: 4,142 samples, 4,134 active
+(idle 0.2%): journal read (SQLite) 55.1%, hash/JSON 26.4%, window stages 6.6%, DB write 3.6%, record decode 3.0%, DB other
+2.9%, materialize 1.4%; CPU mean 48.8%, median 39.5%, max 86.2% (#1: 46.0 / 37.6 / 86.3) - same shape as #1.
+**flow**: 1,665 samples: flow 47.9%, hash/JSON 41.2% (#1 30.2%), DB other 6.4%; top leaves `load_downstream_bindings`
+27.9% (#1 12.9%), `iterencode` 23.9%, `raw_decode` 10.4%; CPU mean 18.7%, median 13.3%, max 60.7% (#1: 13.1 / 9.4 / 61.0):
+flow's per-iteration read of the session's downstream bindings grows with the windows bound so far (P8; not in the V3-1
+Steps 1-2 scope, a V3-1 follow-up). **window**: 110 samples: DB other 55.5%, window stages 31.8%; CPU mean 2.3%.
+
+### Nov 11 (15:55-16:18 UTC): API segfaults on the Options Flow breadth read (R47); r85 rollback and r89 back
+
+Watch 15:57: `realtime-v2-advanced-api` (r89) restarted twice, Docker `die` exit 139, no traceback; nginx: both times
+`GET /api/options/flow?cohort_id=566cc5a4...` (Options Alerts page, polled every ~2 min) "upstream prematurely closed".
+Rolled the API back to r85 15:58:39-15:59:21 (fallback, cause unknown then). Shadow APIs with `PYTHONFAULTHANDLER=1`, the
+same read in a loop: r89 segfault after 9 reads (GC during json encode in `breadth_screener_row`), r85 after 7 (psycopg2
+`RealDictRow.__setitem__` in fetchall) - present before r89. API back to r89 16:05-16:08 (R45/R46 again). Plain process
+probes (`breadth_crash_probe*.py`, read-only): dict cursor + row builder crash at iteration ~12; fetch only 30/30; tuple
+cursor + builder 30/30 once, crash once in 40; builder over in-memory rows crash once in 60, 80/80 another time; parts
+alone and pickled copies 80/80. Live 16:08-16:17: 5 Flow reads 200, 0 restarts. Intermittent native memory corruption;
+diagnosis after the close (R47).
+16:27 watch: third R47 crash at 16:21:29 (API r89, `GET /api/options/flow` 502, restarted, healthy); about 1 crash per 7
+Flow reads while the Options Alerts page is open (15:45-16:21: 3 of ~20). No Flow reads after 16:21.
+
+### Nov 11 (16:54-17:11 UTC): V3-1 flip - market-state on the V3 loop (r85)
+
+Preconditions held (market-state r85 `74e2c255d715`, Options windows COMPLETE, 16:47 watch). `rollout/compose.stable.json`
+backed up to `compose.stable.before-v3-loop-20261111.json`; one key added to `realtime-v3-options-p8-market-state`
+environment: `"REALTIME_V3_MARKET_STATE_LOOP": "V3"` (diff: that line only; file kept CRLF, indent 1). `hotfix -Service
+realtime-v3-options-p8-market-state -Image r85` 16:54:36-16:59:59 (waited for the quiet part of the cycle; recreate 16:58:00,
+started 16:59:02); 8 lease-handover restarts (`DurableLeaseUnavailable`, known), running from 16:59:33; env
+`REALTIME_V3_MARKET_STATE_LOOP=V3` in the container. The role waited in `_wait_v3_binding` until the next window's
+binding opened at its O cutoff (E:17:00 -> O 17:05:00, E+300 s): `advanced_options_market_state_loop mode=V3` 17:05:00.
+Shard lease `advanced-options:566cc5a4...:2026-11-11:market-state` renewing (lease_until 17:05:50 at 17:05:23). First V3
+window `4fe84b7b` (O 17:05:00): deferred 1 s on MARKET_STATE, marks at 17:05:17 (40 marked), COMPLETE 54.4 s (watch 63 s
+incl. deferral, 21%); lanes O1 COMPLETE_SELECTED, OS1/OS2 COMPLETE_ZERO, O2/O3 as designed; O1 51 packages, 0 not stored.
+Second V3 window `f0ac34ae` (O 17:10:00): marks 17:10:10 (38 marked), COMPLETE 40.4 s. market-state docker CPU every ~11 s
+17:06:13-17:10:33 (24 samples): mean 18.1%, median 16.8%, 9-25% between windows, 33-35% in the 17:10 window (P8 #1/#2:
+mean 46.0/48.8%, median 37.6/39.5%, peaks 86%). 0 tracebacks and no restarts since 17:05. Fallback not needed (backup kept).
+17:18-17:26 (R47): the crash no longer reproduces: the dict-cursor probe 30/30 three times (default allocator twice,
+`PYTHONMALLOC=malloc` once) and 25/25 under `PYTHONMALLOC=debug` (nothing reported); at 16:09-16:14 it crashed about every
+12 reads. Breadth is recaptured every 5 min (all 9 underlyings), so the trigger may be data-dependent. A per-capture cache
+would save little (polls every 2 min). Catcher started 17:26 (`r47_catch_loop.sh`, read-only, until 21:05): every 5 min one
+breadth read saved to `ev/r47/breadth-current.pkl` and 40 in-memory replays; on a crash the rows are kept for offline replay.
+
+### Nov 11 (17:57-18:08 UTC): V3-1 Step 0 profile **V3 #1** (profile #3; market-state on the V3 loop since 16:59)
+
+`profile_options_roles.sh 180`; log `ev/profile-v3-1.log` (scratchpad); R47 catcher running alongside (one read per 5 min,
+`--cpus=1`). **market-state**: 3,234 samples (P8 #2: 4,142; py-spy records active samples only, so ~36% vs ~46% of the
+time on CPU): hash/JSON 49.1% (`iterencode` 17.4%, `_canonical_value` 13.3%, `<dictcomp>` 7.0%, `_quote_document` 3.3%),
+journal read (SQLite) 22.9% (P8 55%; `read_normalized_after` 5.4%), DB write (state, checkpoints) 11.6% (P8 3.6%), window
+stages 10.4%, DB other 2.4%, decode 1.2%, materialize 1.1%; docker CPU mean 38.1%, median 36.9%, max 66.0% (P8 #1/#2 mean
+46.0/48.8, median 37.6/39.5, max 86). The re-read is gone; per-record hashing/JSON of quote documents and state writes are
+now the cost (docker CPU 17:06-17:10, just after the flip: mean 18.1%). **flow** (P8 loop): CPU mean 32.7%, median 30.0%,
+max 56.5% (P8 #1/#2 13.1/18.7): `load_downstream_bindings` 37.9% (#2 27.9%), `iterencode` 29.5%, `raw_decode` 15.8% - the
+per-iteration read of all downstream bindings keeps growing with the windows bound. **window**: 441 samples, CPU mean 4.3%
+(hash/JSON 40.4%, DB other 30.4%). Options window run time 43-78 s (14-26%) 17:30-18:05.
+
+### Nov 11 (18:15 UTC): Options Flow shows 8 contracts after a failed breadth capture (R48; user question)
+
+`breadth_flow_data` uses breadth for a ticker only when its latest capture is COMPLETE; otherwise that ticker keeps its
+streamed contracts (allocation: SPY/QQQ/TSLA 8, NFLX 3, others 9) and, for the selected ticker, the page shows the streamed
+matrix ("latest complete matrix"). Captures not COMPLETE today: SPY 16:02:32 (ConnectionError), AMZN 18:06:26
+(ConnectionError), SPY 18:13:21 (ConnectTimeout), TSLA 18:13:21 PARTIAL (DEADLINE), all `api.massive.com`; the next
+capture 5 min later was COMPLETE each time (AMZN 18:11:31 758). No whole-page breadth failures in the API log since 16:08.
+
+### Nov 11 (18:20-18:35 UTC): R48 Flow keeps the last good chain and warns (r90 API, f28 frontend)
+
+User 18:19: apply before the close, and the page should warn. Change: `load_breadth_screener_rows_cursor` labels each
+ticker with its last COMPLETE capture (a failed or partial capture writes no rows over the last good ones) and names a
+later capture that was not COMPLETE (`latest_capture_state/at/reason`); `breadth_flow_data` adds `breadth_fallback`
+(`selected`, `streamed_only`) and, when the selected ticker has no COMPLETE capture, serves the streamed rows with the
+capture label; `_flow_with_breadth` reports `flow_breadth` FALLBACK in that case. Frontend: `breadthCoverageWarning` on the
+Flow page ("Full chain unavailable" / "Latest chain capture failed" / "Partial chain coverage"). Tests: new
+`test_option_flow_breadth_fallback_nov11.py` 3 and the updated fallback test, with breadth/Flow/portal/screens files 82
+passed; frontend f28 294 tests, 249 pass, 40 fail = f27's 40 (3 new pass). r90
+`alpha-research-realtime-v3:stable-nov5-r90-09ed5b07443808bf` = `sha256:0e63c082e3bf14cf102b68dec2af7042378003b0ba50d8a6dd1b33cacba5c44b`
+(= r89 + R48). Shadow r90 18:28 (all captures COMPLETE): Flow for the 9 tickers identical to live r89. r90 read as of
+18:15 on live data: SPY last COMPLETE 18:07:43 (5,128) with latest FAILED 18:13:21 ConnectTimeout; TSLA last COMPLETE
+18:07:48 with latest PARTIAL (DEADLINE); AMZN COMPLETE 18:11:31. Deploy: `hotfix` API r90 18:29:41-18:33:40, frontend f28
+`sha256:94e17a9762e81fdc2cd4a2093c8928b524563b764bb9dfbc9f64dc7ab20207a9` 18:33:40-18:34:21; both healthy; API smoke
+`r90-api` 131 of 153 (no change); domain 302 to Access; tunnel no errors; Flow via the proxy 200. Rollback: API r89, frontend f27.
+
+### Nov 11 (18:47 UTC): Stock Alerts restarted once with exit 0 (R43 repeat; mechanism)
+
+`realtime-v2-canonical-stock-alerts` restarted 18:45:35 (exit 0, not OOM, healthy after; publications 18:30, 18:35, 18:40
+before and 18:45 PUBLISHED at 18:45:48 after; no log between 18:40:28 and the restart). Same pattern as retention 14:51:45.
+Code: `PostgresLeaseHeartbeat._run` (renew every lease/3 s) sets the wrapper's stop event on a `PsycopgError` or a lease
+not renewed; `run_fenced_child` then terminates the child and returns; the container exits 0 and Docker restarts it.
+Nothing is logged on that path, which matches both restarts. Fix later: log the reason and retry one renewal (R43).

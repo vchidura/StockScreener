@@ -144,8 +144,10 @@ def breadth_flow_data(
     rows: Sequence[Mapping[str, object]],
     captures: Mapping[str, Mapping[str, object]],
 ) -> dict[str, object]:
-    """The Flow data with breadth in place of the streamed contracts for every underlying whose latest capture is
-    COMPLETE; underlyings without one keep their streamed rows. Unchanged when the selected one has no breadth."""
+    """The Flow data with breadth in place of the streamed contracts for every underlying with a COMPLETE capture (the
+    last good one when a later capture failed, R48: the capture label then names the failed one); underlyings without
+    one keep their streamed rows. When the selected one has no breadth, the streamed data is served and
+    `breadth_fallback` says so (R48: the page warns instead of switching silently)."""
     by_underlying = defaultdict(list)
     for row in rows:
         by_underlying[str(row["underlying"])].append(row)
@@ -154,9 +156,15 @@ def breadth_flow_data(
         if items and (captures.get(underlying) or {}).get("breadth_state") == "COMPLETE"
     }
     selected = str(data.get("selected") or "")
-    if selected not in usable:
-        return dict(data)
     streamed = {str(item["underlying"]): item for item in data.get("underlyers") or ()}
+    streamed_only = sorted(underlying for underlying in streamed if underlying not in usable)
+    if selected not in usable:
+        result = dict(data)
+        result.update(
+            breadth=dict(captures.get(selected) or {"breadth_state": "NOT_CAPTURED"}),
+            breadth_fallback={"selected": True, "streamed_only": streamed_only},
+        )
+        return result
     summaries = [
         _summary(underlying, by_underlying[underlying], streamed.get(underlying), captures.get(underlying))
         if underlying in usable else dict(item)
@@ -190,6 +198,7 @@ def breadth_flow_data(
         top_contracts=[_top_contract(row) for row in ranked],
         coverage_source=BREADTH_FLOW_SOURCE,
         breadth=dict(captures.get(selected) or {}),
+        breadth_fallback={"selected": False, "streamed_only": streamed_only} if streamed_only else None,
         definitions={**dict(data.get("definitions") or {}), "coverage_source": BREADTH_FLOW_DEFINITION},
     )
     return result

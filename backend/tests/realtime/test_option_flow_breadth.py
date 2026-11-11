@@ -56,9 +56,13 @@ def test_underlyings_without_complete_breadth_keep_their_streamed_rows():
     assert qqq == {"underlying": "QQQ", "asset_type": "ETF", "contract_count": 8}
 
 
-def test_no_breadth_for_the_selected_underlying_leaves_the_release_unchanged():
-    assert breadth_flow_data(_data(), ROWS, {"QQQ": COMPLETE}) == _data()
-    assert breadth_flow_data(_data(), [], {}) == _data()
+def test_no_breadth_for_the_selected_underlying_serves_the_release_and_names_the_fallback():
+    """R48 (Nov 11): the streamed rows are served as before, and `breadth_fallback` lets the page warn."""
+    for captures, rows in (({"QQQ": COMPLETE}, ROWS), ({}, [])):
+        data = breadth_flow_data(_data(), rows, captures)
+        assert {key: value for key, value in data.items() if key not in {"breadth", "breadth_fallback"}} == _data()
+        assert data["breadth_fallback"]["selected"] is True and "SPY" in data["breadth_fallback"]["streamed_only"]
+        assert data["breadth"]["breadth_state"] == "NOT_CAPTURED"
 
 
 # ---- INV-9 (Nov 10 review R7): optional reads say what they served --------------------------------------------------
