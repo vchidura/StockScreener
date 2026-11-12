@@ -4,7 +4,8 @@ import { AlertTriangle, Database } from 'lucide-react'
 import { usePublishPageContext } from '../layout/pageContext'
 import { useSessionDate } from '../layout/sessionDate'
 import { getOptionFlow, optionsDataTierLabel } from '../services/api'
-import { OptionSessionNotice, optionFlowUnavailableReason, TickerBoard } from './OptionsFlowPage'
+import { flowWindowMs, OptionSessionNotice, optionFlowUnavailableReason, TickerBoard } from './OptionsFlowPage'
+import { msUntilWindowRead, OPTIONS_FIRST_CHECK_MS } from '../utils/refreshTiming'
 import './OptionsFlowPage.css'
 
 export default function OptionsActivityPage() {
@@ -14,7 +15,9 @@ export default function OptionsActivityPage() {
   const activity = useQuery({
     queryKey: ['options', 'activity', sessionDate],
     queryFn: () => getOptionFlow(undefined, sessionDate || undefined),
-    refetchInterval: 60_000,
+    // Nov 12 (user, RF1 for Activity): read when the next window's release and chain capture land, as Options Flow does.
+    refetchInterval: current => msUntilWindowRead(Date.now(), flowWindowMs(current.state.data), OPTIONS_FIRST_CHECK_MS,
+      60_000),
   })
   const data = activity.data?.data
 

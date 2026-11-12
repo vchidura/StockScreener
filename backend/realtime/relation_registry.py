@@ -365,8 +365,10 @@ RELATIONS: dict[str, Relation] = {
     "rt.option_flow_policies": _r(
         "options", "BOUNDED", append=True
     ),
+    # OA1/OA2 (Nov 12, user's yes ~19:00 UTC): the API's Options Alerts valuation reads the session's rate and dividend
+    # from the reference state, so the API role may read it (SELECT only; writes stay with the app role).
     "rt.advanced_options_reference_states": _r(
-        "options", "BOUNDED", append=True
+        "options", "BOUNDED", append=True, api=True
     ),
     "rt.advanced_options_reference_state_members": _r(
         "options", "BOUNDED", append=True

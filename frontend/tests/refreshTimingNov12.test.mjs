@@ -105,3 +105,14 @@ test('the ticker page wires the timing in', () => {
   const workspace = read('pages/ticker/TickerWorkspace.tsx')
   assert.match(workspace, /marketWarning && !marketWindowBuilding\(Date\.now\(\), publication\?\.market_time\) \? marketWarning : null/)
 })
+
+test('Options Activity and Options Alerts follow the Options run like Flow (RF1, Nov 12)', () => {
+  const activity = read('pages/OptionsActivityPage.tsx')
+  assert.match(activity, /refetchInterval: current => msUntilWindowRead\(Date\.now\(\), flowWindowMs\(current\.state\.data\), OPTIONS_FIRST_CHECK_MS,/)
+  assert.doesNotMatch(activity, /refetchInterval: 60_000/)
+  const alerts = read('pages/OptionsAlertsPage.tsx')
+  assert.match(alerts, /const optionRunRefetch = [\s\S]{0,160}msUntilWindowRead\(Date\.now\(\), windowTimeMs\(current\.state\.data\?\.as_of\), OPTIONS_FIRST_CHECK_MS, 30_000\)/)
+  // The run inventory, the alert list and the evaluations list follow the run; only the schedule keeps its plain 30 s.
+  assert.equal((alerts.match(/refetchInterval: optionRunRefetch/g) || []).length, 4)
+  assert.equal((alerts.match(/refetchInterval: 30_000/g) || []).length, 2)
+})

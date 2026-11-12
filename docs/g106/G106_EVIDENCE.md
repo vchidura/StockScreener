@@ -28,3 +28,34 @@ the Model Lab and backtests); no paper P/L; request headroom: as recommended; ga
 and should be used wherever they apply. Recorded in `G106_TARGET_DESIGN.md` 10-11.
 
 **User, Nov 12 ~18:10:** the `backend/options/analytics` scripts can be copied and updated directly for A3 (gamma exposure, OI walls, OI change, IV context, variance risk premium); the legacy pipeline does not run through this code base. A3 and design 11 updated.
+
+### Nov 12 (19:06 UTC, market open): C1 provider REST checks, read-only (user's yes)
+
+Probe `scratchpad/provider_probe.py` in an r98 container with the provider key mounted (never printed); output
+`scratchpad/ev/provider-probe-1912.txt`. **Per-contract trades** `/v3/trades/{option}`: HTTP 200 for a streamed contract
+(NVDA 251113 155 P: newest trade 0.7 s old) and a not-streamed one (SPY 261218 718 P, 20,301 day volume: newest 18 s
+old); fields `conditions, exchange, price, size, sip_timestamp, sequence_number`. **Per-contract quotes**
+`/v3/quotes/{option}`: HTTP 200, real time, fields `bid/ask price, size, exchange, sip_timestamp`. So trade side and
+urgency can be computed for any contract from REST without a stream slot (B4 feasible). **Single-contract snapshot**
+`/v3/snapshot/options/{u}/{option}`: 200, 1.7-3.4 s. **Indices** `/v3/snapshot/indices` (I:VIX, I:VVIX, I:SPX): **403
+NOT_AUTHORIZED** (not entitled; D16 uses our own SPY/QQQ IV and skew instead). **Rate**: header `x-ratelimit-limit
+50000`, remaining 50000; 10 sequential trades reads all 200, latency 0.28 / 1.09 / 4.61 s (min/avg/max): ~50 contracts per
+window needs parallel requests (8 workers ~ 15 s). Stream checks (trades-only beyond 1,000; second connection) not run
+(C2: never in a session).
+
+### Nov 12 (18:57-19:10 UTC): chain history started; A3 gamma/OI-wall prototype on live chains; AL1 coverage line
+
+**Chain history (H1/H2 head start, read-only, no DB change):** `scratchpad/capture_chains.sh` copies
+`rt.option_breadth_current` for the session after each window's chain capture (mark + 150 s) into
+`recovery-20261104/research/chains/2026-11-12/HHMM.csv.gz` (ops folder, not in git) until the close, plus `close` at
+21:05; first copy 18:57 UTC 18,180 contracts, 2.5 MB (all chain columns incl. provider and our IV/Greeks, spot, rate,
+dividend). About 26 copies by the close (~65 MB). **A3 prototype** (`scratchpad/gex_proto.py`, r98 image, network none,
+on the 19:05 copy; existing `options/analytics` `build_gamma_profile`, `detect_gamma_walls`, `detect_oi_wall_clusters`;
+convention DEALER_LONG_CALLS_SHORT_PUTS as a hypothesis; IV ours else provider; output `scratchpad/ev/gex-proto.txt`):
+SPY spot 762.64, net +$3.35B per 1%, POSITIVE, flip 760.95, 0DTE peak 762 (+$2.28B); QQQ 693.57, +$0.92B, POSITIVE,
+flip 692.27, 0DTE peak 693; IWM 279.60, -$2.13B, NEGATIVE, flip 283.73; NVDA 166.85, -$0.18B, NEGATIVE, flip 175.42,
+gamma walls 170/180/175, OI walls 200/190/185; AAPL +$1.13B POSITIVE (walls 360/355/350); AMZN +$0.73B (270/275/265);
+MSFT +$0.62B; TSLA +$0.40B (400/380/390); NFLX -$18.6M NEGATIVE. Runs in seconds for 9 names; the modules work on chain
+rows as they are (A3 = adapters + storage + reads). **AL1**: `scratchpad/coverage.sql` added to the watcher (O1 SELECTED
+day / last hour and OPTION alerts per name); at 19:10: NVDA 580 / 26 / 5 alerts, AMZN 8 / 8 / 1, QQQ 5 / 0 / 1, AAPL
+2 / 1 / 1, others 0.

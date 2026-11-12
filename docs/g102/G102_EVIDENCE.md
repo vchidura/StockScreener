@@ -1984,3 +1984,72 @@ one window inside) mean **7.9%**, median 5.7%, max 38.8%; before: V3-1.6 alone o
 median 12.1%, profile #3 (17:59-18:02) mean 26.3%; 18:13:09-27 between windows 2.6-17.5%. Profile #4 at 20:47 measures
 it by cause. Fallback (~1 min): `compose_env.py realtime-v3-options-p8-market-state REALTIME_V3_MARKET_STATE_ENCODE
 --remove` + the same hotfix with r97; a mismatch already falls back to the full encode by itself.
+
+Nov 12 18:35 UTC (user: "lets commit current changes, so after hours work can start cleanly"): secrets scan of the
+staged additions (1,530 lines) against the five mounted secret files and key/DSN patterns: 0 hits; no localhost/port
+strings in the frontend diff. Commit `ad65946` on `v3-live-fixes` (r96/r97 code and tests, f33 RF1 code and tests,
+G102 docs, new `docs/g106`), pushed; `main` fast-forwarded and pushed. Night handover for a new session:
+`HANDOVER-20261112-NIGHT.md` (ops folder), summary in `G102_PLAN_20261112.md` "Night plan".
+
+### Nov 12 (18:59-19:07 UTC): OA1/OA2 on live (user's yes ~18:58 "ok, go ahead"): grant, r98 registry, API switch
+
+**Grant** 18:59:24 (admin DSN from the mounted secret, in an r96 container, database name asserted):
+`GRANT SELECT ON rt.advanced_options_reference_states TO stocks_realtime_v2_api`; after: SELECT true, INSERT false (the
+valuation reads only that table beyond what the API already reads: `option_alert_valuation.py`). **First hotfix refused**
+18:59:40: the deploy tool's `validate_integrated_image.py verify-live` (run in the newest candidate image) compares live
+privileges with the relation registry: `runtime_privileges_match_registry FAIL ['api:SELECT:rt.advanced_options_reference_states:extra']`;
+so every hotfix was blocked while the grant was ahead of the registry (live services do not run this audit; only the
+deploy, harden and apply tools do). **r98** `alpha-research-realtime-v3:stable-nov5-r98-bb55ac1fd211281b` =
+`sha256:1200f917a4d269e1b9b75d2d5d5162f6442571bfccfdffbf9bfb400f64007009` = r97 + `relation_registry.py` only
+(`rt.advanced_options_reference_states` `api=True`; image file diff vs r97: that file only); tests
+`test_schema_v2_registry.py`, `test_security_v2_roles.py`, `test_option_alert_valuation_nov12.py` 48 passed,
+`test_advanced_options_schema_contract.py` 23 passed; last line of `rollout/candidates.txt`. **Switch**: `compose_env.py
+realtime-v2-advanced-api REALTIME_V2_OPTIONS_ALERT_VALUATION ON` 18:59:40 (backup
+`compose.stable.before-realtime_v2_options_alert_valuation-20261112T185940Z.json`); `-Step hotfix -Service
+realtime-v2-advanced-api -Image r98` 19:02:47-19:03:41 (privilege check passed; recreated 19:03:00-03; `others_changed`
+none). **Verify**: env ALERT_VALUATION=ON, BREADTH_CACHE=ON, PYTHONFAULTHANDLER=1; healthy, 0 restarts, 0 tracebacks;
+detector-runs LATEST (3 rows) and HISTORY (7 rows) list `alert_valuation` AVAILABLE (`SOURCE_TIME_MODEL`), 0.71 s cold /
+0.30 s; legs carry `local_iv`, `local_delta`, `local_gamma`, `model_mark`; `model_exit` target 1 sigma / stop 0.5 sigma to the
+21:00 exit with `stock_target` (NVDA 160 C: IV 0.989, delta 0.552, stock target 165.42; AMZN put 18:50: IV 0.392, delta
+-0.391). NVDA 155 P (1 DTE) IV 1.420 at its 14:45 trigger; at 19:01 provider 0.978 / ours 1.087 (NVDA chain ~0.90-0.98
+today; 0-1 DTE read higher with our time-to-expiry convention, known). API smoke 153 / 131 OK, unchanged. Fallback
+(~4 min): `compose_env.py realtime-v2-advanced-api REALTIME_V2_OPTIONS_ALERT_VALUATION --remove` + hotfix r98 (the grant
+can stay: it matches r98's registry). Live now: API r98; market-state r97 (r98 is r97 + registry, either is safe);
+other backend services r96; frontend f33.
+
+### Nov 12 (19:08-19:18 UTC): provider REST slowdown - chain captures FAILED/PARTIAL; R48 fallback exercised live
+
+Options scheduler (`options_breadth_capture_failed`): 19:08:09 SPY `Connection refused` (Errno 111); 19:10 window
+MSFT `RemoteDisconnected`, NVDA read timeout (30 s), QQQ max retries -> captures MSFT, NVDA, QQQ FAILED, SPY and TSLA
+PARTIAL (DEADLINE); 19:15 window: AAPL, AMZN, IWM, MSFT, NFLX, NVDA COMPLETE but slow (IWM 74.9 s vs ~7-14 s
+before, AMZN 26.9 s), QQQ FAILED, SPY/TSLA PARTIAL 0 s (the capture's window deadline spent). Host SNTP check timed out
+the same minutes. Connectivity 19:13: `api.massive.com` reachable from host (0.3-1.4 s) and containers (1.5-5.5 s);
+both websockets LIVE, gaps 0, Options lag 0-1 s; Equity windows COMPLETE (56 through 19:10). So a provider/REST-path
+slowdown, not ours. **R48 live**: `/options/flow?underlyer=SPY` served BREADTH from the last COMPLETE capture (19:02:07,
+5,068 contracts) with `latest_capture_state` PARTIAL, `latest_capture_reason` DEADLINE, at 19:13:27 - the
+last-good-chain path the Nov 12 15:12 check could not exercise. The research chain copies keep the last complete rows
+per contract (18,180 rows at 19:05/19:10/19:15). No action; next windows watched.
+Recovered: the 19:20 window's chain captures were COMPLETE for all 9 names (SPY 46.9 s, IWM 23.3 s, QQQ 17.6 s; still
+slower than the morning); Equity 58 / Options 57 COMPLETE through 19:20; streams LIVE, lag 0.
+
+Nov 12 ~19:40 UTC, user: "confirm 1 and 2" - RF1 (f33 refresh timing on the ticker page and Options Flow) and OA1/OA2
+(Options Alerts leg IV/Greeks and model target/stop) confirmed in the browser. Matrix: RF1, OA1, OA2 VERIFIED.
+
+### Nov 12 (19:40-19:49 UTC): RF1 extended to Options Activity and Options Alerts; f34 live
+
+User ~19:40: "Still anything could be implemented and take it to LIVE?". Frontend only: Options Activity reads like
+Flow (`flowWindowMs`: release + chain capture, 50 s after each mark then 10 s, 60 s idle; was every 60 s); Options
+Alerts: the run inventory, the alert list and the evaluations list read 50 s after each mark then every 10 s until the
+run lands (`optionRunRefetch` on the envelope's `as_of`, 30 s idle; were every 30 s); the schedule and tier reads keep 30 s.
+Test added to `tests/refreshTimingNov12.test.mjs`. **f34** `alpha-research-realtime-v2-frontend:stable-nov5-f34` =
+`sha256:f46357d6a9874d824d3928bd626de2ed6b2401d45d4cc52fdfc8c848d4b88cc1`: 324 tests, 279 pass, 40 fail = f30's 40 by
+name; `localhost` strings 2 = f30. Preview (live nginx config, 127.0.0.1:5186, removed): `/`, `/options/activity`,
+`/options/alerts`, `/options/flow`, `/ticker/AAPL`, API proxy 200. **Live**: `-Step hotfix -Service
+realtime-v2-advanced-frontend -Image f34` 19:47:03-19:48:41 (recreated 19:48:01-02); serving `index-DuZ_Tymh.js`,
+healthy, API proxy 200, public domain 302 to Access. Fallback: the same hotfix with f33 `961eef3391e8` (or f30).
+
+Nov 12 19:53-19:58 UTC watch note: market-state docker CPU 37-52% for ~2 minutes (19:53:45-19:54:52) while E:19:50 was
+pending/processing; back to 1-19% at 19:57-19:58. Checkpoint size unchanged (925,486 bytes at 19:55; 925,040 at 18:19),
+record rate 183/s (lower than 18:20). A 60 s py-spy sample 19:56 (`p8-market-state-20261112T1956-spot.txt`): 278
+active samples; journal read 32.4%, `_persist_quote_materialization` 29.1% (restore/decode check 21.2%, the V3-1.6c
+row), encode 6.5%. Window-time load, not a regression; 0 mismatch/error lines since 18:13.

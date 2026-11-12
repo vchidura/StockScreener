@@ -14,9 +14,15 @@ import {
 import { Modal } from './ScreenLibrary'
 import { optionContractExpired, optionFlowPath, optionModelExitView, optionDetectorSort, optionDetectorSortChange, optionPackageStrategyName, detectorAlertColumns, detectorAlertColumnsForView, detectorObservationFieldStates, detectorColumnPresets, detectorViewPreset, readDetectorPresets, writeDetectorPresets, type DetectorViewPreset } from './optionsAlertPresentation'
 import { emptyOptionAlertForm, optionAlertTabParams, optionCandidateBoardFacts, optionContractSummary, optionCurrentPackagePrice, optionLegMarketValues, optionMarketColumns, optionMarkAge, optionPackagePremium, optionPackagePrice, optionPlanTerms, optionAlertLabel as label, optionAlertMoney as money, optionAlertPercent, optionAlertPreviewRequest, optionAlertTime as time, optionEntryWindow, optionGateTimeframe, optionGateValue, type OptionAlertForm, type OptionAlertView } from './optionsAlertPresentation'
+import { msUntilWindowRead, OPTIONS_FIRST_CHECK_MS, windowTimeMs } from '../utils/refreshTiming'
 import './StockDiscoveryPage.css'
 import './StockScreeningPage.css'
 import './OptionsAlertsPage.css'
+
+/** Nov 12 (user, RF1 for Alerts): read when the next Options run lands (its envelope's `as_of` is the run's window
+ * time): 50 s after each 5-minute mark, then every 10 s until it does; 30 s when no live run is expected. */
+const optionRunRefetch = (current: { state: { data?: { as_of?: string | null } } }) =>
+  msUntilWindowRead(Date.now(), windowTimeMs(current.state.data?.as_of), OPTIONS_FIRST_CHECK_MS, 30_000)
 
 const pageSize = 50
 const capabilityLabels: Record<string, string> = { OBSERVATION: 'Observation evidence', INDICATIVE: 'Indicative package', QUOTE_PAPER: 'Quote-qualified paper', EXECUTION: 'Execution' }
@@ -510,7 +516,7 @@ function DetectorAlertsPanel({ view, params, update, offset, onSessionContext, t
     catch (error) { setPresetError(error instanceof Error ? error.message : 'Saved presets unavailable') }
   }, [])
   const inventory = useQuery({ queryKey: ['option-detector-datasets'], queryFn: getOptionDetectorDatasets,
-    retry: false, refetchInterval: 30_000 })
+    retry: false, refetchInterval: optionRunRefetch })
   const index = inventory.data?.available ? inventory.data.data : undefined
   const requestedSession = params.get('session_date') || ''
   const explicitDataset = params.get('evaluation_dataset') || ''
@@ -524,7 +530,7 @@ function DetectorAlertsPanel({ view, params, update, offset, onSessionContext, t
     detector, underlyer: underlyer || undefined,
     ...optionDetectorSort(params), limit: pageSize, offset } as const
   const review = useQuery({ queryKey: ['option-detector-alerts', request], queryFn: () => getOptionDetectorAlerts(request),
-    enabled: Boolean(dataset), retry: false, refetchInterval: 30_000 })
+    enabled: Boolean(dataset), retry: false, refetchInterval: optionRunRefetch })
   const data = review.data?.available ? review.data.data : undefined
   const incompleteAttempt = Boolean(data && ['RUNNING', 'FAILED', 'INCOMPLETE', 'UNVERIFIED'].includes(data.status))
   const scheduleQuery = useQuery({ queryKey: ['option-alert-schedule'], queryFn: getOptionAlertSchedule, retry: false, refetchInterval: 30_000 })
@@ -699,7 +705,7 @@ function DetectorEvaluationPanel({ params, update, offset, onSessionContext }: {
   const detector = params.get('evaluation_detector')
   const status = params.get('evaluation_status')
   const underlyer = useDeferredValue((params.get('underlyer') || '').trim().toUpperCase())
-  const inventory = useQuery({ queryKey: ['option-detector-datasets'], queryFn: getOptionDetectorDatasets, retry: false, refetchInterval: 30_000 })
+  const inventory = useQuery({ queryKey: ['option-detector-datasets'], queryFn: getOptionDetectorDatasets, retry: false, refetchInterval: optionRunRefetch })
   const index = inventory.data?.available ? inventory.data.data : undefined
   const [observationDetail, setObservationDetail] = useState<OptionDetectorEvaluationReview['rows'][number] | null>(null)
   const requestedSession = params.get('session_date') || ''
@@ -709,7 +715,7 @@ function DetectorEvaluationPanel({ params, update, offset, onSessionContext }: {
     selection_status: status === 'SELECTED' || status === 'NOT_SELECTED' || status === 'REPEAT' || status === 'OBSERVATION' ? status : undefined,
     underlyer: underlyer || undefined, ...optionDetectorSort(params), limit: pageSize, offset } as const
   const review = useQuery({ queryKey: ['option-detector-evaluations', request], queryFn: () => getOptionDetectorEvaluations(request), retry: false,
-    enabled: Boolean(index), refetchInterval: 30_000 })
+    enabled: Boolean(index), refetchInterval: optionRunRefetch })
   const data = review.data?.available ? review.data.data : undefined
   const detectorChoices = data?.models?.length
     ? data.models.map(model => model.detector_id)
