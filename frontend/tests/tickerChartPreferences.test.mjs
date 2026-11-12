@@ -53,7 +53,7 @@ test('legacy ticker links keep their interval defaults and linked pattern', () =
 
 test('all chart preferences round-trip without changing publication or date identity', () => {
   const initial = new URLSearchParams('session_date=2026-10-15&cohort_id=cohort&snapshot_id=saved&filter=keep')
-  const changes = { interval: '1h', period: '6mo', analysisPin: '30m', showRsi: true,
+  const changes = { interval: '1h', period: '6mo', showRsi: true,
     showAutoPatterns: true, showPriceChannel: true, patternSelection: 'frame|1h|RISING_WEDGE' }
   const saved = writeChartPreferences(initial, changes)
   assert.deepEqual(readChartPreferences(saved), changes)
@@ -84,14 +84,14 @@ test('rapid control updates merge pending URL selections rather than overwrite e
   const original = useChartPreferences()
   original.updateChartPreferences({ period: '6mo' })
   original.updateChartPreferences({ showRsi: true })
-  original.updateChartPreferences({ analysisPin: '1wk' })
+  original.updateChartPreferences({ interval: '1wk' })
   params = writes[0]
   useChartPreferences().updateChartPreferences({ showPriceChannel: true })
   params = writes.at(-1)
   const restored = useChartPreferences()
   assert.equal(restored.period, '6mo')
   assert.equal(restored.showRsi, true)
-  assert.equal(restored.analysisPin, '1wk')
+  assert.equal(restored.interval, '1wk')
   assert.equal(restored.showPriceChannel, true)
   assert.equal(params.get('session_date'), '2026-10-15')
   params = new URLSearchParams('cohort_id=cohort&session_date=2026-10-16&interval=1d&period=1y')
@@ -102,15 +102,16 @@ test('rapid control updates merge pending URL selections rather than overwrite e
   assert.equal(readChartPreferences(writes.at(-1)).period, '1y')
 })
 
-test('lookback periods, disabled toggles, follow-chart analysis and show-all survive a reload', () => {
+test('lookback periods, disabled toggles and show-all survive a reload; an old analysis pin is dropped (TP1)', () => {
   assert.deepEqual(CHART_PERIODS, ['1d', '5d', '1mo', '3mo', '6mo', '1y', '2y', '5y'])
   for (const period of CHART_PERIODS) {
     const saved = writeChartPreferences(new URLSearchParams('patterns=on&channel=on&rsi=on&analysis_interval=1wk'), {
-      period, showAutoPatterns: false, showPriceChannel: false, showRsi: false, analysisPin: null, patternSelection: 'all',
+      period, showAutoPatterns: false, showPriceChannel: false, showRsi: false, patternSelection: 'all',
     })
     const restored = readChartPreferences(new URLSearchParams(saved.toString()))
     assert.equal(restored.period, period)
-    assert.equal(restored.analysisPin, null)
+    assert.equal(saved.has('analysis_interval'), false)
+    assert.equal('analysisPin' in restored, false)
     assert.equal(restored.patternSelection, 'all')
     for (const key of ['showAutoPatterns', 'showPriceChannel', 'showRsi']) assert.equal(restored[key], false)
   }

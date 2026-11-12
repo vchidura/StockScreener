@@ -17,7 +17,7 @@ export interface StatementReport {
 export interface StatementRow {
   label: string
   values: (number | null)[]
-  format: 'money' | 'eps' | 'percent'
+  format: 'money' | 'eps' | 'percent' | 'ratio'
   emphasis?: boolean
 }
 
@@ -128,17 +128,23 @@ export function statementSections(reports: StatementReport[], timeframe: Timefra
           const debt = sum(report.current_debt, report.long_term_debt)
           return cash === null || debt === null ? null : cash - debt
         }, true),
-        row('Current ratio', 'percent', report => ratio(report.current_assets, report.current_liabilities)),
+        row('Current ratio', 'ratio', report => ratio(report.current_assets, report.current_liabilities)),
       ],
     })
   }
   return { periods, sections }
 }
 
-export function formatValue(value: number | null, format: StatementRow['format'], label = ''): string {
+/** Fund-like security types have no company statements (ADRs and ordinary shares do). */
+const FUND_TYPES = new Set(['ETF', 'ETN', 'ETV', 'ETS', 'FUND'])
+export const isFundType = (securityType: string | null | undefined) =>
+  !!securityType && FUND_TYPES.has(securityType.toUpperCase())
+
+export function formatValue(value: number | null, format: StatementRow['format']): string {
   if (value === null) return '—'
   if (format === 'eps') return `${value < 0 ? '-' : ''}$${Math.abs(value).toFixed(2)}`
-  if (format === 'percent') return label === 'Current ratio' ? value.toFixed(2) : `${(value * 100).toFixed(1)}%`
+  if (format === 'ratio') return value.toFixed(2)
+  if (format === 'percent') return `${(value * 100).toFixed(1)}%`
   const magnitude = Math.abs(value)
   const [divisor, suffix] = magnitude >= 1e12 ? [1e12, 'T'] : magnitude >= 1e9 ? [1e9, 'B'] : magnitude >= 1e6 ? [1e6, 'M'] : [1e3, 'K']
   return `${value < 0 ? '-' : ''}$${(magnitude / divisor).toFixed(magnitude / divisor >= 100 ? 0 : 1)}${suffix}`

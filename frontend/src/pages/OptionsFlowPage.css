@@ -168,6 +168,8 @@
 .flow-expiry-options { display: flex; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: 10px; }
 .flow-check { display: inline-flex; align-items: center; gap: 4px; color: var(--tm-muted); font-size: 9px; font-weight: 700; white-space: nowrap; cursor: pointer; }
 .flow-check input { margin: 0; accent-color: var(--tm-accent, currentColor); }
+/* The expiry count sat outside every rule and took the page's default font; it now matches the options beside it. */
+.flow-expiry-options__count { color: var(--tm-muted); font-size: 9px; font-weight: 700; font-variant-numeric: tabular-nums; white-space: nowrap; }
 .flow-expiry-stack > span { position: relative; overflow: hidden; }
 .flow-expiry-stack > span em { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; color: #fff; font-size: 8px; font-style: normal; font-weight: 800; line-height: 1; text-shadow: 0 0 2px rgba(0, 0, 0, 0.6); white-space: nowrap; }
 .flow-expiry-empty { margin: 0; padding: 12px; color: var(--tm-faint); font-size: 10px; }

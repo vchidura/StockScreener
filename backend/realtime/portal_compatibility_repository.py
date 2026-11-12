@@ -123,6 +123,8 @@ class BoundedCache:
 ADVANCED_CURRENT_MARK_STALE_SECONDS = 900
 # R33: an alert's market facts at its trigger never change; once complete they are kept by evaluation id.
 _ALERT_SOURCE_FACTS = BoundedCache(4096)
+# OA1 (Nov 12): an alert leg's IV and Greeks at its source time never change either; complete values are kept.
+_ALERT_VALUATIONS = BoundedCache(4096)
 
 
 def _mark_market_time(value) -> datetime | None:
@@ -1128,6 +1130,58 @@ class RealtimeOptionsAlertsPageRepository(_RealtimeCompatibilityRepository):
                 _apply_source_facts(row["original_package"]["legs"], value)
         return envelope
 
+    def _advanced_alert_valuation_reported(self, cursor, envelope):
+        """OA1/OA2 (Nov 12) under a savepoint, reporting what was served (INV-9). Runs after the source facts, which
+        supply each leg's stock price at the trigger."""
+        saved = False
+        try:
+            cursor.execute("SAVEPOINT options_alert_valuation")
+            saved = True
+            valued = self._advanced_alert_valuation(cursor, envelope)
+            cursor.execute("RELEASE SAVEPOINT options_alert_valuation")
+            served = True
+        except Exception:  # noqa: BLE001 - valuation is optional; never fail the alert list
+            if saved:
+                try:
+                    cursor.execute("ROLLBACK TO SAVEPOINT options_alert_valuation")
+                except Exception:  # noqa: BLE001
+                    _log_optional_read_failure("Options alert valuation savepoint rollback failed")
+            _log_optional_read_failure("Advanced Options alert valuation unavailable; serving the alert rows")
+            valued, served = envelope, False
+        return _with_optional_reads(valued, _optional_read(
+            "alert_valuation", served=served, source="SOURCE_TIME_MODEL", fallback_source="ALERT_ROWS",
+            reason_code="ALERT_VALUATION_UNAVAILABLE"))
+
+    def _advanced_alert_valuation(self, cursor, envelope):
+        """OA1: IV and Greeks for each alert leg at its own source time; OA2: the model exit estimate for single
+        bought contracts without a stop/target rule. See `option_alert_valuation`. Values the legs carry are kept."""
+        from . import option_alert_valuation as valuation
+
+        rows = (envelope.get("data") or {}).get("rows") or []
+        pending = [row for row in rows if isinstance(row, dict) and valuation.needs_valuation(row)]
+        results, missing = {}, []
+        for row in pending:
+            key = str(row.get("evaluation_id") or "")
+            cached = _ALERT_VALUATIONS.get(key) if key else None
+            if cached is None:
+                missing.append(row)
+            else:
+                results[key] = cached
+        if missing:
+            inputs = valuation.load_valuation_inputs(cursor, valuation.input_lookups(missing))
+            for row in missing:
+                key = str(row.get("evaluation_id") or "")
+                valued = valuation.value_row(row, inputs)
+                results[key] = valued
+                if key and valued["complete"]:
+                    _ALERT_VALUATIONS.put(key, valued)
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            valued = results.get(str(row.get("evaluation_id") or ""))
+            valuation.apply_row(row, valued or {})
+        return envelope
+
     def _load_source_facts(self, cursor, rows, *, cutoff):
         triggers = {}
         for row in rows:
@@ -1370,6 +1424,7 @@ class RealtimeOptionsAlertsPageRepository(_RealtimeCompatibilityRepository):
                                 )
                                 envelope = self._advanced_current_marks_reported(cursor, envelope, cutoff=cutoff)
                                 envelope = self._advanced_source_facts_reported(cursor, envelope, cutoff=cutoff)
+                                envelope = self._advanced_alert_valuation_reported(cursor, envelope)
                             else:
                                 envelope = publication.detector_runs(request, **identity)
                             return (

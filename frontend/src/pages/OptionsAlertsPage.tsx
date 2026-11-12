@@ -1,18 +1,18 @@
 import { useDeferredValue, useEffect, useState, type FormEvent, type KeyboardEvent, type ReactNode } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
-import { useSearchParams } from 'react-router-dom'
+import { Link, useSearchParams } from 'react-router-dom'
 import { AlertTriangle, ArrowDown, ArrowLeft, ArrowRight, ArrowUp, ArrowUpDown, BarChart3, CheckCircle2, Clock, Eye, History, ListFilter, RefreshCw, RotateCcw, Save, ShieldAlert, Trash2 } from 'lucide-react'
 import { usePublishPageContext, type PageContextValue } from '../layout/pageContext'
 import { ColumnPicker, useColumnPreferences, type ColumnSpec } from '../layout/PageChrome'
 import {
   getOptionCandidate, getOptionCurrentAdvancedQuotes, getOptionDetectorEvaluations, getOptionDetectorAlerts, getOptionDetectorDatasets, getOptionAlertSchedule, previewOptionAlert,
   optionsDataTierLabel,
-  type OptionCurrentMark, type OptionAlertPreviewRequest, type OptionCandidateDetailData, type OptionCandidateLeg,
+  type OptionAlertModelExit, type OptionCurrentMark, type OptionAlertPreviewRequest, type OptionCandidateDetailData, type OptionCandidateLeg,
   type OptionCandidateResearchEvidence, type OptionStockBehaviorGateEvidence,
   type OptionDetectorEvaluationReview, type OptionDetectorAlertReview, type OptionDetectorSort, type OptionDetectorDatasets, type OptionDetectorRunSummary, type OptionLocalSurfaceObservation, type OptionO3CreditObservation,
 } from '../services/api'
 import { Modal } from './ScreenLibrary'
-import { optionContractExpired, optionDetectorSort, optionDetectorSortChange, optionPackageStrategyName, detectorAlertColumns, detectorAlertColumnsForView, detectorObservationFieldStates, detectorColumnPresets, detectorViewPreset, readDetectorPresets, writeDetectorPresets, type DetectorViewPreset } from './optionsAlertPresentation'
+import { optionContractExpired, optionFlowPath, optionModelExitView, optionDetectorSort, optionDetectorSortChange, optionPackageStrategyName, detectorAlertColumns, detectorAlertColumnsForView, detectorObservationFieldStates, detectorColumnPresets, detectorViewPreset, readDetectorPresets, writeDetectorPresets, type DetectorViewPreset } from './optionsAlertPresentation'
 import { emptyOptionAlertForm, optionAlertTabParams, optionCandidateBoardFacts, optionContractSummary, optionCurrentPackagePrice, optionLegMarketValues, optionMarketColumns, optionMarkAge, optionPackagePremium, optionPackagePrice, optionPlanTerms, optionAlertLabel as label, optionAlertMoney as money, optionAlertPercent, optionAlertPreviewRequest, optionAlertTime as time, optionEntryWindow, optionGateTimeframe, optionGateValue, type OptionAlertForm, type OptionAlertView } from './optionsAlertPresentation'
 import './StockDiscoveryPage.css'
 import './StockScreeningPage.css'
@@ -43,10 +43,19 @@ function PackagePrice({ netPremium, legs }: { netPremium: unknown; legs: Paramet
 }
 
 function detectorThresholdCells(netPremium: unknown, legs: Parameters<typeof optionPackagePrice>[1], management: Record<string, unknown> | undefined,
-  options: Parameters<typeof optionPlanTerms>[3]): Record<'technical_stop' | 'technical_target', ReactNode> {
+  options: Parameters<typeof optionPlanTerms>[3], modelExit?: OptionAlertModelExit | null, underlyer = ''): Record<'technical_stop' | 'technical_target', ReactNode> {
   // R33 (Nov 10): a detector with no management policy (O1) sets no stop or target; that is not a missing value.
+  // OA2 (Nov 12): such a row may carry a model exit estimate (expected move to the exit, valued with the alert's IV).
   if (!options?.version) {
-    const none = <span className="oa-muted" title="This detector's alerts carry no stop or target rule">Not set<small>No stop / target rule</small></span>
+    const model = optionModelExitView(modelExit, underlyer)
+    if (model?.available) {
+      const cell = (side: { price: string; stock: string; note: string }, tone: string) => <span className={tone} title={model.title}>
+        {side.price}<small>{side.stock}</small><small>{side.note}</small><small>Model estimate / share / not a fill</small>
+      </span>
+      return { technical_stop: cell(model.stop, 'sd-negative'), technical_target: cell(model.target, 'sd-positive') }
+    }
+    const title = model ? `Model exit estimate unavailable: ${model.reason}` : "This detector's alerts carry no stop or target rule"
+    const none = <span className="oa-muted" title={title}>Not set<small>{model ? model.reason : 'No stop / target rule'}</small></span>
     return { technical_stop: none, technical_target: none }
   }
   const plan = optionPlanTerms(netPremium, legs, management, options)
@@ -395,7 +404,7 @@ function DetectorAlertSidecar({ row, asOf, dataTier, close, openCandidate }: { r
   const thresholds = detectorThresholdCells(original.net_premium, legs, row.management_policy, {
     version: String(row.management_policy?.policy_version || ''), source: credit ? 'O3_MODEL_MARK_CREDIT' : 'EXPLICIT_ALERT_POLICY',
     entryLimit: row.entry_limit, entryKind: credit ? 'MINIMUM_CREDIT' : 'MAXIMUM_DEBIT', exitDeadline: row.exit_deadline,
-  })
+  }, row.model_exit, row.underlyer)
   const legValues = (fields: Array<[string, (leg: OptionCandidateLeg) => ReactNode]>) => legs.flatMap(leg => fields.map(([name, value]) =>
     [`Leg ${leg.leg_index + 1} ${name}`, value(leg)] as [string, ReactNode]))
   const ratio = (leg: OptionCandidateLeg) => Number(leg.open_interest) > 0 && Number.isFinite(Number(leg.day_volume))
@@ -617,10 +626,11 @@ function DetectorAlertsPanel({ view, params, update, offset, onSessionContext, t
             const thresholds = detectorThresholdCells(original?.net_premium, legs, row.management_policy ?? undefined, {
               version: String(row.management_policy?.policy_version || ''), source: credit ? 'O3_MODEL_MARK_CREDIT' : 'EXPLICIT_ALERT_POLICY',
               entryLimit: row.entry_limit, entryKind: credit ? 'MINIMUM_CREDIT' : 'MAXIMUM_DEBIT', exitDeadline: row.exit_deadline ?? undefined,
-            })
+            }, row.model_exit, row.underlyer)
             return <tr key={row.evaluation_id}><ColumnCells columns={columns} values={{
               triggered_at: <span title={row.detector_id === 'O1' || row.detector_id === 'O3' ? 'Original option source time' : 'Original stock trigger-bar time'}>{time(row.triggered_at)}</span>,
-              underlyer: <><button type="button" className="oa-row-link" onClick={() => setPlanDetail(row)}>{row.underlyer}</button><small className={surface ? '' : markTone(row.direction)}>{credit ? `O3 / ${row.direction === 1 ? 'Bullish put credit' : 'Bearish call credit'}` : surface ? 'O2 / IV observation' : `${row.detectors && row.detectors.length > 1 ? row.detectors.join(' + ') : row.detector_id} / ${row.direction === 1 ? 'Bullish' : 'Bearish'}`}</small></>,
+              // Nov 12 (user): the ticker opens its Options Flow; the View column still opens the alert's details.
+              underlyer: <><Link className="oa-row-link" to={optionFlowPath(row.underlyer)} title={`Open ${row.underlyer} Options Flow`}>{row.underlyer}</Link><small className={surface ? '' : markTone(row.direction)}>{credit ? `O3 / ${row.direction === 1 ? 'Bullish put credit' : 'Bearish call credit'}` : surface ? 'O2 / IV observation' : `${row.detectors && row.detectors.length > 1 ? row.detectors.join(' + ') : row.detector_id} / ${row.direction === 1 ? 'Bullish' : 'Bearish'}`}</small></>,
               detector: <>{detectorNames[row.detector_id]}<small>{label(row.origin)}</small></>,
               category: label(row.category), strategy: row.strategy_name ? optionPackageStrategyName(row.strategy_name) : 'Unavailable',
               contract_summary: legs.length ? <>{label(original?.structure_type || '')}<small>{optionContractSummary(row.underlyer, legs)}</small></> : 'Unavailable',
@@ -750,7 +760,7 @@ function DetectorEvaluationPanel({ params, update, offset, onSessionContext }: {
           <DetectorSortHeader title="Category" field="category" params={params} update={update} />
           <DetectorSortHeader title="Package strategy" field="strategy" params={params} update={update} /><th>Details</th></tr></thead>
         <tbody>{data.rows.map(row => { const surface = detectorSurfaceObservation(row); const credit = detectorCreditObservation(row); return <tr key={row.evaluation_id}>
-          <td>{row.underlyer}<small>{row.direction === 1 ? 'Bullish' : row.direction === -1 ? 'Bearish' : 'Nondirectional'}</small></td>
+          <td><Link className="oa-row-link" to={optionFlowPath(row.underlyer)} title={`Open ${row.underlyer} Options Flow`}>{row.underlyer}</Link><small>{row.direction === 1 ? 'Bullish' : row.direction === -1 ? 'Bearish' : 'Nondirectional'}</small></td>
           <td>{time(row.scheduled_cycle)}</td><td>{selectionNames[row.selection_status]}<small>{label(row.selection_reason)}</small>{surface && <><small>{label(surface.finding_disposition)}</small><small>{surface.findings.length} residual findings</small></>}{credit && <><small>{label(credit.structure_type)}</small><small>{label(credit.pricing_basis)}</small></>}</td>
           <td>{row.candidate_rank ?? 'Not applicable'}</td><td>{row.observation ? 'Not applicable' : <>{money(row.entry_limit)}<small>Not a fill</small></>}</td><td>{row.observation ? 'Not applicable' : optionAlertPercent(row.net_return)}</td>
           <td>{detectorNames[row.detector_id]}<small>{label(row.origin)}</small>{row.shared_model_exposure && <small>Shared exposure</small>}</td>

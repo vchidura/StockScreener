@@ -460,6 +460,42 @@ export function Tile({ label, value, tone = INK, sub, note, accent, noteTone }: 
   )
 }
 
+// Nov 12 (TP7): one glossary for the abbreviations on the ticker chart and tabs (hover titles and legends).
+// Definitions describe what the page computes today (see G102_TICKER_PAGE_REVIEW_20261112.md).
+export interface GlossaryEntry {
+  name: string
+  meaning: string
+}
+
+export const GLOSSARY: Record<string, GlossaryEntry> = {
+  'O H L C': { name: 'Open, high, low, close', meaning: 'The first, highest, lowest and last trade price of the bar.' },
+  Vol: { name: 'Volume', meaning: 'Shares traded during the bar.' },
+  SMA: { name: 'Simple moving average', meaning: 'Average of the last N closes (50, 100, 200).' },
+  EMA: { name: 'Exponential moving average', meaning: 'Average of the last N closes weighted toward recent bars (8, 21, 50); an EMA stack is 8 above 21 above 50 (bullish) or the reverse.' },
+  BB: { name: 'Bollinger Bands', meaning: '20-bar SMA (Mid) with bands 2 standard deviations above (Up) and below (Lo).' },
+  RSI: { name: 'Relative Strength Index (14)', meaning: '0-100 balance of gains and losses over the last 14 bars; above 70 overbought, below 30 oversold. Uses simple averages, so it can differ from platforms that use Wilder smoothing.' },
+  MACD: { name: 'Moving Average Convergence Divergence (12, 26, 9)', meaning: 'EMA 12 minus EMA 26 compared with its 9-bar signal line; rising or fading tells the momentum direction.' },
+  ADX: { name: 'Average Directional Index (14)', meaning: 'Trend strength from 0 to 100, not direction: below 20 no trend, 20-25 developing, 25+ strong, 40+ very strong.' },
+  '+DI / −DI': { name: 'Directional indicators (14)', meaning: 'Upward (+DI) and downward (−DI) movement; the larger one controls the trend.' },
+  ATR: { name: 'Average True Range (14)', meaning: 'Average bar range including gaps over 14 bars; ATR % is ATR divided by price. Used to size stops.' },
+  HV20: { name: 'Historical volatility (20)', meaning: 'Annualized standard deviation of the last 20 bar-to-bar returns.' },
+  Percentile: { name: 'Volatility percentile', meaning: 'Where the current HV20 ranks among the last 252 readings: 0 calmest, 100 most volatile.' },
+  RVOL: { name: 'Relative volume', meaning: 'The last completed bar\'s volume divided by the average of the 20 bars before it. On 30m and hourly rows it is not adjusted for time of day, so opening and closing bars read high.' },
+  CMF: { name: 'Chaikin Money Flow (20)', meaning: 'From −1 to +1: positive when bars close near their highs on volume (accumulation), negative near their lows (distribution).' },
+  VWAP: { name: 'Volume-weighted average price (20 bars)', meaning: 'Average price of the last 20 bars weighted by their volume.' },
+  Fib: { name: 'Fibonacci levels', meaning: 'Retracements of a swing (23.6%, 38.2%, 50%, 61.8%, 78.6%) and extensions beyond it (127.2%, 161.8%).' },
+  FVG: { name: 'Fair value gap', meaning: 'A three-bar gap between one bar\'s high and a later bar\'s low (or the reverse) that price has not filled.' },
+  R: { name: 'Risk multiple', meaning: 'Reward divided by risk: 2R means the target is twice as far as the stop.' },
+  TF: { name: 'Timeframe', meaning: 'Bar interval: 30m, 1h (hourly), 1d (daily), 1wk (weekly), 1mo (monthly).' },
+}
+
+export const TIMEFRAME_TERMS = ['TF', 'EMA', 'ADX', '+DI / −DI', 'RSI', 'MACD', 'RVOL', 'CMF', 'HV20', 'Percentile', 'ATR']
+
+export const glossaryTitle = (term: string) => {
+  const entry = GLOSSARY[term]
+  return entry ? `${entry.name}: ${entry.meaning}` : undefined
+}
+
 export function VolumeSparkline({ values, state, slopeState }: {
   values: number[]
   state: TradeSetup['technicals']['volume_trend_state']
@@ -514,15 +550,15 @@ export function DirectionStrengthTrack({ adx, plusDi, minusDi }: {
     <div style={{ minWidth: 132 }} title="ADX measures trend strength; +DI and −DI identify directional control. Completed bars only.">
       <div style={{ display: 'flex', alignItems: 'baseline', gap: '0.35rem', marginBottom: '0.25rem' }}>
         <strong style={{ color: tone }}>{direction}</strong>
-        <span style={{ color: MUTED, fontSize: '0.68rem' }}>ADX {adx.toFixed(1)} · {strength}</span>
+        <span style={{ color: MUTED, fontSize: '0.68rem' }}><abbr className="tk-abbr" title={glossaryTitle('ADX')}>ADX</abbr> {adx.toFixed(1)} · {strength}</span>
       </div>
       <div style={{ display: 'flex', width: 128, height: 6, overflow: 'hidden', borderRadius: 4, background: LINE, marginBottom: '0.25rem' }}>
         <div style={{ width: `${plusShare}%`, background: POS }} />
         <div style={{ width: `${100 - plusShare}%`, background: NEG }} />
       </div>
       <div style={{ display: 'flex', justifyContent: 'space-between', width: 128, fontSize: '0.68rem' }}>
-        <span style={{ color: POS }}>+DI {plusDi.toFixed(1)}</span>
-        <span style={{ color: NEG }}>−DI {minusDi.toFixed(1)}</span>
+        <span style={{ color: POS }}><abbr className="tk-abbr" title={glossaryTitle('+DI / −DI')}>+DI</abbr> {plusDi.toFixed(1)}</span>
+        <span style={{ color: NEG }}><abbr className="tk-abbr" title={glossaryTitle('+DI / −DI')}>−DI</abbr> {minusDi.toFixed(1)}</span>
       </div>
     </div>
   )
@@ -543,14 +579,14 @@ export function VolatilityTrack({ value, percentile, state, atrPct }: {
   return (
     <div style={{ minWidth: 120 }} title="HV20 is annualized 20-bar realized volatility; percentile ranks it against the last 252 rolling windows.">
       <div style={{ display: 'flex', alignItems: 'baseline', gap: '0.35rem', marginBottom: '0.25rem' }}>
-        <strong>HV20 {plainPct(value, 1)}</strong>
+        <strong><abbr className="tk-abbr" title={glossaryTitle('HV20')}>HV20</abbr> {plainPct(value, 1)}</strong>
         <span style={{ color: tone, fontSize: '0.68rem', fontWeight: 700 }}>{stateLabel}</span>
       </div>
       <div style={{ width: 112, height: 6, overflow: 'hidden', borderRadius: 4, background: LINE, marginBottom: '0.25rem' }}>
         <div style={{ width: `${boundedPercentile}%`, height: '100%', background: tone }} />
       </div>
       <div style={{ color: MUTED, fontSize: '0.68rem' }}>
-        {ordinal(percentile)} percentile · ATR {plainPct(atrPct, 1)}
+        {ordinal(percentile)} <abbr className="tk-abbr" title={glossaryTitle('Percentile')}>percentile</abbr> · <abbr className="tk-abbr" title={glossaryTitle('ATR')}>ATR</abbr> {plainPct(atrPct, 1)}
       </div>
     </div>
   )

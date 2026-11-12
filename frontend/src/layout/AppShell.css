@@ -644,6 +644,116 @@
   cursor: help;
 }
 
+/* Nov 12 (user): one header panel on every page: Market data and Mode, then the session picker and refresh. */
+.tm-contextbar__status > .tm-market {
+  display: flex;
+  align-items: center;
+  gap: 22px;
+}
+
+/* Each fact is its label with the value under it; the two sit side by side with room between (user, Nov 12). */
+.tm-market__meta {
+  display: flex;
+  align-items: flex-start;
+  gap: 22px;
+  margin: 0;
+}
+
+.tm-market__meta > div {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+  white-space: nowrap;
+}
+
+.tm-market__meta dt {
+  color: var(--tm-faint);
+  font-size: 8px;
+  font-weight: 800;
+  letter-spacing: 0.1em;
+  text-align: right;
+  text-transform: uppercase;
+}
+
+/* Same look as the earlier Market data stamp (a bold 11px value), for both the stamp and the mode (user, Nov 12). */
+.tm-market__meta dd {
+  margin: 0;
+  min-width: 0;
+  color: var(--tm-ink);
+  font-size: 11px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+  cursor: help;
+}
+
+.tm-market__meta dd.is-alternate {
+  color: var(--tm-warn);
+}
+
+.tm-market__controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+
+.tm-market__controls > .tm-session {
+  display: flex;
+  align-items: stretch;
+  gap: 1px;
+  height: 30px;
+  border: 1px solid var(--tm-line-strong);
+  border-radius: 6px;
+  overflow: hidden;
+  background: var(--tm-surface);
+}
+
+/* A fixed date reads like the picker's value, without the arrows. */
+.tm-session--static .tm-session__value {
+  display: grid;
+  place-items: center;
+  border-inline: 0 !important;
+  color: var(--tm-ink);
+}
+
+/* The refresh control outside a picker keeps the picker's pill look. */
+.tm-market__controls > .tm-refresh {
+  height: 30px;
+  border: 1px solid var(--tm-line-strong);
+  border-radius: 6px;
+  background: var(--tm-surface);
+}
+
+.tm-refresh {
+  display: grid;
+  place-items: center;
+  padding: 0 10px;
+  border: 0;
+  background: transparent;
+  color: var(--tm-ink);
+  cursor: pointer;
+}
+
+.tm-refresh:hover {
+  background: var(--tm-surface-raised);
+  color: var(--tm-accent);
+}
+
+.tm-refresh.is-busy svg {
+  animation: tm-refresh-spin 0.9s linear infinite;
+}
+
+@keyframes tm-refresh-spin {
+  to { transform: rotate(-360deg); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .tm-refresh.is-busy svg {
+    animation: none;
+  }
+}
+
 .tm-session button {
   display: grid;
   place-items: center;
@@ -893,6 +1003,19 @@
   }
 
   .tm-contextbar__status > div {
+    text-align: left;
+  }
+
+  .tm-contextbar__status > .tm-market {
+    flex-wrap: wrap;
+  }
+
+  .tm-market__meta {
+    gap: 16px;
+  }
+
+  .tm-market__meta dt,
+  .tm-market__meta dd {
     text-align: left;
   }
 }

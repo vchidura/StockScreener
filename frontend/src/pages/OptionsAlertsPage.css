@@ -56,7 +56,7 @@
 .oa-permission { display: flex; align-items: center; gap: 7px; color: var(--tm-muted); font-size: 11px; line-height: 1.6; margin: 6px 0; }
 .oa-permission svg { flex: 0 0 14px; color: var(--tm-warn); }
 .option-alerts .sd-table-panel small { max-width: 210px; }
-.oa-row-link { border: 0; background: none; padding: 5px 0; color: var(--tm-accent); font: inherit; font-weight: 700; cursor: pointer; text-align: left; }
+.oa-row-link { display: inline-block; border: 0; background: none; padding: 5px 0; color: var(--tm-accent); font: inherit; font-weight: 700; cursor: pointer; text-align: left; text-decoration: none; }
 .oa-row-link:hover { text-decoration: underline; }
 .oa-trigger-price { color: var(--tm-accent); font-weight: 700; }
 .option-alerts .sd-table-panel td:first-child { position: sticky; left: 0; z-index: 1; background: var(--tm-surface); }

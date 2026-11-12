@@ -252,10 +252,9 @@ test('screener View opens a fixed snapshot without new queries or saved screen f
 test('screener ticker links and table colors match the shared table conventions', () => {
   const page = readFileSync(new URL('../src/pages/OptionsScreenLibrary.tsx', import.meta.url), 'utf8')
   const chain = page.slice(page.indexOf('export function OptionsChainResults'))
-  assert.match(chain, /<Link to=\{publicationPath\(`\/ticker\/\$\{encodeURIComponent\(row\.underlying\)\}`/)
-  assert.match(chain, /params\.get\('snapshot_id'\)/)
-  assert.match(chain, /params\.get\('cohort_id'\)/)
-  assert.match(chain, /title=\{`Open \$\{row.underlying\} ticker page`\}/)
+  // Nov 12 (user): the ticker opens its Options Flow, not the stock ticker page.
+  assert.match(chain, /<Link to=\{optionFlowPath\(row\.underlying\)\} title=\{`Open \$\{row\.underlying\} Options Flow`\}>/)
+  assert.doesNotMatch(chain, /`\/ticker\/\$\{encodeURIComponent\(row\.underlying\)\}`/)
   assert.match(chain, /aria-label=\{`View \$\{row.contract_ticker\} details`\}/)
   const style = readFileSync(new URL('../src/pages/OptionsScreenerPage.css', import.meta.url), 'utf8')
   assert.match(style, /\.options-screening-workspace \.os-package-table th \{ color: var\(--tm-muted\); \}/)

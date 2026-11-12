@@ -171,6 +171,39 @@ export function sessionLabel(date: string): string {
   })
 }
 
+/**
+ * Nov 12 (user): whether the market session is running now, for the header's Mode. True only when the current
+ * publication belongs to today's Eastern date and the clock is in regular hours (9:30 AM to 4:00 PM ET); a weekend,
+ * holiday or the time before the open keeps the previous session's publication and reads false. (An early close at
+ * 1:00 PM still reads true until 4:00 PM; three days a year.)
+ */
+export function marketSessionOpen(publication: { session_date?: string | null } | null | undefined, now = new Date()): boolean {
+  if (!publication?.session_date) return false
+  const parts = Object.fromEntries(new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'America/New_York', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit',
+    hourCycle: 'h23',
+  }).formatToParts(now).map(part => [part.type, part.value]))
+  const today = `${parts.year}-${parts.month}-${parts.day}`
+  const minutes = Number(parts.hour) * 60 + Number(parts.minute)
+  return publication.session_date === today && minutes >= 9 * 60 + 30 && minutes < 16 * 60
+}
+
+/**
+ * The header's Market data stamp, always one format: "Nov 11, 2026, 4:00 PM EST" (Eastern time). A date-only value
+ * (a session date, no time) reads as that session's 4:00 PM ET close instead of switching to a weekday label.
+ */
+export function formatMarketStamp(value: string): string {
+  if (/^\d{4}-\d{2}-\d{2}$/.test(value)) {
+    const [year, month, day] = value.split('-').map(Number)
+    // 21:00 UTC is 4:00 PM EST and 5:00 PM EDT, so build the close from the zone's own offset at noon that day.
+    const noonUtc = Date.UTC(year, month - 1, day, 12)
+    const offsetHours = Number(new Intl.DateTimeFormat('en-US', { timeZone: 'America/New_York', hour: 'numeric', hourCycle: 'h23' })
+      .format(new Date(noonUtc))) - 12
+    return formatMarketTime(new Date(Date.UTC(year, month - 1, day, 16 - offsetHours)).toISOString())
+  }
+  return formatMarketTime(value)
+}
+
 /** Exchange-local stamp, e.g. "Sep 9, 2026, 11:45 AM EDT". */
 export function formatMarketTime(iso: string): string {
   // A session date has no time; read as one, it shows as 7 PM the evening before.

@@ -1570,3 +1570,16 @@ the expected one and reports it (warning `advanced_options_treasury_curve_stale`
 older or newer still refuses. Tests `test_treasury_bond_holidays_nov12.py` 22; related 425 passed, 3 = baseline. Real rows
 (copy `test_realtime_v2_r92`, read-only, worktree code in the r94 image): stored curves Nov 6, 9, 10 (each received 21:00
 UTC); session Nov 11 -> Nov 10; Nov 12 -> Nov 10 (not stale); Nov 11 read at Nov 10 20:30 UTC -> Nov 9 with the fault.
+
+### Nov 12 (08:57-09:25 UTC): ticker-review work merged for r95/f30; tests
+
+The ticker-review session (worktree `ticker-review`, branch `ticker-page-review` from c46f988, uncommitted, last edit
+08:53 UTC) delivered TP1, TP2, TP7, TP11, TP14, TP15, OA1, OA2, OF1-OF3 and PH1 (review doc
+`G102_TICKER_PAGE_REVIEW_20261112.md` sections 7-9). Its diff applied cleanly to this worktree plus its 6 new files; all
+35 files equal the review worktree ignoring line endings. **Backend** (`runner/run_tests_ww.sh`, r94 image, offline; the
+31 test files that import the portal API, compatibility repository, Flow breadth, alert valuation or breadth modules,
+plus the five Nov 12 files): this tree 864 passed / 10 failed / 60 skipped; c46f988 851 / 10 / 60; the 10 failures are the
+same tests by name (daily scanner half-gap x2, pattern watch x4, p7 compose file, ticker vertical slice x3); the 13 extra
+passes are `test_option_alert_valuation_nov12.py`. **Frontend** (f29 build image, source mounted): type check clean; 317
+tests, 272 pass, 40 fail; the failing tests are the same by name as on c46f988 (302, 257, 40). Secrets scan of the diff,
+new files and the review doc: clean.

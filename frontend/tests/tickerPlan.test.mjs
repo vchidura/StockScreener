@@ -31,6 +31,39 @@ test('short plan geometry retains the original ATR fallback', () => {
   assert.deepEqual([plan.entry, plan.stop, plan.target, plan.rr], [100, 102, 96, 2])
 })
 
+test('short plan reads the directional brackets realtime setups publish (TP2, Nov 12)', () => {
+  // Bearish setups carry stops above the close and targets below; before TP2 every short fell back to ATR only.
+  const short = {
+    ...setup, direction: { bias: 'Bearish' },
+    stops: [
+      { price: 102, level: 'ATR Stop (1R)', source: 'ATR' },
+      { price: 101.5, level: 'Swing High', source: 'Price Action' },
+      { price: 108, level: 'Prior 252-Bar High', source: 'Price Action' },
+    ],
+    targets: [
+      { price: 97, level: 'Swing Low (3b ago)', source: 'Price Action' },
+      { price: 96, level: 'ATR Target (2R)', source: 'ATR' },
+      { price: 93, level: '38.2%', source: 'Fibonacci' },
+    ],
+  }
+  const plan = buildTradePlan(short)
+  assert.equal(plan.side, 'SHORT')
+  assert.deepEqual([plan.stop, plan.target, plan.risk, plan.reward, plan.rr], [101.5, 97, 1.5, 3, 2])
+  assert.equal(plan.stopLabel, 'Swing High (Price Action)')
+  assert.equal(plan.targetLabel, 'Swing Low (3b ago) (Price Action)')
+})
+
+test('short plan keeps the ATR fallback when no structure brackets the entry', () => {
+  const short = {
+    ...setup, direction: { bias: 'Bearish' },
+    stops: [{ price: 102, level: 'ATR Stop (1R)', source: 'ATR' }],
+    targets: [{ price: 96, level: 'ATR Target (2R)', source: 'ATR' }],
+  }
+  const plan = buildTradePlan(short)
+  assert.deepEqual([plan.stop, plan.target, plan.rr], [102, 96, 2])
+  assert.match(plan.stopLabel, /ATR/)
+})
+
 test('missing and stale context cannot improve a plan verdict', () => {
   const plan = buildTradePlan(setup)
   for (const value of [null, { frames: { '1d': { status: 'STALE', trend: 'Bullish Stack' } } }]) {

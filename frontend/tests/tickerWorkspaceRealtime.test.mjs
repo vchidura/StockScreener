@@ -131,7 +131,7 @@ test('original ticker service contracts preserve parameters and add only explici
         const expected = [
           { period: '2y', interval: '1h', ...refreshParams }, { interval: '15m', ...refreshParams },
           { interval: '1wk', ...refreshParams }, refresh ? refreshParams : undefined, refreshParams,
-          refresh ? refreshParams : undefined, { report_limit: 12 }, { days_forward: 30 }, { ticker: 'SPY' },
+          refresh ? refreshParams : undefined, { report_limit: 40 }, { days_forward: 30 }, { ticker: 'SPY' },
         ]
         calls.forEach((call, index) => {
           assert.deepEqual(call[1].params, realtime ? { ...expected[index], cohort_id: 'exact-cohort', read_mode: 'retained' } : expected[index])

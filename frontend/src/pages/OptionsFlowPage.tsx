@@ -325,9 +325,9 @@ export default function OptionsFlowPage() {
       {selected && <>
         <section className="flow-summary" aria-label={`${selected.underlying} activity summary`}>
           <div><span>Total volume</span><strong>{formatInteger(selected.total_volume)}</strong><small><i className="flow-call">{formatCompact(selected.call_volume)} calls</i><i className="flow-put">{formatCompact(selected.put_volume)} puts</i></small></div>
+          <div><span>Total open interest</span><strong>{formatInteger(selected.total_open_interest)}</strong><small><i className="flow-call">{formatCompact(selected.call_open_interest)} calls</i><i className="flow-put">{formatCompact(selected.put_open_interest)} puts</i></small></div>
           <div><span>Put / call volume</span><strong>{formatRatio(selected.put_call_volume_ratio)}</strong><small>P/C open interest {formatRatio(selected.put_call_open_interest_ratio)}</small></div>
           <div><span>Est. premium activity</span><strong>{formatCurrency(selected.total_premium_activity)}</strong><small>{formatPercent(selected.premium_activity_contract_count / Math.max(selected.contract_count, 1))} mark coverage</small></div>
-          <div><span>Total open interest</span><strong>{formatInteger(selected.total_open_interest)}</strong><small><i className="flow-call">{formatCompact(selected.call_open_interest)} calls</i><i className="flow-put">{formatCompact(selected.put_open_interest)} puts</i></small></div>
           <div><span>{selected.coverage_source === 'BREADTH' ? 'Chain coverage' : 'Matrix coverage'}</span><strong>{selected.contract_count}</strong><small>{selected.expiration_count} expiries · {selected.strike_count} strikes · {formatPercent(selected.retention_fraction)} retained</small></div>
         </section>
 
@@ -337,7 +337,7 @@ export default function OptionsFlowPage() {
               <div className="flow-expiry-options">
                 <label className="flow-check"><input type="checkbox" checked={includeZeroDte} onChange={event => setIncludeZeroDte(event.target.checked)} />Include 0 DTE</label>
                 <label className="flow-check"><input type="checkbox" checked={showExpiryPercent} onChange={event => setShowExpiryPercent(event.target.checked)} />Show %</label>
-                <span>{expiryProfileRows(data.expirations, includeZeroDte).length} expiries</span>
+                <span className="flow-expiry-options__count">{expiryProfileRows(data.expirations, includeZeroDte).length} expiries</span>
               </div>
             </header>
             <ExpiryProfile rows={expiryProfileRows(data.expirations, includeZeroDte)} metric={profileMetric} showPercent={showExpiryPercent} />
@@ -362,7 +362,9 @@ export default function OptionsFlowPage() {
                     {column.label}{active ? (contractSort.descending ? ' ▼' : ' ▲') : ''}
                   </button></th>
               })}</tr></thead>
-              <tbody>{sortContracts(data.top_contracts, contractSort.key, contractSort.descending).map(contract => <tr key={contract.contract_id}>
+              {/* Nov 12: keyed by contract ticker; breadth rows (not streamed) all carry contract_id 0, and the shared key
+                  made React reuse rows on re-render and sort, which showed as duplicate records. */}
+              <tbody>{sortContracts(data.top_contracts, contractSort.key, contractSort.descending).map(contract => <tr key={contract.contract_ticker}>
                 <td><strong className={contract.contract_type === 'CALL' ? 'flow-call' : 'flow-put'}>{Number(contract.strike).toLocaleString('en-US', { maximumFractionDigits: 2 })} {contract.contract_type}</strong><small title={contract.contract_ticker}>{contract.contract_ticker}</small></td>
                 <td>{formatDate(contract.expiration_date)}<small>{contract.calendar_dte} DTE</small></td>
                 <td title={contract.volume_baseline === 'INCOMPLETE' ? VOLUME_INCOMPLETE_NOTE : undefined}>{formatInteger(contract.day_volume)}{contract.volume_baseline === 'INCOMPLETE' ? ' *' : ''}</td>

@@ -59,6 +59,17 @@ test('the contract column sorts by type then numeric strike', () => {
     ['600 CALL', '610 CALL', '590 PUT'])
 })
 
+test('total open interest sits next to total volume; the expiry count is styled; contract rows have unique keys', () => {
+  const tiles = [...source.matchAll(/<div><span>([^<{]+)<\/span><strong>/g)].map(match => match[1])
+  assert.deepEqual(tiles.slice(0, 4), ['Total volume', 'Total open interest', 'Put / call volume', 'Est. premium activity'])
+  assert.match(source, /<span className="flow-expiry-options__count">/)
+  const css = readFileSync(new URL('../src/pages/OptionsFlowPage.css', import.meta.url), 'utf8')
+  assert.match(css, /\.flow-expiry-options__count \{[^}]*font-size: 9px/)
+  // Breadth rows all carry contract_id 0, so the row key must be the contract ticker.
+  assert.match(source, /\.map\(contract => <tr key=\{contract\.contract_ticker\}>/)
+  assert.doesNotMatch(source, /<tr key=\{contract\.contract_id\}>/)
+})
+
 test('the page shows total open interest, the 0 DTE and % options and sortable headers', () => {
   assert.doesNotMatch(source, /Matched OI change/)
   assert.match(source, /<span>Total open interest<\/span>/)

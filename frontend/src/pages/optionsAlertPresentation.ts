@@ -1,4 +1,4 @@
-import type { OptionAlertPreviewRequest, OptionCandidateDetailData, OptionCandidateLeg, OptionStockBehaviorGateEvidence, OptionDetectorAlertReview } from '../services/api'
+import type { OptionAlertModelExit, OptionAlertPreviewRequest, OptionCandidateDetailData, OptionCandidateLeg, OptionStockBehaviorGateEvidence, OptionDetectorAlertReview } from '../services/api'
 import type { ColumnSpec } from '../layout/PageChrome'
 
 export type OptionAlertView = 'behavior' | 'day_history' | 'daily'
@@ -457,4 +457,43 @@ export function optionContractExpired(expirationDate: string | null | undefined,
     timeZone: 'America/New_York', year: 'numeric', month: '2-digit', day: '2-digit',
   }).format(new Date(asOf))
   return expirationDate < currentSession
+}
+
+/** Nov 12 (user): a ticker on the Options Screener and Options Alerts opens its Options Flow. */
+export const optionFlowPath = (underlyer: string) => `/options/flow?underlyer=${encodeURIComponent(underlyer.trim().toUpperCase())}`
+
+const sigmaText = (value: number) => `${value.toLocaleString('en-US', { maximumFractionDigits: 2 })}σ`
+const exitClock = (value: string | null | undefined) => !value || !Number.isFinite(Date.parse(value)) ? 'exit'
+  : new Intl.DateTimeFormat('en-US', { timeZone: 'America/New_York', hour: 'numeric', minute: '2-digit' }).format(new Date(value))
+
+/** OA2 (Nov 12): the model exit estimate as Target and Stop cell text; null when the row carries none. */
+export function optionModelExitView(exit: OptionAlertModelExit | null | undefined, underlyer: string) {
+  if (!exit) return null
+  if (exit.status !== 'AVAILABLE') {
+    return { available: false as const, reason: optionAlertLabel(exit.reason || 'MODEL_EXIT_UNAVAILABLE') }
+  }
+  const spot = Number(exit.spot)
+  const signed = (level: unknown, sigma: number) => `${Number(level) >= spot ? '+' : '−'}${sigmaText(sigma)}`
+  const clock = exitClock(exit.exit_at)
+  const breakeven = exit.breakeven_stock_at_exit == null ? 'Breakeven by exit unavailable'
+    : `Breakeven by ${clock} ET: ${underlyer} ${optionAlertMoney(exit.breakeven_stock_at_exit)}`
+      + (exit.breakeven_sigma_at_exit == null ? '' : ` (${sigmaText(Math.abs(exit.breakeven_sigma_at_exit))} move)`)
+  return {
+    available: true as const,
+    title: `Model estimate, not a fill. ${underlyer} expected move to the ${clock} ET exit: ${optionAlertMoney(exit.expected_move)} `
+      + `(spot ${optionAlertMoney(exit.spot)} × IV ${optionAlertPercent(exit.iv)} × √time). Target and stop value the option `
+      + `if the stock moves ${sigmaText(exit.target_sigma)} in the trade's direction or ${sigmaText(exit.stop_sigma)} against it, `
+      + 'with the same IV and before time decay.',
+    target: {
+      price: optionAlertMoney(exit.target_price),
+      stock: `If ${underlyer} ${optionAlertMoney(exit.stock_target)} (${signed(exit.stock_target, exit.target_sigma)})`,
+      note: `${optionAlertMoney(exit.target_price_at_exit)} if reached at the ${clock} ET exit`,
+    },
+    stop: {
+      price: optionAlertMoney(exit.stop_price),
+      stock: `If ${underlyer} ${optionAlertMoney(exit.stock_stop)} (${signed(exit.stock_stop, exit.stop_sigma)})`,
+      note: breakeven,
+    },
+    rewardRisk: exit.reward_risk ?? null,
+  }
 }

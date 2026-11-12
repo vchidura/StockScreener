@@ -1013,6 +1013,9 @@ export interface EquitySecurityProfileResponse {
     share_class_figi: string | null
   } | null
   fundamental_reports: FundamentalReport[]
+  /** Set when the workspace kept only the newest periods that fit its size bound (Nov 10, G37). */
+  fundamental_reports_status?: string
+  fundamental_reports_available?: number
 }
 
 export interface TickerOverviewRow {
@@ -1923,13 +1926,17 @@ export const getLatestQuote = async (ticker: string, refresh = false, snapshotId
   return response.data
 }
 
+export const FINANCIAL_REPORT_LIMIT = 40
+
 export const getEquitySecurityProfile = async (
   ticker: string,
   snapshotId?: string,
   closingView = false,
 ): Promise<EquitySecurityProfileResponse> => {
   const response = await api.get(`/equity/security/${ticker}`, {
-    params: retainedTickerParams({ report_limit: 12 }, snapshotId, closingView),
+    // Nov 12 (TP14): the publication keeps up to 30 reports (12 quarterly, 6 annual, 12 TTM); 12 across all three
+    // skipped quarters (AAPL showed Q4/Q3 only).
+    params: retainedTickerParams({ report_limit: FINANCIAL_REPORT_LIMIT }, snapshotId, closingView),
   })
   return response.data
 }
@@ -2448,7 +2455,8 @@ export interface OptionFlowStrike {
 }
 
 export interface OptionFlowContract {
-  contract_id: number
+  /** Null for a full-chain (breadth) contract outside the catalog (OF3, Nov 12); `contract_ticker` identifies a row. */
+  contract_id: number | null
   contract_ticker: string
   contract_type: 'CALL' | 'PUT'
   expiration_date: string
@@ -2896,6 +2904,33 @@ export interface OptionCurrentMark {
   execution_permission: false
 }
 
+/** OA2 (Nov 12): model exit estimate for a single bought contract whose detector sets no stop or target (O1). Prices
+ * per share; the stock levels are the expected move to the exit deadline (spot x IV x sqrt(time)); not a fill. */
+export interface OptionAlertModelExit {
+  status: 'AVAILABLE' | 'UNAVAILABLE'
+  reason: string | null
+  policy_version: string
+  basis: 'EXPECTED_MOVE_TO_EXIT'
+  target_sigma: number
+  stop_sigma: number
+  per: 'SHARE'
+  not_a_fill: true
+  valuation_time?: string
+  exit_at?: string
+  iv?: number
+  spot?: string
+  expected_move?: string
+  stock_target?: string
+  stock_stop?: string
+  entry_price?: string
+  target_price?: string
+  stop_price?: string
+  target_price_at_exit?: string
+  reward_risk?: number | null
+  breakeven_stock_at_exit?: string | null
+  breakeven_sigma_at_exit?: number | null
+}
+
 export interface OptionDetectorAlertReview {
   version: 'option_detector_alert_review_v2'
   dataset_id: string
@@ -2935,6 +2970,7 @@ export interface OptionDetectorAlertReview {
     current_mark: OptionCurrentMark | null;
     observation?: OptionLocalSurfaceObservation | OptionO3CreditObservation;
     outcome_status: 'NOT_BOUND_TO_PROSPECTIVE_OUTCOMES'; net_return: null; fill: null;
+    model_exit?: OptionAlertModelExit | null;
   }>
 }
 

@@ -529,6 +529,35 @@ test('Day History current price is per share and signed like the trigger price (
   assert.equal(model.optionMarkAge(null), 'Age unavailable')
   const page = readFileSync(new URL('../src/pages/OptionsAlertsPage.tsx', import.meta.url), 'utf8')
   assert.match(page, /optionCurrentPackagePrice\(mark, legs, originalNetPremium\)/)
-  assert.match(page, />Not set<small>No stop \/ target rule<\/small>/)
+  // OA2 (Nov 12): a row without a rule or model estimate still reads "No stop / target rule".
+  assert.match(page, />Not set<small>\{model \? model\.reason : 'No stop \/ target rule'\}<\/small>/)
   assert.doesNotMatch(page, /-Number\(mark\.package_price\)/)
+})
+
+test('OA2: the model exit estimate reads as target and stop with the stock level and sigma it assumes', () => {
+  // NVDA 172.5P bought at $1.595 on Nov 11 09:43 ET (served row valued on the r92 copy).
+  const exit = {
+    status: 'AVAILABLE', reason: null, policy_version: 'options-alert-model-exit-v1', basis: 'EXPECTED_MOVE_TO_EXIT',
+    target_sigma: 1, stop_sigma: 0.5, per: 'SHARE', not_a_fill: true, valuation_time: '2026-11-11T14:43:33.710000+00:00',
+    exit_at: '2026-11-11T21:00:00+00:00', iv: 1.017, spot: '173.09', expected_move: '4.71', stock_target: '168.38',
+    stock_stop: '175.44', entry_price: '1.5950', target_price: '4.5944', stop_price: '0.7699', target_price_at_exit: '4.1237',
+    reward_risk: 3.63, breakeven_stock_at_exit: '170.90', breakeven_sigma_at_exit: 0.46,
+  }
+  const view = model.optionModelExitView(exit, 'NVDA')
+  const plain = text => text.replace(/ /g, ' ')  // ICU puts a narrow no-break space before AM/PM
+  assert.equal(view.available, true)
+  assert.equal(view.target.price, '$4.59')
+  assert.equal(view.target.stock, 'If NVDA $168.38 (−1σ)')
+  assert.equal(plain(view.target.note), '$4.12 if reached at the 4:00 PM ET exit')
+  assert.equal(view.stop.price, '$0.77')
+  assert.equal(view.stop.stock, 'If NVDA $175.44 (+0.5σ)')
+  assert.equal(plain(view.stop.note), 'Breakeven by 4:00 PM ET: NVDA $170.90 (0.46σ move)')
+  assert.match(plain(view.title), /^Model estimate, not a fill\. NVDA expected move to the 4:00 PM ET exit: \$4\.71/)
+  assert.equal(view.rewardRisk, 3.63)
+  assert.deepEqual(model.optionModelExitView({ ...exit, status: 'UNAVAILABLE', reason: 'VALUATION_INPUT_UNAVAILABLE' }, 'NVDA'),
+    { available: false, reason: 'Valuation input unavailable' })
+  assert.equal(model.optionModelExitView(null, 'NVDA'), null)
+  const page = readFileSync(new URL('../src/pages/OptionsAlertsPage.tsx', import.meta.url), 'utf8')
+  assert.equal(page.match(/row\.model_exit, row\.underlyer\)/g)?.length, 2)
+  assert.match(page, /Model estimate \/ share \/ not a fill/)
 })

@@ -1,10 +1,12 @@
 import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
+import { useIsFetching, useQueryClient } from '@tanstack/react-query'
 import { NavLink, useLocation, useSearchParams } from 'react-router-dom'
+import { refreshPortalIdentity, usePortalIdentity } from '../services/portalIdentity'
 import { ChevronDown, ChevronLeft, ChevronRight, LogIn, Menu, Moon, PanelLeftClose, PanelLeftOpen, RotateCcw, Sun } from 'lucide-react'
 import GlobalSearch from './GlobalSearch'
 import { StalenessBanner } from './StalenessBanner'
 import { PageContextSetter, type PageContextValue } from './pageContext'
-import { formatMarketTime, sessionLabel, useSessionDate } from './sessionDate'
+import { formatMarketStamp, marketSessionOpen, sessionLabel, useSessionDate } from './sessionDate'
 import {
   BRAND_MARK,
   BRAND_NAME,
@@ -50,6 +52,45 @@ function storedExpandedGroups(pathname: string): Set<string> {
   return new Set(activeGroup && activeGroup !== 'console' ? [activeGroup] : [])
 }
 
+/**
+ * Nov 12 (user): one refresh control in every page header. On a past session it returns to the latest session (as
+ * the All Tickers icon did); on the latest it reloads the page's data in place (portal identity, then every query).
+ */
+function RefreshButton({ historical, toLatest }: { historical: boolean; toLatest?: () => void }) {
+  const queryClient = useQueryClient()
+  const fetching = useIsFetching() > 0
+  const realtimeOnly = import.meta.env.VITE_REALTIME_ONLY === 'true'
+  const refresh = async () => {
+    if (historical && toLatest) {
+      toLatest()
+      return
+    }
+    if (realtimeOnly) {
+      try {
+        await refreshPortalIdentity()
+      } catch {
+        // The identity poll retries on its own; the page's reads still refresh below.
+      }
+    }
+    await queryClient.invalidateQueries()
+  }
+  const label = historical && toLatest ? 'Return to the latest session' : 'Refresh this page'
+  return (
+    <button type="button" className={`tm-refresh${fetching ? ' is-busy' : ''}`} onClick={() => void refresh()}
+      aria-label={label} title={label}>
+      <RotateCcw size={14} aria-hidden="true" />
+    </button>
+  )
+}
+
+/** A page without session selection shows the latest stored session as a fixed date. */
+function StaticSession() {
+  const { date } = useSessionDate()
+  return <div className="tm-session tm-session--static" title="Latest stored trading session">
+    <span className="tm-session__value">{sessionLabel(date)}</span>
+  </div>
+}
+
 function SessionStepper({ interval }: { interval: string }) {
   const { date, sessions, isLatest, canStepBack, canStepForward, step, reset, requestInterval, choose, isStrategy, isTicker, isPattern, isAllTickers, error } = useSessionDate()
 
@@ -92,10 +133,7 @@ function SessionStepper({ interval }: { interval: string }) {
       >
         <ChevronRight size={15} aria-hidden="true" />
       </button>
-      {(isStrategy || isTicker || isPattern || isAllTickers) && <button type="button" onClick={reset} disabled={isLatest}
-        aria-label="Return to latest trading session" title="Return to latest trading session">
-        <RotateCcw size={14} aria-hidden="true" />
-      </button>}
+      <RefreshButton historical={!!date && sessions.length > 0 && date !== sessions[sessions.length - 1]} toLatest={reset} />
     </div>{error && <span role="alert">{error}</span>}</>
   )
 }
@@ -108,7 +146,7 @@ function storedCollapsed(): boolean {
   }
 }
 
-function AlertSessionStepper({ dates, selected, source, emptyLabel = 'No publications', resetKeys = [], datasetByDate = {}, sessionRollup = false, historicalView, historicalSource }: NonNullable<PageContextValue['alertSessions']>) {
+function AlertSessionStepper({ dates, selected, emptyLabel = 'No publications', resetKeys = [], datasetByDate = {}, sessionRollup = false, historicalView, historicalSource }: NonNullable<PageContextValue['alertSessions']>) {
   const [params, setParams] = useSearchParams()
   const index = dates.indexOf(selected)
   const choose = (session: string) => {
@@ -136,19 +174,63 @@ function AlertSessionStepper({ dates, selected, source, emptyLabel = 'No publica
       {[...dates].reverse().map(date => <option key={date} value={date}>{sessionLabel(date)}</option>)}
     </select>
     <button type="button" title="Next alert session" aria-label="Next alert session" disabled={index < 0 || index === dates.length - 1} onClick={() => choose(dates[index + 1])}><ChevronRight size={15} /></button>
-    <button type="button" title={source === 'REPLAY' ? 'Return to latest replay session' : 'Return to latest alert session'} aria-label="Return to latest alert session" disabled={index < 0 || index === dates.length - 1} onClick={() => choose(dates[dates.length - 1])}><RotateCcw size={14} /></button>
+    <RefreshButton historical={index >= 0 && index < dates.length - 1} toLatest={() => choose(dates[dates.length - 1])} />
   </div>
 }
 
-function MarketDataStamp() {
+/** Whether the header is showing a past session (alert pages list their own sessions). A date in the address that is
+ * the newest session (links between ticker pages and All Tickers carry one) is not a past session. */
+function useHistoricalSelection(context: PageContextValue) {
+  const { date, sessions } = useSessionDate()
+  const alerts = context.alertSessions
+  if (alerts) return !!alerts.selected && alerts.dates.length > 0 && alerts.selected !== alerts.dates[alerts.dates.length - 1]
+  return !!context.session && !!date && sessions.length > 0 && date !== sessions[sessions.length - 1]
+}
+
+/**
+ * Nov 12 (user): the same right side on every page header: Market data (newest stored bar, Eastern time), Mode under
+ * it, then the session picker where the page supports one (a fixed date otherwise) and the refresh control.
+ */
+function HeaderMarketPanel({ context, realtimeOnly }: { context: PageContextValue; realtimeOnly: boolean }) {
   const { dataAsOf, dataInterval } = useSessionDate()
-  if (!dataAsOf) return null
+  const identity = usePortalIdentity()
+  const { pathname } = useLocation()
+  const historical = useHistoricalSelection(context)
+  // Nov 12 (user): one stamp, one format, the latest data we have. Each page's session list used to supply it, and
+  // they disagree (`/trading-sessions` gives a date only). The realtime portal shows the newest published window:
+  // its cutoff, Equity's on stock pages and Options' on Options pages, updated as each window publishes.
+  const optionsPage = pathname === '/options' || pathname.startsWith('/options/')
+  const publication = optionsPage ? identity?.options : identity?.equity
+  const stamp = realtimeOnly ? publication?.cutoff ?? null : dataAsOf
+  const stampTitle = realtimeOnly
+    ? `Latest published ${optionsPage ? 'Options' : 'Equity'} data window (cutoff, Eastern time)`
+    : `Newest stored bar across all intervals${dataInterval ? ` (${dataInterval})` : ''}`
+  // Nov 12 (user): Real-Time while the market session runs; Session close off hours (the last session's closing data
+  // is what is shown) and whenever a past session is picked. The identity poll re-renders this every minute.
+  const open = realtimeOnly && marketSessionOpen(publication)
+  const closed = historical || (realtimeOnly && !open)
+  const mode = context.mode ?? (closed ? 'Session close' : realtimeOnly ? 'Real-Time' : 'Research')
+  const modeTitle = context.modeTitle ?? (historical
+    ? 'A past session is selected: its closing data is shown.'
+    : closed ? 'Market closed: the last session\'s closing data is shown. Real-Time from 9:30 AM to 4:00 PM ET on trading days.'
+      : realtimeOnly ? 'Market open: the newest published data, updated as each window publishes.' : undefined)
   return (
-    <div className="tm-datastamp">
-      <span>Market data</span>
-      <strong title={`Newest stored bar across all intervals${dataInterval ? ` (${dataInterval})` : ''}`}>
-        {formatMarketTime(dataAsOf)}
-      </strong>
+    <div className="tm-market">
+      <dl className="tm-market__meta">
+        <div>
+          <dt>Market data</dt>
+          <dd title={stampTitle}>{stamp ? formatMarketStamp(stamp) : '—'}</dd>
+        </div>
+        <div>
+          <dt>Mode</dt>
+          <dd title={modeTitle} className={closed || context.mode ? 'is-alternate' : undefined}>{mode}</dd>
+        </div>
+      </dl>
+      <div className="tm-market__controls">
+        {context.alertSessions ? <AlertSessionStepper {...context.alertSessions} />
+          : context.session ? <SessionStepper interval={context.session} />
+            : <><StaticSession /><RefreshButton historical={false} /></>}
+      </div>
     </div>
   )
 }
@@ -401,20 +483,7 @@ export default function AppShell({ children, realtimeOnly = false }: { children:
               {pageContext.detail && <p>{pageContext.detail}</p>}
             </div>
             <div className="tm-contextbar__status">
-              {pageContext.status?.map(entry => (
-                <div key={entry.label}>
-                  <span>{entry.label}</span>
-                  <strong
-                    title={entry.title}
-                    style={entry.tone ? { color: entry.tone === 'positive' ? 'var(--tm-pos)' : 'var(--tm-neg)' } : undefined}
-                  >
-                    {entry.value}
-                  </strong>
-                  {entry.note && <small>{entry.note}</small>}
-                </div>
-              ))}
-              {pageContext.alertSessions ? <AlertSessionStepper {...pageContext.alertSessions} /> : <MarketDataStamp />}
-              {pageContext.session && <SessionStepper interval={pageContext.session} />}
+              <HeaderMarketPanel context={pageContext} realtimeOnly={realtimeOnly} />
             </div>
           </section>
         )}

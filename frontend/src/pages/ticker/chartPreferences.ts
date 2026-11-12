@@ -2,7 +2,7 @@ import { useCallback, useRef } from 'react'
 import { useSearchParams } from 'react-router-dom'
 import type { FormingChartPattern } from '../../services/api'
 import {
-  CHART_INTERVALS, PATTERN_INTERVAL_ORDER, defaultPeriodForInterval,
+  CHART_INTERVALS, defaultPeriodForInterval,
   parsePatternChoice, patternChoiceValue, supportsPatternInterval,
 } from './tickerShared'
 
@@ -11,12 +11,10 @@ export const CHART_PERIODS = ['1d', '5d', '1mo', '3mo', '6mo', '1y', '2y', '5y']
 export function readChartPreferences(params: URLSearchParams) {
   const interval: string = CHART_INTERVALS.find(value => value === params.get('interval')) ?? '1d'
   const period: string = CHART_PERIODS.find(value => value === params.get('period')) ?? defaultPeriodForInterval(interval)
-  const analysisPin = params.get('analysis_interval')
   const pattern = params.get('pattern')
   return {
     interval,
     period,
-    analysisPin: analysisPin && PATTERN_INTERVAL_ORDER.some(value => value === analysisPin) ? analysisPin : null,
     showRsi: params.get('rsi') === 'on',
     showAutoPatterns: params.get('patterns') === 'on',
     showPriceChannel: params.get('channel') === 'on' && interval !== '1m',
@@ -58,8 +56,8 @@ export function writeChartPreferences(previous: URLSearchParams, changes: Partia
   next.set('patterns', state.showAutoPatterns ? 'on' : 'off')
   next.set('channel', state.showPriceChannel && state.interval !== '1m' ? 'on' : 'off')
   next.set('rsi', state.showRsi ? 'on' : 'off')
-  if (state.analysisPin) next.set('analysis_interval', state.analysisPin)
-  else next.delete('analysis_interval')
+  // Nov 12 (TP1): analysis always follows the chart interval; links saved with the old pin drop it on the next write.
+  next.delete('analysis_interval')
   const choice = parsePatternChoice(state.patternSelection)
   if (state.patternSelection === 'all') next.set('pattern', 'all')
   else if (choice) next.set('pattern', choice.type)

@@ -6,8 +6,7 @@ import { ColumnPicker } from '../layout/PageChrome'
 import { optionsDataTierLabel, queryEligibleChain, type EligibleChainRow, type EligibleChainRequest, type OptionDiscoveryCatalog } from '../services/api'
 import { Modal } from './ScreenLibrary'
 import { builtinScreenRuleLabels, chainFilterRanges, serverScreenOverrides, columnsForView, independentScreenQuery, makeOptionsScreen, optionColumnPresets, optionContractDetailSections, optionRuleLabels, optionTemplates, OPTIONS_LIBRARY_KEY, serverScreenFor, readOptionsLibrary, screenQuery, visibleOptionsColumns, writeOptionsLibrary, type OptionsLibrary, type OptionsScreen, type OptionsView } from './optionsScreenLibrary'
-import { optionAlertMoney, optionAlertPercent, optionAlertTime } from './optionsAlertPresentation'
-import { publicationPath } from './publicationNavigation'
+import { optionAlertMoney, optionAlertPercent, optionAlertTime, optionFlowPath } from './optionsAlertPresentation'
 import './StockScreeningPage.css'
 
 type ControlsProps = { catalog?: OptionDiscoveryCatalog; params: URLSearchParams; setParams: SetURLSearchParams }
@@ -308,7 +307,8 @@ export function OptionsChainResults({ catalog, params, setParams, sessionDate, r
   function cell(row: EligibleChainRow, key: string): ReactNode {
     if (key === 'contract') return <><strong className={row.contract_type === 'CALL' ? 'os-positive' : 'os-negative'}>{row.strike} {row.contract_type}</strong><small>{row.expiration_date}</small><small title={row.contract_ticker}>{row.contract_ticker}</small></>
     if (key === 'market_data_time') return <span title={`Observed ${timestamp(row.first_observed_at)} ET / ${readable(row.mark_source)}`}>{timestamp(row.market_data_time)}</span>
-    if (key === 'underlying') return <Link to={publicationPath(`/ticker/${encodeURIComponent(row.underlying)}`, params.get('snapshot_id') ?? undefined, params.get('cohort_id') ?? undefined)} title={`Open ${row.underlying} ticker page`}>{row.underlying}</Link>
+    // Nov 12 (user): the ticker opens its Options Flow (it opened the stock ticker page).
+    if (key === 'underlying') return <Link to={optionFlowPath(row.underlying)} title={`Open ${row.underlying} Options Flow`}>{row.underlying}</Link>
     if (key === 'mark_market_data_time' || key === 'first_observed_at') return optionAlertTime(row[key])
     if (key === 'mark_source') return row.mark_source ? readable(row.mark_source) : 'Unavailable'
     if (key === 'quality_flags') return row.quality_flags?.length ? row.quality_flags.map(readable).join(' / ') : 'None recorded'

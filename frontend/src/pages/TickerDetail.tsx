@@ -58,7 +58,6 @@ import {
   StructureRead,
   Tile,
   VolatilityTrack,
-  VolumeSparkline,
   WARN,
   WARN_SOFT,
   DirectionStrengthTrack,
@@ -70,6 +69,7 @@ import {
   defaultPeriodForInterval,
   formatChartTick,
   formatChartTime,
+  formatQuoteTime,
   formatTickerReadError,
   getVisibleChartData,
   gradeTone,
@@ -87,6 +87,8 @@ import {
 import { NO_TREND_ADX, trendLabel } from './setupPresentation'
 import { buildTradePlan, evaluatePlan } from './ticker/tickerPlan'
 import PriceLadder, { type LadderBadge, type LadderRow } from './ticker/PriceLadder'
+import { Abbr, AbbreviationLegend, TIMEFRAME_TERMS } from './ticker/tickerGlossary'
+import { VolumeFlowRead } from './ticker/VolumeFlow'
 import { resolveChartTheme, useChartTheme } from './ticker/chartTheme'
 import { confluenceZonesAtPrice, fibonacciPriceContext } from './ticker/priceContext'
 import { CHART_PERIODS, selectChartPatterns, useChartPreferences } from './ticker/chartPreferences'
@@ -122,7 +124,7 @@ function TickerDetail({ view, publication, readsEnabled = true, publicationLoadi
   const snapshotId = publication?.snapshot_id
   const closingView = publication?.read_mode === 'SESSION_CLOSE'
   const queryScope = realtimeOnly ? [publication?.cohort_id, snapshotId, ...(closingView ? ['session_close'] : [])] : []
-  const { period, interval, analysisPin, showRsi, showAutoPatterns, showPriceChannel, patternSelection, updateChartPreferences } = useChartPreferences()
+  const { period, interval, showRsi, showAutoPatterns, showPriceChannel, patternSelection, updateChartPreferences } = useChartPreferences()
   const chartContainerRef = useRef<HTMLDivElement>(null)
   const chartRef = useRef<IChartApi | null>(null)
   const candleSeriesRef = useRef<ISeriesApi<'Candlestick'> | null>(null)
@@ -274,10 +276,8 @@ function TickerDetail({ view, publication, readsEnabled = true, publicationLoadi
   const selectableSetupIntervals: readonly string[] = setups['30m']
     ? [...SETUP_INTERVALS, '30m']
     : SETUP_INTERVALS
-  // Resolved before the setup lookup so the pin and the chart cannot disagree about which frame is read.
-  const analysis = analysisPin
-    ? { interval: analysisPin, snapped: false }
-    : resolveAnalysisInterval(interval, selectableSetupIntervals)
+  // Nov 12 (TP1): analysis always follows the chart interval; finer intervals read the nearest published frame.
+  const analysis = resolveAnalysisInterval(interval, selectableSetupIntervals)
   const setupInterval = analysis.interval
   const tradeSetup = multiSetup?.setups[setupInterval as SetupTimeframe] ?? null
   const tradeSetupError = multiSetup?.errors[setupInterval as SetupTimeframe] ?? null
@@ -949,6 +949,19 @@ function TickerDetail({ view, publication, readsEnabled = true, publicationLoadi
           )}
           {visibleChartData.length > 0 && (
             <div className="tk-stats">
+              {/* Nov 12 (user): the close price, moved here from the page header, comes before Period high. */}
+              {displayPrice !== null && (
+                <div className="tk-stats__close" title={latestQuote ? `As of ${formatQuoteTime(latestQuote)}` : 'Last chart bar'}>
+                  <span>{realtimeOnly ? 'Close' : 'Last'}</span>
+                  {/* The price and its day change take the change's colour: green up, red down. */}
+                  <strong style={Number.isFinite(priceChange) ? { color: priceChange >= 0 ? POS : NEG } : undefined}>
+                    {money(displayPrice)}
+                    {Number.isFinite(priceChangePercent) && (
+                      <small>{` ${priceChangePercent >= 0 ? '+' : ''}${priceChangePercent.toFixed(2)}%`}</small>
+                    )}
+                  </strong>
+                </div>
+              )}
               {[
                 { label: 'Period high', value: `$${Math.max(...visibleChartData.map(d => d.high)).toFixed(2)}`, color: POS },
                 { label: 'Period low', value: `$${Math.min(...visibleChartData.map(d => d.low)).toFixed(2)}`, color: NEG },
@@ -1356,53 +1369,16 @@ function TickerDetail({ view, publication, readsEnabled = true, publicationLoadi
       {/* Trade Setup Analysis */}
       {view !== 'financials' && (
       <section className="tk-panel tk-panel--analysis">
-        <div className="tk-analysis-bar">
-          <label className="tk-field">
-            <span>Analysis timeframe</span>
-            <select
-              className="tk-select"
-              value={analysisPin ?? ''}
-              onChange={event => updateChartPreferences({ analysisPin: event.target.value || null })}
-            >
-              <option value="">Follow chart</option>
-              {analysisPin && !selectableSetupIntervals.includes(analysisPin) && <option value={analysisPin} disabled>
-                {PATTERN_INTERVAL_LABEL[analysisPin] ?? analysisPin} · {publicationLoading || setupLoading ? 'Loading…' : 'Unavailable'}
-              </option>}
-              {selectableSetupIntervals.map(value => (
-                <option key={value} value={value}>
-                  {INTERVAL_NOUN[value] ?? PATTERN_INTERVAL_LABEL[value] ?? value}
-                </option>
-              ))}
-            </select>
-          </label>
-          <Pill
-            text={analysisPin
-              ? `Pinned to ${analysisLabel}`
-              : analysis.snapped
-                ? `${analysisLabel} · nearest published to ${interval}`
-                : `Following chart · ${analysisLabel}`}
-            tone={analysisPin ? INFO : analysis.snapped ? WARN : MUTED}
-            title={analysisPin
-              ? `Analysis stays on ${setupInterval} regardless of the ${interval} chart.`
-              : analysis.snapped
-                ? `No analysis is published on ${interval}; ${setupInterval} is the nearest published frame.`
-                : 'Analysis follows the chart interval.'}
-          />
-          {analysisPin && (
-            <button type="button" className="tk-toggle" onClick={() => updateChartPreferences({ analysisPin: null })}>
-              Follow chart
-            </button>
-          )}
-          {tradeSetup && setupReadMetrics?.status === 'STALE' && (
-            <Pill
-              text="Stale analysis"
-              tone={WARN}
-              title={`Last published ${analysisLabel} analysis at ${setupReadMetrics.market_time ?? tradeSetup.date}. Awaiting the next completed publication; signals and swing anchors have not been recalculated at the current quote.`}
-            />
-          )}
-        </div>
-
         <div className="tk-panel__body">
+        {tradeSetup && setupReadMetrics?.status === 'STALE' && (
+          <p role="status" className="tk-analysis-note">
+            <Pill text="Stale analysis" tone={WARN} />
+            <span>
+              Last published {analysisLabel} analysis at {setupReadMetrics.market_time ?? tradeSetup.date}. Awaiting the next
+              completed publication; signals and swing anchors have not been recalculated at the current quote.
+            </span>
+          </p>
+        )}
         {availabilityError && tradeSetup && <p role="alert" style={{ color: MUTED, padding: '0.5rem' }}>{availabilityError}</p>}
         {(publicationLoading || setupLoading) && !tradeSetup && (
           <div role="status" style={{ color: MUTED, padding: '2rem' }}>
@@ -1529,6 +1505,7 @@ function TickerDetail({ view, publication, readsEnabled = true, publicationLoadi
                     </div>
                     <span style={{ fontSize: '0.72rem', color: MUTED }}>
                       Nearest technical stop and first target on {INTERVAL_NOUN[setupInterval] ?? setupInterval} bars
+                      {analysis.snapped ? ` · nearest published to the ${interval} chart` : ''}
                     </span>
                   </div>
 
@@ -1686,7 +1663,7 @@ function TickerDetail({ view, publication, readsEnabled = true, publicationLoadi
                             ['Structure', 'Newest active confirmed chart pattern plus elevated-volume pivot count and Fibonacci overlap'],
                             ['Direction', 'Completed-bar ADX(14) trend strength with +DI and −DI directional control'],
                             ['Momentum', 'RSI and MACD state'],
-                            ['Volume flow', '5-vs-20 completed-bar volume, completed-bar RVOL, 8-bar slope and CMF'],
+                            ['Volume flow', 'Participation: the last 8 completed bars against their 20-bar average (dashed line = 1×), RVOL of the newest bar and the 5-vs-20-bar trend. Pressure: Chaikin Money Flow (20), sell to buy.'],
                             ['Volatility', 'Annualized 20-bar historical volatility, trailing percentile and ATR percentage'],
                           ].map(([label, description], index) => (
                             <th
@@ -1734,29 +1711,11 @@ function TickerDetail({ view, publication, readsEnabled = true, publicationLoadi
                                 />
                               </td>
                               <td>
-                                <strong>RSI {setup.technicals.rsi.toFixed(1)}</strong>
-                                <div style={{ color: MUTED, fontSize: '10px' }}>{macdLabel}</div>
+                                <strong><Abbr term="RSI" /> {setup.technicals.rsi.toFixed(1)}</strong>
+                                <div style={{ color: MUTED, fontSize: '10px' }}><Abbr term="MACD" /> {macdLabel}</div>
                               </td>
                               <td>
-                                <div style={{ display: 'flex', alignItems: 'center', gap: '0.45rem', minWidth: 190 }}>
-                                  <VolumeSparkline
-                                    values={setup.technicals.volume_sparkline}
-                                    state={setup.technicals.volume_trend_state}
-                                    slopeState={setup.technicals.volume_slope_state}
-                                  />
-                                  <div>
-                                    <strong style={{ color: setup.technicals.volume_trend_state === 'EXPANDING' ? INFO : setup.technicals.volume_trend_state === 'CONTRACTING' ? WARN : INK }}>
-                                      {setup.technicals.volume_trend_state.toLowerCase()}
-                                      {setup.technicals.volume_trend_pct !== null ? ` ${signedPct(setup.technicals.volume_trend_pct, 0)}` : ''}
-                                    </strong>
-                                    <div style={{ color: MUTED, fontSize: '10px' }}>
-                                      {setup.technicals.relative_volume === null ? '—' : `${setup.technicals.relative_volume.toFixed(2)}× last completed`}
-                                    </div>
-                                    <div style={{ color: MUTED, fontSize: '10px' }}>
-                                      {setup.technicals.volume_slope_state.toLowerCase()} slope · {setup.technicals.volume_pressure.toLowerCase()}
-                                    </div>
-                                  </div>
-                                </div>
+                                <VolumeFlowRead technicals={setup.technicals} intraday={timeframe === '30m' || timeframe === '1h'} />
                               </td>
                               <td>
                                 <VolatilityTrack
@@ -1772,6 +1731,7 @@ function TickerDetail({ view, publication, readsEnabled = true, publicationLoadi
                       </tbody>
                     </table>
                   </div>
+                  <AbbreviationLegend terms={TIMEFRAME_TERMS} />
                 </>
               )
             })()}

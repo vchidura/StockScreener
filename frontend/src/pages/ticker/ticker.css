@@ -130,8 +130,7 @@
   overflow: hidden;
 }
 
-.tk-panel__bar,
-.tk-analysis-bar {
+.tk-panel__bar {
   display: flex;
   align-items: center;
   gap: 10px;
@@ -242,32 +241,29 @@
   font-variant-numeric: tabular-nums;
 }
 
-.tk-field {
-  display: grid;
-  gap: 3px;
-}
-
-.tk-field > span {
-  color: var(--tm-faint);
-  font-size: 8.5px;
-  font-weight: 800;
-  letter-spacing: 0.1em;
-  text-transform: uppercase;
-}
-
-.tk-analysis-meta {
-  display: grid;
-  gap: 1px;
-  min-width: 0;
-}
-
-.tk-analysis-meta span {
-  color: var(--tm-muted);
+/* The close's day change beside the price (Nov 12, moved from the page header). */
+.tk-stats strong small {
+  margin-left: 2px;
   font-size: 10.5px;
+  font-weight: 700;
 }
 
-.tk-analysis-bar > :last-child {
-  margin-left: auto;
+/* The close stands apart, left of the period stats, its price starting under its label (user, Nov 12). */
+.tk-stats > .tk-stats__close {
+  margin-right: 10px;
+  padding-right: 22px;
+  border-right: 1px solid var(--tm-line);
+  text-align: left;
+}
+
+.tk-analysis-note {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  margin: 0 0 10px;
+  color: var(--tm-muted);
+  font-size: 11px;
+  line-height: 1.45;
 }
 
 /* Hairline metric grid: the 1px gap over a line-coloured background draws the dividers. */
@@ -583,30 +579,147 @@
   font-variant-numeric: tabular-nums;
 }
 
-.ticker-table--statement {
-  margin-bottom: 14px;
+.ticker-panel__body {
+  padding: 12px 13px;
 }
 
-.ticker-table--statement caption {
-  padding: 6px 0;
-  color: var(--tm-ink);
-  font-size: 11px;
-  font-weight: 800;
-  text-align: left;
+.ticker-panel__segment {
+  flex: 0 0 auto;
+  align-self: center;
+}
+
+/* Nov 12 (TP15): one table for all statements; fixed layout so every section shares the same columns. */
+.ticker-table--statement {
+  margin-bottom: 10px;
+  table-layout: fixed;
 }
 
 .ticker-table--statement tbody th {
+  overflow: hidden;
   color: var(--tm-ink);
   background: transparent;
   font-size: 11px;
   font-weight: 500;
   letter-spacing: 0;
+  text-overflow: ellipsis;
   text-transform: none;
 }
 
 .ticker-table--statement td,
 .ticker-table--statement thead th:not(:first-child) {
   text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.ticker-table--statement tr.ticker-statement__section th {
+  height: auto;
+  padding: 12px 10px 5px;
+  color: var(--tm-ink);
+  background: transparent;
+  border-bottom: 1px solid var(--tm-line-strong);
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.ticker-table__note--inline {
+  margin: 0 0 8px;
+  text-transform: none;
+}
+
+/* Abbreviations (Nov 12, TP7): hover titles and collapsible legends. */
+.tk-abbr {
+  text-decoration: underline dotted;
+  text-decoration-color: var(--tm-line-strong);
+  text-underline-offset: 2px;
+  cursor: help;
+}
+
+.tk-legend {
+  margin: 8px 0 0;
+  padding: 6px 10px;
+  color: var(--tm-muted);
+  font-size: 10.5px;
+}
+
+.tk-legend summary {
+  width: fit-content;
+  cursor: pointer;
+}
+
+.tk-legend summary:focus-visible {
+  outline: 2px solid var(--tm-ink);
+  outline-offset: 3px;
+}
+
+.tk-legend dl {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 300px), 1fr));
+  gap: 6px 18px;
+  margin: 8px 0 2px;
+}
+
+.tk-legend dl > div {
+  display: grid;
+  grid-template-columns: 74px minmax(0, 1fr);
+  gap: 8px;
+}
+
+.tk-legend dt {
+  color: var(--tm-ink);
+  font-weight: 800;
+}
+
+.tk-legend dd {
+  margin: 0;
+  line-height: 1.45;
+}
+
+.tk-legend dd strong {
+  color: var(--tm-ink);
+  font-weight: 600;
+}
+
+/* Volume flow (Nov 12, TP11): participation and pressure side by side. */
+.tk-volflow {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(118px, auto));
+  gap: 4px 14px;
+  min-width: 250px;
+}
+
+.tk-volflow__read {
+  display: grid;
+  gap: 2px;
+  align-content: start;
+}
+
+.tk-volflow__label {
+  color: var(--tm-faint);
+  font-size: 8.5px;
+  font-weight: 800;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+
+.tk-volflow__picture {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 28px;
+  font-variant-numeric: tabular-nums;
+}
+
+.tk-volflow__caption {
+  font-size: 10px;
+  white-space: nowrap;
+}
+
+.tk-volflow__footnote {
+  grid-column: 1 / -1;
+  color: var(--tm-faint);
+  font-size: 9.5px;
 }
 
 /* Price ladder */

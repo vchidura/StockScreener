@@ -18,7 +18,8 @@ test('Options Screener keeps its original catalog and explicit unavailable chain
   assert.match(library, /'screen', 'builtin', 'session_date', 'cohort_id', 'snapshot_id'/)
   assert.doesNotMatch(workspace + library, /AdvancedOptionsV2|getAdvancedOptionsV2Projection/)
   assert.match(workspace, /<OptionsChainResults catalog=\{catalog\}/)
-  assert.match(library, /publicationPath\(`\/ticker\//)
+  // Nov 12 (user): a ticker opens its Options Flow.
+  assert.match(library, /<Link to=\{optionFlowPath\(row\.underlying\)\}/)
   assert.match(library, /optionsDataTierLabel\(query\.data\?\.data_tier\)/)
   assert.doesNotMatch(library, /delayed model marks/)
 })

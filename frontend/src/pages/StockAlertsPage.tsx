@@ -205,6 +205,9 @@ export default function StockAlertsPage() {
   }
   usePublishPageContext({ eyebrow: 'Stocks', title: 'Stock Alerts',
     status: [{ label: 'Data', value: view === 'eod' ? 'Retained selection evidence' : sourceLabel, title: source === 'REPLAY' ? `Simulated alerts, not delivered live. Prices and outcomes frozen at ${time(data?.as_of)} ET.` : data?.source_label }],
+    // Nov 12: the header's Mode line; simulated alerts must not read Real-Time.
+    ...(view !== 'eod' && source === 'REPLAY' ? { mode: 'Replay',
+      modeTitle: `Simulated alerts, not delivered live. Prices and outcomes frozen at ${time(data?.as_of)} ET.` } : {}),
     alertSessions: view === 'eod'
       ? { dates: eodSessions.dates, selected: eodSessions.selected, source: 'STOCK_EOD_REVIEW', emptyLabel: 'No evaluated sessions', resetKeys: ['offset'], historicalView: 'history', historicalSource: 'SHADOW' }
       : { dates: data?.sessions || [], selected: params.get('session_date') || data?.session || '', source: requestedSource, historicalView: 'history', historicalSource: requestedSource } })

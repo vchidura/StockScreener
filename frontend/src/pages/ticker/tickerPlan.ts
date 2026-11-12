@@ -29,8 +29,12 @@ export function buildTradePlan(setup: TradeSetup): TradePlan | null {
   const above = [...(setup.targets ?? [])].filter(t => t.price > entry).sort((a, b) => a.price - b.price)
   const atr = setup.technicals.atr
 
-  const shortStops = above.filter(level => level.source !== 'ATR')
-  const shortTargets = below.filter(level => level.source !== 'ATR')
+  // Nov 12 (TP2): realtime setups publish directional brackets, so a Bearish setup's stops are already above the
+  // close and its targets below. Reading only the long-side lists left every short with the ATR fallback alone.
+  // Taking every served level by its side of the entry covers both the directional and the older contract.
+  const served = [...(setup.stops ?? []), ...(setup.targets ?? [])].filter(level => level.source !== 'ATR')
+  const shortStops = served.filter(level => level.price > entry)
+  const shortTargets = served.filter(level => level.price < entry)
   if (Number.isFinite(atr) && atr > 0) {
     shortStops.push({ level: 'ATR Stop (1R)', price: entry + atr, source: 'ATR' })
     if (entry - 2 * atr > 0) {

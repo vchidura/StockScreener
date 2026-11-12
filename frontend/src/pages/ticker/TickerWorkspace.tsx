@@ -5,9 +5,9 @@ import TickerDetail, { type TickerView } from '../TickerDetail'
 import EntityRail from './EntityRail'
 import FinancialsView from './FinancialsView'
 import { usePublishPageContext } from '../../layout/pageContext'
-import { getEquitySecurityProfile, getLatestQuote, getOptionEventCalendar, getTickerWorkspacePublication, type TradeSetup } from '../../services/api'
+import { getEquitySecurityProfile, getOptionEventCalendar, getTickerWorkspacePublication, type TradeSetup } from '../../services/api'
 import { usePublicationQuery } from '../publicationNavigation'
-import { formatQuoteTime, type SetupTimeframe } from './tickerShared'
+import { type SetupTimeframe } from './tickerShared'
 import './ticker.css'
 
 const VIEWS: Array<{ value: TickerView; label: string }> = [
@@ -60,12 +60,6 @@ export default function TickerWorkspace() {
     enabled: !!symbol && readsEnabled,
     staleTime: 24 * 60 * 60 * 1000,
   })
-  const { data: quote = null } = useQuery({
-    queryKey: ['latest-quote', symbol, ...queryScope],
-    queryFn: () => getLatestQuote(symbol, false, snapshotId, closingView),
-    enabled: !!symbol && readsEnabled,
-    refetchInterval: realtimeOnly ? false : 60_000,
-  })
   const {
     data: calendar = null,
     isFetching: calendarLoading,
@@ -78,25 +72,14 @@ export default function TickerWorkspace() {
   })
 
   const company = profile?.security?.company_name ?? null
-  const change = quote?.change ?? null
-  const changePercent = quote?.change_percent ?? null
 
+  // Nov 12 (user): the close price moved from the header to the chart's stats, before Period high.
   usePublishPageContext({
     eyebrow: profile?.security?.sector ?? 'Equity',
     title: company ? `${symbol.toUpperCase()} · ${company}` : symbol.toUpperCase(),
     detail: [profile?.security?.primary_exchange, profile?.security?.industry]
       .filter(Boolean)
       .join(' · ') || undefined,
-    status: [
-      {
-        label: realtimeOnly ? 'Close' : 'Last',
-        value: quote
-          ? `$${quote.price.toFixed(2)}${changePercent === null ? '' : `  ${changePercent >= 0 ? '+' : ''}${changePercent.toFixed(2)}%`}`
-          : '—',
-        title: quote ? `As of ${formatQuoteTime(quote)}` : undefined,
-        tone: change === null ? undefined : change >= 0 ? 'positive' : 'negative',
-      },
-    ],
     session: realtimeOnly ? '1d' : undefined,
   })
 

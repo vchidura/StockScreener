@@ -117,7 +117,10 @@ def _top_contract(row):
     premium = _premium(row)
     ratio = _decimal(row.get("volume_open_interest_ratio"))
     return {
-        "contract_id": int(row.get("contract_id") or 0),
+        # OF3 (Nov 12): a contract outside the catalog (not streamed) has no id. The breadth row carries 0 for it, so
+        # many Flow rows shared one id and the page, keyed by it, showed repeated rows. Null says "no id" (catalog ids
+        # start at 1); the contract ticker identifies the row.
+        "contract_id": int(row.get("contract_id") or 0) or None,
         "contract_ticker": row["contract_ticker"],
         "contract_type": row["contract_type"],
         "expiration_date": row["expiration_date"],
