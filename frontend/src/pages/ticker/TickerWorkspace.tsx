@@ -8,6 +8,7 @@ import { usePublishPageContext } from '../../layout/pageContext'
 import { getEquitySecurityProfile, getOptionEventCalendar, getTickerWorkspacePublication, type TradeSetup } from '../../services/api'
 import { usePublicationQuery } from '../publicationNavigation'
 import { type SetupTimeframe } from './tickerShared'
+import { marketWindowBuilding } from '../../utils/refreshTiming'
 import './ticker.css'
 
 const VIEWS: Array<{ value: TickerView; label: string }> = [
@@ -46,9 +47,13 @@ export default function TickerWorkspace() {
   const publicationError = realtimeOnly ? release.error : null
   const referenceWarning = publicationError ?? publication?.section_warnings?.reference ?? null
   const laterActionEvidence = closingView && publication?.action_status === 'CHANGED'
+  // Nov 12 (user): for the minute or two after each 5-minute mark the API reports the previous window as not current
+  // while the new one is being built; within the normal build time the page shows no message (user: no "updating"
+  // text either), and the warning appears only when the window is late.
+  const marketWarning = closingView ? null : publication?.section_warnings?.market
   const technicalWarning = release.error ?? ([
     laterActionEvidence ? null : publication?.section_warnings?.actions,
-    closingView ? null : publication?.section_warnings?.market,
+    marketWarning && !marketWindowBuilding(Date.now(), publication?.market_time) ? marketWarning : null,
   ].filter(Boolean).join(' ') || null)
   const publicationNotice = laterActionEvidence
     ? `This saved view uses the ${publication.session} closing inputs. Newer corporate-action evidence is not included in these frozen inputs.`

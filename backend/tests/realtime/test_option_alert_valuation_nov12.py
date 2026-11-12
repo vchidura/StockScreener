@@ -192,6 +192,24 @@ def test_repository_serves_valuation_reports_it_and_keeps_complete_values():
     assert broken.statements[-1] == "ROLLBACK TO SAVEPOINT options_alert_valuation"
 
 
+def test_valuation_runs_only_with_its_switch_on(monkeypatch):
+    # Nov 12 r95 rehearsal: the API role cannot read rt.advanced_options_reference_states, so OA1/OA2 stay off until
+    # that grant exists. Off: no statement, rows unchanged, no optional read listed (the read as before OA1).
+    from realtime import portal_compatibility_repository as module
+
+    repository = module.RealtimeOptionsAlertsPageRepository.__new__(module.RealtimeOptionsAlertsPageRepository)
+    monkeypatch.delenv(module.OPTIONS_ALERT_VALUATION_SWITCH, raising=False)
+    cursor = _ValuationCursor({("NVDA", "2026-11-11"): INPUT})
+    envelope = {"data": {"rows": [_row()]}}
+    served = repository._advanced_alert_valuation_switched(cursor, envelope)
+    assert served is envelope and cursor.statements == []
+    assert "optional_reads" not in served["data"]
+    assert served["data"]["rows"][0]["original_package"]["legs"][0]["local_iv"] is None
+    monkeypatch.setenv(module.OPTIONS_ALERT_VALUATION_SWITCH, "on")
+    valued = repository._advanced_alert_valuation_switched(cursor, {"data": {"rows": [_row()]}})
+    assert valued["data"]["optional_reads"][0]["status"] == "AVAILABLE"
+
+
 def test_of3_flow_rows_without_a_catalog_id_carry_null():
     from realtime.option_flow_breadth import _top_contract
 

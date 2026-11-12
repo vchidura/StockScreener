@@ -92,6 +92,7 @@ import { VolumeFlowRead } from './ticker/VolumeFlow'
 import { resolveChartTheme, useChartTheme } from './ticker/chartTheme'
 import { confluenceZonesAtPrice, fibonacciPriceContext } from './ticker/priceContext'
 import { CHART_PERIODS, selectChartPatterns, useChartPreferences } from './ticker/chartPreferences'
+import { msUntilMinuteRead } from '../utils/refreshTiming'
 
 export type TickerView = 'overview' | 'timeframes' | 'levels' | 'fibonacci' | 'financials'
 
@@ -184,11 +185,12 @@ function TickerDetail({ view, publication, readsEnabled = true, publicationLoadi
   })
   // Nov 12 (user): the realtime chart's developing bar for 5m-1mo, read once a minute beside the published bars;
   // it is drawn as the provisional last candle and, like before, stays out of indicators and patterns.
+  // Read 5 s after each minute, when the minute's stored 1m bar is there (stored ~2 s after the minute ends).
   const { data: formingBar = null } = useQuery({
     queryKey: ['chart-forming', symbol, interval, ...queryScope],
     queryFn: () => getChartFormingBar(symbol!, interval, snapshotId),
     enabled: !!symbol && readsEnabled && realtimeOnly && !closingView && FORMING_BAR_INTERVALS.has(interval),
-    refetchInterval: 60_000,
+    refetchInterval: () => msUntilMinuteRead(Date.now()),
   })
   const chartData = useMemo(
     () => realtimeOnly && !closingView ? withFormingBar(publishedChartData, formingBar) : publishedChartData,

@@ -1583,3 +1583,404 @@ same tests by name (daily scanner half-gap x2, pattern watch x4, p7 compose file
 passes are `test_option_alert_valuation_nov12.py`. **Frontend** (f29 build image, source mounted): type check clean; 317
 tests, 272 pass, 40 fail; the failing tests are the same by name as on c46f988 (302, 257, 40). Secrets scan of the diff,
 new files and the review doc: clean.
+
+### Nov 12 (09:22-09:24 UTC): r95 and f30 built from cc676d4
+
+**r95** `alpha-research-realtime-v3:stable-nov5-r95-ef7cf74329986b05` = `sha256:2e67bc4c02fe164cbc955feebd845bc7a4da7a1e4530b8664e016075212df3be`
+(= r94 + R52 widened + OA1/OA2 + OF3): role entry points import, policy 2; image code == worktree, 959 files.
+**f30** `alpha-research-realtime-v2-frontend:stable-nov5-f30` = `sha256:66a57dac5fc0a26e3372067bc69e49adf9630efe8d0a273a5026258be8f70410`
+(= f29 + TP1, TP2, TP7, TP11, TP14, TP15, OA2 cells, OF1-OF3, PH1, Options ticker links): 317 tests, 272 pass, 40 fail,
+the same 40 by name as c46f988. Both last lines of their candidate files. Rehearsal, deploy and the session: the new
+live session (`HANDOVER-20261112-LIVE.md` in the ops folder).
+
+### Nov 12 (09:26-09:57 UTC): live session takeover - validation, r95 rehearsal (OA1 fails on the API grant), r96
+
+New live session (`HANDOVER-20261112-LIVE.md`). **Validation, read-only.** Live = handover: API r90 `0e63c082e3bf`,
+scheduler r88 `10cba306c446`, 17 services r85 `74e2c255d715`, frontend f28 `94e17a9762e8`. r95 vs worktree
+(`image_vs_tree.py`): runtime code identical; one test file under `tests/options` differs, 43 base-package leftovers.
+Every `Nov 12: A` row is in c46f988 (R52 widened) or cc676d4 (OA1/OA2, OF3, TP1/2/7/11/14/15, PH1). Deploy inputs: last
+candidate lines r95 / f30; Docker host 852 GB free, C: 368 GB free, backups folder 42 GB. Live (SQL, read-only):
+`ref.risk_free_rate_observations` (`us_treasury_par_yield_v1`) Nov 5, 6, 9, 10 (14 tenors each, received 21:00); Nov 11
+close Equity 78 COMPLETE (+4 FAILED retried), Options 77/77 COMPLETE, 1d bars 25/25 RAW and ADJUSTED; Nov 12 Options
+preparation PREPARING at CATALOG_QUOTE ("provider window is not open; history ready"). Clock (container SNTP) +0.088 s;
+W32Time synced 07:36 UTC. Code read: R52 curve load point in time (`received_at <= known_at`), fault emitter cannot raise;
+a stale curve is used with evidence AVAILABLE and no reason code (log + fault only; row R52.1). OA1 under its own
+savepoint with an optional read (INV-7/9). OF3's null reaches only the API response. **Found:** `runner/close_check.sh`
+ran `data-audit/close_check.sql` hard-coded to 2026-11-05 and reading `rt.bar_current` (the Nov 11 "close check" printed
+Nov 5 rows); now date-relative, daily bars from `rt.bar_revisions` final rows (row Close check).
+**r95 rehearsal** (copy `test_realtime_v2_r92`, Nov 11 close; `rehearse_r92.sh`, switches ON; isolation probed): 19
+running, 0 restarts, 0 error lines, 18 healthy; lifecycle `treasury_refresh` `required_rate_date` 2026-11-10 VERIFIED; API
+smoke 153 routes / 131 OK on the copy and on live, 0 routes different; Flow cache ON twice == OFF (SPY, TSLA; 0.11-0.20 s
+vs 1.33 s); OF3: 0 `contract_id` 0, null SPY 7 / TSLA 4 of 25; **alerts FAIL**: dataset 01f250a0 (Nov 11) LATEST 2 rows /
+HISTORY 14 rows, 0 legs valued, `alert_valuation` FALLBACK `ALERT_VALUATION_UNAVAILABLE`, 4 API traceback lines:
+`InsufficientPrivilege: permission denied for table advanced_options_reference_states`. The API role has no SELECT on it
+(`relation_registry.py`: `api=False`); live the same (`has_table_privilege`: api f, app t). The review measured OA1 with a
+script under another role, not through the API. Stop 61 s: 17 exit 0, ingress 241, flow 137 (SIGTERM logged, killed at
+the 60 s grace while waiting for the session; r92's run: flow 0). **r96** `alpha-research-realtime-v3:stable-nov5-r96-4cf548ed9fe43fee`
+= `sha256:2aa3e4d958107c9603fcbbfe1318b3a7775d141dfc158125abb0ae9b278121ea` = r95 + `REALTIME_V2_OPTIONS_ALERT_VALUATION`
+(OFF default: the detector-runs read skips OA1/OA2 and lists no optional read, as r94); image diff vs r95: only
+`portal_compatibility_repository.py` and its test. Tests: OA1 file 14 passed; the 25 files importing the portal
+repository / alert valuation / portal API 743 passed, 9 failed (baseline names), 60 skipped. **r96 rehearsal** (same
+copy, switches ON): 19 running, 0 restarts, 0 errors, 18 healthy at 2 and 4.5 min; Treasury VERIFIED 2026-11-10; smoke
+153/131 == live, 0 different; Flow ON==OFF; OF3 as r95; alerts LATEST 2 / HISTORY 14 rows, `alert_valuation` not listed,
+0 API errors; stop 3 s, 18 exit 0, market-state 241 (known pattern). Copy renamed back, test logins NOLOGIN, stack
+removed; logs `rehearsal-r92/r92-evidence/r96-log-*`, `r95-log-api-oa1-grant.txt`. Frontend: no localhost setting in the
+committed diff or in f30 (the review preview's proxy config is a scratchpad file mounted into `ticker-review-preview`;
+f30's two `http://localhost` strings are the router library's URL fallback, identical in f28; nginx config unchanged).
+Rollback list `rollout/pre-r96-images-20261112.txt`.
+
+### Nov 12 (09:58-10:01 UTC): pre-open audit trial on today's images (new `runner/preopen_audit.sh`)
+
+One read-only entry point for the 13:00 audit (clock, services, `coverage_preopen.sql`, G94, read flags, R40
+readiness; report `data-audit/preopen-audit-SESSION.txt`). Trial before the deploy: clock +0.087 s; MEMBERS 25,
+DIVIDEND_THROUGH_CLOSE 25/25, SPLIT_NEWER_THAN_COVERAGE 0, LEASES 20 renewing; G94 PASS (25 covered from 2025-09-29);
+readiness: every member 283/283 adjusted, 20/20 raw, Nov 11 RTH 390/78/26/13/7, earnings to Nov 14 21:06, Fed to Nov 18,
+workspaces and Dashboard all present at the Nov 11 close, Options preparation PREPARING at CATALOG_QUOTE; ISSUES 19 on 9
+tickers = CRWD Nov 9 1m 389/390 (row CRWD empty minute, ends Nov 17) and the 8 funds' reference sector/industry (funds
+carry none; accepted). Read flags: the script's default cohort lookup raised before the open (no PLATFORM cohort active at
+"now"); the audit now passes the portal's current Equity cohort (`/api/realtime/portal/current`): charts 199 OK, 1 REFUSED
+(CRWD 1m `NATIVE_1M_HISTORY_INCOMPLETE`), Screener Nov 11 25 rows COMPLETE, hourly lineage VERIFIED 25, Dashboard READY,
+Stock Alerts OK (stale warning before the open). Crons (session-only): 12:45 UTC deploy-deadline check, 13:01 audit,
+13:31 dry run.
+
+### Nov 12 (10:03-10:27 UTC): r96 + f30 deployed pre-open (user's go ~10:03) and verified (runbook 3.7)
+
+User (~10:03): "how about deploying now". Rollback list `rollout/pre-r96-images-20261112.txt` (API r90, scheduler r88, 17
+services r85, frontend f28). Compose: `PYTHONFAULTHANDLER=1` on the API (`runner/compose_env.py`, backup
+`compose.stable.before-pythonfaulthandler-20261112T100541Z.json`, one key, CRLF kept). `-Step preflight` 10:05: no
+pending migrations (latest 052), audit passed, no legacy containers. `-Step g102-services -Image r96 sha256:2aa3e4d95810`
+10:06:11-10:24:18, exit 0, 19 of 19 services; `-Step g102-frontend -Image f30 sha256:66a57dac5fc0` 10:24:38-10:25:17.
+Verification 10:25-10:27: every service on its new image, running, 18 healthy (preparation has no health check);
+lease-handover restarts only: capability-refresh, detectors, Advanced scheduler, Options scheduler 8 each, every error
+line `DurableLeaseUnavailable` (32 of 32), none after each settled (last 10:20:12); 0 error lines elsewhere since 10:06;
+LEASES 20 renewed 10:26:36; API env `PYTHONFAULTHANDLER=1`, switches absent (flow P8, breadth cache OFF, market-state hash
+CANONICAL, alert valuation OFF), market-state `REALTIME_V3_MARKET_STATE_LOOP=V3`; API smoke 153 routes / 131 OK, 0 routes
+different from the 09:53 pre-deploy live smoke; the frontend serves f30's bundle (`index-C58L8k9b.js`), the portal API
+through it 200; alpha-screener-pro.com 302 to Cloudflare Access. In-session checks pending: market-state `mode=V3` and the
+first-window B items (plan B list), R52 reference stage with the Nov 10 curve.
+
+### Nov 12 (10:30 UTC): ticker-review preview stopped (user: not needed; "make sure it doesn't cause any live run issues")
+
+Before: the container `ticker-review-preview` (Vite dev server, f29 build image, review worktree source, `127.0.0.1:5190`)
+was only a client of the live API on `alpha-research-realtime-v2-application`: no reference in the live compose, the
+tunnel routes to `realtime-v2-advanced-frontend:80`, no request in the last hour. `docker stop` at 10:30:41 removed it
+(it was started with `--rm`). After: every live service unchanged (21 running, restart counts as at the deploy), API
+health 200, frontend -> API 200, alpha-screener-pro.com 302, no cloudflared error. To recreate it if wanted:
+`docker run -d --rm --name ticker-review-preview --network alpha-research-realtime-v2-application -p 127.0.0.1:5190:5190
+-e VITE_REALTIME_ONLY=true -e VITE_API_BASE_URL=/api -v <ticker-review worktree>/frontend/src:/app/src -v
+<scratchpad 83d3ecf7>/preview/vite.preview.config.mjs:/app/vite.preview.config.mjs --entrypoint npx
+alpha-research-realtime-v2-frontend:stable-nov5-f29-build vite --config /app/vite.preview.config.mjs`.
+
+### Nov 12 (10:35-10:50 UTC): V3-1.6b market-state checkpoint encode cache (user: "carefully analyze and make the changes to take it today")
+
+Analysis: `encode_materializer_state` (only caller `build_materializer_checkpoint`, only live caller the market-state
+consumer's `plan_slice`) encodes every shard's whole state on every pass; the role keeps its states in memory
+(`self._states`) and the state advance (`_materialize_partitioned_shard_batch`) carries unchanged quotes and trades over
+as the same frozen objects. Change (`realtime/materialization.py`): `REALTIME_V3_MARKET_STATE_ENCODE=CACHED` keeps each
+quote/trade object's JSON text from the shard's previous encode (key = the object itself, held strongly, so an id cannot
+be reused; never the value: `Decimal("1.5") == Decimal("1.50")` but encodes differently) and assembles the payload with
+the same json options; anything else (default `FULL`) runs the unchanged full encode. Self-check: calls 1-20 and every
+200th also run the full encode; a difference writes the full bytes, logs `advanced_options_market_state_encode_mismatch`,
+emits fault `MARKET_STATE_ENCODE_MISMATCH` (DEGRADED) and turns the cache off for the process. Tests
+`test_market_state_encode_cache_nov12.py` 7 passed (12 passes x 2 shards with trades, a BAD quote, Decimal text variants:
+bytes and checkpoints identical, restore equal; only new quotes encoded; equal-valued twins not shared; mismatch fallback;
+default untouched; byte limit). **Replay** (`scratchpad/v316b/replay_encode.py`, read-only on the copy volume's Nov 11
+Options journal `bf6b9c4d`, live's shard map `c867c4c7` reproduced, registered session `8c3fe766`): 11,784 uneven passes
+(1-1,000 records), 6,345,604 records, **0 mismatches** between the cached and full bytes; final state
+`8d63fc50...` == the checkpoint live stored at the Nov 11 close (462,402 bytes); encode 7.56 -> 3.31 ms per pass (56%
+less; quote texts reused 4.34 M, encoded 2.45 M at ~540 records per pass; live passes are smaller).
+
+**Nov 12 ~10:56 UTC, user (going away):** the rest of the day runs in this session without further authorization:
+V3-1.6b (r97 build, market-state pre-open hotfix with the switch off, switch on ~18:10 UTC), the planned flips (Flow V3
+~15:03, R47 cache ~15:33, V3-1.6 ~16:17), the pre-open audit and dry run, the watcher with fix-forward single-service
+hotfixes, the close. Still the user's yes: migrations and grants (OA1/OA2), budgets, universe, ledger, READY/clock/
+watermark/window-state edits, self-heal actions, whole-platform rollback, commit/push.
+
+### Nov 12 (10:40-11:06 UTC): V3-1.6b tests, r97 built, copy start, market-state on r97 (switch off) pre-open
+
+**Tests** (r96 image, worktree mounted, offline; the 55 test files touching the materializer, the market-state
+consumers or the hash switch, plus the new file): `REALTIME_V3_MARKET_STATE_ENCODE` unset 868 passed / 7 failed / 85
+skipped; the whole set again with `CACHED` 868 / 7 / 85, the same 7 by name: daily scanner half-gap x2, ticker vertical
+slice x3 (baseline), `test_advanced_options_p8_docker_runtime` compose file (no compose file in the test container) and
+`test_realtime_architecture_profile` (90 vs 108 calls), both failing identically on r96's own code. **r97**
+`alpha-research-realtime-v3:stable-nov5-r97-8c84c8f22e5c8f8d` = `sha256:cbf553160d29849c9b8fe32beeecab459218cdd451cbab111fabf2a5772862be`
+= r96 + V3-1.6b (image diff vs r96: `realtime/materialization.py` and the new test only). **Copy start** (copy
+`test_realtime_v2_r92`, isolation probed): market-state on r97 with `REALTIME_V3_MARKET_STATE_HASH=CHECKPOINT` and
+`REALTIME_V3_MARKET_STATE_ENCODE=CACHED`, the other 18 on r96 with their switches on: 2.5 minutes 19 running, 0 restarts,
+0 errors, 18 healthy; stop 3 s, 18 exit 0, flow 241 (known pattern); copy renamed back, logins NOLOGIN. **Live**
+11:05:15-11:05:56: `-Step hotfix -Service realtime-v3-options-p8-market-state -Image r97` (pre-open; switch absent = the
+r96 encode): running, healthy, 0 restarts, `READY_WAITING_FOR_SESSION`, env only `REALTIME_V3_MARKET_STATE_LOOP=V3`.
+Crons: 16:17 V3-1.6 job now hotfixes with r97; new 18:13 UTC V3-1.6b switch-on (after profile #3) with its checks and
+fallback (`compose_env.py ... REALTIME_V3_MARKET_STATE_ENCODE --remove` + hotfix).
+
+### Nov 12 (13:01-13:02 UTC): pre-open audit (`runner/preopen_audit.sh 2026-11-12`), read-only - PASS
+
+Report `data-audit/preopen-audit-2026-11-12.txt`. **R34** CLOCK OK +0.066 s. **Services** 21 running (19 healthy with
+checks; preparation and cloudflared have none); images r96 on 18, market-state r97 `cbf553160d29`, frontend f30
+`66a57dac5fc0`; restarts 8 only on capability-refresh, detectors, scheduler, options-scheduler, all inside ~90 s of their
+r96 creation (10:06-10:20 UTC, lease handover), none since. **R9** 25 members, dividends through close 25/25, splits newer
+than coverage 0, 20 leases. **G94** PASS (25/25 from 2025-09-29). **Read flags** (portal Equity cohort `effad99e`):
+charts 199 OK + 1 REFUSED (CRWD 1m `NATIVE_1M_HISTORY_INCOMPLETE`, known), screener 2026-11-11 COMPLETE 25 rows, hourly
+details 25 OK / VERIFIED, dashboard READY, stock alerts OK (pre-open "retained alert data stale" warning). **R40**
+readiness: 283/283 adjusted sessions and 20/20 everywhere; ISSUES 19 on 9 tickers = the accepted set (CRWD Nov 9 1m
+389/390 and its two page refusals; sector/industry missing on the 8 funds IWM, QQQ, SMH, SPY, XLC, XLE, XLK, XLY).
+Options preparation `PREPARING` at `CATALOG_QUOTE` (history ready); 9 Options underlyings. Next: 13:31 dry run.
+
+### Nov 12 (13:31-13:33 UTC): R20 pre-open dry run (`runner/preopen_dry_run.sh 2026-11-12`), read-only - PASS, GO
+
+Report `data-audit/preopen-dry-run-2026-11-12.txt`, exit 0. CLOCK OK +0.056 s. READINESS PASS (desired 19 Equity, 9
+Options underlyings, 6 sector ETFs; capability profile PASS until 11-12 21:01; Options cohort created at activation).
+OPTIONS PASS: revision `86179d1f` PREPARING at CATALOG_QUOTE; capture OK on all 9 underlyings (42 provider requests,
+rejected rows 0, slowest SPY 11.4 s); candidates 8,640, invalid 0; CAPACITY_SHARDS allocation 72 contracts (NFLX 2, QQQ
+8, SPY 8, the rest 9). STOCK_ALERTS PASS (19 evaluations: 16 NO_RULE_DUE, 3 BENCHMARK_ONLY, 3.0 s). WORKSPACE PASS (25/25,
+0 unavailable, largest NFLX 130,904 of 131,072 bytes, over 0; 80 s). Previous session: Options windows 77 COMPLETE, run
+time max 26% / p90 21% (Nov 10: 5 over 60%); WARN O2 UNAVAILABLE and O3 BLOCKED 77/77 on Nov 11, the same as Nov 10
+(56/56), not new. Live images: r96 `2aa3e4d95810` on 18 services, market-state r97 `cbf553160d29`, frontend f30
+`66a57dac5fc0`. **GO.**
+
+### Nov 12 (14:33-14:39 UTC): first watch pass - open normal; Options attached after the first Equity window
+
+Watch 14:33 (`scratchpad/ev/watch-1433.txt`): Stocks stream `25103f1c` LIVE from 14:30:01, gaps 0; all services on r96
+(market-state r97, frontend f30), 0 restarts since the deploy handover, 0 error lines; OPT_RUNTIME_ALARM 0;
+O1_SELECTED_NOT_STORED 0. Options preparation ACTIVE 14:34:21-26 (Nov 11: 14:34:22); continuous session `6f80edb6`
+prepared 14:34:13; acquisition holds `massive:options:websocket` from 14:34:23 and writes journal `e3e11560` (54 MB by
+14:36). The P8 roles left READY_WAITING_FOR_SESSION at 14:34:21 and attached once Equity `advanced-20261112T143500Z`
+COMPLETED at 14:38:16 (**196 s**; Nov 11 174 s, Nov 10 188 s), by design (Options waits for a COMPLETE window with
+EQUITY_MATERIALIZE): Options stream `3d3997c3` LIVE 14:38:33, Nov 11's `8c3fe766` STOPPED `ENDED_BY_NEXT_SESSION` at its
+last heartbeat (B14a); E:14:35 Options PENDING 14:38:19. **Faults** (first collector pass since Nov 11 21:47): CRASH_LOOP
+x3 = the 8 lease-handover restarts of the r96 deploy (10:07-10:20, RECOVERED rows); STREAM_STALE on `8c3fe766` = the
+pre-attach minutes, as Nov 11 14:37:44 (B14a/R38 END_STALE_SESSION); WINDOW_PAST_DEADLINE 59 PENDING/RUNNING from Nov 5-10
+= R32/R38 MARK_MISSED (record-only, user's yes). No new matrix rows. Note: Nov 11's Options journal registration
+`bf6b9c4d` is still DRAINING (normalized 6,345,544) - check it at the close with the Nov 12 one.
+
+### Nov 12 (14:39-14:47 UTC): first-window checks (B items R16/R19, R52, V3 mode, R14, R15, G65, R42) - all PASS
+
+Read-only (session SQL via `runner/audit_live.ps1`, docker logs, `scratchpad/ctx-1441.json`). **(1) R16/R19** lifecycle:
+CAPACITY_SHARDS COMPLETE 9/9 (last TSLA 14:34:09), SESSION_ACTIVATION 14:34:11-21, work rows all COMPLETE (REFERENCE_OI,
+HISTORY, CATALOG_QUOTE, CAPACITY_SHARDS 9 each, activation 1); preparation ACTIVE/COMPLETE (READY comes at 21:00 for the
+next session, as Nov 10/11); no refused-candidate line (dry run: invalid 0) and no SerializationFailure; lifecycle 0
+restarts since 10:18. Its `treasury_refresh`: VERIFIED, cached, `required_rate_date` 2026-11-10, curve `871cabf6`.
+**(2) R52** Options E:14:35 COMPLETE 14:41:52 (69.3 s attempt, all 7 stages), E:14:40 COMPLETE 14:46:43 (101.7 s); the
+reference states at 14:34:13, 14:40, 14:45 (148 members) carry `rate_date` "2026-11-10"; no
+`advanced_options_treasury_curve_stale` line, no TREASURY_CURVE_STALE fault (the 6 grep hits were `lane_errors` keys).
+Marks: E:14:35 72/72; E:14:40 52, 20 `OPTION_NBBO_STALE_OR_NONCAUSAL` (clock +0.056 s; watch). **(3)** market-state
+`advanced_options_market_state_loop mode=V3` 14:40:00 (r97, encode switch off). **(4) R14** 0 `O:B1` roots of 17,814
+`rt.option_breadth_current` rows (9 underlyings; 9 captures COMPLETE by 14:39:18). **(5) R15** TICKER_WORKSPACE_V1 25 at
+14:35; summary, Dashboard, Stock Alerts, Pattern Watch at 14:35. **(6) G65** `/api/stocks/context` 200, 25 rows,
+`expected_members` 25, `eligible_ranked` 25, no `member_status` PARTIAL; status STALE at 14:41 = the hourly 14:35
+Dashboard against the 14:40 expected time (`staleness_state`, serveable, by design). **(7) R42** detectors `healthy`,
+READY, 50/50 leases, 1 active journal, capability refresh READY (14:40:02). Lanes at E:14:40 as Nov 11: O1
+COMPLETE_SELECTED (7 SELECTED / 1,284 NOT_SELECTED, 4 packages, not stored 0), O2 UNAVAILABLE `O2_MODEL_NOT_ACCEPTED`,
+O3 BLOCKED `E_CONTEXT_INCOMPLETE` + `ACCEPTED_INPUT_EVIDENCE_ABSENT` (R44), OS1 BLOCKED at E:14:35 then COMPLETE_ZERO, OS2
+BLOCKED `E_CONTEXT_INCOMPLETE` (needs 3 session 5m bars). Options run time 112 s / 104 s (37% / 35%; Nov 11 64/43 s),
+alarms 0, lag 1 s. Equity E:14:35 196 s, E:14:40 COMPLETE 14:40:40. Matrix: R14, R42, R52, G65 VERIFIED; R15, R16, R19
+notes (paths not exercised / check at the close).
+
+### Nov 12 (14:48-14:52 UTC): watch pass and portal B checks (r96 + f30) - all PASS
+
+**Watch 14:48** (`scratchpad/ev/watch-1448.txt`): Equity 3 COMPLETE through 14:45, Options 2 COMPLETE (E:14:45 pending
+its cutoff), lanes as at 14:45 (O1 SELECTED 7, not stored 0, 4 packages; O2 `O2_MODEL_NOT_ACCEPTED`; O3/OS2 BLOCKED
+`E_CONTEXT_INCOMPLETE`; OS1 COMPLETE_ZERO), 3 Options alerts OPEN, workspaces 25 at 14:35/14:40/14:45, streams LIVE, gaps
+0, lag 1 s, run time 35-37%, alarms 0; no restarts since the deploy, 0 error lines; market-state CPU 21.6%, acquisition
+451 MiB. Faults: only WINDOW_PAST_DEADLINE again (R32/R38, old sessions).
+**Portal** (read-only; files in `scratchpad/portal/`): **R49** `/api/stock/SPY/chart/forming` 5m FORMING bucket
+14:45-14:50 (3 minute bars, as of 14:48) -> 14:50-14:55 (as of 14:51); 1d FORMING 18 -> 21 minute bars, volume 3.15 M ->
+3.52 M. **R50** Flow SPY `selected_summary.total_open_interest` 8,421,894 (call 3,437,381 / put 4,984,513), 17
+expirations (0 DTE 254 contracts); bundle `OptionsFlowPage-B4Fm5EFl.js` has "Total open interest", "Include 0 DTE", "Show
+%", `aria-sort`, no "Open interest change". **OF3** SPY `top_contracts` 25: `contract_id` null 12, 0 none, catalog ids
+13; 25 unique tickers; breadth COMPLETE 5,046 contracts, `flow_breadth` AVAILABLE. **PH1** `/api/realtime/portal/current`
+Equity and Options session 2026-11-12, status CURRENT, cutoffs 14:45 -> 14:50 at 14:51:45; `PageChrome` has "Market
+data", "Real-Time", "Session close". **TP** (served `TickerWorkspace-TQQeYRFO.js` / `index-C58L8k9b.js`, image
+`66a57dac5fc0`): TP1 no "Analysis timeframe"/"Following chart", `analysis_interval` deleted from the URL; TP7
+"Abbreviations"; TP11 `tk-volflow` Participation picture; TP14 `report_limit` 40; TP15 `ticker-table--statement`; TP2
+bracket code present (a short plan not inspected on the page). **OA1/OA2 off**: `/options/alerts/detector-runs`
+(dataset `47285957`, 2026-11-12) 3 rows, `optional_reads` = session_alerts, current_marks, source_facts, no
+`alert_valuation`; API log since 10:20 has no valuation line (the one grep hit is an `/evaluations` URL). Matrix: R49,
+R50, OF1-OF3, PH1, TP1, TP2, TP7, TP11, TP14, TP15 VERIFIED; OA1/OA2 notes (off, grant needs the user's yes).
+
+### Nov 12 (14:53-15:03 UTC): V3-1 profile **#1** (market-state V3 loop on r97, encode switch off; Flow still P8)
+
+`runner/profile_options_roles.sh 180` (py-spy `--nonblocking`, 180 s per role); log `scratchpad/profile1.log`; data
+`data-audit/profiles/p8-<role>-20261112T1453.txt(.cpu)`. Same time of day as Nov 11 **P8 #1** (14:49, market-state on
+P8); same loops as Nov 11 **V3 #1** (17:57). **market-state**: 2,292 active samples (P8 #1 3,844; V3 #1 3,234): journal
+read (SQLite) 49.8% (P8 #1 54.9%, V3 #1 22.9%; all under `_run_market_state > read_normalized_after`, 53.1% of stacks vs
+24.6% at V3 #1), hash/JSON 29.5% (25.9 / 49.1), window stages 9.2%, DB write 4.0% (3.3 / 11.6), decode 3.0%, materialize
+1.8%; top leaves `<genexpr>` 25.8%, `read_normalized_after` 13.9%, `iterencode` 10.8%, `_canonical_value` 7.8%; docker CPU
+mean **31.6%**, median 26.9%, max 59.9% (P8 #1 46.0 / 37.6 / 86.3; V3 #1 38.1 / 36.9 / 66.0). Fewer samples and lower
+CPU than both; the journal-read share is high again in the opening hour (heavier record flow per pass than at 17:57), so
+V3-1.6b (encode) addresses the ~30% hash/JSON part, not the read. **flow** (P8 loop): 1,226 samples: flow 36.9%
+(`offsets_at` 24.3%), journal read 25.9%, hash/JSON 25.9% (`iterencode` 14.0%), `load_downstream_bindings` 12.0% (P8 #1
+12.9%, V3 #1 37.9%), DB other 7.6%; CPU mean 15.0%, median 10.2%, max 74.0% (P8 #1 13.1 / 9.4 / 61.0). **window**: 1,057
+samples (P8 #1 97, V3 #1 441): hash/JSON 71.0% (`iterencode` 28.4%, `_canonical_value` 13.2%, `<dictcomp>` 13.2%,
+`persist_flow_package_evidence_cursor` 12.0%), DB write 16.7%, DB other 6.3%; CPU mean 10.0%, median 1.5%, max 98.4% (P8
+#1 1.6 mean; V3 #1 4.3). **Stands out (watch, not a fault):** the window role works ~10x the Nov 11 opening samples, in
+evidence hashing/persisting (O1 packages: 71 by 15:10), matching Options window run time 27-40% today vs 14-21% on Nov 11
+at this hour; alarms 0. Follow-up row if it grows toward 60%.
+
+### Nov 12 (15:03-15:12 UTC): V3-1.F on - Flow on the V3 loop (`REALTIME_V3_FLOW_LOOP=V3`, r96), API checks R25 R29 R45 R46 R48
+
+**Precondition 15:03:20**: Options E:14:35-14:55 all COMPLETE, lanes as designed, Flow 0 restarts / 0 error lines / no
+fault rows. **Flip**: `runner/compose_env.py realtime-v3-options-p8-flow REALTIME_V3_FLOW_LOOP V3` 15:03:34 (backup
+`rollout/compose.stable.before-realtime_v3_flow_loop-20261112T150334Z.json`; the other env keys unchanged); `-Step hotfix
+-Service realtime-v3-options-p8-flow -Image r96` 15:03:49-15:04:33 (old container stopped in ~3 s, not the 60 s grace;
+`others_changed` none; log `scratchpad/deploy-flow-v3.log`). **Verify**: env `REALTIME_V3_FLOW_LOOP=V3`, healthy, 0
+restarts; `advanced_options_flow_loop mode=V3` 15:05:00; E:15:00 COMPLETE 15:06:43 (run 103 s), E:15:05 COMPLETE 15:11:27
+(87 s), E:15:10 COMPLETE 15:16:00; lanes at E:15:10 normal (O1 126 SELECTED / 71 packages / not stored 0). Flow CPU
+(`scratchpad/ev/flow-v3-flip-watch.txt`, every ~22 s): 98% for ~40 s of catch-up after the start, then 6-11% between
+windows with 60-74% for ~40 s inside each window (P8 before: 7-10% with 71-74% spikes); flat, memory 207 MiB. Fallback
+(~1 min): `compose_env.py ... REALTIME_V3_FLOW_LOOP --remove` + the same hotfix.
+**API checks** (files `scratchpad/portal/`): **R25** `/options/flow` and `/options/alerts/datasets` every ~22 s
+15:12:20-15:18:21 (one full cycle and the 15:10 -> 15:15 cutoff change): `available` true, `stale` false,
+`staleness_seconds` 0 in all 34 samples, `valid_until` 21:35. **R29** detector-runs (dataset = latest run `cc42fa44`):
+no repeated `session_alert_id` or `candidate_id` in either scope. **R45** LATEST 1 row (NVDA 14:57, 53 hits) vs HISTORY 4
+rows (NVDA 14:40 x2, 14:45, 14:57), latest run withheld and named in HISTORY. **R46** one row per contract and side in
+both scopes. **R48** SPY, QQQ, TSLA, NFLX, AAPL `coverage_source` BREADTH, captures COMPLETE (5,080 / 5,370 / 1,114 / 390 /
+876 contracts), `breadth_fallback` null; all 72 captures today COMPLETE, so the last-good-chain path was not exercised.
+Note: the alerts `dataset_id` is the latest run's id and changes every window (47285957 at 14:50, cc42fa44 at 15:10).
+
+### Nov 12 (15:15-15:21 UTC): user "yes for both" - R38 MARK_MISSED acted once on live; R44 O3 night 2 confirmed
+
+User ~15:15 ("yes for both"), answering the watch line that the old past-deadline windows wait on their yes and that O3
+is not evaluated (R44). **R38/R32**: before (`scratchpad/ev/mark-missed-before.txt`, 15:18:12): Options windows past
+deadline PENDING Nov 3 10, Nov 4 77, Nov 5 13, Nov 6 37, Nov 9 3, Nov 10 4 + RUNNING 2 (MISSED already 4). One pass
+`run_realtime_v2_self_heal.py --once` in r96 with `REALTIME_V2_SELF_HEAL_MODE=ACT`, `REALTIME_V2_SELF_HEAL_ACTIONS=
+MARK_MISSED` (same mounts and network as the collector) 15:18:30: `acted 1`, ACTED WINDOW_PAST_DEADLINE on **55**
+windows (Nov 5 9, Nov 6 37, Nov 9 3, Nov 10 6; guard: `E:` keys, PENDING/RUNNING, deadline + 2 min passed, no live
+lease); out/err `scratchpad/ev/mark-missed-act.*`. After (15:18:40): MISSED Nov 5 9, Nov 6 39, Nov 9 3, Nov 10 8; still
+PENDING Nov 3 10, Nov 4 77, Nov 5 4 (= 91, older than the check's 7-day look-back; closing them is a one-time wider
+window-state edit, asked separately); today 8 COMPLETE + 1 PENDING untouched. Window, controller, schedulers, lifecycle:
+0 restarts and 0 error lines after; E:15:15 COMPLETE 15:21:09. The watcher's collector passes stay record-only; a new
+WOULD_ACT past-deadline finding today gets the same one-off ACT pass. **R44**: the user's yes confirms night 2 of the O3
+input design tonight (no live change now).
+
+### Nov 12 (15:33-15:40 UTC): R47 breadth cache ON on the API (`REALTIME_V2_FLOW_BREADTH_CACHE=ON`, r96)
+
+**Precondition**: API 0 restarts since 10:17:24; Flow V3 settled (E:15:05-15:25 COMPLETE). **Before** (r96 image,
+`rehearsal-r92/flow_get.py` against `stock-screener-realtime-v2-advanced-api:8002`, files `scratchpad/r47/before*`):
+15:33:23 SPY 2.11 s / TSLA 1.85 s, 15:33:28 SPY 1.87 s / TSLA 1.68 s, BREADTH 25 top contracts, the two reads equal
+without the per-request clocks; API smoke 15:33:59 153 routes 131 OK (`scratchpad/ev/api-smoke-r47-before-*.json`).
+**Flip**: `compose_env.py realtime-v2-advanced-api REALTIME_V2_FLOW_BREADTH_CACHE ON` 15:34:45 (backup
+`rollout/compose.stable.before-realtime_v2_flow_breadth_cache-20261112T153445Z.json`; PYTHONFAULTHANDLER=1 kept);
+`-Step hotfix -Service realtime-v2-advanced-api -Image r96` 15:34:46, waited for the quiet part, recreated 15:38:01-03,
+done 15:38:40 (`others_changed` none; log `scratchpad/deploy-api-r47.log`). **After**: env has the switch, healthy, 0
+restarts; 15:38:48 SPY **2.12 s** (first read builds the cache) / TSLA 0.17 s, 15:38:52 SPY **0.26 s** / TSLA **0.17 s**;
+after1 == after2 for both tickers without the clocks (the uncached SPY build equals the cached read, capture 15:36:28);
+before vs after differ only because the 15:35 release and a new capture landed in between (release cutoff 15:30 ->
+15:35). API smoke 15:39 153 / 131 OK, no route with a different status; API log since 15:38: 0 tracebacks, no
+segfault. Fallback (~4 min with the quiet-part wait): `compose_env.py realtime-v2-advanced-api
+REALTIME_V2_FLOW_BREADTH_CACHE --remove` + the same hotfix.
+
+User question 15:2x (ticker page warning) and 15:3x (chart refresh): measured for the answer: Equity windows publish
+41-71 s after each 5-minute mark (14:35 first window 197 s); the ticker page polls the publication every 30 s
+(`LIVE_PUBLICATION_POLL_MS`) and the developing bar every 60 s; 1m stream bars are stored 1.8 s median (p90 2.4 s, max
+2.5 s) after the minute ends (750 bars, 15:10-15:40). Proposal (portal batch, not deployed): minute-aligned forming-bar
+read and window-aligned publication poll; market warning only past the normal build time.
+
+### Nov 12 (15:41 UTC): watch - normal; host clock +0.615 s (containers +0.08-0.11 s)
+
+Equity 14 COMPLETE through 15:40; Options 12 COMPLETE through E:15:30 (E:15:35 running, E:15:40 pending), lanes as
+designed (O1 359 SELECTED / 187 packages / not stored 0); run time 20-29% (15:10-15:35), alarms 0; first STOCK alert of
+the day OPEN 15:30; streams LIVE, gaps 0; API 0 restarts since the R47 flip. Faults: CLOCK_OFFSET DEGRADED +0.615 s is
+the collector's host (Windows) SNTP check; the services' clock (`runner/clock_offset.py` in a container) reads +0.082,
++0.085, +0.106 s at 15:41; W32Time RUNNING. Under the 1 s action line (R34), no resync asked. Marks per window
+41-72 of 72 (unmarked = `OPTION_NBBO_STALE_OR_NONCAUSAL`, quiet contracts; Nov 11 43-58), not clock-driven (Nov 10's skew
+unmarked all). LANE_NOT_EVALUATED O3 = R44.
+
+### Nov 12 (15:43-15:53 UTC): V3-1 profile **#2** (Flow on the V3 loop since 15:04; market-state V3 on r97, encode off)
+
+`runner/profile_options_roles.sh 180`; log `scratchpad/profile2.log`; data `data-audit/profiles/p8-<role>-20261112T1543.txt`.
+Compared with Nov 11 **P8 #2** (15:44, both roles on P8) and today's **#1** (14:53, Flow still P8). **flow**: **516**
+active samples (#1 1,226; P8 #2 1,665): flow 41.9%, hash/JSON 27.9%, DB other 19.6% (`transaction` 18.2%), journal read
+**1.6%** (#1 25.9%); in the stacks `load_downstream_bindings` 25.9% at #1 is gone, its V3 replacement
+`load_downstream_bindings_after` is 1.4%, and `offsets_at` fell 25.9% -> 1.6%. Docker CPU mean **7.7%**, median 5.7%, max
+20.8% (#1 15.0 / 10.2 / 74.0; P8 #2 18.7 / 13.3 / 60.7): about half of #1 and 40% of Nov 11 at this hour, and the
+window spike dropped from ~74% to ~21%. **market-state**: 2,024 samples: journal read 46.5% (#1 49.8%), hash/JSON 31.2%,
+window stages 9.8%, DB write 5.5%, decode 2.6%, materialize 1.3%; CPU mean 23.2%, median 19.2%, max 49.5% (#1 31.6 / 26.9
+/ 59.9; P8 #2 48.8 / 39.5 / 86.2). **window**: 695 samples (#1 1,057; P8 #2 110): hash/JSON 67.1% (`iterencode` 26.0%,
+`persist_flow_package_evidence_cursor` 13.2%), DB write 15.1%, DB other 9.8%; CPU mean 5.3%, median 1.0%, max 52.9% (#1
+10.0; P8 #2 2.3) - still above Nov 11 (O1 packages 223 by 15:50 vs ~7 at this hour Nov 11), not growing. Options window
+run time 19-34% 15:25-15:50. **V3-1.F VERIFIED**: the per-pass read of all downstream bindings is gone and Flow CPU halved.
+
+### Nov 12 (16:00-16:14 UTC): RF1 refresh timing for the ticker chart and Options Flow (user's go); f33 live
+
+User 15:2x-16:0x: how often the ticker page and Options Flow refresh, then "go for chart and flow refresh changes", then
+(before deploy) "lets not show this message 'Updating to 10:35 AM ET data…'". **Change** (frontend only; new
+`src/utils/refreshTiming.ts`): ticker publication check 40 s after each 5-minute mark, then every 10 s until the window
+lands, 30 s when late (4 min) and the old plain 30 s when no live window is expected (before the first window, more
+than two windows behind) (`publicationNavigation.ts`); developing candle read 5 s after each minute (`TickerDetail.tsx`,
+was every 60 s); Options Flow 50 s after the mark, then every 10 s until both the release and (on BREADTH) the chain
+capture are in, 60 s idle (`OptionsFlowPage.tsx`, was every 60 s); the ticker page's "Market data is not current"
+warning is not shown while the next window is within its normal build time (150 s after the mark) and shows when it is
+late; no "updating" text (user). Measured basis: 1m bars stored 1.8 s median (max 2.5 s) after the minute; Equity
+windows 41-71 s after the mark (first 197 s); Options captures 47-130 s, Options windows 60-121 s. **Tests**: new
+`tests/refreshTimingNov12.test.mjs` (6); `portalPublicationRegressions.test.mjs` loader compiles the new module and the
+running-session test checks the interval function (30 s with no window / an old one). **f33**
+`alpha-research-realtime-v2-frontend:stable-nov5-f33` = `sha256:961eef3391e86e60807e8a271f7c48ba86b48d0e8f8f6970b94a99d924dc89c2`:
+323 tests, 278 pass, 40 fail = the same 40 by name as f30 (f31/f32 were intermediate builds: f31 before the loader fix,
+6 extra failures; f32 with the "updating" text). No "Updating to" in the bundle; `localhost` strings 2 = f30.
+**Preview** (f33 with the live nginx config, 127.0.0.1:5185, removed after): index, `/ticker/AAPL`, `/options/flow`,
+`/api/realtime/portal/current`, forming read 200. **Live**: `-Step hotfix -Service realtime-v2-advanced-frontend -Image
+f33` 16:11:57-16:13:40 (recreated 16:13:01-03, `others_changed` none); serving `index-B22y7vlw.js`, healthy, API proxy
+200, public domain 302 to Access. Fallback: the same hotfix with f30 `sha256:66a57dac5fc0a26e3372067bc69e49adf9630efe8d0a273a5026258be8f70410`.
+
+### Nov 12 (16:17-16:27 UTC): V3-1.6 on - market-state slice identity from checkpoints (`REALTIME_V3_MARKET_STATE_HASH=CHECKPOINT`, r97)
+
+**Precondition 16:17:05**: market-state r97 `cbf553160d29`, 0 restarts, env `REALTIME_V3_MARKET_STATE_LOOP=V3`; Flow V3
+(15:04) and R47 (15:38) settled, no Flow/API restarts; Options E:14:35-16:05 COMPLETE, lanes as designed. **Flip**:
+`compose_env.py realtime-v3-options-p8-market-state REALTIME_V3_MARKET_STATE_HASH CHECKPOINT` 16:17:20 (backup
+`rollout/compose.stable.before-realtime_v3_market_state_hash-20261112T161720Z.json`; LOOP=V3 kept); `-Step hotfix
+-Service realtime-v3-options-p8-market-state -Image r97` 16:17:21-16:18:39 (recreated 16:18:00-02; `others_changed`
+none; log `scratchpad/deploy-ms-v316.log`). **Verify**: env HASH=CHECKPOINT + LOOP=V3, healthy, 0 restarts;
+`advanced_options_market_state_loop mode=V3` 16:20:00 (idle 0.8-1.2% CPU until the session loop resumed at the 16:20
+boundary, 90% for one sample of catch-up); checkpoint `market-state-materializer-v1` shard 0 at owner epoch 2, offset
+3,528,679 and climbing, committed every pass (16:26:58); 0 'identity changed before commit', 0 tracebacks/errors. Options
+E:16:15 COMPLETE 16:21:14 (run 75 s, 25%), E:16:20 COMPLETE 16:25:58 (59 s, 20%); lanes at E:16:25 as designed (O1
+COMPLETE_SELECTED, not stored 0; O2 UNAVAILABLE; O3 BLOCKED R44; OS1/OS2 COMPLETE_ZERO). Marks 32/72 at 16:20 and 16:25
+(40 `OPTION_NBBO_STALE_OR_NONCAUSAL`) - within the afternoon's pre-flip range 33-50 (15:45 33), quiet contracts, not the
+flip. **CPU** (`scratchpad/ev/ms-v316-watch.txt`, docker stats every ~17 s): one full cycle 16:21:14-16:26:16 mean
+**15.9%**, median 12.1% (between windows 5-15%, inside the window 33-48%); before (profile #2 15:43, same encode): mean
+23.2%, median 19.2% (between windows 14-27%, window 41-50%). Profile #3 at 17:57 measures it by cause. Fallback (~1 min,
+resumes from checkpoints): `compose_env.py realtime-v3-options-p8-market-state REALTIME_V3_MARKET_STATE_HASH --remove` +
+the same hotfix with **r97**.
+
+Nov 12 16:27 UTC watch: normal after V3-1.6 (Equity 23 / Options 22 COMPLETE through 16:25, lanes as designed, run
+17-29%, alarms 0, market-state 7% CPU between windows). Options lag one sample 7 s, then 0-1 s (16:27:54-16:28:15).
+Host (Windows) SNTP offset +0.833 s (15:41 +0.615 s, drifting); the services' clock in a container +0.116 / +0.131 s:
+under the 1 s line, no action; watch the host trend (a host over 1 s gets the user's admin `w32tm /resync /force`).
+
+### Nov 12 (17:59-18:09 UTC): V3-1 profile **#3** (market-state HASH=CHECKPOINT since 16:18, encode cache off; Flow V3)
+
+`runner/profile_options_roles.sh 180`; log `scratchpad/profile3.log`; data `data-audit/profiles/p8-<role>-20261112T1757.txt`.
+Compared with Nov 11 **V3 #1** (17:57, same hour) and today's #2 (15:43). **market-state**: 2,062 active samples (#2
+2,024; Nov 11 V3 #1 3,234): DB write (state, checkpoints) **26.7%** (#2 5.5%, V3 #1 11.6%), journal read 24.7% (#2
+46.5%), **hash/JSON 23.5%** (#2 31.2%, V3 #1 49.1%), window stages 16.4%, DB other 4.1%, materialize 1.5%, decode 1.1%;
+CPU mean 26.3%, median 30.4%, max 49.3% (#2 23.2 / 19.2 / 49.5; V3 #1 38.1 / 36.9 / 66.0). Inclusive by function (#2 ->
+#3): `_slice_identity` **23.2% -> 0.2%** (V3-1.6 did what it was for: no whole-state re-hash per window), but
+`_persist_quote_materialization` 5.9% -> **30.4%**, `decode_materializer_state` 3.7% -> **21.3%**,
+`encode_materializer_state` 13.5% -> 22.6%, checkpoint path 17.9% -> 45.7%. The persist step's safety check
+(`restore_materializer_checkpoint(checkpoint, shard_map)` then `restored != state`, `materialization_repository.py:67-69`)
+decodes the whole checkpoint payload (~0.9 MB text at 16:26) and compares it every persist; with CHECKPOINT mode that
+path now carries the cost the hash used to. Net: hashing fell as designed, total market-state CPU did not (26% vs Nov 11
+38% at the same hour, about #2's level). New G102 row V3-1.6c (persist-path restore check). V3-1.6b (encode cache, on at
+18:13) cuts the encode half of it. **flow** (V3 loop): 545 samples (#2 516), flow 41.7%, hash/JSON 26.2%, DB other
+21.3%; CPU mean 7.8%, median 5.9%, max 31.2% (#2 7.7%): stable. **window**: 119 samples (#2 695, #1 1,057), DB other 51.3%
+(`load_v3_pending_window_bindings` 20.2%), window stages 34.5%; CPU mean 1.7% (#2 5.3%): fewer O1 packages per window this
+hour (O1 COMPLETE_ZERO in several windows). Options window run 13-22% (17:25-18:03), alarms 0.
+
+### Nov 12 (18:13-18:25 UTC): V3-1.6b on - market-state checkpoint encode cache (`REALTIME_V3_MARKET_STATE_ENCODE=CACHED`, r97)
+
+**Precondition 18:13:09**: profile #3 finished 18:09; V3-1.6 on since 16:18 (0 restarts, 0 error/mismatch lines);
+Options E:17:55-18:05 COMPLETE, lanes as designed; no market-state fault rows. **Flip**: `compose_env.py
+realtime-v3-options-p8-market-state REALTIME_V3_MARKET_STATE_ENCODE CACHED` 18:13:41 (backup
+`rollout/compose.stable.before-realtime_v3_market_state_encode-20261112T181341Z.json`); `-Step hotfix -Service
+realtime-v3-options-p8-market-state -Image r97` 18:13:42-18:14:22 (recreated 18:13:43-45; `others_changed` none; log
+`scratchpad/deploy-ms-v316b.log`). **Verify**: `printenv` in the container: ENCODE=CACHED, HASH=CHECKPOINT, LOOP=V3;
+`advanced_options_market_state_loop mode=V3` 18:15:00; 0 `advanced_options_market_state_encode_mismatch` lines, 0
+tracebacks/errors, no MARKET_STATE_ENCODE_MISMATCH fault (self-check: first 20 encodes and every 200th compared with
+the full encode); checkpoint `market-state-materializer-v1` at owner epoch 3, offset 5,794,949 (18:19:53) -> 5,800,903
+(18:20:14), committed every pass. Options E:18:10 COMPLETE 18:15:43, E:18:15 COMPLETE 18:19:16; marks 38 and 22 of 72
+(afternoon range 20-46 since 16:25, 17:30 20). **CPU** (`scratchpad/ev/ms-v316b-*.txt`): 18:20:34-18:24:23 (17 samples,
+one window inside) mean **7.9%**, median 5.7%, max 38.8%; before: V3-1.6 alone one cycle 16:21-16:26 mean 15.9% /
+median 12.1%, profile #3 (17:59-18:02) mean 26.3%; 18:13:09-27 between windows 2.6-17.5%. Profile #4 at 20:47 measures
+it by cause. Fallback (~1 min): `compose_env.py realtime-v3-options-p8-market-state REALTIME_V3_MARKET_STATE_ENCODE
+--remove` + the same hotfix with r97; a mismatch already falls back to the full encode by itself.

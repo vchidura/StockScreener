@@ -4,6 +4,7 @@ import { useQuery, useQueryClient } from '@tanstack/react-query'
 import type { DashboardPublication } from '../services/api'
 import { realtimeCohortId, usePortalIdentity } from '../services/portalIdentity'
 import { useOptionalSessionDate } from '../layout/sessionDate'
+import { EQUITY_FIRST_CHECK_MS, msUntilWindowRead, windowTimeMs } from '../utils/refreshTiming'
 
 const isTickerPath = (path: string) => /^\/ticker\/[^/]+(?:\/|$)/.test(path)
 export const isTickerWorkspaceQuery = (name: string) => name.startsWith('ticker-workspace:')
@@ -57,8 +58,12 @@ export function useStrategyInterval(searchState?: { current: { pending: URLSearc
   return { interval, setInterval }
 }
 
-/** A window publishes every 5 minutes; this finds it soon after, and each new one reloads the page's reads. */
+/** A window publishes every 5 minutes; this finds it soon after, and each new one reloads the page's reads.
+ * Nov 12 (user): the check follows the window (40 s after each 5-minute mark, then every 10 s until it lands);
+ * this interval applies only while no live window is expected (before the day's first window). */
 const LIVE_PUBLICATION_POLL_MS = 30_000
+const publicationWindowMs = (data: unknown) =>
+  windowTimeMs((data as { publication?: { market_time?: string } } | undefined)?.publication?.market_time)
 
 export function usePublicationQuery<T extends { publication: Pick<DashboardPublication, 'cohort_id' | 'snapshot_id'> & { session?: string } }>(
   name: string, load: (snapshotId?: string, sessionDate?: string) => Promise<T>,
@@ -134,7 +139,10 @@ export function usePublicationQuery<T extends { publication: Pick<DashboardPubli
     staleTime: Infinity,
     refetchOnMount: internalSelection ? 'always' : undefined,
     refetchOnWindowFocus: false,
-    refetchInterval: readingLive && tickerWorkspace ? LIVE_PUBLICATION_POLL_MS : false,
+    refetchInterval: readingLive && tickerWorkspace
+      ? current => msUntilWindowRead(Date.now(), publicationWindowMs(current.state.data), EQUITY_FIRST_CHECK_MS,
+        LIVE_PUBLICATION_POLL_MS)
+      : false,
   })
   const commit = (result: T) => {
     const snapshot = result.publication.snapshot_id

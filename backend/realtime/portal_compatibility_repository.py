@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import re
 from collections import OrderedDict
 from collections.abc import Mapping, Sequence
@@ -125,6 +126,12 @@ ADVANCED_CURRENT_MARK_STALE_SECONDS = 900
 _ALERT_SOURCE_FACTS = BoundedCache(4096)
 # OA1 (Nov 12): an alert leg's IV and Greeks at its source time never change either; complete values are kept.
 _ALERT_VALUATIONS = BoundedCache(4096)
+OPTIONS_ALERT_VALUATION_SWITCH = "REALTIME_V2_OPTIONS_ALERT_VALUATION"
+
+
+def options_alert_valuation_enabled() -> bool:
+    """OA1/OA2: `ON` values alert legs at read time; anything else (the default) leaves the rows as stored."""
+    return os.environ.get(OPTIONS_ALERT_VALUATION_SWITCH, "OFF").strip().upper() == "ON"
 
 
 def _mark_market_time(value) -> datetime | None:
@@ -1130,6 +1137,15 @@ class RealtimeOptionsAlertsPageRepository(_RealtimeCompatibilityRepository):
                 _apply_source_facts(row["original_package"]["legs"], value)
         return envelope
 
+    def _advanced_alert_valuation_switched(self, cursor, envelope):
+        """OA1/OA2 only with `REALTIME_V2_OPTIONS_ALERT_VALUATION=ON`. Off (the default) serves the rows as before OA1,
+        with no optional read listed. Nov 12 r95 rehearsal: the API role has no SELECT on
+        `rt.advanced_options_reference_states` (relation registry, api=False), so every read fell back; the switch
+        goes on after that grant is in place (a hardening run: the user's yes)."""
+        if not options_alert_valuation_enabled():
+            return envelope
+        return self._advanced_alert_valuation_reported(cursor, envelope)
+
     def _advanced_alert_valuation_reported(self, cursor, envelope):
         """OA1/OA2 (Nov 12) under a savepoint, reporting what was served (INV-9). Runs after the source facts, which
         supply each leg's stock price at the trigger."""
@@ -1424,7 +1440,7 @@ class RealtimeOptionsAlertsPageRepository(_RealtimeCompatibilityRepository):
                                 )
                                 envelope = self._advanced_current_marks_reported(cursor, envelope, cutoff=cutoff)
                                 envelope = self._advanced_source_facts_reported(cursor, envelope, cutoff=cutoff)
-                                envelope = self._advanced_alert_valuation_reported(cursor, envelope)
+                                envelope = self._advanced_alert_valuation_switched(cursor, envelope)
                             else:
                                 envelope = publication.detector_runs(request, **identity)
                             return (

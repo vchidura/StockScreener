@@ -20,6 +20,8 @@ function compile(file, overrides = {}) {
   module.paths = Module._nodeModulePaths(path.dirname(filename))
   module.require = specifier => {
     if (Object.hasOwn(overrides, specifier)) return overrides[specifier]
+    // Nov 12: the refresh timing helper is plain code with no imports; compile the real one.
+    if (specifier.endsWith('/utils/refreshTiming')) return compile('utils/refreshTiming.ts')
     if (specifier === '../layout/sessionDate') return { useOptionalSessionDate: () => null }
     if (specifier === '../services/livePrices') {
       return {
@@ -753,7 +755,12 @@ test('the ticker page follows a running session, and All Tickers stays on the la
       const page = open('ticker-workspace:AAPL', search, running, async (pin, session) => { calls.push(session); return answer(session) })
       await page.view.retry()
       assert.deepEqual(calls, [undefined], 'today reads the latest published window, not a close')
-      assert.equal(page.options().refetchInterval, 30_000)
+      // Nov 12: the check follows the 5-minute window (refreshTimingNov12.test.mjs); with no window shown yet, or
+      // one more than two windows old, it is the plain 30 s check.
+      const interval = page.options().refetchInterval
+      assert.equal(typeof interval, 'function')
+      assert.equal(interval({ state: { data: undefined } }), 30_000)
+      assert.equal(interval({ state: { data: { publication: { market_time: '2026-11-05T14:35:00+00:00' } } } }), 30_000)
     }
 
     const beforeFirstWindow = []

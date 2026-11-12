@@ -3,6 +3,9 @@ from __future__ import annotations
 from bisect import bisect_left
 import hashlib
 import json
+import logging
+import os
+import threading
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from decimal import Decimal, InvalidOperation
@@ -771,6 +774,16 @@ def encode_materializer_state(
 ) -> bytes:
     if maximum_bytes <= 0:
         raise ValueError("checkpoint byte limit must be positive")
+    if market_state_encode_mode() == "CACHED" and not _ENCODE_CACHE["failed"]:
+        payload = _encode_state_cached(state)
+    else:
+        payload = _encode_state_full(state)
+    if len(payload) > maximum_bytes:
+        raise ValueError("materializer checkpoint exceeds its byte limit")
+    return payload
+
+
+def _encode_state_full(state: MaterializerShardState) -> bytes:
     document = {
         "codec": MATERIALIZER_STATE_CODEC,
         "shard_id": state.shard_id,
@@ -780,15 +793,99 @@ def encode_materializer_state(
         "trades": [_trade_document(trade) for trade in state.trades],
         "quote_history": [_quote_document(quote) for quote in state.quote_history],
     }
-    payload = json.dumps(
+    return json.dumps(
         document,
         sort_keys=True,
         separators=(",", ":"),
         ensure_ascii=True,
     ).encode("ascii")
-    if len(payload) > maximum_bytes:
-        raise ValueError("materializer checkpoint exceeds its byte limit")
-    return payload
+
+
+# V3-1.6b (Nov 12): the market-state role encodes every shard's whole state into its checkpoint on every pass (Nov 11
+# V3 #2 profile: ~17% of the role's busy samples), although a pass changes only the quotes and trades it read. With
+# `REALTIME_V3_MARKET_STATE_ENCODE=CACHED` each quote and trade object's JSON text is kept from the shard's previous
+# encode and the payload is assembled from those texts; the bytes are identical to the full encode (same json options;
+# JSON encoding is compositional), so checkpoints, `state_hash` and every reader are unchanged. The key is the object
+# itself (identity; quotes and trades are frozen and the state advance carries unchanged ones over), never its value:
+# Decimal("1.5") == Decimal("1.50") but they encode differently. The cache holds only the shard's last encoded state.
+# Self-check: the first calls and every Nth call also run the full encode; a difference writes the full bytes, reports
+# a fault and turns the cache off for the process. Anything but `CACHED` (the default, `FULL`) encodes as before.
+MARKET_STATE_ENCODE_SWITCH = "REALTIME_V3_MARKET_STATE_ENCODE"
+_ENCODE_OPTIONS = {"sort_keys": True, "separators": (",", ":"), "ensure_ascii": True}
+_ENCODE_VERIFY_FIRST = 20
+_ENCODE_VERIFY_EVERY = 200
+_ENCODE_SHARDS_MAX = 64
+_ENCODE_LOCK = threading.Lock()
+_ENCODE_CACHE: dict = {"failed": False, "calls": 0, "verified": 0, "fragments": {}}
+
+
+def market_state_encode_mode() -> str:
+    value = os.environ.get(MARKET_STATE_ENCODE_SWITCH, "FULL").strip().upper()
+    return "CACHED" if value == "CACHED" else "FULL"
+
+
+def _encode_state_cached(state: MaterializerShardState) -> bytes:
+    payload = _encode_state_fragments(state)
+    with _ENCODE_LOCK:
+        _ENCODE_CACHE["calls"] += 1
+        calls = _ENCODE_CACHE["calls"]
+    if calls > _ENCODE_VERIFY_FIRST and calls % _ENCODE_VERIFY_EVERY:
+        return payload
+    full = _encode_state_full(state)
+    if full == payload:
+        with _ENCODE_LOCK:
+            _ENCODE_CACHE["verified"] += 1
+        return payload
+    with _ENCODE_LOCK:
+        _ENCODE_CACHE["failed"] = True
+        _ENCODE_CACHE["fragments"] = {}
+    message = (
+        f"cached checkpoint encode differed from the full encode (shard {state.shard_id}, offset "
+        f"{state.scanned_offset}, {len(payload)} vs {len(full)} bytes); the full bytes were written and the cache is "
+        "off for this process"
+    )
+    logging.getLogger(__name__).error("advanced_options_market_state_encode_mismatch %s", message)
+    from .fault_journal import emit_fault
+
+    emit_fault(kind="MARKET_STATE_ENCODE_MISMATCH", severity="DEGRADED", recoverable=True, action="ENCODE_FULL",
+               service="options-market-state", key=f"encode-mismatch|{state.shard_id}", message=message,
+               context={"shard_id": state.shard_id, "scanned_offset": state.scanned_offset, "matrix_row": "V3-1.6b"})
+    return full
+
+
+def _encode_state_fragments(state: MaterializerShardState) -> bytes:
+    key = (state.shard_map_sha256, state.shard_id)
+    with _ENCODE_LOCK:
+        previous = _ENCODE_CACHE["fragments"].get(key) or {}
+    current: dict[int, tuple[object, str]] = {}
+
+    def text(item, document) -> str:
+        held = current.get(id(item))
+        if held is None:
+            held = previous.get(id(item))
+        if held is None or held[0] is not item:
+            held = (item, json.dumps(document(item), **_ENCODE_OPTIONS))
+        current[id(item)] = held
+        return held[1]
+
+    parts = {
+        "codec": json.dumps(MATERIALIZER_STATE_CODEC, **_ENCODE_OPTIONS),
+        "shard_id": json.dumps(state.shard_id, **_ENCODE_OPTIONS),
+        "shard_map_sha256": json.dumps(state.shard_map_sha256, **_ENCODE_OPTIONS),
+        "scanned_offset": json.dumps(state.scanned_offset, **_ENCODE_OPTIONS),
+        "quotes": "[" + ",".join(text(quote, _quote_document) for quote in state.quotes) + "]",
+        "trades": "[" + ",".join(text(trade, _trade_document) for trade in state.trades) + "]",
+        "quote_history": "[" + ",".join(text(quote, _quote_document) for quote in state.quote_history) + "]",
+    }
+    payload = "{" + ",".join(
+        json.dumps(name, **_ENCODE_OPTIONS) + ":" + parts[name] for name in sorted(parts)
+    ) + "}"
+    with _ENCODE_LOCK:
+        fragments = _ENCODE_CACHE["fragments"]
+        if key not in fragments and len(fragments) >= _ENCODE_SHARDS_MAX:
+            fragments.clear()
+        fragments[key] = current
+    return payload.encode("ascii")
 
 
 def _parse_decimal(value: object, name: str) -> Decimal | None:

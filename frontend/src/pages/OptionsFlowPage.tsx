@@ -19,7 +19,14 @@ import {
   type OptionFlowStrike,
   type OptionFlowSummary,
 } from '../services/api'
+import { msUntilWindowRead, OPTIONS_FIRST_CHECK_MS, windowTimeMs } from '../utils/refreshTiming'
 import './OptionsFlowPage.css'
+
+/** The window the Flow read shows: its release cutoff, or the chain capture's time when that is older. */
+export const flowWindowMs = (envelope?: { release_cutoff?: string; as_of?: string | null;
+  data?: { coverage_source?: string; breadth?: { breadth_observed_at?: string } | null } } | null) =>
+  envelope ? windowTimeMs(envelope.release_cutoff ?? envelope.as_of,
+    envelope.data?.coverage_source === 'BREADTH' ? envelope.data.breadth?.breadth_observed_at : undefined) : null
 
 type ProfileMetric = 'volume' | 'open_interest'
 
@@ -279,10 +286,13 @@ export default function OptionsFlowPage() {
   const [includeZeroDte, setIncludeZeroDte] = useState(true)
   const [showExpiryPercent, setShowExpiryPercent] = useState(false)
   const [contractSort, setContractSort] = useState<{ key: ContractSortKey | null; descending: boolean }>({ key: null, descending: true })
+  // Nov 12 (user): read when the next window's data lands (its release and, for breadth, its chain capture: first check
+  // 50 s after each 5-minute mark, then every 10 s until both are in); 60 s when no live window is expected.
   const flow = useQuery({
     queryKey: ['options', 'flow', ticker, sessionDate],
     queryFn: () => getOptionFlow(ticker, sessionDate || undefined),
-    refetchInterval: 60_000,
+    refetchInterval: current => msUntilWindowRead(Date.now(), flowWindowMs(current.state.data), OPTIONS_FIRST_CHECK_MS,
+      60_000),
   })
   const data = flow.data?.data
   const selected = data?.selected_summary
