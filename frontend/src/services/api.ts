@@ -834,7 +834,7 @@ export interface ChartDataPoint {
   volume: number
   derived?: boolean
   provisional?: boolean
-  source_interval?: '5m'
+  source_interval?: '1m' | '5m'
   available_through?: number
 }
 
@@ -1823,6 +1823,38 @@ export const getChartData = async (
   const response = await api.get(`/stock/${ticker}/chart`, { params: retainedTickerParams(params, snapshotId, closingView) })
     .catch(error => { throw storedReadError(error) })
   return response.data
+}
+
+/** Nov 12 (user): the chart interval's developing bar, built from stored final 1m bars (display only). */
+export interface ChartFormingBar {
+  interval: string
+  status: 'FORMING' | 'NONE'
+  reason: string | null
+  point: (ChartDataPoint & { forming: true; as_of: string; minute_bars: number; daily_bars: number }) | null
+}
+
+export const getChartFormingBar = async (
+  ticker: string,
+  interval: string,
+  snapshotId?: string,
+): Promise<ChartFormingBar | null> => {
+  try {
+    const response = await api.get(`/stock/${ticker}/chart/forming`, { params: retainedTickerParams({ interval }, snapshotId, false) })
+    return response.data
+  } catch {
+    return null // an API without the read (or a failed read) simply draws no developing bar
+  }
+}
+
+/** Appends the developing bar as the chart's provisional last candle when it starts after the last final one. */
+export const withFormingBar = (points: ChartDataPoint[], forming: ChartFormingBar | null | undefined): ChartDataPoint[] => {
+  const point = forming?.status === 'FORMING' ? forming.point : null
+  const last = points[points.length - 1]
+  if (!point || (last && point.time <= last.time)) return points
+  return [...points, {
+    time: point.time, open: point.open, high: point.high, low: point.low, close: point.close, volume: point.volume,
+    provisional: true, source_interval: '1m', available_through: Math.floor(new Date(point.as_of).getTime() / 1000),
+  }]
 }
 
 export const getChartPatterns = async (

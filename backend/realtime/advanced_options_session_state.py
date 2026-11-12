@@ -1632,6 +1632,100 @@ class PostgresContinuousSessionStateRepository(SessionRuntimeStatePort):
         self._head_checked_at = self._monotonic()
         return bindings
 
+    def load_downstream_bindings_after(
+        self,
+        session_binding: P8PreopenSessionBinding,
+        *,
+        after_sequence: int,
+        after_binding_sha256: str | None,
+    ) -> tuple[P8DownstreamBinding, ...]:
+        """V3-1.F (Nov 11): the downstream bindings after `after_sequence`, checked as a continuation of the binding the
+        caller already holds (`after_binding_sha256`). The same chain and head checks as `load_downstream_bindings`,
+        applied to the new tail only, so a reader that polls twice a second no longer re-reads and re-decodes every
+        binding of the session (the flow role's cost grew from 13% to 43% of a core over Nov 11)."""
+        if after_sequence < 0 or (after_sequence == 0) != (after_binding_sha256 is None):
+            raise ValueError("downstream continuation point is invalid")
+        stored = self._load_stored()
+        if session_binding != stored.session_binding:
+            raise ValueError(
+                "PostgreSQL downstream read targets another session"
+            )
+        with self._provider.transaction(
+            APP_ROLE,
+            read_only=True,
+        ) as unit:
+            unit.cursor.execute(
+                "WITH captured_head AS MATERIALIZED ("
+                "SELECT sequence,binding_sha256 "
+                "FROM rt.advanced_options_downstream_heads "
+                "WHERE session_binding_id=%s"
+                ") SELECT head.sequence,head.binding_sha256,"
+                "binding.sequence,binding.binding_sha256,"
+                "binding.binding_document "
+                "FROM captured_head AS head "
+                "LEFT JOIN rt.advanced_options_downstream_bindings "
+                "AS binding "
+                "ON binding.session_binding_id=%s "
+                "AND binding.sequence>%s "
+                "AND binding.sequence<=head.sequence "
+                "ORDER BY binding.sequence",
+                (
+                    str(stored.session_binding_id),
+                    str(stored.session_binding_id),
+                    after_sequence,
+                ),
+            )
+            rows = unit.cursor.fetchall()
+        if not rows:
+            raise RuntimeError(
+                "PostgreSQL Options downstream head is unavailable"
+            )
+        head_sequence = int(rows[0][0])
+        head_sha256 = (
+            None if rows[0][1] is None else str(rows[0][1])
+        )
+        if any(
+            int(row[0]) != head_sequence
+            or (
+                None if row[1] is None else str(row[1])
+            )
+            != head_sha256
+            for row in rows
+        ):
+            raise RuntimeError(
+                "PostgreSQL Options captured head changed"
+            )
+        bindings = tuple(
+            p8_downstream_binding_from_payload(row[4])
+            for row in rows
+            if row[2] is not None
+        )
+        previous = after_binding_sha256
+        for sequence, binding in enumerate(bindings, start=after_sequence + 1):
+            if (
+                binding.sequence != sequence
+                or binding.previous_binding_sha256 != previous
+                or binding.session_binding_sha256
+                != session_binding.binding_sha256
+            ):
+                raise RuntimeError(
+                    "PostgreSQL Options downstream chain diverged"
+                )
+            previous = binding.binding_sha256
+        if (
+            head_sequence != after_sequence + len(bindings)
+            or (head_sequence == 0 and head_sha256 is not None)
+            or (head_sequence > 0 and previous != head_sha256)
+        ):
+            raise RuntimeError(
+                "PostgreSQL Options downstream head is not the chain tail"
+            )
+        if bindings:
+            self._head_sequence = head_sequence
+            self._head_binding = bindings[-1]
+        self._head_checked_at = self._monotonic()
+        return bindings
+
     @staticmethod
     def _validate_downstream_facts(
         cursor,

@@ -1733,6 +1733,20 @@ class RealtimeTickerWorkspaceRepository(_RealtimeCompatibilityRepository):
                 raise TickerPublicationUnavailable("Ticker publication does not match the selected session close")
         read_state = payload.get("_retained_read_state")
         provider_tier = payload["_chart_source"]["provider_tier"]
+        if contract == "forming":
+            # Nov 12 (user): the chart's developing bar, built at read time from stored final bars; display only.
+            from .ticker_forming_bar import FORMING_INTERVALS, load_forming_bar_cursor, xnys_sessions
+
+            if interval not in FORMING_INTERVALS:
+                raise ValueError("Forming bars cover 5m, 15m, 30m, 1h, 1d, 1wk and 1mo")
+            if closing_view:  # a past session's closing view has no developing bar
+                return dict(interval=interval, status="NONE", reason="CLOSING_VIEW", point=None)
+            with self._cursor() as cursor:
+                self._begin(cursor)
+                return load_forming_bar_cursor(
+                    cursor, instrument_id=int(payload["_chart_source"]["instrument_id"]), interval=interval,
+                    now=cutoff, sessions=xnys_sessions,
+                )
         if contract == "publication":
             context = payload["context"]["cohort"]
             quote = payload["quote"]

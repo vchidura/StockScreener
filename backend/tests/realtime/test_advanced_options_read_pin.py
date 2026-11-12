@@ -161,7 +161,8 @@ def test_read_pin_refuses_another_enabled_package():
         port.enable(cohort_id=COHORT, release_id=RELEASE)
 
 
-def test_read_pin_rollback_removes_new_pin_when_prior_pin_is_absent():
+def test_read_pin_rollback_disables_new_pin_when_prior_pin_is_absent():
+    # G20 (Nov 12): the app role may not delete a pin, so the first pin is disabled; readers serve only enabled pins.
     provider = _Provider()
     port = PostgresAdvancedOptionsStoredReadPort(
         provider,
@@ -170,6 +171,13 @@ def test_read_pin_rollback_removes_new_pin_when_prior_pin_is_absent():
     )
 
     port.enable(cohort_id=COHORT, release_id=RELEASE)
+    original = provider.cursor.execute
+
+    def no_delete(statement, parameters=()):
+        assert not statement.startswith("DELETE"), "rollback must not delete the pin"
+        return original(statement, parameters)
+
+    provider.cursor.execute = no_delete
     restored = port.restore(
         cohort_id=COHORT,
         expected_release_id=RELEASE,
@@ -177,7 +185,24 @@ def test_read_pin_rollback_removes_new_pin_when_prior_pin_is_absent():
     )
 
     assert restored is None
-    assert provider.cursor.pin is None
+    assert provider.cursor.pin["enabled"] is False
+    assert provider.cursor.pin["release_id"] == str(RELEASE)
+    assert provider.cursor.pin["disabled_at"] == NOW
+
+
+def test_read_pin_rollback_of_a_first_pin_is_idempotent():
+    provider = _Provider()
+    port = PostgresAdvancedOptionsStoredReadPort(
+        provider,
+        package_sha256=PACKAGE,
+        clock=lambda: NOW,
+    )
+    port.enable(cohort_id=COHORT, release_id=RELEASE)
+    port.restore(cohort_id=COHORT, expected_release_id=RELEASE, previous=None)
+    disabled = dict(provider.cursor.pin)
+
+    assert port.restore(cohort_id=COHORT, expected_release_id=RELEASE, previous=None) is None
+    assert provider.cursor.pin == disabled
 
 
 def test_read_pin_rollback_restores_exact_disabled_prior_pin():

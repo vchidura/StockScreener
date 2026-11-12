@@ -163,3 +163,18 @@
   .flow-strike-legend,
   .flow-strike-row { grid-template-columns: minmax(0, 1fr) 44px minmax(0, 1fr); gap: 3px; }
 }
+/* Nov 12 (user): expiry chart options (0 DTE, % labels) and sortable contract columns. */
+.flow-section__header--expiry { align-items: center; }
+.flow-expiry-options { display: flex; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: 10px; }
+.flow-check { display: inline-flex; align-items: center; gap: 4px; color: var(--tm-muted); font-size: 9px; font-weight: 700; white-space: nowrap; cursor: pointer; }
+.flow-check input { margin: 0; accent-color: var(--tm-accent, currentColor); }
+.flow-expiry-stack > span { position: relative; overflow: hidden; }
+.flow-expiry-stack > span em { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; color: #fff; font-size: 8px; font-style: normal; font-weight: 800; line-height: 1; text-shadow: 0 0 2px rgba(0, 0, 0, 0.6); white-space: nowrap; }
+.flow-expiry-empty { margin: 0; padding: 12px; color: var(--tm-faint); font-size: 10px; }
+.flow-table th .flow-sort { padding: 0; color: inherit; background: none; border: 0; font: inherit; letter-spacing: inherit; text-transform: inherit; cursor: pointer; white-space: nowrap; }
+.flow-table th .flow-sort:hover,
+.flow-table th .flow-sort.is-active { color: var(--tm-ink); }
+@media (max-width: 640px) {
+  .flow-section__header--expiry { display: grid; grid-template-columns: 1fr; }
+  .flow-expiry-options { justify-content: flex-start; }
+}

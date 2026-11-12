@@ -547,7 +547,7 @@ def run_cycles(
     stop: threading.Event,
     clock: Callable[[], datetime] = _now,
     calendar: OptionExchangeCalendar | None = None,
-    emit: Callable[[str], None] = print,
+    emit: Callable[[str], None] = lambda line: print(line, flush=True),
     statistics: Callable[[datetime], dict[str, object]] | None = None,
 ) -> int:
     """The retention cycle every `--interval-seconds`; with `statistics` (G99), the planner-statistics step after each
@@ -670,8 +670,14 @@ def main(argv=None) -> int:
     cycle = _build_cycle(args, app_connect, admin_connect)
     stop = threading.Event()
     if args.continuous:
-        signal.signal(signal.SIGINT, lambda *_: stop.set())
-        signal.signal(signal.SIGTERM, lambda *_: stop.set())
+        def request_stop(signum, _frame):
+            # R43 (Nov 11): retention exited 0 at 14:51 with nothing in its log; name the signal that stops it.
+            print(json.dumps({"retention_stop_signal": signal.Signals(signum).name,
+                              "at": _now().isoformat()}), file=sys.stderr, flush=True)
+            stop.set()
+
+        signal.signal(signal.SIGINT, request_stop)
+        signal.signal(signal.SIGTERM, request_stop)
     statistics = (
         PlannerStatistics(admin_connect, statistics_status_path(args.status_path))
         if args.statistics_interval_seconds > 0

@@ -4,7 +4,7 @@ import hashlib
 import json
 import math
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from xml.etree import ElementTree
 from uuid import NAMESPACE_URL, UUID, uuid5
@@ -15,6 +15,31 @@ TREASURY_RECEIPT_AGE_POLICY = "treasury-receipt-age-v1"
 TREASURY_PRIOR_SESSION_PUBLICATION_POLICY = (
     "treasury-prior-xnys-session-publication-v1"
 )
+
+
+def bond_market_holiday(day: date) -> bool:
+    """Nov 12 2026: days the US Treasury market is closed while stocks and listed options trade, so Treasury publishes
+    no par yield curve: Columbus Day (second Monday of October) and Veterans Day (Nov 11; observed Friday when it falls
+    on a Saturday, Monday when on a Sunday). Nov 11 2026 left the Nov 12 Options reference state without its curve."""
+    if day.month == 10 and day.weekday() == 0 and 8 <= day.day <= 14:
+        return True
+    if day.month == 11:
+        observed = date(day.year, 11, 11)
+        if observed.weekday() == 5:
+            observed -= timedelta(days=1)
+        elif observed.weekday() == 6:
+            observed += timedelta(days=1)
+        return day == observed
+    return False
+
+
+def treasury_rate_date_for_session(session_date: date, calendar) -> date:
+    """The Treasury curve date an Options session values with: the previous XNYS session, stepping back over Treasury
+    market holidays (policy `treasury-prior-xnys-session-publication-v1`, unchanged otherwise)."""
+    day = calendar.previous_session_date(session_date)
+    while bond_market_holiday(day):
+        day = calendar.previous_session_date(day)
+    return day
 TREASURY_CURVE_URL = (
     "https://home.treasury.gov/resource-center/data-chart-center/interest-rates/"
     "pages/xml?data=daily_treasury_yield_curve&field_tdr_date_value={year}"

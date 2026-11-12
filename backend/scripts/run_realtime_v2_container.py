@@ -355,7 +355,11 @@ def run_fenced_child(
     )
     process = None
 
-    def request_stop(*_unused):
+    def request_stop(signum=None, _frame=None):
+        # R43 (Nov 11): say why a fenced role stops (a signal here; a lost lease is logged by the heartbeat).
+        if signum is not None:
+            print(json.dumps({"fenced_role_stop_signal": signal.Signals(signum).name, "component": component}),
+                  file=sys.stderr, flush=True)
         stop.set()
         if process is not None and process.poll() is None:
             process.terminate()

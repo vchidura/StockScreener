@@ -73,6 +73,23 @@ Each invariant is testable; the matrix lists its status and test.
   CLOSED once the cutoff reaches `valid_until`. A failed session read serves the release rows and says so (INV-9).
 - No schema change.
 
+**Read rules on the Options Alerts and Flow pages (matrix A0.2; built Nov 10-11 as R29, R45, R46, R48; read side only,
+`AdvancedOptionsPublication.detector_runs`, `option_flow_breadth.breadth_flow_data`).**
+
+- **Repeats fold (R29).** A later run's row for a candidate the session list already holds is a repeat hit on that
+  alert (hit and repeat count +1, last seen), never a second alert; `repeat_hits` counts hits beyond the first.
+- **One row per contract and side (R46).** The session list shows one alert per (contract, side): the first trigger is
+  the alert; a later detector on the same contract and side (order O1, OS1, OS2) is added to it as a confirmation with
+  its own trigger time and price (`detectors`, `confirmations`), and its hits count on the alert. The opposite side is a
+  separate alert. A detector filter returns that detector's own rows. Storage keeps one `rt.alert_current` row per
+  (session, detector, contract) as above; the grouping happens on read.
+- **Latest Run and Day History differ (R45).** `scope=LATEST`: alerts triggered or hit in the latest run.
+  `scope=HISTORY`: alerts first triggered before it, with the latest run withheld and named for the current session,
+  as Stock Alerts does.
+- **Flow keeps the last good chain (R48).** Flow and Activity use the latest COMPLETE breadth capture per ticker; a
+  later capture that failed or was partial is named beside it (`latest_capture_state`, `_at`, `_reason`) and the page
+  warns; a ticker with no COMPLETE capture serves its streamed contracts with `breadth_fallback` set (INV-9).
+
 ## 4. A4: bars keyed without the cohort
 
 ### 4.1 Schema

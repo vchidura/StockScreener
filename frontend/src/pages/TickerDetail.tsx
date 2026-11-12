@@ -17,6 +17,8 @@ import {
 } from 'lightweight-charts'
 import { 
   getChartData,
+  getChartFormingBar,
+  withFormingBar,
   getChartPatterns,
   getPriceChannel,
   scanTickerChartPatterns,
@@ -92,6 +94,7 @@ import { CHART_PERIODS, selectChartPatterns, useChartPreferences } from './ticke
 export type TickerView = 'overview' | 'timeframes' | 'levels' | 'fibonacci' | 'financials'
 
 const DEVELOPING_CANDLE_INTERVALS = new Set(['15m', '30m', '1h', '1d'])
+const FORMING_BAR_INTERVALS = new Set(['5m', '15m', '30m', '1h', '1d', '1wk', '1mo'])
 
 function formatDevelopingThrough(unixSeconds: number): string {
   return new Intl.DateTimeFormat(undefined, {
@@ -165,7 +168,7 @@ function TickerDetail({ view, publication, readsEnabled = true, publicationLoadi
   const chartRequestPeriod = interval === '1h' ? '2y' : interval === '1wk' ? '5y' : period
 
   const {
-    data: chartData = [],
+    data: publishedChartData = [],
     isFetching: chartLoading,
     isError: chartError,
     error: chartReadError,
@@ -177,6 +180,18 @@ function TickerDetail({ view, publication, readsEnabled = true, publicationLoadi
       previousQuery?.queryKey[3] === interval && (!realtimeOnly || previousQuery.queryKey[5] === snapshotId) ? previous : undefined,
     refetchInterval: !realtimeOnly && DEVELOPING_CANDLE_INTERVALS.has(interval) ? 60_000 : false,
   })
+  // Nov 12 (user): the realtime chart's developing bar for 5m-1mo, read once a minute beside the published bars;
+  // it is drawn as the provisional last candle and, like before, stays out of indicators and patterns.
+  const { data: formingBar = null } = useQuery({
+    queryKey: ['chart-forming', symbol, interval, ...queryScope],
+    queryFn: () => getChartFormingBar(symbol!, interval, snapshotId),
+    enabled: !!symbol && readsEnabled && realtimeOnly && !closingView && FORMING_BAR_INTERVALS.has(interval),
+    refetchInterval: 60_000,
+  })
+  const chartData = useMemo(
+    () => realtimeOnly && !closingView ? withFormingBar(publishedChartData, formingBar) : publishedChartData,
+    [publishedChartData, formingBar, realtimeOnly, closingView],
+  )
   const loading = publicationLoading || chartLoading
   const visibleChartData = getVisibleChartData(chartData, period, interval)
   const finalizedChartData = useMemo(
@@ -926,7 +941,7 @@ function TickerDetail({ view, publication, readsEnabled = true, publicationLoadi
             <Pill
               text="Developing candle"
               tone={WARN}
-              title={`Built from finalized 5m bars through ${formatDevelopingThrough(
+              title={`Built from finalized ${chartData[chartData.length - 1].source_interval ?? '5m'} bars through ${formatDevelopingThrough(
                 (chartData[chartData.length - 1].available_through
                   ?? chartData[chartData.length - 1].time),
               )}`}

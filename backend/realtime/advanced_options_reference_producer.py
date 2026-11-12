@@ -18,6 +18,7 @@ from options.model_inputs import (
     RiskFreeRateObservation,
     TREASURY_PRIOR_SESSION_PUBLICATION_POLICY,
     prepare_expiration_valuation_candidate,
+    treasury_rate_date_for_session,
 )
 from psycopg2 import Error as PsycopgError
 from psycopg2.extras import RealDictCursor
@@ -945,12 +946,19 @@ def _load_treasury_curve(
         ))
         return (), None
     rate_date = rows[0]["rate_date"]
-    expected_rate_date = OptionExchangeCalendar().previous_session_date(
-        plan.control_plane.session_date
+    # Nov 12 (R52): Treasury publishes no curve on Columbus Day or Veterans Day, when Options trade; the session values
+    # with the previous publication (Nov 12 2026 -> Nov 10). And a reference input is used when present, not a reason
+    # to stop every window: when the expected curve is missing (late refresh, Treasury outage), the latest stored one
+    # up to TREASURY_CURVE_MAXIMUM_STALE_SESSIONS older is used and reported (log line + DEGRADED fault); short-dated
+    # IV and Greeks move by basis points between adjacent curves. Older than that, or newer than expected, still refuses.
+    calendar = OptionExchangeCalendar()
+    expected_rate_date = treasury_rate_date_for_session(
+        plan.control_plane.session_date, calendar
     )
+    sessions_behind = _treasury_sessions_behind(expected_rate_date, rate_date, calendar)
     if (
         len(rows) > 64
-        or rate_date != expected_rate_date
+        or sessions_behind is None
         or len({int(row["tenor_days"]) for row in rows}) != len(rows)
         or any(
             row["rate_date"] != rate_date
@@ -979,6 +987,20 @@ def _load_treasury_curve(
         )
         for row in rows
     )
+    if sessions_behind:
+        import logging
+
+        from .fault_journal import emit_fault
+
+        message = (
+            f"Treasury curve {rate_date.isoformat()} used for session {plan.control_plane.session_date.isoformat()}: "
+            f"expected {expected_rate_date.isoformat()} is not stored ({sessions_behind} session(s) older)"
+        )
+        logging.getLogger(__name__).warning("advanced_options_treasury_curve_stale %s", message)
+        emit_fault(kind="TREASURY_CURVE_STALE", severity="DEGRADED", recoverable=True, action="USED_LATEST_CURVE",
+                   service="options-window", key=f"treasury-stale|{expected_rate_date.isoformat()}", message=message,
+                   context={"rate_date": rate_date.isoformat(), "expected_rate_date": expected_rate_date.isoformat(),
+                            "sessions_behind": sessions_behind, "matrix_row": "R52"})
     evidence.append(_evidence(
         "TREASURY_CURVE",
         rate_date.isoformat(),
@@ -989,6 +1011,24 @@ def _load_treasury_curve(
         valid_until=plan.valid_until,
     ))
     return curve, rate_date
+
+
+TREASURY_CURVE_MAXIMUM_STALE_SESSIONS = 5
+
+
+def _treasury_sessions_behind(expected, rate_date, calendar) -> int | None:
+    """How many sessions `rate_date` is older than `expected` (0 when it is the expected curve); None when it is newer
+    or more than TREASURY_CURVE_MAXIMUM_STALE_SESSIONS older. Counted in XNYS sessions, so a curve published on a day
+    the stock market was closed counts with the session after it."""
+    if rate_date > expected:
+        return None
+    day, behind = expected, 0
+    while day > rate_date:
+        day = calendar.previous_session_date(day)
+        behind += 1
+        if behind > TREASURY_CURVE_MAXIMUM_STALE_SESSIONS:
+            return None
+    return behind
 
 
 def _load_discovery_spots(

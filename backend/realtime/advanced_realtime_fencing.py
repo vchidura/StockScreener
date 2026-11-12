@@ -1,6 +1,7 @@
 """PostgreSQL fencing for Advanced Realtime V3 runtime owners."""
 from __future__ import annotations
 
+import logging
 import threading
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -14,6 +15,7 @@ from .database_access_v2 import APP_ROLE, V2ConnectionProvider
 
 
 UTC = timezone.utc
+_LOGGER = logging.getLogger(__name__)
 RUNTIME_GROUP_RESOURCE = "advanced-realtime-v3:runtime"
 OPTIONS_PHYSICAL_SOCKET_RESOURCE = (
     "advanced-realtime-v3:options-physical-socket"
@@ -388,30 +390,69 @@ class PostgresLeaseHeartbeat:
             self._detail = dict(detail or {})
         self._record()
 
+    def _renew_once(self):
+        now = self._clock()
+        with self._provider.transaction(APP_ROLE) as unit:
+            return renew_durable_runtime_lease_cursor(
+                unit.cursor,
+                self.lease,
+                checked_at=now,
+                lease_seconds=self._lease_seconds,
+            )
+
+    def _renew(self):
+        """R43 (Nov 11): one renewal, and one retry after a database error while the lease still has time left. Returns
+        (lease or None, reason). A renewal the database refuses (the lease expired or another owner holds it) is final."""
+        try:
+            renewed = self._renew_once()
+        except PsycopgError as error:
+            first = f"{type(error).__name__}: {str(error).strip()[:200]}"
+            remaining = (self.lease.lease_until - self._clock()).total_seconds()
+            if remaining <= 2.0:
+                return None, f"RENEWAL_ERROR {first} (lease ends in {remaining:.1f} s, no retry)"
+            _LOGGER.warning(
+                "durable_lease_renewal_retry resource=%s error=%s lease_ends_in=%.1fs",
+                self._resource_key, first, remaining,
+            )
+            if self._stop.wait(min(2.0, remaining / 2)):
+                return self.lease, "STOPPING"
+            try:
+                renewed = self._renew_once()
+            except PsycopgError as retry_error:
+                return None, (
+                    f"RENEWAL_ERROR {first}; retry {type(retry_error).__name__}: {str(retry_error).strip()[:200]}"
+                )
+        if renewed is None:
+            return None, "LEASE_NOT_RENEWED (expired or held by another owner)"
+        return renewed, None
+
     def _run(self) -> None:
         interval = max(1.0, self._lease_seconds / 3)
         while not self._stop.wait(interval):
-            try:
-                now = self._clock()
-                with self._provider.transaction(APP_ROLE) as unit:
-                    renewed = renew_durable_runtime_lease_cursor(
-                        unit.cursor,
-                        self.lease,
-                        checked_at=now,
-                        lease_seconds=self._lease_seconds,
-                    )
-            except PsycopgError:
+            renewed, reason = self._renew()
+            if renewed is None:
+                # R43: this stops the role (the wrapper ends its child and the container restarts); say why.
+                _LOGGER.error(
+                    "durable_lease_lost resource=%s owner=%s epoch=%s reason=%s; stopping the role",
+                    self._resource_key, self._owner_id,
+                    getattr(self.lease, "owner_epoch", None), reason,
+                )
                 self._lost.set()
                 if self._external_stop is not None:
                     self._external_stop.set()
                 return
-            if renewed is None:
-                self._lost.set()
-                if self._external_stop is not None:
-                    self._external_stop.set()
+            if reason == "STOPPING":
                 return
             self.lease = renewed
-            self._record()
+            try:
+                self._record()
+            except PsycopgError as error:
+                # The service-state row is advisory; a failed write must not end renewals (it used to end this thread
+                # with only a traceback, leaving the role running while its lease ran out).
+                _LOGGER.warning(
+                    "durable_lease_state_record_failed resource=%s error=%s: %s",
+                    self._resource_key, type(error).__name__, str(error).strip()[:200],
+                )
 
     def close(self) -> None:
         self._stop.set()

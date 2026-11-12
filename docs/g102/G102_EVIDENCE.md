@@ -1355,3 +1355,218 @@ before and 18:45 PUBLISHED at 18:45:48 after; no log between 18:40:28 and the re
 Code: `PostgresLeaseHeartbeat._run` (renew every lease/3 s) sets the wrapper's stop event on a `PsycopgError` or a lease
 not renewed; `run_fenced_child` then terminates the child and returns; the container exits 0 and Docker restarts it.
 Nothing is logged on that path, which matches both restarts. Fix later: log the reason and retry one renewal (R43).
+
+### Nov 11 (20:47-20:58 UTC): V3-1 Step 0 profile **V3 #2** (profile #4; busy end of day) and the four-profile comparison
+
+`profile_options_roles.sh 180`; log `ev/profile-v3-2.log`. **market-state** (V3 loop): 1,857 samples (active ~21% of the
+time): hash/JSON 62.1% (`iterencode` 25.2%, `_canonical_value` 16.3%, `<dictcomp>` 8.1%, `_quote_document` 5.5%,
+`_utc` 4.5%), window stages 14.2%, journal read 9.5%, DB write 9.2%, DB other 1.8%, materialize 1.3%, decode 0.3%;
+docker CPU mean 23.8%, median 20.6%, max 49.0%. **flow** (P8 loop): 4,756 samples: `load_downstream_bindings` 42.2%,
+`iterencode` 28.3%, `raw_decode` 16.1%; CPU mean 43.4%, median 42.1%, max 57.0%. **window**: CPU mean 8.9%, median 1.6%,
+max 97.2% (one window's burst); hash/JSON 48.5%.
+
+| Profile (UTC) | market-state loop | market-state CPU mean / median / max | market-state samples | journal read share | hash/JSON share | flow CPU mean |
+|---|---|---|---|---|---|---|
+| P8 #1 14:49 | P8 | 46.0 / 37.6 / 86.3 | 3,855 | 54.9% | 25.9% | 13.1 |
+| P8 #2 15:44 | P8 | 48.8 / 39.5 / 86.2 | 4,142 | 55.1% | 26.4% | 18.7 |
+| V3 #1 17:57 | V3 | 38.1 / 36.9 / 66.0 | 3,234 | 22.9% | 49.1% | 32.7 |
+| V3 #2 20:47 | V3 | 23.8 / 20.6 / 49.0 | 1,857 | 9.5% | 62.1% | 43.4 |
+
+Reading: V3 removes the per-pass journal re-read (55% -> 10-23%) and halves market-state CPU at the busy close (mean 24%
+vs 46-49%, peak 49% vs 86%); what is left is hashing/JSON of quote documents (V3-1.6). Flow (still P8) grows all day,
+13% -> 43%, from re-reading every downstream binding (V3-1.F).
+R47 catcher result (17:26-21:05): 44 passes, each one breadth read (18,450-18,510 rows) and 40 in-memory replays of
+`breadth_screener_row`: 0 crashes (1,760 replays). The live API (r89/r90) had no restart after 16:21. The crash seen
+15:55-16:21 (live) and 16:01-16:14 (probes) has not recurred since ~16:15; the last capture's rows are kept in
+`ev/r47/breadth-current.pkl` for tonight's offline work.
+
+### Nov 11 (21:52-22:00 UTC): close check and the Step 0 conclusion
+
+**Close.** Equity 78 of 78 cutoffs COMPLETE; the 21:00 close failed four attempts 21:00-21:04
+(`CLOSING_DAILY_INPUTS_PENDING`, G103) and completed on retry4 by ~21:45 (Nov 9: 22:01); the close built the Dashboard
+(DASHBOARD_V1 21:00; R39 overnight read at 22:05). Daily bars Nov 11: ADJUSTED NATIVE_REST 26 (25 members + META),
+RAW_UNADJUSTED DERIVED 25. **Options:** 77 of 77 windows COMPLETE (14:40-20:58), none FAILED, MISSED or PENDING (Nov 10:
+56 COMPLETE, 2 FAILED, 2 MISSED, 4 PENDING, 2 RUNNING); run time 39-78 s (13-26%). Lanes for the day: O1
+COMPLETE_SELECTED 53 / COMPLETE_ZERO 24; OS1 SELECTED 2 / ZERO 74 / BLOCKED 1 (opening context); OS2 SELECTED 5 / ZERO
+70 / BLOCKED 2; O2 UNAVAILABLE 77; O3 BLOCKED 77 (R44). O1 evaluations: 144 SELECTED, 180 OBSERVATION (R31), 5,950 not
+selected; 95 packages stored, 0 selected not stored. Alerts: 20 OPTION, 7 STOCK. (`close_check.sh`'s OPTW line counts
+other keys: 50 COMPLETE / 13 PENDING; the `E:2026-11-11` windows are the ones above.)
+
+**Faults of the day** (`faults-2026-11-11.md`): all known or now rows - API Dashboard drift before r86 (R39), detectors
+health (R42), the close's four attempts (G103), lease-handover restarts after the r88 and V3 deploys, stale Options
+streams (B14a), 59 old windows past deadline (R32, down from 136 this morning), O3 not evaluated (R44), API restarts
+(R47), retention and Stock Alerts silent restarts (R43), one SNTP timeout. **Clock:** 13 CLOCK_OFFSET records, the latest
++0.650 s at 20:47 (morning +0.26-0.36 s): the host clock is drifting again; under the 2 s tolerance, but check W32Time
+before the Nov 12 open (R34).
+
+**Step 0 conclusion** (four profiles; table in the V3 #2 entry and in `G102_V3_1_DESIGN.md` Section 2): on P8 the
+per-pass journal re-read (55%) plus hashing (26%) fill market-state, and decode + materialize are ~4%, so the gate gives
+Steps 1-2 first and does not move Step 4 up. Steps 1-2 (V3 loop) were already built and switched on at 16:59: the busy
+close ran at mean 24% / peak 49% of a core (P8: 46-49% / 86%). Next: V3-1.6 (hashing/JSON 62% on V3), V3-1.F (flow, 13% ->
+43% through the session), Step 5, then Step 3 at 3x.
+22:05 R39 overnight check: API smoke `close-r86` (`ev/api-smoke-close-r86-live-*.json`) 131 of 153 200;
+`/latest-price-date`, `/stocks/context`, `/tickers/overview`, `/tickers/setup-summary`, `/scan/all` 200 after the close
+(08:58 this morning: 503 on the Nov 10 close Dashboard). Nov 11 Dashboards `58674ec2` (14:35), `64200ab2` and `56236f2b`
+(21:00): stored checksum matches the payload after jsonb for all three. R39 VERIFIED.
+
+### Nov 11 (22:13-22:40 UTC): post-close implementation, items 1-4 (user's go ~19:00 UTC); r91 built
+
+**R43** (`advanced_realtime_fencing.PostgresLeaseHeartbeat`): `_renew` retries one renewal after a database error while
+the lease has more than 2 s left (warning `durable_lease_renewal_retry`); a renewal the database refuses is final; before
+stopping the role it logs `durable_lease_lost` with the resource, owner, epoch and reason; a failed service-state write is
+logged (`durable_lease_state_record_failed`) and renewals continue (it used to end the heartbeat thread). The retention
+service and the fenced-role wrapper log the stop signal they receive; retention flushes each line. Tests
+`test_lease_heartbeat_r43_nov11.py` 7 passed. **V3-1.F** (`PostgresContinuousSessionStateRepository.
+load_downstream_bindings_after`, `_FlowVolumeBaselineReconciler(incremental=...)`, `flow_loop_mode`,
+`REALTIME_V3_FLOW_LOOP`, P8 default; the role logs `advanced_options_flow_loop mode=`): the reconciler (refresh every
+0.5 s) reads only the bindings after the last one it holds, checked as a continuation (sequence, previous hash, session,
+head = tail); a state without the method keeps the full read. Tests `test_flow_incremental_bindings_nov11.py` 6 passed.
+**O3** (R44): design `G102_O3_INPUTS_DESIGN.md` (producer step in the window behind `REALTIME_V3_O3_INPUTS`; no
+migration; 2-3 nights; not in r91). **R47**: no reproduction (200 more replays of the 21:02 rows under `-X dev`, 0
+crashes); mitigation `PYTHONFAULTHANDLER=1` on the API (compose).
+
+Test set (r91 image, worktree mounted; Options alert/portal 17 files + p8 runtime, session state, services, consumers +
+new): 425 passed, 6 failed = the compose-file baseline (they need `docker-compose.realtime-v2.yml`, outside the mount;
+same on HEAD). r91 `alpha-research-realtime-v3:stable-nov5-r91-357ee2902f360678` =
+`sha256:961e3ee8e5a705624e6c7a91c4db33b582565caae0eecb9183dbb064353d5a68` (= r90 + R43 + V3-1.F). Live backup for the
+rehearsal: `stocks_db_backup_v3-r91-rehearsal-20261111T222505Z.dump` (4.01 GB, 2,903 entries, 488 s, sha256 5AF2711A...).
+
+### Nov 11 (22:33-22:45 UTC): r91 rehearsal on a copy (Nov 10 and Nov 11 session data)
+
+Restore of the 22:25 backup into `test_realtime_v2_r91` on `g102-test-pg`: 344 s, 471,383 bar heads, latest window
+21:38:10 (the Nov 11 close). **V3-1.F on the real chains** (`scratchpad/r91/r91_bindings_equivalence.py`, read-only on the
+copy, `r91-evidence/bindings-equivalence.json`): Nov 10 66 bindings, Nov 11 77; the incremental read continued from every
+prefix (67 and 78 prefixes) equals the tail of the full read, 0 mismatches; a continuation from a wrong hash is refused;
+full read 130.7 ms (Nov 10) and 137.4 ms (Nov 11) vs 3.0 / 3.5 ms for one new binding (at two refreshes a second the
+full read costs ~27% of a core at the end of the day, matching the flow role's measured growth). **Service start run**
+(`scratchpad/r91/rehearse_r91.sh`, runbook 6): logins, hardening 11/11 pass, volumes (journals 4.5 GB with the Nov 11
+Options folder `bf6b9c4d`), compose with all 19 services on r91, market-state `REALTIME_V3_MARKET_STATE_LOOP=V3`, flow
+`REALTIME_V3_FLOW_LOOP=V3`, API `PYTHONFAULTHANDLER=1`; isolation proven (host, provider and internet unreachable). After
+2.5 minutes all 19 running, 0 restarts, 0 error lines, 18 health checks healthy (detectors included). API smoke: 153 routes,
+131 OK on the copy and on live, no route with a different status. Stop: 18 exit 0, Options ingress 241 (the known
+whole-stack-stop pattern); the new lines appeared: `retention_stop_signal: SIGTERM`, `fenced_role_stop_signal` (Stock
+Alerts). Copy renamed back to `test_realtime_v2_r91`, test logins NOLOGIN, stack removed; logs in `r91/r91-evidence`.
+Not covered on the copy (no session there): the flow loop inside a live window and a lease renewal error; covered by the
+unit tests and the chain check above.
+
+### Nov 12 (02:50-03:05 UTC): scan of every G102 design for pending items; Nov 12 targets
+
+Handover `HANDOVER-20261112.md` (user: target every pending item for the Nov 12 run). Scope and method in
+`G102_PLAN_20261112.md` ("How the scan was done"). Real state: `runner/image_vs_tree.py` - r91 `961e3ee8e5a7` 1,631 files,
+1 differs (`tests/options/test_stock_bar_detection.py`, outside the copied `tests/realtime`), so r91 == worktree; live r85
+`74e2c255d715` differs in 17 files (R42, R43, V3-1.F, r86-r90 read and scheduler changes), scheduler r88 in 13, API r90 in 6
+(R43, V3-1.F). Running 03:15: API r90, scheduler r88, 17 services r85, frontend f28 `94e17a9762e8`, all healthy. Clock
+03:20: host +0.04 to +0.14 s (`w32tm /stripchart`, W32Time last sync 22:30 UTC), Docker VM +0.155 s (`clock_offset.py`).
+Pipeline C9 (retire duplicate control paths) not done: daily supervisor and `activate-session` still in the image, used by
+no compose service; two dated one-time scheduled tasks registered, no next run. Result: 90 pending rows targeted (A 9,
+B 23, C 6, D 52) plus the V3-1 umbrella; status corrections R42, Quiet contract, G92, B20, R9, R20, R35, R40, V3-1 Steps 1-2;
+new rows A0.2, R21.1, Model Lab, Package assessment, Stock Alerts performance, Screens.
+
+### Nov 12 (03:05-03:52 UTC): build pass for r92 (R47 cache, G20, V3-1.6, A0.2, G22 trace, O3 night 1)
+
+**R47** (`advanced_options_breadth.load_breadth_screener_rows_cursor`): with `REALTIME_V2_FLOW_BREADTH_CACHE=ON` a cheap
+per-underlying identity (row count, matched catalog ids, observed_at min/max/sum) is read first; while it is unchanged the
+built rows are reused (bounded LRU of 2, lock-protected, each caller gets its own list); a new capture rebuilds and logs
+`advanced_options_breadth_rows_built`. Off (default) reads exactly as before (no identity query). Consumers (`breadth_flow_data`,
+the Screener query) were checked not to mutate rows. Tests `test_breadth_row_cache_r47_nov12.py` 6 + breadth 8 = 14 passed.
+**G20** (`advanced_options_read_pin.restore`): with no previous pin the new pin is disabled (enabled false, disabled_at)
+instead of deleted; readers serve only enabled pins (`portal_identity`); a repeat call is a no-op; test file 10 passed.
+**V3-1.6** (`advanced_options_consumers._market_state_slice_identity`): profile V3 #2 attribution (raw py-spy file
+`data-audit/profiles/p8-market-state-20261111T2047.txt`): `plan_slice` canonical hash of every state 34.7%, `commit_slice`
+re-hash 7.3%, checkpoint encode ~17%. `REALTIME_V3_MARKET_STATE_HASH=CHECKPOINT` derives the in-memory slice identity
+from the checkpoints (shard, offset, `state_hash` = SHA-256 of the full encoded state); the identity is never stored, so
+checkpoints, payloads and states are unchanged (tests: identical in both modes at 1- and 10-record slices, restart
+equivalence, a changed checkpoint or a mode switch between plan and commit is refused; 6 new + 13 consumer tests passed).
+Micro-benchmark (r91 image, 1 CPU, 72 contracts with 8-quote history): identity 9.13 ms x2 per pass -> 0.004 ms; encode
+5.76 ms unchanged. **A0.2**: read rules R29/R45/R46/R48 in target design section 3. **G22** trace (read-only, Nov 11
+releases): 221 of 232 INTRADAY releases name an earlier `receipt_id`; the column holds the first receipt of the
+publication run (one receipt named by 111 releases, one by 74); every manifest's `source_receipt_ids` holds the receipt at
+the release's own cutoff (232 of 232). **O3 (R44)** sized at ~03:15: the window has no 30m trend source (202 completed 30m +
+21 daily bars per underlying for `build_canonical_trend_evidence`), no 30m structural levels and no model-valued leg
+snapshots (live O1 packages are NBBO-midpoint only): D, Nov 12 night. Night 1 built: `realtime/advanced_options_o3_inputs.py`
+(C6 pair rule, cutoff midpoint pricing, activity leg by volume/OI, O3 leg floors, bound 2 per underlying, judged-legs set
+for the marks gate), tests 15 passed, not wired. **A4.9**: moved to D (an env-only switch protects nothing; needs a database
+setting the writer reads, with the user's yes).
+
+### Nov 12 (03:52-04:25 UTC): r92 built and rehearsed on a copy (Nov 10 and Nov 11 session data); R38 MARK_MISSED on the copy
+
+**Tests** (150 offline realtime files touching the changed areas, `runner/run_tests_ww.sh`, r91 image): worktree 2,243
+passed / 118 failed; r91's own code (image `/backend`, same files) 2,225 passed / 108 failed; the 108 are identical; the
+10 extra are `test_advanced_options_p8_canary_executor.py` creating `/backend/.realtime-canary` on the read-only worktree
+mount (24 of 24 pass with the worktree code copied into a writable container). **r92**
+`alpha-research-realtime-v3:stable-nov5-r92-7afc7afe7ec4b57a` = `sha256:5b09f86a847e503ae9ff861f237c68abcc5c5f20a05b16ab14c9a2cb376b91c1`
+(= r91 + R47 breadth cache, G20, V3-1.6, O3 night-1 module unwired; image code == worktree, 957 files). **Backup**
+`stocks_db_backup_v3-r92-rehearsal-20261112T035242Z.dump` (4.01 GB, 2,903 entries, 426 s, sha256 E4E0291B...). **Copy**
+`test_realtime_v2_r92` on `g102-test-pg`: restore 411 s, 471,383 bar heads, latest window 21:38:10 Nov 11 (the close);
+logins, hardening 11/11, volumes (journals 4.5 GB with the Nov 11 Options folder `bf6b9c4d`); isolation proven
+(host, provider, internet unreachable). **Service start run** (`rehearsal-r92/rehearse_r92.sh`), all 19 services on r92
+with every new switch on (flow `REALTIME_V3_FLOW_LOOP=V3`, market-state V3 loop + `REALTIME_V3_MARKET_STATE_HASH=CHECKPOINT`,
+API `REALTIME_V2_FLOW_BREADTH_CACHE=ON` + `PYTHONFAULTHANDLER=1`): after 2.5 minutes 19 running, 0 restarts, 0 error lines,
+18 healthy (preparation has no health check). **API smoke**: 153 routes, 131 OK on the copy and on live, no route with a
+different status. **R47 on the copy**: Flow reads for SPY and TSLA with the cache on 0.09-0.16 s, a second time the same,
+then the API alone recreated with the cache off 1.22-1.46 s; bodies equal except the per-request `checked_at` and
+`staleness_seconds` (both tickers BREADTH, 25 top contracts). (`advanced_options_breadth_rows_built` is an INFO line the
+API's log level hides.) **R38 on the copy**: `run_realtime_v2_self_heal.py --once` with `REALTIME_V2_SELF_HEAL_MODE=ACT`,
+`REALTIME_V2_SELF_HEAL_ACTIONS=MARK_MISSED`: acted once, E:% windows past deadline PENDING 144 / RUNNING 2 / MISSED 4 ->
+PENDING 87 / MISSED 63 (every Nov 5-10 window; the 87 left are Nov 3-4, outside the check's 7-day look-back by design);
+then the Options window, controller, scheduler and lifecycle restarted: controller, scheduler, lifecycle 0 errors; the
+window exited once on `DurableLeaseUnavailable` (restart inside the previous holder's 30 s lease; the copy runs with
+restart no), started again clean `READY_WAITING_FOR_SESSION`, MISSED windows untouched (the window runner and resident
+barrier select only PENDING/RUNNING before their deadline; Equity gap repair selects `advanced-%` keys). **Stop run**: 61 s,
+17 exit 0, controller 137 (killed at the 60 s grace) and Options window 241: the known whole-stack-stop pattern (row Stack
+stop, image-independent); stop-signal lines (R43) in every fenced role. Copy renamed back, test logins NOLOGIN, stack
+removed; logs in `rehearsal-r92/r92-evidence`.
+
+### Nov 12 (04:15-04:45 UTC): portal batch for the user (R49 developing bar, R50 Options Flow display); r93 and f29
+
+User (Nov 12 ~04:12): show the developing bar on the ticker chart for 5m-1mo; on Options Flow a total open interest tile
+instead of matched OI change, Include 0 DTE and % on the expiry chart, sortable contract table. Alignment of stored bars
+read on live (read-only, SPY): 1d 09:30-16:00 ET; 30m and 1h from 09:30 (last hourly 15:30-16:00); 1wk first session
+open to last close (current week and month have no bar until complete). **R49** `realtime/ticker_forming_bar.py`, route
+`/api/stock/{ticker}/chart/forming`, read contract `forming` in `ticker_repository.read` (closing view: NONE); tests 16.
+Equivalence on the r92 copy (`scratchpad/forming/forming_equivalence.py`, read-only): first run volumes off by 1-4 shares
+(fractional 1m volumes truncated per minute) -> summed exactly then truncated once; then 1,250 of 1,250 completed Nov 11
+buckets (SPY AAPL NVDA CRWD QQQ TSLA IWM MSFT AMZN NFLX x 5m/15m/30m/1h/1d RAW) equal the stored final bars; weekly
+(Nov 6 as today) O/H/L 10 of 10, close/volume differ by the official daily close (closing auction not in 1m bars).
+**r93** `alpha-research-realtime-v3:stable-nov5-r93-c99df6aaf5e914da` = `sha256:3473e3f243c04a391876033b5bab1ec5248fa58557db19df3b0a8d521d511ce0`
+(= r92 + `ticker_forming_bar.py`, `ticker_repository.py`, `portal_api.py`; image_vs_tree against r92 shows only these).
+API alone on r93 against the copy: 153 routes, 131 OK, no route different from live; forming route NONE
+`NO_SESSION_IN_PROGRESS` for all seven intervals at 04:40, `interval=1m` 422; 0 error lines. Ticker/portal/bar-boundary
+tests 209 passed, 3 failed = the same 3 on r92's own code. **f29** `sha256:4947841493ab3d8ec5ec0cb985a6026b205584f02dfb8e8a8ed9153f5298d6fd`:
+302 tests, 257 pass, 40 fail = f28's 40 (one existing assertion moved to the new expiry rows). Both held for the go.
+
+### Nov 12 (04:50-05:05 UTC): r93 full-stack start run; R52 Treasury holiday blocker found and fixed (r94)
+
+**r93 start run** (same copy, all 19 services on r93 `3473e3f243c0`, switches on, the R38 MISSED windows present): 2.5 minutes:
+19 running, 0 restarts, 18 healthy; the Options lifecycle's status line carried `"treasury_refresh": {"attempts": 6,
+"error_type": "ConnectionError", ...}` (the copy cannot reach the internet; during r92's run the refresh was not yet due).
+Stop: 3 s, 19 exit 0. **R52**: live's lifecycle shows the same refresh `BUDGET_EXHAUSTED` for rate date 2026-11-11; live
+`ref.risk_free_rate_observations` (source `us_treasury_par_yield_v1`) newest 2026-11-10; Nov 11 2026 was Veterans Day (no
+Treasury curve; Oct 12 Columbus Day also absent). The window's reference producer requires the previous XNYS session's
+curve: the real `_load_treasury_curve` on the copy returns the Nov 10 curve (14 tenors) for session Nov 11 and raises
+`ValueError: Treasury curve identity, freshness, or clocks changed` for session Nov 12; it runs in every Options window
+(`advanced_options_p8_window.py` reference stage), so every Nov 12 Options window would fail on the live images and on
+r91-r93. The pre-open dry run does not run this producer. Fix in r94 `alpha-research-realtime-v3:stable-nov5-r94-5ab69aad781bd578`
+= `sha256:47ad1c82eac6b842dcbab121bf5d889d617be41ac89738838f2600898cd3bb6d` (= r93 + `options/model_inputs.py`,
+`realtime/treasury_refresh.py`, `realtime/advanced_options_reference_producer.py`): Treasury market holidays (Columbus Day,
+Veterans Day with its observed weekday) are skipped when choosing the curve date; tests 16 new, 419 related passed (3 =
+baseline). r94 probe on the copy: session Nov 12 OK, Nov 10 curve, 14 tenors.
+**r94 full-stack start run** (same copy, 19 services on r94 `47ad1c82eac6`, switches on): 2.5 minutes: 19 running, 0
+restarts, 0 error lines, 18 healthy; lifecycle `treasury_refresh` `required_rate_date` 2026-11-10, `status` VERIFIED
+(curve 871cabf6...; no provider request). API smoke 153 routes, 131 OK, identical to a fresh live smoke. Flow with the cache
+on twice and off: bodies equal except per-request clocks (0.10-0.20 s vs 1.21-1.68 s). Stop 3 s: 18 exit 0, Options
+scheduler 241 (the known whole-stack-stop pattern). Copy renamed back, logins NOLOGIN, stack removed; logs
+`rehearsal-r92/r92-evidence/r94-log-*`.
+
+### Nov 12 (05:15-05:30 UTC): R52 widened at the user's direction (reference data used when present)
+
+User: the Treasury curve is reference data; use it if present, otherwise do not stop the pipeline (like earnings N/A).
+How it is used today (code read): each Options window's reference state turns the curve into a risk-free rate per expiry
+(with the dividend yield) for our Black-Scholes IV and Greeks: streamed contracts (Screener local IV/delta), breadth rows
+(already tolerant: empty Greeks and a log line when inputs are missing), O1 package evidence (each leg's valuation input,
+model version). Marks (NBBO midpoint), O1 detection, OS1/OS2 and alert entries do not use it. Change (worktree, no image
+yet): `_load_treasury_curve` accepts the latest stored curve up to `TREASURY_CURVE_MAXIMUM_STALE_SESSIONS` (5) older than
+the expected one and reports it (warning `advanced_options_treasury_curve_stale`, fault `TREASURY_CURVE_STALE` DEGRADED);
+older or newer still refuses. Tests `test_treasury_bond_holidays_nov12.py` 22; related 425 passed, 3 = baseline. Real rows
+(copy `test_realtime_v2_r92`, read-only, worktree code in the r94 image): stored curves Nov 6, 9, 10 (each received 21:00
+UTC); session Nov 11 -> Nov 10; Nov 12 -> Nov 10 (not stale); Nov 11 read at Nov 10 20:30 UTC -> Nov 9 with the fault.

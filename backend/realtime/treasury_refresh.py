@@ -16,6 +16,7 @@ from options.model_inputs import (
     TREASURY_CURVE_SOURCE,
     TREASURY_TENORS,
     parse_treasury_curve,
+    treasury_rate_date_for_session,
 )
 
 from .acquisition_ledger import (
@@ -61,7 +62,8 @@ def _utc(value):
 
 
 def required_treasury_rate_date(session_date, *, calendar=None):
-    return (calendar or OptionExchangeCalendar()).previous_session_date(session_date)
+    # Nov 12: the previous session, stepping back over Treasury market holidays (Columbus Day, Veterans Day).
+    return treasury_rate_date_for_session(session_date, calendar or OptionExchangeCalendar())
 
 
 def validate_treasury_rows(rows, *, required_rate_date, checked_at):

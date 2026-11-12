@@ -164,6 +164,16 @@ def market_state_loop_mode(environment) -> str:
     return "V3" if value == "V3" else "P8"
 
 
+FLOW_LOOP_ENVIRONMENT = "REALTIME_V3_FLOW_LOOP"
+
+
+def flow_loop_mode(environment) -> str:
+    """V3-1.F (Nov 11): P8 (the default) or V3, where the flow role reads only the new downstream bindings. Anything
+    else is P8. Set on the flow service only; switching back is a container recreate."""
+    value = str((environment or {}).get(FLOW_LOOP_ENVIRONMENT, "P8")).strip().upper()
+    return "V3" if value == "V3" else "P8"
+
+
 def _records_after(shared, offset):
     """The shared read's records after `offset` (contiguous from offset + 1), or None when there is no shared read
     (the caller then reads for itself)."""
@@ -2218,6 +2228,7 @@ class _FlowVolumeBaselineReconciler:
         bundle,
         source,
         refresh_seconds: float = 0.5,
+        incremental: bool = False,
     ):
         self._session_state = session_state
         self._session_binding = (
@@ -2229,7 +2240,10 @@ class _FlowVolumeBaselineReconciler:
         self._refresh_seconds = refresh_seconds
         self._next_refresh = 0.0
         self._seen_sequence = 0
+        self._seen_sha256 = None
         self._pending = {}
+        # V3-1.F (REALTIME_V3_FLOW_LOOP=V3): read only the bindings after the last one seen, when the state can.
+        self._incremental = incremental and hasattr(session_state, "load_downstream_bindings_after")
 
     @staticmethod
     def _baselines(downstream):
@@ -2301,9 +2315,16 @@ class _FlowVolumeBaselineReconciler:
         now = time.monotonic()
         if now < self._next_refresh:
             return
-        bindings = self._session_state.load_downstream_bindings(
-            self._session_binding
-        )
+        if self._incremental:
+            bindings = self._session_state.load_downstream_bindings_after(
+                self._session_binding,
+                after_sequence=self._seen_sequence,
+                after_binding_sha256=self._seen_sha256,
+            )
+        else:
+            bindings = self._session_state.load_downstream_bindings(
+                self._session_binding
+            )
         for binding in bindings:
             if binding.sequence <= self._seen_sequence:
                 continue
@@ -2314,6 +2335,7 @@ class _FlowVolumeBaselineReconciler:
                 )
                 self._pending[key] = baseline
             self._seen_sequence = binding.sequence
+            self._seen_sha256 = getattr(binding, "binding_sha256", None)
         self._next_refresh = now + self._refresh_seconds
 
     def apply(self, consumer):
@@ -2735,11 +2757,14 @@ def _run_flow(
         fenced=False,
     )
     runner = options_flow_runner(runner_environment)
+    flow_mode = flow_loop_mode(environment)
+    _LOGGER.warning("advanced_options_flow_loop mode=%s", flow_mode)
     volume_reconciler = (
         _FlowVolumeBaselineReconciler(
             session_state=session_state,
             bundle=bundle,
             source=source,
+            incremental=flow_mode == "V3",
         )
         if bundle.get("orchestration", {}).get("catalog_version")
         == STAGE_CATALOG_VERSION_V5

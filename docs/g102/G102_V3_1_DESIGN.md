@@ -1,6 +1,8 @@
 # V3-1: Options market-state capacity and the window's price input (design)
 
-Matrix row V3-1 (and G75 V4, R32, R33, R34, R35, R37). Status: DESIGN for review, Nov 11 2026. Nothing here is built.
+Matrix row V3-1 (and G75 V4, R32, R33, R34, R35, R37; V3-1.F, V3-1.3-.6, C9). Status (Nov 11, 22:00 UTC): Steps 1-2 built
+(r85) and live on market-state since Nov 11 16:59 behind `REALTIME_V3_MARKET_STATE_LOOP=V3`; Step 0 done (Section 2); the
+rest designed.
 Goal set by the user (Nov 9): reach the V3 Options runtime in as few cycles as possible, with no throwaway P8 work.
 
 ## 1. Goal
@@ -32,6 +34,25 @@ connection for the slice read and another for the router read, and, when records
 timeout). The fixed per-iteration cost, not the record volume, is the likely load. The original V3-1 outline (split
 the service across processes) would multiply this overhead per process without removing it. **Step 0 confirms this
 with a profile before any code.**
+
+**Measured in the Nov 11 session (Step 0, four profiles, 180 s per role, py-spy `--nonblocking`; evidence Nov 11).**
+
+| Profile (UTC) | market-state loop | CPU mean / median / max (%) | samples | journal read | hash/JSON | DB write | decode | materialize | flow CPU mean |
+|---|---|---|---|---|---|---|---|---|---|
+| P8 #1 14:49 | P8 | 46.0 / 37.6 / 86.3 | 3,855 | 54.9% | 25.9% | 3.3% | 2.9% | 1.5% | 13.1 |
+| P8 #2 15:44 | P8 | 48.8 / 39.5 / 86.2 | 4,142 | 55.1% | 26.4% | 3.6% | 3.0% | 1.4% | 18.7 |
+| V3 #1 17:57 | V3 | 38.1 / 36.9 / 66.0 | 3,234 | 22.9% | 49.1% | 11.6% | 1.2% | 1.1% | 32.7 |
+| V3 #2 20:47 | V3 | 23.8 / 20.6 / 49.0 | 1,857 | 9.5% | 62.1% | 9.2% | 0.3% | 1.3% | 43.4 |
+
+- On P8 the per-pass journal re-read was 55% of market-state's samples and hashing 26%, never idle; decode and
+  materialize together ~4%. **Gate:** per-iteration overhead above half of busy CPU -> Steps 1-2 first (they were
+  built ahead, r85, and switched on at 16:59). Decode/materialize do not dominate -> Step 4 does not move up.
+- On V3 the re-read fell to 10-23%, busy-close CPU halved (mean 24% vs 46-49%, peak 49% vs 86%), within the 25% average
+  and 65% busiest-minute acceptance at today's rate. What remains is hashing/JSON of quote documents (49-62%: `iterencode`,
+  `_canonical_value`, `_quote_document`) and state writes (9-12%): V3-1.6, before the 3x check (Step 3).
+- The flow role (still P8) grows through the session, 13% -> 43% mean CPU, from `load_downstream_bindings` re-reading
+  every downstream binding on every pass (13% -> 42% of its samples): V3-1.F, the same Step 1 pattern for flow.
+- Window (Options) run time stayed 40-78 s (13-26% of the 300 s budget) all session; 77 of 77 windows COMPLETE.
 
 ## 3. Design
 
@@ -159,6 +180,12 @@ the Nov 11 session, then the package deploy before the next open on the user's g
 | ~16:55 | back up `rollout/compose.stable.json`, add `REALTIME_V3_MARKET_STATE_LOOP=V3` to market-state (never before the morning deploy, or market-state would start on V3) | Claude |
 | ~17:00 | `-Step hotfix -Service realtime-v3-options-p8-market-state -Image r85` (same image, recreates the one container on V3; the tool waits for 3:00-4:15 of the cycle) | user |
 | 17:57, 20:47 | Step 0 profiles #3-#4: the V3 loop (same-day comparison with #1-#2) | scheduled |
+
+**Status (Nov 11, 22:00 UTC).** r85 went to every backend service before the open (market-state on P8); Step 0 profiles
+P8 #1-#2 confirmed the gate (Section 2); market-state switched to `V3` at 16:59 (one compose key, backup
+`compose.stable.before-v3-loop-20261111.json`), first V3 window 17:05, no fallback needed; V3 #1-#2 measured. Next (plan
+`G102_PLAN_20261111.md`): V3-1.F flow loop behind `REALTIME_V3_FLOW_LOOP`; then V3-1.6 (hashing), Step 5 (marks at the
+cutoff), Step 3 (3x replay); C9 removes the P8 loops after a few clean V3 sessions.
 
 Fallback layers: V3 misbehaves -> remove the variable and recreate market-state (P8, ~1-2 min; at most ~10 minutes of
 fixing first); r85 misbehaves in a service (not the loop) -> hotfix that service to r84 (r85 minus the loop and the

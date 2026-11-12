@@ -692,6 +692,15 @@ def create_realtime_portal_app(
     ):
         return ticker_read(ticker, "chart", cohort_id, interval=interval, period=period, snapshot_id=snapshot_id, read_mode=read_mode)
 
+    @app.get("/api/stock/{ticker}/chart/forming")
+    def ticker_chart_forming(
+        ticker: str, interval: Literal["5m", "15m", "30m", "1h", "1d", "1wk", "1mo"] = "1d",
+        cohort_id: UUID | None = None, snapshot_id: UUID | None = None,
+        read_mode: Literal["current", "retained", "session_close"] = "current",
+    ):
+        """Nov 12 (user): the developing bar of a chart interval (display only; `status` NONE when there is none)."""
+        return ticker_read(ticker, "forming", cohort_id, interval=interval, snapshot_id=snapshot_id, read_mode=read_mode)
+
     @app.get("/api/stock/{ticker}/chart-patterns")
     def ticker_patterns(ticker: str, interval: str = "1d", refresh: bool = False, cohort_id: UUID | None = None, snapshot_id: UUID | None = None, read_mode: Literal["current", "retained", "session_close"] = "current"):
         return ticker_read(ticker, "patterns", cohort_id, interval=interval, snapshot_id=snapshot_id, read_mode=read_mode)

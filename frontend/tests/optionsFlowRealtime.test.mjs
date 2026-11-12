@@ -20,7 +20,7 @@ test('Options Activity and Flow keep the original pages and explicit unavailable
   assert.doesNotMatch(activity + flow, /AdvancedOptionsV2|getAdvancedOptionsV2Projection/)
   assert.match(activity, /<TickerBoard rows=\{data\.underlyers\}/)
   assert.match(flow, /className="flow-summary"/)
-  assert.match(flow, /<ExpiryProfile rows=\{data\.expirations\}/)
+  assert.match(flow, /<ExpiryProfile rows=\{expiryProfileRows\(data\.expirations, includeZeroDte\)\}/) // Nov 12: 0 DTE can be left out
   assert.match(flow, /<StrikeProfile rows=\{strikeRows\}/)
   assert.match(activity + flow, /optionsDataTierLabel/)
   assert.doesNotMatch(flow, /Delayed options activity/)

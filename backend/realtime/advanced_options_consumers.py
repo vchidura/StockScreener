@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
 import json
+import os
 from types import MappingProxyType
 from typing import Callable, Mapping
 from uuid import UUID
@@ -831,7 +832,7 @@ class AdvancedOptionsMarketStateConsumer:
             states=next_states,
             checkpoints=checkpoints,
             dirty_instrument_ids=dirty,
-            state_sha256=canonical_sha256(next_states),
+            state_sha256=_market_state_slice_identity(next_states, checkpoints),
             detector_routing=detector_routing,
         )
 
@@ -847,7 +848,7 @@ class AdvancedOptionsMarketStateConsumer:
             tuple(checkpoint.committed_offset for checkpoint in planned.checkpoints)
             != tuple(state.scanned_offset for state in planned.states)
             or planned.shard_map.sha256 != self.shard_map.sha256
-            or canonical_sha256(planned.states) != planned.state_sha256
+            or _market_state_slice_identity(planned.states, planned.checkpoints) != planned.state_sha256
         ):
             raise ValueError("market-state slice identity changed before commit")
         self._states = planned.states
@@ -860,6 +861,36 @@ class AdvancedOptionsMarketStateConsumer:
                 allocation=self._detector_router.allocation,
                 state=planned.detector_routing.state,
             )
+
+
+MARKET_STATE_HASH_SWITCH = "REALTIME_V3_MARKET_STATE_HASH"
+
+
+def market_state_hash_mode() -> str:
+    """V3-1.6 (Nov 12): `CHECKPOINT` derives a market-state slice's identity from its checkpoints; anything else (the
+    default, `CANONICAL`) hashes every shard state's canonical JSON as before."""
+    value = os.environ.get(MARKET_STATE_HASH_SWITCH, "CANONICAL").strip().upper()
+    return "CHECKPOINT" if value == "CHECKPOINT" else "CANONICAL"
+
+
+def _market_state_slice_identity(states, checkpoints) -> str:
+    """The identity a planned slice is committed under (plan and commit must agree; it is never stored).
+
+    CANONICAL hashes the full canonical JSON of every shard state on each pass (Nov 11 V3 #2 profile: 42% of the
+    market-state role's busy samples, plan and commit together). CHECKPOINT hashes what each checkpoint already holds:
+    its shard, offset and `state_hash`, the SHA-256 of `encode_materializer_state`, which encodes the whole shard state
+    (the checkpoint restores from it). Checkpoints, payloads and stored states are the same in both modes."""
+    if market_state_hash_mode() != "CHECKPOINT":
+        return canonical_sha256(states)
+    if len(checkpoints) != len(states):
+        raise ValueError("market-state slice checkpoints do not match its states")
+    return canonical_sha256({
+        "contract": "advanced-options-market-state-slice-identity-v2",
+        "shards": [
+            (checkpoint.shard_id, checkpoint.committed_offset, checkpoint.state_hash)
+            for checkpoint in checkpoints
+        ],
+    })
 
 
 def persist_advanced_options_market_state_slice_cursor(

@@ -15,7 +15,10 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
+import threading
+from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
@@ -632,6 +635,55 @@ def breadth_screener_row(row: Mapping[str, object]) -> dict[str, object]:
     }
 
 
+BREADTH_ROW_CACHE_SWITCH = "REALTIME_V2_FLOW_BREADTH_CACHE"
+_BREADTH_ROW_CACHE_SIZE = 2
+_BREADTH_ROW_CACHE: "OrderedDict[tuple, tuple]" = OrderedDict()
+_BREADTH_ROW_CACHE_LOCK = threading.Lock()
+
+
+def breadth_row_cache_enabled() -> bool:
+    """R47: `ON` keeps built breadth rows per process; anything else (the default) builds them on every read."""
+    return os.environ.get(BREADTH_ROW_CACHE_SWITCH, "OFF").strip().upper() == "ON"
+
+
+def _breadth_rows_identity(cursor, session_date, underlyings, available_by) -> tuple:
+    """What the stored rows are at `available_by`, per underlying: a capture replaces its underlying's rows with a later
+    `observed_at` in one statement (`persist_breadth_cursor`), so the row count, the matched catalog ids and the
+    observed_at range and sum change whenever the rows do."""
+    cursor.execute(
+        "SELECT breadth.underlying,count(*) AS row_count,count(catalog.contract_id) AS catalog_count,"
+        "min(breadth.observed_at) AS first_observed,max(breadth.observed_at) AS last_observed,"
+        "sum(extract(epoch FROM breadth.observed_at)) AS observed_sum "
+        "FROM rt.option_breadth_current AS breadth "
+        "LEFT JOIN ref.option_contracts AS catalog ON catalog.contract_ticker=breadth.contract_ticker "
+        "WHERE breadth.session_date=%s AND breadth.underlying=ANY(%s) AND breadth.observed_at<=%s "
+        "GROUP BY breadth.underlying ORDER BY breadth.underlying",
+        (session_date, list(underlyings), available_by),
+    )
+    names = ("underlying", "row_count", "catalog_count", "first_observed", "last_observed", "observed_sum")
+    found = []
+    for values in cursor.fetchall():
+        item = dict(values) if isinstance(values, Mapping) else dict(zip(names, values))
+        found.append(tuple(str(item[name]) for name in names))
+    return tuple(found)
+
+
+def _breadth_row_cache_get(key):
+    with _BREADTH_ROW_CACHE_LOCK:
+        rows = _BREADTH_ROW_CACHE.get(key)
+        if rows is not None:
+            _BREADTH_ROW_CACHE.move_to_end(key)
+        return rows
+
+
+def _breadth_row_cache_put(key, rows) -> None:
+    with _BREADTH_ROW_CACHE_LOCK:
+        _BREADTH_ROW_CACHE[key] = rows
+        _BREADTH_ROW_CACHE.move_to_end(key)
+        while len(_BREADTH_ROW_CACHE) > _BREADTH_ROW_CACHE_SIZE:
+            _BREADTH_ROW_CACHE.popitem(last=False)
+
+
 def load_breadth_screener_rows_cursor(
     cursor,
     *,
@@ -639,19 +691,32 @@ def load_breadth_screener_rows_cursor(
     underlyings: Sequence[str],
     available_by: datetime,
 ) -> tuple[list[dict[str, object]], dict[str, dict[str, object]]]:
-    """The breadth rows visible at `available_by` and, per underlying, its latest capture (for the freshness label)."""
-    cursor.execute(
-        "SELECT breadth.*,catalog.contract_id FROM rt.option_breadth_current AS breadth "
-        "LEFT JOIN ref.option_contracts AS catalog ON catalog.contract_ticker=breadth.contract_ticker "
-        "WHERE breadth.session_date=%s AND breadth.underlying=ANY(%s) AND breadth.observed_at<=%s",
-        (session_date, list(underlyings), available_by),
-    )
-    # The API reads with a dict cursor; other callers with a tuple cursor. Both shapes give the same rows.
-    columns = [column[0] for column in cursor.description]
-    rows = [
-        breadth_screener_row(dict(values) if isinstance(values, Mapping) else dict(zip(columns, values)))
-        for values in cursor.fetchall()
-    ]
+    """The breadth rows visible at `available_by` and, per underlying, its latest capture (for the freshness label).
+
+    R47 (Nov 12): with `REALTIME_V2_FLOW_BREADTH_CACHE=ON` the built rows are kept per process and reused while the
+    stored rows are unchanged (one build per capture instead of one per page poll); off (the default) reads as before."""
+    cache_key, rows = None, None
+    if breadth_row_cache_enabled():
+        cache_key = (session_date, tuple(sorted({str(item) for item in underlyings})),
+                     _breadth_rows_identity(cursor, session_date, underlyings, available_by))
+        cached = _breadth_row_cache_get(cache_key)
+        rows = None if cached is None else list(cached)
+    if rows is None:
+        cursor.execute(
+            "SELECT breadth.*,catalog.contract_id FROM rt.option_breadth_current AS breadth "
+            "LEFT JOIN ref.option_contracts AS catalog ON catalog.contract_ticker=breadth.contract_ticker "
+            "WHERE breadth.session_date=%s AND breadth.underlying=ANY(%s) AND breadth.observed_at<=%s",
+            (session_date, list(underlyings), available_by),
+        )
+        # The API reads with a dict cursor; other callers with a tuple cursor. Both shapes give the same rows.
+        columns = [column[0] for column in cursor.description]
+        rows = [
+            breadth_screener_row(dict(values) if isinstance(values, Mapping) else dict(zip(columns, values)))
+            for values in cursor.fetchall()
+        ]
+        if cache_key is not None:
+            _breadth_row_cache_put(cache_key, tuple(rows))
+            _LOGGER.info("advanced_options_breadth_rows_built rows=%d underlyings=%d", len(rows), len(cache_key[1]))
     names = ("underlying", "state", "observed_at", "contracts", "reason")
 
     def latest(complete_only):

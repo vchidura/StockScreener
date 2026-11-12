@@ -65,6 +65,19 @@ def load_enabled_advanced_options_release_cursor(
     )
 
 
+def _is_exact_disabled_pin(
+    pin: Mapping[str, object] | None,
+    release_id: UUID,
+    package_sha256: str,
+) -> bool:
+    return (
+        pin is not None
+        and pin["enabled"] is False
+        and pin["release_id"] == str(release_id)
+        and pin["package_sha256"] == package_sha256
+    )
+
+
 def _pin_state(pin: Mapping[str, object] | None) -> tuple[object, ...] | None:
     if pin is None:
         return None
@@ -366,6 +379,10 @@ class PostgresAdvancedOptionsStoredReadPort:
             )
             if _pin_state(current) == _pin_state(previous):
                 return previous
+            if previous is None and _is_exact_disabled_pin(
+                current, expected_release_id, self._package_sha256
+            ):
+                return None  # already rolled back (G20: disabled, not deleted)
             if (
                 current is None
                 or current["release_id"] != str(expected_release_id)
@@ -375,11 +392,17 @@ class PostgresAdvancedOptionsStoredReadPort:
                     "Advanced Options read pin changed before rollback"
                 )
             if previous is None:
+                # G20 (Nov 12): the app role may not delete a pin, so rolling back the cohort's first pin disables it;
+                # readers serve only enabled pins (`portal_identity`), so a disabled pin serves nothing, as no pin did.
+                checked = _utc(self._clock(), "clock")
                 cursor.execute(
-                    "DELETE FROM rt.advanced_options_read_pins "
+                    "UPDATE rt.advanced_options_read_pins SET enabled=false,"
+                    "disabled_at=%s,updated_at=%s "
                     "WHERE cohort_id=%s AND release_id=%s "
                     "AND package_sha256=%s RETURNING cohort_id",
                     (
+                        checked,
+                        checked,
                         str(cohort_id),
                         str(expected_release_id),
                         self._package_sha256,
@@ -414,6 +437,14 @@ class PostgresAdvancedOptionsStoredReadPort:
                 cohort_id=cohort_id,
                 for_update=True,
             )
+        if previous is None:
+            if not _is_exact_disabled_pin(
+                restored, expected_release_id, self._package_sha256
+            ):
+                raise RuntimeError(
+                    "Advanced Options read pin rollback verification failed"
+                )
+            return None
         if _pin_state(restored) != _pin_state(previous):
             raise RuntimeError(
                 "Advanced Options read pin rollback verification failed"
