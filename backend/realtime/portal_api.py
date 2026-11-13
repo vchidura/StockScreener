@@ -887,6 +887,23 @@ def create_realtime_portal_app(
             logging.getLogger(__name__).exception("Realtime Options Flow stored read failed")
             raise unavailable(error) from error
 
+    @app.get("/api/options/gamma")
+    def option_gamma(underlyer: str, session_date: date | None = None):
+        """G106 A3 (Nov 12 night): research read behind `REALTIME_V2_OPTIONS_GAMMA_READ` (off by default: 404)."""
+        from .options_gamma_read import options_gamma_read_enabled
+
+        if not options_gamma_read_enabled():
+            raise HTTPException(404, "Options gamma read is off")
+        if repositories.option_flow is None:
+            raise HTTPException(503, "Realtime Options Flow repository is unavailable")
+        try:
+            return repositories.option_flow.gamma(available_by=cutoff(), underlyer=underlyer, session_date=session_date)
+        except ValueError as error:
+            raise HTTPException(422, str(error)) from error
+        except Exception as error:
+            logging.getLogger(__name__).exception("Realtime Options gamma read failed")
+            raise unavailable(error) from error
+
     @app.get("/api/options/discovery-catalog")
     def option_discovery_catalog(cohort_id: UUID | None = None):
         if cohort_id is None:

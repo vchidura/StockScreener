@@ -53,6 +53,7 @@ from .advanced_options_activity_momentum_c6 import (
     ACTIVITY_MOMENTUM_PROFILE_VERSION,
     LEGACY_ACTIVITY_MOMENTUM_PROFILE_VERSION,
     SUCCESSOR_ACTIVITY_MOMENTUM_PROFILE_VERSION,
+    V4_ACTIVITY_MOMENTUM_PROFILE_VERSION,
     activity_momentum_allocation_from_payload,
     activity_momentum_allocation_payload,
     allocate_activity_momentum,
@@ -190,6 +191,33 @@ def c8_options_tier_binding(*, cohort_id, profile_id, manifest_sha256, effective
 
 _LOGGER = logging.getLogger(__name__)
 
+# V4.1 rehearsal (Nov 13 03:59): the v3-family profiles (v3, v4) drop every 0-5 DTE candidate whose underlying has no
+# supported last-trading convention (SHORT_EXPIRY_PRODUCT_CONVENTION_UNSUPPORTED); only the manual pre-session script
+# took them (`--last-trading-convention`), so the scheduled preparation gave v4 no same-day, near or this-week contracts
+# and treated the index ETFs as weekly products. Every configured underlying is a US-listed stock or ETF with standard
+# PM-settled options (last trade at the 16:00 ET close): the profile's supported US_EQUITY_STANDARD_PM. An index
+# product with other rules would need its own value (REALTIME_V3_OPTIONS_LAST_TRADING_CONVENTION, or per name
+# UNDERLYING=CONVENTION pairs separated by commas).
+LAST_TRADING_CONVENTION_SETTING = "REALTIME_V3_OPTIONS_LAST_TRADING_CONVENTION"
+DEFAULT_LAST_TRADING_CONVENTION = "US_EQUITY_STANDARD_PM"
+
+
+def scheduled_last_trading_conventions(underlyings, environment=None) -> dict[str, str]:
+    import os
+
+    raw = str((os.environ if environment is None else environment).get(
+        LAST_TRADING_CONVENTION_SETTING, DEFAULT_LAST_TRADING_CONVENTION,
+    )).strip().upper()
+    names = sorted({str(value).strip().upper() for value in underlyings})
+    if "=" not in raw:
+        return {name: raw or DEFAULT_LAST_TRADING_CONVENTION for name in names}
+    pairs = {}
+    for item in raw.split(","):
+        name, _, convention = item.partition("=")
+        if name.strip() and convention.strip():
+            pairs[name.strip()] = convention.strip()
+    return {name: pairs.get(name, pairs.get("*", DEFAULT_LAST_TRADING_CONVENTION)) for name in names}
+
 
 def _isolated_activity_candidates(
     rows,
@@ -296,6 +324,7 @@ class PostgresAutomaticOptionsPreparationExecutor(
                 LEGACY_ACTIVITY_MOMENTUM_PROFILE_VERSION,
                 ACTIVITY_MOMENTUM_PROFILE_VERSION,
                 SUCCESSOR_ACTIVITY_MOMENTUM_PROFILE_VERSION,
+                V4_ACTIVITY_MOMENTUM_PROFILE_VERSION,
             }
             or (
                 exact_four_compatibility
@@ -1116,7 +1145,10 @@ class PostgresAutomaticOptionsPreparationExecutor(
         resolution_arguments = {}
         if (
             profile.version
-            == SUCCESSOR_ACTIVITY_MOMENTUM_PROFILE_VERSION
+            in (
+                SUCCESSOR_ACTIVITY_MOMENTUM_PROFILE_VERSION,
+                V4_ACTIVITY_MOMENTUM_PROFILE_VERSION,
+            )
         ):
             resolution_arguments = {
                 "preparation_at": selection.selection.reviewed_at,
@@ -1124,7 +1156,9 @@ class PostgresAutomaticOptionsPreparationExecutor(
                     OptionExchangeCalendar("XNYS"),
                     session_date=claim.session_date,
                     activity_candidates=candidates,
-                    conventions={},
+                    conventions=scheduled_last_trading_conventions(
+                        {row.underlying for row in candidates},
+                    ),
                 ),
                 "same_day_enabled": profile.same_day_enabled,
             }

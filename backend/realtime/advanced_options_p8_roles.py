@@ -148,6 +148,11 @@ from .stage_runners_options import (
 from .advanced_options_service import OPTIONS_LATE_CANARY_V4_STAGE_ORDER
 
 
+# V4.1 (Nov 13): the bounded detector router runs for v2 and v4 allocations.
+_ROUTED_ADMISSION_PROFILES = frozenset({
+    ACTIVITY_MOMENTUM_PROFILE_VERSION,
+    "c6_activity_momentum_v4",
+})
 UTC = timezone.utc
 _LOGGER = logging.getLogger(__name__)
 # V3-1 market-state loop (docs/g102/G102_V3_1_DESIGN.md, Steps 1-2). Housekeeping (registration refresh, barrier
@@ -1682,7 +1687,7 @@ def _run_market_state(
             None
             if selection_plan is None
             or selection_plan.admission_profile_version
-            != ACTIVITY_MOMENTUM_PROFILE_VERSION
+            not in _ROUTED_ADMISSION_PROFILES
             else load_advanced_options_detector_routing_state_cursor(
                 unit.cursor,
                 selection_generation_id=(
@@ -1694,7 +1699,7 @@ def _run_market_state(
     if (
         selection_plan is not None
         and selection_plan.admission_profile_version
-        == ACTIVITY_MOMENTUM_PROFILE_VERSION
+        in _ROUTED_ADMISSION_PROFILES
     ):
         detector_router = AdvancedOptionsBoundedDetectorRouter(
             allocation=activity_momentum_allocation_from_payload(

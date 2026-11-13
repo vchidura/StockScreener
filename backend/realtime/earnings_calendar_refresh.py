@@ -33,6 +33,7 @@ from .reference_repository import persist_reference_facts_cursor
 from .reference_service import ReferenceSeedRequest
 from .reference_transports import (
     FinnhubReferenceTransport,
+    ReferenceTransportLimits,
     RequestsReferenceHttpTransport,
 )
 
@@ -41,6 +42,9 @@ EARNINGS_CALENDAR_SOURCE = "finnhub"
 FINNHUB_KEY_FILE = Path("/run/secrets/realtime_v2_finnhub_key")
 # A company Finnhub did not answer is retried after this long, not on every idle loop.
 EARNINGS_RETRY_BACKOFF = timedelta(minutes=15)
+# R60 (Nov 13): per-symbol calls over the 47-day window are two 30-day requests per company; the transport's default
+# cap of 64 refused the 33rd company onward (35 companies at 07:26 and 07:44: WFC, WMT, XOM N/A). Sized for 400 names.
+EARNINGS_MAXIMUM_REQUESTS = 1024
 _DESIRED_STATE_SCOPE = "ADVANCED_REALTIME"  # advanced_realtime_desired_state_repository.DESIRED_STATE_SCOPE
 _last_attempt: dict[str, datetime] = {}
 
@@ -181,6 +185,7 @@ def run_earnings_calendar_refresh(
             fetch = FinnhubReferenceTransport(
                 key,
                 RequestsReferenceHttpTransport(),
+                limits=ReferenceTransportLimits(maximum_requests=EARNINGS_MAXIMUM_REQUESTS),
             ).fetch
         return refresh_earnings_calendar(provider, clock=clock, fetch=fetch)
     except Exception as error:  # noqa: BLE001 - see above

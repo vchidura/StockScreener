@@ -1211,6 +1211,12 @@ def _project_realtime_ticker_workspace(
                 _check_cancelled(should_stop)
                 bars = adjusted if interval == "1d" else available.get(interval, ())
                 basis = "ADJUSTED" if interval in {"1d", "1wk", "1mo"} else "RAW_UNADJUSTED"
+                if interval in {"30m", "1h"} and missing.get("raw_history") == "RAW_SPLIT_WINDOW_REVIEW":
+                    # TP6 (F6): raw intraday bars on both sides of a split mix price scales; withhold the setup with
+                    # the reason instead of computing levels and indicators across the split.
+                    errors[interval] = "RAW_SPLIT_WINDOW_REVIEW"
+                    missing[f"setup:{interval}"] = errors[interval]
+                    continue
                 if len(bars) < 50:
                     errors[interval] = "SETUP_HISTORY_SHORT" if bars else "RETAINED_INTERVAL_UNAVAILABLE"
                     missing[f"setup:{interval}"] = errors[interval]
@@ -1236,6 +1242,9 @@ def _project_realtime_ticker_workspace(
             for interval in PATTERN_WATCH_INTERVALS:
                 _check_cancelled(should_stop)
                 bars = available.get(interval, ())
+                if interval in {"30m", "1h"} and missing.get("raw_history") == "RAW_SPLIT_WINDOW_REVIEW":
+                    missing[f"patterns:{interval}"] = "RAW_SPLIT_WINDOW_REVIEW"  # TP6 (F6): mixed price scales
+                    continue
                 if len(bars) < 50:
                     missing[f"patterns:{interval}"] = "PATTERN_HISTORY_UNAVAILABLE"
                     continue

@@ -577,6 +577,24 @@ class _RealtimeCompatibilityRepository:
 
 
 class RealtimeOptionFlowRepository(_RealtimeCompatibilityRepository):
+    def gamma(
+        self,
+        *,
+        available_by: datetime,
+        underlyer: str,
+        session_date: date | None = None,
+    ) -> dict[str, object]:
+        """G106 A3: gamma exposure and OI walls from the stored chain capture (`options_gamma_read`)."""
+        from .options_gamma_read import gamma_from_breadth_cursor
+
+        cutoff = _utc(available_by, "available_by")
+        symbol = (underlyer or "").strip().upper()
+        if not _TICKER_PATTERN.fullmatch(symbol):
+            raise ValueError("Invalid Options gamma underlying")
+        with self._cursor() as cursor:
+            self._begin(cursor)
+            return gamma_from_breadth_cursor(cursor, underlyer=symbol, available_by=cutoff, session_date=session_date)
+
     def flow(
         self,
         *,

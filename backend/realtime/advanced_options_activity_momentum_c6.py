@@ -5,7 +5,7 @@ import json
 from collections import Counter
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, replace
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from enum import Enum
 from pathlib import Path
@@ -28,6 +28,15 @@ LEGACY_ACTIVITY_MOMENTUM_PROFILE_VERSION = "c6_activity_momentum_v1"
 ACTIVITY_MOMENTUM_PROFILE_VERSION = "c6_activity_momentum_v2"
 SUCCESSOR_ACTIVITY_MOMENTUM_PROFILE_VERSION = (
     "c6_activity_momentum_v3"
+)
+# G106 B1 / V4.1 (Nov 13): 24 contracts per underlying in product buckets (docs/OPTIONS_COVERAGE_TASK.md, Nov 8;
+# docs/g106/G106_PLAN_20261112.md "V4.1 implementation note"). Behaves as v3 (expiry evidence, same-day contracts)
+# plus the buckets; chosen only by a preparation's admission profile version (live runs v2).
+V4_ACTIVITY_MOMENTUM_PROFILE_VERSION = "c6_activity_momentum_v4"
+V4_ACTIVITY_MOMENTUM_PROFILE_PATH = (
+    Path(__file__).resolve().parent
+    / "policies"
+    / "advanced_options_activity_momentum_c6_v4.json"
 )
 LEGACY_ACTIVITY_MOMENTUM_PROFILE_PATH = (
     Path(__file__).resolve().parent
@@ -53,6 +62,9 @@ ACTIVITY_MOMENTUM_PROFILE_PATHS = MappingProxyType({
     ),
     SUCCESSOR_ACTIVITY_MOMENTUM_PROFILE_VERSION: (
         SUCCESSOR_ACTIVITY_MOMENTUM_PROFILE_PATH
+    ),
+    V4_ACTIVITY_MOMENTUM_PROFILE_VERSION: (
+        V4_ACTIVITY_MOMENTUM_PROFILE_PATH
     ),
 })
 DEFAULT_ACTIVITY_MOMENTUM_STRATEGY_POLICY_PATH = (
@@ -99,10 +111,25 @@ _V3_ROOT_KEYS = frozenset({
     "expiry_preferences",
     "ranking_anchors",
 })
+_V4_ROOT_KEYS = frozenset({
+    *_V3_ROOT_KEYS,
+    "product_buckets",
+})
 _BOUNDED_ACTIVITY_MOMENTUM_PROFILE_VERSIONS = frozenset({
     ACTIVITY_MOMENTUM_PROFILE_VERSION,
     SUCCESSOR_ACTIVITY_MOMENTUM_PROFILE_VERSION,
 })
+# v3 behaviour (resolved expiry evidence, same-day contracts, v3 bootstrap) applies to v4 too.
+_V3_FAMILY_PROFILE_VERSIONS = frozenset({
+    SUCCESSOR_ACTIVITY_MOMENTUM_PROFILE_VERSION,
+    V4_ACTIVITY_MOMENTUM_PROFILE_VERSION,
+})
+# Every profile after the v1 legacy one (criteria, consumer requirements, bounded allocation inputs).
+_NON_LEGACY_PROFILE_VERSIONS = frozenset({
+    *_BOUNDED_ACTIVITY_MOMENTUM_PROFILE_VERSIONS,
+    V4_ACTIVITY_MOMENTUM_PROFILE_VERSION,
+})
+V4_PRODUCT_KINDS = ("DAILY_EXPIRY", "WEEKLY_EXPIRY")
 _EXPECTED_ROLES = (
     "PARTICIPATION_CONTEXT",
     "SHORT_DATED_SWEEP_LIKE",
@@ -348,6 +375,44 @@ class ActivityMomentumConsumerRequirement:
 
 
 @dataclass(frozen=True, slots=True)
+class ActivityMomentumProductBucket:
+    """V4.1 (Nov 13): one depth bucket of a product. `selector`: DTE_RANGE (calendar DTE within the bounds),
+    NEXT_LISTED (the n-th listed expiries after the session, n within the bounds: "1-2 DTE" counted in listed
+    sessions, so a Friday's NEAR is Monday and Tuesday, not an empty weekend) or WEEKLY_LADDER (the weekday ladder's
+    listed expiries, docs/OPTIONS_COVERAGE_TASK.md Nov 8)."""
+
+    product: str
+    bucket_id: str
+    order: int
+    selector: str
+    minimum_dte: int
+    maximum_dte: int
+    unique_contracts: int
+
+    def __post_init__(self) -> None:
+        if (
+            self.product not in V4_PRODUCT_KINDS
+            or self.selector not in ("DTE_RANGE", "NEXT_LISTED", "WEEKLY_LADDER")
+            or type(self.order) is not int
+            or self.order <= 0
+            or type(self.minimum_dte) is not int
+            or type(self.maximum_dte) is not int
+            or not 0 <= self.minimum_dte <= self.maximum_dte <= 60
+            or type(self.unique_contracts) is not int
+            or self.unique_contracts <= 0
+        ):
+            raise ValueError("activity/momentum product bucket is invalid")
+        object.__setattr__(self, "bucket_id", _text(self.bucket_id, "product bucket id"))
+
+    def matches(self, *, expiration: date, dte: int, ladder: tuple[date, ...], ordinal: int | None = None) -> bool:
+        if self.selector == "WEEKLY_LADDER":
+            return expiration in ladder
+        if self.selector == "NEXT_LISTED":
+            return ordinal is not None and self.minimum_dte <= ordinal <= self.maximum_dte
+        return self.minimum_dte <= dte <= self.maximum_dte
+
+
+@dataclass(frozen=True, slots=True)
 class ActivityMomentumProfile:
     version: str
     profile_sha256: str
@@ -392,12 +457,14 @@ class ActivityMomentumProfile:
     short_near_expiry_contract_target: int
     short_end_of_week_contract_target: int
     delta_targets_are_ranking_anchors: bool
+    product_buckets: tuple[ActivityMomentumProductBucket, ...] = ()
 
     def __post_init__(self) -> None:
         supported_versions = {
             LEGACY_ACTIVITY_MOMENTUM_PROFILE_VERSION,
             ACTIVITY_MOMENTUM_PROFILE_VERSION,
             SUCCESSOR_ACTIVITY_MOMENTUM_PROFILE_VERSION,
+            V4_ACTIVITY_MOMENTUM_PROFILE_VERSION,
         }
         if (
             self.version not in supported_versions
@@ -484,6 +551,46 @@ class ActivityMomentumProfile:
                 raise ValueError(
                     "activity/momentum v3 expiry profile is invalid"
                 )
+        elif self.version == V4_ACTIVITY_MOMENTUM_PROFILE_VERSION:
+            totals = {
+                product: sum(
+                    row.unique_contracts
+                    for row in self.product_buckets
+                    if row.product == product
+                )
+                for product in V4_PRODUCT_KINDS
+            }
+            if (
+                self.default_contracts_per_underlying != 24
+                or self.maximum_contracts_per_underlying != 24
+                or self.default_discovery_maximum_dte != 60
+                or self.strategy_discovery_maximum_dte != 60
+                or not self.selection_criteria
+                or not self.consumer_requirements
+                or not self.same_day_enabled
+                or not self.supported_last_trading_conventions
+                or not self.delta_targets_are_ranking_anchors
+                or any(total != 24 for total in totals.values())
+                or len({
+                    (row.product, row.bucket_id)
+                    for row in self.product_buckets
+                }) != len(self.product_buckets)
+                or any(
+                    tuple(
+                        row.order
+                        for row in self.product_buckets
+                        if row.product == product
+                    )
+                    != tuple(range(1, 1 + sum(
+                        1 for row in self.product_buckets
+                        if row.product == product
+                    )))
+                    for product in V4_PRODUCT_KINDS
+                )
+            ):
+                raise ValueError(
+                    "activity/momentum v4 depth profile is invalid"
+                )
         elif (
             self.active_quote_contract_budget != 900
             or self.quote_slot_reserve != 100
@@ -503,7 +610,7 @@ class ActivityMomentumProfile:
         }))
         if (
             self.version
-            != SUCCESSOR_ACTIVITY_MOMENTUM_PROFILE_VERSION
+            not in _V3_FAMILY_PROFILE_VERSIONS
             and (
                 conventions
                 or self.same_day_enabled
@@ -624,6 +731,7 @@ def load_activity_momentum_profile(
         LEGACY_ACTIVITY_MOMENTUM_PROFILE_VERSION: _V1_ROOT_KEYS,
         ACTIVITY_MOMENTUM_PROFILE_VERSION: _V2_ROOT_KEYS,
         SUCCESSOR_ACTIVITY_MOMENTUM_PROFILE_VERSION: _V3_ROOT_KEYS,
+        V4_ACTIVITY_MOMENTUM_PROFILE_VERSION: _V4_ROOT_KEYS,
     }.get(loaded_version)
     expected_status = {
         LEGACY_ACTIVITY_MOMENTUM_PROFILE_VERSION: (
@@ -635,6 +743,9 @@ def load_activity_momentum_profile(
         SUCCESSOR_ACTIVITY_MOMENTUM_PROFILE_VERSION: (
             "C6_WEEKLY_EXPIRY_CALIBRATION_RUNTIME_LOADED"
         ),
+        V4_ACTIVITY_MOMENTUM_PROFILE_VERSION: (
+            "C6_V4_DEPTH_RUNTIME_LOADED"
+        ),
     }.get(loaded_version)
     if (
         loaded_version
@@ -642,6 +753,7 @@ def load_activity_momentum_profile(
             LEGACY_ACTIVITY_MOMENTUM_PROFILE_VERSION,
             ACTIVITY_MOMENTUM_PROFILE_VERSION,
             SUCCESSOR_ACTIVITY_MOMENTUM_PROFILE_VERSION,
+            V4_ACTIVITY_MOMENTUM_PROFILE_VERSION,
         }
         or frozenset(value) != expected_keys
         or value.get("status") != expected_status
@@ -777,7 +889,7 @@ def load_activity_momentum_profile(
         or deferrals["silent_accumulation"].get("live_quote_slots") != 0
     ):
         raise ValueError("activity/momentum profile contract changed")
-    if loaded_version in _BOUNDED_ACTIVITY_MOMENTUM_PROFILE_VERSIONS:
+    if loaded_version in _NON_LEGACY_PROFILE_VERSIONS:
         if (
             compatibility.get("stored_v1_decode_supported") is not True
             or allocation.get(
@@ -791,7 +903,7 @@ def load_activity_momentum_profile(
             or discovery.get(
                 "strategy_extension_requires_enabled_strategy_or_required_group"
             )
-            is not True
+            is not (loaded_version != V4_ACTIVITY_MOMENTUM_PROFILE_VERSION)
             or discovery.get("future_foundation_live_enabled")
             is not False
             or coverage_targets.get("minimum_fill_required")
@@ -821,7 +933,7 @@ def load_activity_momentum_profile(
             )
         if (
             loaded_version
-            == SUCCESSOR_ACTIVITY_MOMENTUM_PROFILE_VERSION
+            in _V3_FAMILY_PROFILE_VERSIONS
             and (
                 compatibility.get("stored_v2_decode_supported")
                 is not True
@@ -915,6 +1027,24 @@ def load_activity_momentum_profile(
                 "put_coverage_required_when_available": False,
             },
         )
+        if loaded_version == V4_ACTIVITY_MOMENTUM_PROFILE_VERSION:
+            # V4.1: stocks' extension bucket (22-60 DTE, 4 contracts) is activity coverage, not strategy-only.
+            basket_values = (
+                *basket_values[:2],
+                {
+                    "id": "EXTENSION_ACTIVITY",
+                    "priority": 3,
+                    "minimum_dte": 22,
+                    "maximum_dte": 60,
+                    "roles": [
+                        "PARTICIPATION_CONTEXT",
+                        "DIRECTIONAL_MOMENTUM",
+                    ],
+                    "remaining_budget_only": False,
+                    "call_priority": False,
+                    "put_coverage_required_when_available": True,
+                },
+            )
     else:
         basket_values = value.get("live_baskets")
         if not isinstance(basket_values, list):
@@ -1156,13 +1286,44 @@ def load_activity_momentum_profile(
         ),
         delta_targets_are_ranking_anchors=(
             loaded_version
-            == SUCCESSOR_ACTIVITY_MOMENTUM_PROFILE_VERSION
+            in _V3_FAMILY_PROFILE_VERSIONS
             and ranking_anchors.get(
                 "delta_targets_are_hard_cutoffs"
             )
             is False
         ),
+        product_buckets=_v4_product_buckets(value)
+        if loaded_version == V4_ACTIVITY_MOMENTUM_PROFILE_VERSION
+        else (),
     )
+
+
+def _v4_product_buckets(value: Mapping[str, object]) -> tuple[ActivityMomentumProductBucket, ...]:
+    document = value.get("product_buckets")
+    if not isinstance(document, dict) or set(document) != {"recognition", *V4_PRODUCT_KINDS}:
+        raise ValueError("activity/momentum v4 product buckets are invalid")
+    recognition = document["recognition"]
+    if recognition != {
+        "daily_expiry_minimum_listed_expiries": 4,
+        "window_calendar_days": 6,
+        "listed_expirations_only": True,
+    }:
+        raise ValueError("activity/momentum v4 product recognition changed")
+    rows = []
+    for product in V4_PRODUCT_KINDS:
+        if not isinstance(document[product], list):
+            raise ValueError("activity/momentum v4 product buckets are invalid")
+        for order, row in enumerate(document[product], start=1):
+            rows.append(ActivityMomentumProductBucket(
+                product=product,
+                bucket_id=str(row["id"]),
+                order=order,
+                selector=str(row["selector"]),
+                minimum_dte=int(row["minimum_dte"]),
+                maximum_dte=int(row["maximum_dte"]),
+                unique_contracts=int(row["unique_contracts"]),
+            ))
+    return tuple(rows)
 
 
 @dataclass(frozen=True, slots=True)
@@ -2746,7 +2907,7 @@ def _shortlist_activity_momentum_candidates(
         raise ValueError("expiry calendar evidence is duplicated")
     if (
         profile.version
-        == SUCCESSOR_ACTIVITY_MOMENTUM_PROFILE_VERSION
+        in _V3_FAMILY_PROFILE_VERSIONS
     ):
         if preparation_at is None:
             raise ValueError(
@@ -2833,14 +2994,14 @@ def _shortlist_activity_momentum_candidates(
             reason = "DATED_QUOTE_STALE"
         elif (
             profile.version
-            == SUCCESSOR_ACTIVITY_MOMENTUM_PROFILE_VERSION
+            in _V3_FAMILY_PROFILE_VERSIONS
             and 0 <= dte <= 5
             and calendars.get(candidate.underlying) is None
         ):
             reason = "SHORT_EXPIRY_CALENDAR_EVIDENCE_UNAVAILABLE"
         elif (
             profile.version
-            == SUCCESSOR_ACTIVITY_MOMENTUM_PROFILE_VERSION
+            in _V3_FAMILY_PROFILE_VERSIONS
             and 0 <= dte <= 5
             and calendars[
                 candidate.underlying
@@ -2850,14 +3011,14 @@ def _shortlist_activity_momentum_candidates(
             reason = "SHORT_EXPIRY_PRODUCT_CONVENTION_UNSUPPORTED"
         elif (
             profile.version
-            == SUCCESSOR_ACTIVITY_MOMENTUM_PROFILE_VERSION
+            in _V3_FAMILY_PROFILE_VERSIONS
             and dte == 0
             and not resolved_same_day_enabled
         ):
             reason = "SAME_DAY_DISABLED"
         elif (
             profile.version
-            == SUCCESSOR_ACTIVITY_MOMENTUM_PROFILE_VERSION
+            in _V3_FAMILY_PROFILE_VERSIONS
             and dte == 0
         ):
             calendar = calendars.get(candidate.underlying)
@@ -2937,7 +3098,7 @@ def _shortlist_activity_momentum_candidates(
             same_day_enabled=resolved_same_day_enabled,
         )
         if profile.version
-        == SUCCESSOR_ACTIVITY_MOMENTUM_PROFILE_VERSION
+        in _V3_FAMILY_PROFILE_VERSIONS
         else ()
     )
     expiry_protected_tickers = (
@@ -3401,7 +3562,7 @@ def _resolve_activity_momentum_groups(
         }
         if (
             profile.version
-            == SUCCESSOR_ACTIVITY_MOMENTUM_PROFILE_VERSION
+            in _V3_FAMILY_PROFILE_VERSIONS
         ):
             group_identity["short_delta_override"] = (
                 None
@@ -3414,7 +3575,7 @@ def _resolve_activity_momentum_groups(
             group_version=(
                 "c6-activity-momentum-resolver-v2"
                 if profile.version
-                == SUCCESSOR_ACTIVITY_MOMENTUM_PROFILE_VERSION
+                in _V3_FAMILY_PROFILE_VERSIONS
                 else "c6-activity-momentum-resolver-v1"
             ),
             underlying=values[0].underlying,
@@ -3470,6 +3631,16 @@ def _resolve_activity_momentum_groups(
             if candidate.option_side is OptionSide.CALL:
                 roles.append("SHORT_DATED_SWEEP_LIKE")
         elif include_coverage_groups and 6 <= dte <= 21:
+            roles.extend((
+                "PARTICIPATION_CONTEXT",
+                "DIRECTIONAL_MOMENTUM",
+            ))
+        elif (
+            include_coverage_groups
+            and profile.version == V4_ACTIVITY_MOMENTUM_PROFILE_VERSION
+            and 22 <= dte <= 60
+        ):
+            # V4.1: single stocks' extension bucket (22-60 DTE) is activity coverage.
             roles.extend((
                 "PARTICIPATION_CONTEXT",
                 "DIRECTIONAL_MOMENTUM",
@@ -3716,7 +3887,7 @@ def resolve_activity_momentum_selection(
     if (
         short_delta_override is not None
         and profile.version
-        != SUCCESSOR_ACTIVITY_MOMENTUM_PROFILE_VERSION
+        not in _V3_FAMILY_PROFILE_VERSIONS
     ):
         raise ValueError(
             "short delta override requires the v3 profile"
@@ -4339,6 +4510,7 @@ class ActivityMomentumAllocation:
                 LEGACY_ACTIVITY_MOMENTUM_PROFILE_VERSION,
                 ACTIVITY_MOMENTUM_PROFILE_VERSION,
                 SUCCESSOR_ACTIVITY_MOMENTUM_PROFILE_VERSION,
+                V4_ACTIVITY_MOMENTUM_PROFILE_VERSION,
             }
             or self.active_contract_budget < 0
             or self.quote_contract_ceiling <= 0
@@ -4364,7 +4536,7 @@ class ActivityMomentumAllocation:
             )
         if (
             self.profile_version
-            in _BOUNDED_ACTIVITY_MOMENTUM_PROFILE_VERSIONS
+            in _NON_LEGACY_PROFILE_VERSIONS
             and (
                 self.admission_evidence is None
                 or self.admission_evidence.effective_total_budget
@@ -4392,7 +4564,7 @@ class ActivityMomentumAllocation:
         ))
         if (
             self.profile_version
-            == SUCCESSOR_ACTIVITY_MOMENTUM_PROFILE_VERSION
+            in _V3_FAMILY_PROFILE_VERSIONS
         ):
             if (
                 len({
@@ -4518,14 +4690,14 @@ def activity_momentum_allocation_payload(
             **(
                 {"future_50ms_detector_evaluations": 0}
                 if allocation.profile_version
-                in _BOUNDED_ACTIVITY_MOMENTUM_PROFILE_VERSIONS
+                in _NON_LEGACY_PROFILE_VERSIONS
                 else {}
             ),
         },
     }
     if (
         allocation.profile_version
-        in _BOUNDED_ACTIVITY_MOMENTUM_PROFILE_VERSIONS
+        in _NON_LEGACY_PROFILE_VERSIONS
     ):
         if allocation.admission_evidence is None:
             raise ValueError(
@@ -4542,7 +4714,7 @@ def activity_momentum_allocation_payload(
         ]
     if (
         allocation.profile_version
-        == SUCCESSOR_ACTIVITY_MOMENTUM_PROFILE_VERSION
+        in _V3_FAMILY_PROFILE_VERSIONS
     ):
         value["short_expiry_evidence"] = [
             activity_momentum_short_expiry_evidence_payload(row)
@@ -4568,6 +4740,7 @@ def activity_momentum_allocation_from_payload(
             LEGACY_ACTIVITY_MOMENTUM_PROFILE_VERSION,
             ACTIVITY_MOMENTUM_PROFILE_VERSION,
             SUCCESSOR_ACTIVITY_MOMENTUM_PROFILE_VERSION,
+            V4_ACTIVITY_MOMENTUM_PROFILE_VERSION,
         }
         or value.get("profile_version") != value.get("schema")
     ):
@@ -4894,6 +5067,108 @@ def _consumer_eligibility(
     ))
 
 
+def v4_product_kind(
+    expiry_evidence: "ActivityMomentumShortExpiryEvidence | None",
+    session_date: date,
+) -> str:
+    """V4.1: DAILY_EXPIRY when at least 4 listed expiries fall in the next 6 calendar days (index ETFs list one per
+    session; holiday weeks keep 4), else WEEKLY_EXPIRY (single stocks' Friday weeklies)."""
+    expiries = () if expiry_evidence is None else expiry_evidence.candidate_expiries
+    upcoming = {value for value in expiries if 0 <= (value - session_date).days <= 6}
+    return "DAILY_EXPIRY" if len(upcoming) >= 4 else "WEEKLY_EXPIRY"
+
+
+def v4_weekly_ladder(
+    session_date: date,
+    expiries: Iterable[date],
+    product: str,
+) -> tuple[date, ...]:
+    """The weekday weekly ladder (docs/OPTIONS_COVERAGE_TASK.md, Nov 8), from the listed expiries (a week's weekly is
+    its last listed expiry, so a holiday week keeps its Thursday): Monday to Wednesday this week's weekly; Thursday this
+    week's (1 DTE) and next week's; Friday next week's as the primary one, plus today's expiry for single stocks (the
+    stock's 0DTE on its expiry day; index ETFs hold 0DTE in their SAME_DAY bucket)."""
+    listed = sorted({value for value in expiries if value >= session_date})
+    monday = session_date - timedelta(days=session_date.weekday())
+
+    def weekly(start: date) -> date | None:
+        week = [value for value in listed if start <= value <= start + timedelta(days=4)]
+        return week[-1] if week else None
+
+    this_week, next_week = weekly(monday), weekly(monday + timedelta(days=7))
+    weekday = session_date.weekday()
+    if weekday <= 2:
+        ladder = (this_week,)
+    elif weekday == 3:
+        ladder = (this_week, next_week)
+    elif product == "DAILY_EXPIRY":
+        ladder = (next_week,)
+    else:
+        ladder = (next_week, this_week)
+    return tuple(dict.fromkeys(value for value in ladder if value is not None))
+
+
+def _v4_fill_product_buckets(
+    profile: "ActivityMomentumProfile",
+    *,
+    queue: list,
+    session_date: date,
+    expiry_evidence,
+    share_left: int,
+    take,
+    incremental,
+) -> int:
+    """Fill one underlying's v4 buckets in order from its ranked queue (the profile's one quality ranking: calls and
+    puts together, no side quota). Single-contract groups only; a bucket stops at its unique-contract count or when
+    the share is used. Returns the slots used; the normal rounds fill what the buckets leave."""
+    product = v4_product_kind(expiry_evidence, session_date)
+    expiries = set(() if expiry_evidence is None else expiry_evidence.candidate_expiries)
+    expiries.update(candidate.expiration for group in queue for candidate in group.candidates)
+    ladder = v4_weekly_ladder(session_date, expiries, product)
+    ordinals = {
+        value: index
+        for index, value in enumerate(sorted(value for value in expiries if value > session_date), start=1)
+    }
+    used = 0
+    for bucket in sorted(
+        (row for row in profile.product_buckets if row.product == product),
+        key=lambda row: row.order,
+    ):
+        taken = 0
+        eligible = [
+            row
+            for row in queue
+            if len(row.candidates) == 1
+            and bucket.matches(
+                expiration=row.candidates[0].expiration,
+                dte=row.candidates[0].dte_for(session_date),
+                ladder=ladder,
+                ordinal=ordinals.get(row.candidates[0].expiration),
+            )
+        ]
+        if bucket.selector == "WEEKLY_LADDER" and len(ladder) > 1:
+            # Both ladder expiries share the bucket, the primary one first (Friday: next week's, beside the stock's
+            # own 0DTE; Thursday: this week's and next week's), each in the queue's quality order.
+            lanes = [
+                [row for row in eligible if row.candidates[0].expiration == expiration]
+                for expiration in ladder
+            ]
+            eligible = [
+                lane[position]
+                for position in range(max(len(lane) for lane in lanes))
+                for lane in lanes
+                if position < len(lane)
+            ]
+        for group in eligible:
+            if taken >= bucket.unique_contracts:
+                break
+            cost = incremental(group)
+            if cost == 0 or used + cost > share_left or group not in queue:
+                continue
+            used += take(group)
+            taken += cost
+    return used
+
+
 def allocate_activity_momentum(
     profile: ActivityMomentumProfile,
     *,
@@ -4987,7 +5262,7 @@ def allocate_activity_momentum(
     }))
     if (
         profile.version
-        == SUCCESSOR_ACTIVITY_MOMENTUM_PROFILE_VERSION
+        in _V3_FAMILY_PROFILE_VERSIONS
         and resolution is None
     ):
         raise ValueError(
@@ -5147,7 +5422,7 @@ def allocate_activity_momentum(
         queue = remaining[underlying]
         if (
             profile.version
-            == SUCCESSOR_ACTIVITY_MOMENTUM_PROFILE_VERSION
+            in _V3_FAMILY_PROFILE_VERSIONS
         ):
             explicitly_required = tuple(
                 group
@@ -5171,7 +5446,20 @@ def allocate_activity_momentum(
                 underlying
             )
             expiry_targets = []
-            if (
+            if profile.version == V4_ACTIVITY_MOMENTUM_PROFILE_VERSION:
+                # V4.1: the product buckets replace v3's near / end-of-week expiry targets.
+                used_by_underlying[underlying] += _v4_fill_product_buckets(
+                    profile,
+                    queue=queue,
+                    session_date=session_date,
+                    expiry_evidence=expiry_evidence,
+                    share_left=(
+                        initial_share - used_by_underlying[underlying]
+                    ),
+                    take=lambda group, _u=underlying: take(_u, group),
+                    incremental=incremental,
+                )
+            elif (
                 expiry_evidence is not None
                 and expiry_evidence.near_expiry is not None
             ):
@@ -5273,7 +5561,9 @@ def allocate_activity_momentum(
                     )
         bootstrap = []
         basket_bootstrap = (
-            profile.baskets[1:2]
+            ()
+            if profile.version == V4_ACTIVITY_MOMENTUM_PROFILE_VERSION
+            else profile.baskets[1:2]
             if profile.version
             == SUCCESSOR_ACTIVITY_MOMENTUM_PROFILE_VERSION
             else (
@@ -5311,7 +5601,7 @@ def allocate_activity_momentum(
                         )
                         and (
                             profile.version
-                            in _BOUNDED_ACTIVITY_MOMENTUM_PROFILE_VERSIONS
+                            in _NON_LEGACY_PROFILE_VERSIONS
                             or side is OptionSide.CALL
                             and basket.call_priority
                             or side is OptionSide.PUT
@@ -5337,7 +5627,7 @@ def allocate_activity_momentum(
                 )
         if (
             profile.version
-            in _BOUNDED_ACTIVITY_MOMENTUM_PROFILE_VERSIONS
+            in _NON_LEGACY_PROFILE_VERSIONS
         ):
             short_target = min(
                 profile.short_basket_contract_target,
@@ -5467,7 +5757,7 @@ def allocate_activity_momentum(
     resolved_expiry_evidence = []
     if (
         profile.version
-        == SUCCESSOR_ACTIVITY_MOMENTUM_PROFILE_VERSION
+        in _V3_FAMILY_PROFILE_VERSIONS
     ):
         if resolution is None:
             raise ValueError("v3 expiry resolution is absent")

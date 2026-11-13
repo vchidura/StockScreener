@@ -36,6 +36,7 @@ from .acquisition_ledger import (
 )
 from .contracts import canonical_sha256
 from .database_access_v2 import APP_ROLE, V2ConnectionProvider
+from .transient_retry import retry_transient
 from .provider_budget import (
     ProviderBudgetExceeded,
     ProviderBudgetScope,
@@ -1256,29 +1257,42 @@ def run_advanced_options_preparation_cycle(
     calendar: OptionExchangeCalendar | None = None,
 ) -> dict[str, object]:
     checked = _utc(checked_at, "Options preparation cycle checked_at")
-    with provider.transaction(
-        APP_ROLE,
-        isolation_level="SERIALIZABLE",
-    ) as unit:
-        expired_sessions = (
-            expire_obsolete_advanced_options_preparation_cursor(
-                unit.cursor,
-                checked_at=checked,
-                calendar=calendar,
+
+    def _expire_mark_claim():
+        with provider.transaction(
+            APP_ROLE,
+            isolation_level="SERIALIZABLE",
+        ) as unit:
+            expired = (
+                expire_obsolete_advanced_options_preparation_cursor(
+                    unit.cursor,
+                    checked_at=checked,
+                    calendar=calendar,
+                )
             )
-        )
-        mark_stale_provider_requests_ambiguous_cursor(
-            unit.cursor,
-            reserved_before=(
-                checked - timedelta(seconds=lease_seconds)
-            ),
-        )
-        claim = claim_advanced_options_preparation_cursor(
-            unit.cursor,
-            owner_id=owner_id,
-            checked_at=checked,
-            lease_seconds=lease_seconds,
-        )
+            mark_stale_provider_requests_ambiguous_cursor(
+                unit.cursor,
+                reserved_before=(
+                    checked - timedelta(seconds=lease_seconds)
+                ),
+            )
+            claimed = claim_advanced_options_preparation_cursor(
+                unit.cursor,
+                owner_id=owner_id,
+                checked_at=checked,
+                lease_seconds=lease_seconds,
+            )
+        return expired, claimed
+
+    # R19.1 (Nov 12 21:32: the lifecycle exited on a SerializationFailure in the stale-ledger marking): this
+    # transaction is one whole unit (no provider work), so a serialization failure or deadlock repeats it from the
+    # start with a short backoff instead of ending the process; any other error is raised as before.
+    expired_sessions, claim = retry_transient(
+        _expire_mark_claim,
+        name="preparation-expire-mark-claim",
+        service="options-lifecycle",
+        classify=lambda error: str(getattr(error, "pgcode", "") or "") in {"40001", "40P01"},
+    )
     if claim is None:
         return {
             "status": "IDLE",

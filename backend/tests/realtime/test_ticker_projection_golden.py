@@ -33,49 +33,49 @@ GOLDEN = {
     "summary_charts": "b915396d4c175aa1bade66211327b530ecba96362fe89cd445d4b7ec5cb748c7",
     "workspaces": {
         "AAPL": {
-            "evidence": "96a6d3b1515786829953f36d1f518aba8a31b1edfd00c4508b8655c4cc83c646",
+            "evidence": "156f7013e4cf7f5c1f48172c0470f674c362350a2ac53219acab8a87463c6682",
             "manifest": "2cf04ddda27d807f851d8baa9ae612ce2034d248836a8840d585e164ad858ea7",
-            "payload": "3f06d9fb0bf58f7ca89e40db139b90948041bbf69ddbea7fbe1f61fed0523c8e"
+            "payload": "574f0ae1162cb31c79dd4d1f42865e920ac0da2b74eb11e6979f44b6cd363229"
         },
         "AMZN": {
-            "evidence": "739f430e320c429907c6d88b832cc8f20ef6be9974fba11e20bddc86c187a8be",
+            "evidence": "afca336209adf5406ea758100e11e25b8cbbce7cc65f7086aefc976ac7964694",
             "manifest": "d6f72685d00ebfe107de3d19df0fef51c25e8cd466c80dd89946158033adb00f",
-            "payload": "a0c73fba3722692d2f5523c9eaac5ac297c56d94fac449707a06efa89038e710"
+            "payload": "1c5400b2158a4818e2b74c1d370073d2d9639da4b1adaae25281d064b0315a4f"
         },
         "IWM": {
-            "evidence": "79dadd2b670be84379e7f508648e8ba27b5bd902fe93bb5cb32b5f487a9850ee",
+            "evidence": "51706b0cd81518dbe097ef88915ac097c75b087835d465856fda7b55d80082ca",
             "manifest": "0b1bb5f8960a70a8f1103c9aac8151a5cca3708b0b61484e2c9b358fd2c3686b",
-            "payload": "969bac58f58be7c30307c43c2e7ac8574728e01200a837229bfeb0003ca5bc45"
+            "payload": "2e3b869eaa7996d0ccb006e52f93b200cd3db0393fb8c460f8850650b5f2ff87"
         },
         "MSFT": {
-            "evidence": "2e82d59436134841aa79fe38a345db6d00ba2a987e0590f3358c7fd9c71532ff",
+            "evidence": "1d109f1756afa5614ad1f8533e4292f811ea3bd9ccb5f63115e623255449ee02",
             "manifest": "8348fd6bc19b7f6f9f5a67433dbdf5788f671a4d1208735c6145e31cfb7ee808",
-            "payload": "d88c12f431fc1cdf9a3ff9d2a30e171737afa24e62b4a3a2a16575c7025b69bb"
+            "payload": "730b9cca4454ffe7d8c2626797643e7c474ee570fe9ff955c88862ec2cb7d5d4"
         },
         "NFLX": {
-            "evidence": "5b3ecc43b9a2c481278aa8d25186307e03035850ebcf85a2e37ae9690a10109e",
+            "evidence": "04e4da18594049fcd3cdc9cac69a54081cf72bd1dc291faddb6a0bc57429dc47",
             "manifest": "92b5a33fc536895eefa0c91178f0eecc07478c9ec1058576ab3d00e72da4e8d5",
-            "payload": "be1007716fc120a02ee713b31c2c6079ddc0b6d37aa9cd8d7b94063a18f82978"
+            "payload": "3492aec941a6b77ec59aed41dd60a5cfba8928ac25648ffcc728399a7b9a4461"
         },
         "NVDA": {
-            "evidence": "0657f19426e6fbfcfc338b24429e28043ddf8648d8ce60eee3711c69e06a5884",
+            "evidence": "4a408418b13d51099020bb2c8667793d6fb266a5a3b9481d13c2d0f295fd12d5",
             "manifest": "316b8796b997539fadd35cf8e85edab6fa1cb80abf034abe9681aea1da1e2b94",
-            "payload": "56acdd74d66ea97a04ef61b271241e4491b0456b11d149f6bd19304495ba5b40"
+            "payload": "399b8988cf2fde3594696c64a7adbc4c1d30ea98672a1475e1f1b1d445904d02"
         },
         "QQQ": {
-            "evidence": "75a78eb2d1694abab594481f608911178435cd12f2cce67a9d43dba9e540363a",
+            "evidence": "ca6d4799a3c33005c430df3cb4567c823b49e2127c8436a9f9d5d9a04ec8068b",
             "manifest": "aa5b0c7b6544559d19ed898eee18c1ab3286ae7f99753feff3c3d84c299ef090",
-            "payload": "f48011e3f63c2d206f71cacaff7d520c1bd111e475738a5dcacea99b52f1bc1e"
+            "payload": "cd89fee0b803334a0f6ca044fa2d498e402cbdec1bbeca74fc6b7b5abcc8aab8"
         },
         "SPY": {
-            "evidence": "00b44c93490a3a987fa70d100115b517b68950cc1da5f43191c9fc48f22294c9",
+            "evidence": "6759505e0160a26d0a3707d97fe2814facb8756c0b2ea426f38b0004f47df249",
             "manifest": "65558d1354cb43af63a239bf38a7d6b78c864588f69e866c9fb33b80a9bd11ee",
-            "payload": "1affbc8bdf6b36e9016d1bd3ab75c5fb169a5458226f4ec5070ce9e08e7a3db3"
+            "payload": "b2297af7b9b7488866ee226f9f480412d0f2d06e002959d8626cc1987c51c98d"
         },
         "TSLA": {
-            "evidence": "fc9bdbe7d5b7de5bdf0b2922f5c4ee284f30802431950f76bd80c991b6157546",
+            "evidence": "ea45053f410447492272b0d91ba8c116f9f624110b20f0cfa5312446f1e82c81",
             "manifest": "0b0a1e659b22e376c3fa77e74390233b80f18903fee08de89f9bf60213bc8447",
-            "payload": "bc135e3f8d979fe5f42785e1cde500cbfe0fa0e962cf84d1fea4fbe2136d419e"
+            "payload": "3388e18d8268d260db701d3c146a51bb78f1df1afe13d1788406082a830fbdd6"
         }
     }
 }

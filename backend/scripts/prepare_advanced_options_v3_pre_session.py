@@ -26,6 +26,7 @@ from realtime.advanced_options_activity_momentum_c6 import (  # noqa: E402
     ACTIVITY_MOMENTUM_PROFILE_VERSION,
     LEGACY_ACTIVITY_MOMENTUM_PROFILE_VERSION,
     SUCCESSOR_ACTIVITY_MOMENTUM_PROFILE_VERSION,
+    V4_ACTIVITY_MOMENTUM_PROFILE_VERSION,
     ActivityMomentumCandidate,
     ActivityMomentumExpiryCalendarEvidence,
     ActivityMomentumLastTradingEvidence,
@@ -86,6 +87,12 @@ _OPTION_TICKER = re.compile(
 )
 
 
+_V3_FAMILY_VERSIONS = (
+    SUCCESSOR_ACTIVITY_MOMENTUM_PROFILE_VERSION,
+    V4_ACTIVITY_MOMENTUM_PROFILE_VERSION,
+)
+
+
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--database", required=True)
@@ -128,6 +135,7 @@ def parse_args(argv=None):
             LEGACY_ACTIVITY_MOMENTUM_PROFILE_VERSION,
             ACTIVITY_MOMENTUM_PROFILE_VERSION,
             SUCCESSOR_ACTIVITY_MOMENTUM_PROFILE_VERSION,
+            V4_ACTIVITY_MOMENTUM_PROFILE_VERSION,
         ),
         default=ACTIVITY_MOMENTUM_PROFILE_VERSION,
     )
@@ -274,7 +282,7 @@ def parse_args(argv=None):
     args.last_trading_conventions = conventions
     if (
         args.admission_profile_version
-        != SUCCESSOR_ACTIVITY_MOMENTUM_PROFILE_VERSION
+        not in _V3_FAMILY_VERSIONS
         and (
             args.short_delta_override is not None
             or args.disable_same_day
@@ -927,7 +935,7 @@ def main(argv=None) -> int:
                 conventions=args.last_trading_conventions,
             )
             if profile.version
-            == SUCCESSOR_ACTIVITY_MOMENTUM_PROFILE_VERSION
+            in _V3_FAMILY_VERSIONS
             else ()
         )
         resolution = resolve_activity_momentum_selection(
@@ -941,7 +949,7 @@ def main(argv=None) -> int:
             preparation_at=(
                 checked_at
                 if profile.version
-                == SUCCESSOR_ACTIVITY_MOMENTUM_PROFILE_VERSION
+                in _V3_FAMILY_VERSIONS
                 else None
             ),
             expiry_calendars=expiry_calendars,
@@ -949,7 +957,7 @@ def main(argv=None) -> int:
                 profile.same_day_enabled
                 and not args.disable_same_day
                 if profile.version
-                == SUCCESSOR_ACTIVITY_MOMENTUM_PROFILE_VERSION
+                in _V3_FAMILY_VERSIONS
                 else None
             ),
             short_delta_override=args.short_delta_override,

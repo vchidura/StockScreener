@@ -34,6 +34,7 @@ from .acquisition_ledger import (
 )
 from .contracts import canonical_sha256
 from .database_access_v2 import APP_ROLE
+from .fault_journal import emit_fault
 from .provider_budget import (
     MASSIVE_ADVANCED_ACCOUNT_DECODED_BYTE_CEILING, MASSIVE_ADVANCED_ACCOUNT_REQUEST_CEILING, ProviderBudgetExceeded,
     ProviderBudgetScope, reserve_coordinated_provider_request_cursor,
@@ -534,13 +535,28 @@ def capture_options_breadth(
         except Exception as error:  # noqa: BLE001
             _LOGGER.warning("options_breadth_persist_failed underlying=%s error=%s", underlying, error)
             summary[underlying] = {"state": "FAILED", "reason": f"PERSIST: {type(error).__name__}"}
+            _report_capture_fault(underlying, equity_cutoff, summary[underlying])
             continue
         summary[underlying] = {
             "state": captured.state, "contracts": len(captured.rows), "pages": captured.pages,
             "seconds": round((observed - started).total_seconds(), 1),
             **({"reason": captured.reason} if captured.reason else {}),
         }
+        if captured.state != "COMPLETE":
+            _report_capture_fault(underlying, equity_cutoff, summary[underlying])
     return summary
+
+
+def _report_capture_fault(underlying, equity_cutoff, outcome) -> None:
+    """R53 (Nov 12: 19:08-19:38 provider slowdown seen only in plain log lines): a FAILED or PARTIAL capture becomes
+    one DEGRADED fault per underlying and window in the fault journal. Flow keeps serving that name's last COMPLETE
+    chain (R48), so the action is LAST_GOOD_CHAIN. Reporting only; nothing else changes."""
+    emit_fault(
+        kind="BREADTH_CAPTURE_FAILED", severity="DEGRADED", recoverable=True, action="LAST_GOOD_CHAIN",
+        service="options-scheduler", key=f"{underlying}",
+        message=f"{underlying} chain capture {outcome.get('state')} at {equity_cutoff}: {outcome.get('reason', '-')}"[:300],
+        context={"underlying": underlying, "equity_cutoff": str(equity_cutoff), **outcome},
+    )
 
 
 # ---- reads (Options Screener) -------------------------------------------------------------------------------------
@@ -641,6 +657,17 @@ _BREADTH_ROW_CACHE: "OrderedDict[tuple, tuple]" = OrderedDict()
 _BREADTH_ROW_CACHE_LOCK = threading.Lock()
 
 
+BREADTH_LATEST_CAPTURE_SWITCH = "REALTIME_V2_BREADTH_LATEST_CAPTURE_ONLY"
+
+
+def breadth_latest_capture_only() -> bool:
+    """R55 (Nov 12 night): the current-rows table keeps rows of contracts that left the band in earlier captures (4-86
+    per name at the Nov 12 close). `ON` reads only each underlying's latest capture (the rows sharing its newest
+    `observed_at`; a FAILED/PARTIAL capture writes no rows, R48, so that is the last COMPLETE one); anything else (the
+    default) reads every current row as before."""
+    return os.environ.get(BREADTH_LATEST_CAPTURE_SWITCH, "OFF").strip().upper() == "ON"
+
+
 def breadth_row_cache_enabled() -> bool:
     """R47: `ON` keeps built breadth rows per process; anything else (the default) builds them on every read."""
     return os.environ.get(BREADTH_ROW_CACHE_SWITCH, "OFF").strip().upper() == "ON"
@@ -702,11 +729,18 @@ def load_breadth_screener_rows_cursor(
         cached = _breadth_row_cache_get(cache_key)
         rows = None if cached is None else list(cached)
     if rows is None:
+        latest_only = breadth_latest_capture_only()
         cursor.execute(
             "SELECT breadth.*,catalog.contract_id FROM rt.option_breadth_current AS breadth "
             "LEFT JOIN ref.option_contracts AS catalog ON catalog.contract_ticker=breadth.contract_ticker "
-            "WHERE breadth.session_date=%s AND breadth.underlying=ANY(%s) AND breadth.observed_at<=%s",
-            (session_date, list(underlyings), available_by),
+            "WHERE breadth.session_date=%s AND breadth.underlying=ANY(%s) AND breadth.observed_at<=%s"
+            # R55: one uncorrelated (hashed) subquery for every underlying's latest capture; a correlated max() per row
+            # rescanned the underlying's rows for each row (no observed_at index): SPY 24 s cold on the r99 copy.
+            + (" AND (breadth.underlying,breadth.observed_at) IN (SELECT latest.underlying,max(latest.observed_at) "
+               "FROM rt.option_breadth_current AS latest WHERE latest.session_date=%s AND latest.underlying=ANY(%s) "
+               "AND latest.observed_at<=%s GROUP BY latest.underlying)" if latest_only else ""),
+            (session_date, list(underlyings), available_by,
+             *((session_date, list(underlyings), available_by) if latest_only else ())),
         )
         # The API reads with a dict cursor; other callers with a tuple cursor. Both shapes give the same rows.
         columns = [column[0] for column in cursor.description]

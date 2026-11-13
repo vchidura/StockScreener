@@ -107,23 +107,20 @@ function SessionStepper({ interval }: { interval: string }) {
       >
         <ChevronLeft size={15} aria-hidden="true" />
       </button>
-      {isStrategy || isTicker || isPattern || isAllTickers ? <select className="tm-session__value"
-        aria-label={isTicker ? 'Ticker session date' : isPattern ? 'Pattern Watch session date'
-          : isAllTickers ? 'All Tickers session date' : 'Strategy session date'} value={date}
-        disabled={!sessions.length} onChange={event => choose(event.target.value)}>
-        {date && !sessions.includes(date) && <option value={date}>{sessionLabel(date)} (unavailable)</option>}
-        {!date && <option value="">No stored sessions</option>}
-        {[...sessions].reverse().map(session => <option key={session} value={session}>{sessionLabel(session)}</option>)}
-      </select> : <button
-        type="button"
-        className="tm-session__value"
-        onClick={reset}
-        disabled={isLatest}
-        title={isLatest ? `Latest ${interval} session (${date || 'loading'})` : `${date} — click to return to the latest session`}
-      >
-        {sessionLabel(date)}
-        {!isLatest && <small>Historical</small>}
-      </button>}
+      {/* Nov 13 (user): every page picks its session from a dropdown of the stored sessions (as the ticker pages
+          did), and a past session shows "Historical" under it (as the Options pages' button did). Choosing the
+          newest session, or the refresh control, returns to the latest. */}
+      <span className="tm-session__pick">
+        <select className="tm-session__value"
+          aria-label={isTicker ? 'Ticker session date' : isPattern ? 'Pattern Watch session date'
+            : isAllTickers ? 'All Tickers session date' : isStrategy ? 'Strategy session date' : 'Session date'}
+          title={isLatest ? `Latest ${interval} session (${date || 'loading'})` : `${date}: a past session`}
+          value={date} disabled={!sessions.length} onChange={event => choose(event.target.value)}>
+          {date && !sessions.includes(date) && <option value={date}>{sessionLabel(date)} (unavailable)</option>}
+          {!date && <option value="">No stored sessions</option>}
+          {[...sessions].reverse().map(session => <option key={session} value={session}>{sessionLabel(session)}</option>)}
+        </select>
+      </span>
       <button
         type="button"
         onClick={() => step(1)}
@@ -169,10 +166,12 @@ function AlertSessionStepper({ dates, selected, emptyLabel = 'No publications', 
   }
   return <div className="tm-session sa-session" role="group" aria-label="Alert trading session">
     <button type="button" title="Previous alert session" aria-label="Previous alert session" disabled={index <= 0} onClick={() => choose(dates[index - 1])}><ChevronLeft size={15} /></button>
-    <select aria-label="Alert session date" value={selected || ''} disabled={!dates.length} onChange={event => choose(event.target.value)}>
-      {!dates.length && <option value="">{emptyLabel}</option>}
-      {[...dates].reverse().map(date => <option key={date} value={date}>{sessionLabel(date)}</option>)}
-    </select>
+    <span className="tm-session__pick">
+      <select className="tm-session__value" aria-label="Alert session date" value={selected || ''} disabled={!dates.length} onChange={event => choose(event.target.value)}>
+        {!dates.length && <option value="">{emptyLabel}</option>}
+        {[...dates].reverse().map(date => <option key={date} value={date}>{sessionLabel(date)}</option>)}
+      </select>
+    </span>
     <button type="button" title="Next alert session" aria-label="Next alert session" disabled={index < 0 || index === dates.length - 1} onClick={() => choose(dates[index + 1])}><ChevronRight size={15} /></button>
     <RefreshButton historical={index >= 0 && index < dates.length - 1} toLatest={() => choose(dates[dates.length - 1])} />
   </div>

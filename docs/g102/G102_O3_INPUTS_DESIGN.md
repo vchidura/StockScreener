@@ -82,3 +82,58 @@ the activity -> `assess_options_credit_canonical_trend(activity, stock, directio
 | 3 | Rehearsal, package, deploy with the switch off; turn on in a session after two clean windows |
 
 Not in r91 (Nov 12 open). Needs no migration and no universe change.
+
+## 8. Night 2 porting map (Nov 12 night; implementation moved to the next night)
+
+Night 1 code (`realtime/advanced_options_o3_inputs.py`: pairs, activity leg, floors, bound, marks-gate leg set) is in
+r98's tree, unwired. Night 2 must produce exactly what `decode_advanced_o3_invocation_document` (native adapters) and
+`options/credit_detection.assess_o3_credit` accept; every object below has a developer-path builder in
+`realtime/option_package_context.load_forward_technical_package_context` that is the reference:
+
+| Input to `assess_o3_credit` | Type | Live source and builder |
+|---|---|---|
+| `candidate` | `OptionCandidate` (SPREAD_RANGE_LOCATOR, two legs with snapshot ids) | Night 1 `CreditVertical` -> `OptionCandidate` via the matrix candidate constructor used by `option_package_context` (identity hashed like other packages) |
+| `snapshots` | `OptionContractSnapshot` per leg | Cutoff quote midpoints (rolling state / `rt.option_mark_evidence`) + reference `valuation_inputs` greeks; the same fields the P8 window's O1 package legs carry (`option_package_legs`) |
+| `decision` | CONFIRMED options-first decision from `options/dual_origin.assess_options_credit_canonical_trend(activity, stock, direction, market_cutoff, decision_at)` | `activity`: the activity leg's dated source (episode id, day volume / OI at the cutoff; rolling `contract_volumes` + reference OI); `stock`: the canonical stock snapshot built from the E (5m) and H bars the window already loads for OS1/OS2 |
+| `structural_invalidation` | Decimal | `equity/materialization.materialize_equity_evidence(interval="30m", bars=<30m bars to the cutoff>)` -> `directional_levels`, bound with `options/detector_collection.bind_direct_structural_levels(levels, security, direction, spot, received_at, valid_until)`; first level with role INVALIDATION |
+| persistence | `rt.option_packages` + `rt.option_package_legs` (two legs), `rt.detector_versions` (`ADVANCED_OPTIONS_O3_INPUT`, once), `rt.detector_events` CONFIRMED at `trigger_at = cutoff` (dedup on cohort, candidate, cutoff), `rt.detector_event_inputs` `O3_NATIVE_INVOCATION` with the retained `advanced-options-o3-invocation-v1` document | One transaction, inside the window before `_load_o3`, behind `REALTIME_V3_O3_INPUTS` |
+
+Order for the next night: (a) snapshot + candidate builders with unit tests against a stored Nov 12 O1 package's legs;
+(b) stock snapshot + levels from the window's loaded bars (30m from `rt.bar_head`), unit-tested on Nov 12 bars;
+(c) decision + `assess_o3_credit` end-to-end on Nov 12 inputs offline (expect COMPLETE_ZERO or SELECTED, never an
+exception); (d) persistence + event with idempotency; (e) wiring + replay of Nov 10-12 windows on the copy with the
+switch on: O1/OS1/OS2 outputs unchanged, O3 not BLOCKED. Effort ~1 night; not in r99.
+
+**Additions to the porting map (Nov 13 00:2x, from reading the code):**
+- The developer snapshot normalizer (`options/data/normalizer.DeveloperOptionNormalizer`) marks from day close / VWAP
+  (developer marks), but `_load_o3` requires `mark_source == ADVANCED_NBBO_MIDPOINT` on every snapshot: the leg snapshots
+  must be built from the cutoff NBBO (the `rt.option_mark_evidence` row the marks gate already reads: bid, ask, mark,
+  market_time; no IV or greeks stored there).
+- `CandidateLeg` requires float IV / delta / gamma / theta / vega / rho and a model mark: compute them per leg at the
+  mark's market time with the code the OA1 Options Alerts valuation uses (r96, `REALTIME_V2_OPTIONS_ALERT_VALUATION`,
+  "SOURCE_TIME_MODEL": reference-state spot, Treasury curve, dividends, the session valuation policy). The snapshot's
+  optional IV fields take the same values; `iv_converged` / solver fields from that solve.
+- The marks gate in `_load_o3` (all slot-set contracts marked at the cutoff) must narrow to the judged legs (night 1's
+  `judged_leg_instrument_ids`) behind the same switch, or O3 stays blocked whenever one quiet contract has no mark.
+- Package: model on `options_alert_v1_event_package` (two legs, SELL short + BUY wing, entry net premium = credit,
+  capital at risk = width x multiplier - credit, exit deadline = session close), candidate id by uuid5 over cohort,
+  cutoff and the two contract ids.
+
+## 9. Night 2 as built (Nov 13 02:29-02:59 UTC; worktree, next package)
+
+- Module `realtime/advanced_options_o3_producer.py`; wiring in `advanced_options_p8_window` just before the native
+  preflight (`produce_o3_inputs(provider, native_candidate)`, own REPEATABLE READ write transaction, never raises);
+  lane changes in `advanced_options_native_loader._load_o3` and the v6 decision decode, all behind `REALTIME_V3_O3_INPUTS`.
+- Day volume: the window's rolling state (cumulative per contract); open interest and rate/dividend/model version:
+  its reference state; spot: last realtime 1m close at the cutoff known by the decision time; decision time: the
+  Equity receipt's `known_by`, never before the cutoff.
+- Activity: the window's own O1 `ActivitySource`s (flow events of the last 10 minutes); a vertical needs one on a leg.
+- Records are pre-checked with `assess_o3_credit`; clock rule named (`O3_LEG_MARK_STALE`: oldest leg mark older than
+  the policy's 1,800 s source age at the decision; `O3_SESSION_CLOSED_AT_DECISION`).
+- `NO_INPUT` row per underlying and cutoff (disposition `NO_INPUT`, reason codes and counts in the payload) so the lane
+  reports zero inputs (evaluated) rather than "no producer"; a producer failure writes nothing and keeps
+  `O3_ACCEPTED_INPUT_EVIDENCE_ABSENT`.
+- Finding (read-only dry run Nov 10-12, 234 windows): 0 qualifying inputs of 702 verticals; the stops are O3's own
+  policy (participation baseline, 30m trend alignment, leg floors, an O1 event on a leg). With 8 contracts per name
+  O3 will rarely fire; V4 (24 per name) widens the pairs. Turn-on question for the user after the window replay:
+  O3 evaluated with mostly zero inputs is the honest state, not a fault.

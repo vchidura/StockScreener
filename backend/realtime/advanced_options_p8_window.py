@@ -69,6 +69,8 @@ from .advanced_options_rolling_producer import (
     PostgresAdvancedOptionsRollingProducer,
     build_advanced_options_rolling_producer_plan,
 )
+from .advanced_options_o3_inputs import o3_inputs_enabled
+from .advanced_options_o3_producer import produce_o3_inputs
 from .advanced_options_service import OPTIONS_V3_STAGE_ORDER
 from .contracts import canonical_sha256
 from .database_access_v2 import APP_ROLE
@@ -898,6 +900,10 @@ def build_and_run_p8_serial_window(
         ),
         unmarked_instrument_ids=unmarked_instrument_ids,
     )
+    if o3_inputs_enabled():
+        # R44 (G102_O3_INPUTS_DESIGN step 5): write this cutoff's O3 inputs before the native preflight freezes the
+        # input identity, in their own transaction; idempotent on retry, never fails the window (O3 stays BLOCKED).
+        produce_o3_inputs(provider, native_candidate, role=APP_ROLE)
     native_preflight = PostgresAdvancedOptionsNativeInputLoader(
         provider,
         native_candidate,

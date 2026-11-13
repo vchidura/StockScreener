@@ -84,10 +84,14 @@ internet; prove it each time with a socket probe). Script used Nov 10: scratchpa
    without hardening retention exits on `permission denied for schema rt` (Nov 10, r63); hardening resets the database
    grants, so a CONNECT granted before it is lost and every service exits on start (Nov 10, r66).
 5. Volumes: reports and retention copies; journals: the stocks files and only the latest session's Options folder.
+   Then verify the copy file by file against its source, both read after page-cache eviction (Nov 12 night: a copy
+   read back 16 foreign bytes from memory, R56/R57); kit `recovery-20261104/rehearsal-r99/rehearse_r99.sh` step `verify`.
 6. Compose project from `rollout/compose.stable.json` with every backend service on the image, `restart: no`, no host
    ports, test secrets (test DSNs, fake provider keys), the test network only.
 7. Up, wait two minutes, check states, restarts and error lines; `api_smoke.py` on the test API and on live (same
-   statuses); the change's feature checks.
+   statuses; once per night: the live API segfaulted during one such smoke on Nov 13 00:06, R57, and restarted by
+   itself - compare later copies with that live result); the change's feature checks. A recreated role can meet its
+   predecessor's lease and exit 1 (`restart: no` on the copy): start it again once the lease frees.
    - Bar writer changes: replay stored revisions newest first through the writer in one transaction that is rolled
      back; no head may move, every head must equal the canonical winner (Nov 10: scratchpad `r66_replay.py`, run on
      the new and the previous code as an A/B). The service start run does not write bars, so this is the writer's
@@ -96,6 +100,12 @@ internet; prove it each time with a socket probe). Script used Nov 10: scratchpa
      timings (Nov 10: scratchpad `r66_parity.py`).
 8. Stop (all exit 0 expected; investigate otherwise with an A/B against the live image on the same copy), save logs,
    `down`, rename the copy back, set the test logins NOLOGIN.
+
+### After the close: journal check
+
+`runner/verify_journals.sh` (read-only): every journal written in the last ~25 hours, raw payload hashes and
+normalized hash format, ~20 s per Options day; a mismatch is re-read after page-cache eviction (memory vs disk).
+Nov 13 00:15: Nov 12 Options and stocks journals clean.
 
 ## 7. Pre-open audit (13:00)
 

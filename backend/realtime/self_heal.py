@@ -278,9 +278,37 @@ def check_window_runtime(cursor, now: datetime) -> list[Finding]:
     )]
 
 
+BREADTH_STALE_AFTER = timedelta(minutes=15)
+
+
+def check_breadth_stale(cursor, now: datetime) -> list[Finding]:
+    """R53 (Nov 12): names whose latest COMPLETE chain capture today is older than three windows while captures
+    are still running (Flow serves an old chain, R48). Record-only; no action."""
+    if not in_session(now):
+        return []
+    cursor.execute(
+        "SELECT underlying, max(observed_at) FILTER (WHERE state='COMPLETE'), max(observed_at) "
+        "FROM rt.option_breadth_captures WHERE session_date=%s GROUP BY underlying",
+        (session_date_at(now),),
+    )
+    stale = []
+    for underlying, last_complete, last_any in cursor.fetchall():
+        if last_any is None or now - last_any > BREADTH_STALE_AFTER:
+            continue  # captures are not running for this name (before the first window, or paused): not this check
+        if last_complete is None or now - last_complete > BREADTH_STALE_AFTER:
+            stale.append((underlying, last_complete))
+    if not stale:
+        return []
+    return [Finding(
+        "BREADTH_STALE", "DEGRADED", f"{len(stale)} Options names without a COMPLETE chain capture in "
+        f"{int(BREADTH_STALE_AFTER.total_seconds() // 60)} minutes", True, "OPTIONS", "NONE",
+        {"names": {name: (when.isoformat() if when else None) for name, when in stale}},
+    )]
+
+
 CHECKS = (
     check_windows_past_deadline, check_windows_today, check_lanes, check_preparation_parked, check_streams,
-    check_leases, check_window_runtime,
+    check_leases, check_window_runtime, check_breadth_stale,
 )
 
 

@@ -38,6 +38,14 @@ FUNDAMENTALS_VALIDITY = timedelta(days=3)
 FUNDAMENTALS_LOOKBACK = timedelta(days=366 * 5)
 FUNDAMENTALS_RETRY_BACKOFF = timedelta(hours=1)
 PROVIDER_KEY_FILE = Path("/run/secrets/realtime_v2_provider_key")
+# R60 (Nov 13): one batched request per endpoint for every company passed the transport's 2 MB per-response cap once the
+# list grew to 35 companies (income statements; ValueError at 07:26). Companies are fetched in groups of
+# FUNDAMENTALS_BATCH (live Nov 13: about 0.6 MB per group on the largest endpoint, 20 requests for 35 companies), and
+# the refresh's own transport caps cover a 400-name list (about 50 groups x 4 endpoints).
+FUNDAMENTALS_BATCH = 8
+FUNDAMENTALS_MAXIMUM_REQUESTS = 512
+FUNDAMENTALS_MAXIMUM_TOTAL_BYTES = 128_000_000
+FUNDAMENTALS_MAXIMUM_ROWS = 400_000
 _last_attempt: dict[str, datetime] = {}
 
 
@@ -83,15 +91,21 @@ def collect_fundamental_facts(
     created_at: datetime,
     valid_until: datetime,
 ) -> tuple[list[ReferenceFact], dict[str, int]]:
-    """Report facts and one coverage fact per company, from one batched request per endpoint."""
+    """Report facts and one coverage fact per company, from one batched request per endpoint and group of
+    FUNDAMENTALS_BATCH companies (R60)."""
     tickers = tuple(sorted(securities))
     if not tickers:
         return [], {}
     as_of = created_at.date()
-    income = tuple(fetch_income_statements(tickers, as_of))
-    balance = tuple(fetch_balance_sheets(tickers, as_of))
-    cash_flow = tuple(fetch_cash_flow_statements(tickers, as_of))
-    filings = tuple(fetch_filing_index(tickers, as_of))
+    groups = tuple(tickers[start:start + FUNDAMENTALS_BATCH] for start in range(0, len(tickers), FUNDAMENTALS_BATCH))
+
+    def fetched(fetch: Callable) -> tuple:
+        return tuple(row for group in groups for row in fetch(group, as_of))
+
+    income = fetched(fetch_income_statements)
+    balance = fetched(fetch_balance_sheets)
+    cash_flow = fetched(fetch_cash_flow_statements)
+    filings = fetched(fetch_filing_index)
     window_start = as_of - FUNDAMENTALS_LOOKBACK
     facts: list[ReferenceFact] = []
     counts: dict[str, int] = {}
@@ -190,9 +204,16 @@ def run_fundamentals_refresh(provider, *, clock: Callable[[], datetime], api_key
                 key = key_file.read_text(encoding="utf-8").strip()
             if not key:
                 return {"fundamentals": "NOT_CONFIGURED"}
-            from .reference_transports import MassiveReferenceTransport, RequestsReferenceHttpTransport
+            from .reference_transports import (
+                MassiveReferenceTransport,
+                ReferenceTransportLimits,
+                RequestsReferenceHttpTransport,
+            )
 
-            transport = MassiveReferenceTransport(key, RequestsReferenceHttpTransport())
+            transport = MassiveReferenceTransport(key, RequestsReferenceHttpTransport(), limits=ReferenceTransportLimits(
+                maximum_requests=FUNDAMENTALS_MAXIMUM_REQUESTS, maximum_total_bytes=FUNDAMENTALS_MAXIMUM_TOTAL_BYTES,
+                maximum_rows=FUNDAMENTALS_MAXIMUM_ROWS,
+            ))
         return refresh_fundamentals(provider, clock=clock, transport=transport)
     except Exception as error:  # noqa: BLE001 - the Financials tab never blocks the role
         return {"fundamentals": "FAILED", "error_type": type(error).__name__}

@@ -10,18 +10,27 @@ from equity.ticker_contracts import setup_summary_row
 
 from .contracts import canonical_sha256
 from .equity_materialization_adapter import materialize_realtime_equity_evidence
+from .lineage_head import inputs_sha256
 from .ticker_projection import _fact, _security
 
 
 def produce_daily_setup_summary(inputs, *, materializations=None, excluded_tickers=()):
+    """R61 (Nov 13): the run id is keyed by `inputs_sha256` (the memoized digest written to replace
+    `canonical_sha256(inputs)`: identity fields, members, actions, coverage and per-ticker bar lineage heads) instead of
+    serializing every bar (~10 s of the Nov 12 first-window Dashboard at 25 names), and the bars are grouped by ticker
+    once instead of rescanned per member. The rows and evidence payloads are unchanged; only the run id (and with it
+    the evidence ids, which already change every window) is derived differently."""
     calendar = exchange_calendars.get_calendar("XNYS")
-    analysis_run_id = uuid5(NAMESPACE_URL, f"realtime-daily-summary:{canonical_sha256(inputs)}")
+    analysis_run_id = uuid5(NAMESPACE_URL, f"realtime-daily-summary:{inputs_sha256(inputs)}")
     rows, evidence, missing = [], [], {}
+    bars_by_ticker = {}
+    for row in inputs.bars:
+        bars_by_ticker.setdefault(row["ticker"], []).append(row)
     for member in sorted(inputs.members, key=lambda row: row["ticker"]):
         ticker = member["ticker"]
         if ticker in excluded_tickers:
             continue
-        own = [row for row in inputs.bars if row["ticker"] == ticker]
+        own = bars_by_ticker.get(ticker, [])
         daily = sorted((row for row in own if row["interval"] == "1d"
                         and row["adjustment_basis"] == "ADJUSTED"), key=lambda row: row["bar_start"])
         if not daily:

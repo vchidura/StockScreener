@@ -109,13 +109,10 @@ def build_ticker_confluence_zones(setups: dict[str, dict]) -> list[dict]:
             if value is not None:
                 add_reference(interval, label, value, value, label, family)
         for level in setup.get("targets", []) + setup.get("stops", []):
-            label = level["level"]
+            # TP13 (L3): ATR multiples are plan fallbacks, not price evidence; a zone made only of them is not a level.
             if level["source"] == "ATR":
-                atr = float(technicals.get("atr") or 0)
-                multiple = abs(float(level["price"]) - float(setup["last_close"])) / atr if atr > 0 else 0
-                sign = "+" if float(level["price"]) >= float(setup["last_close"]) else "−"
-                label = f"ATR {sign}{multiple:.0f}×"
-            add_reference(interval, label, level["price"], level["price"], level["source"])
+                continue
+            add_reference(interval, level["level"], level["price"], level["price"], level["source"])
         for zone in setup.get("zones", []):
             add_reference(interval, zone["name"], zone["low"], zone["high"], zone["source"],
                           qualifier=zone.get("qualifier"))
@@ -128,16 +125,20 @@ def build_ticker_confluence_zones(setups: dict[str, dict]) -> list[dict]:
                 add_reference(interval, f"Confirmed Fib {level['name']}",
                               level["price"], level["price"], "Fibonacci confirmed", "fibonacci")
 
+    # TP13 (L4): one reference per interval, family and price range (the same Fibonacci price used to enter twice, as
+    # "127.2%" and "Confirmed Fib 127.2%"); the first label is kept.
     unique = {}
     for reference in references:
-        key = (reference["interval"], reference["family"], reference["label"],
-               reference["low"], reference["high"])
-        unique[key] = reference
+        key = (reference["interval"], reference["family"], reference["low"], reference["high"])
+        unique.setdefault(key, reference)
     references = sorted(unique.values(), key=lambda item: item["price"])
+    # TP13 (L5): a zone is at most half a daily ATR or 1% of price wide (the larger); a wider cluster is split.
+    width_cap = max(daily_atr * 0.5, current_price * 0.01)
     clusters = []
     for reference in references:
         candidates = [cluster for cluster in clusters
-                      if abs(reference["price"] - cluster["center"]) <= tolerance]
+                      if abs(reference["price"] - cluster["center"]) <= tolerance
+                      and max(cluster["high"], reference["high"]) - min(cluster["low"], reference["low"]) <= width_cap]
         if not candidates:
             clusters.append({"low": reference["low"], "high": reference["high"],
                              "center": reference["price"], "references": [reference]})
@@ -159,7 +160,10 @@ def build_ticker_confluence_zones(setups: dict[str, dict]) -> list[dict]:
         strength = ("STRONG_CONFLUENCE" if len(intervals) >= 2 and len(families) >= 2
                     else "CONFLUENCE" if len(families) >= 2 or len(intervals) >= 2 else "SINGLE_REFERENCE")
         confirmations = []
+        # TP13 (L6): a candle confirms a zone only from one of the zone's own timeframes.
         for interval, setup in setups.items():
+            if interval not in intervals:
+                continue
             for pattern in setup.get("candlestick_patterns", []):
                 if pattern["high"] >= low - tolerance and pattern["low"] <= high + tolerance:
                     confirmations.append({**pattern, "interval": interval})

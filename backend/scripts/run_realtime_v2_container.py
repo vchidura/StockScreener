@@ -299,6 +299,16 @@ def run_session_bound_child(
     return 0
 
 
+def requested_stop_exit_code(returncode, stop_signal):
+    """G102 stack stop (Nov 13): the wrapper ends its child with SIGTERM when it is itself stopped by a signal; a child
+    without a SIGTERM handler (Options lifecycle, market-state) then ends by that signal (returncode -15), which
+    SystemExit turns into status 241 and a clean stop looked like a failure. A child that ended by the stop signal after
+    a requested stop is reported 0; every other exit (a lost lease sets no stop signal) is passed through."""
+    if stop_signal is not None and returncode in (-int(signal.SIGTERM), -int(signal.SIGINT)):
+        return 0
+    return returncode
+
+
 def run_fenced_child(
     component,
     command,
@@ -354,10 +364,12 @@ def run_fenced_child(
         stop_event=stop,
     )
     process = None
+    stop_signals = []
 
     def request_stop(signum=None, _frame=None):
         # R43 (Nov 11): say why a fenced role stops (a signal here; a lost lease is logged by the heartbeat).
         if signum is not None:
+            stop_signals.append(signum)
             print(json.dumps({"fenced_role_stop_signal": signal.Signals(signum).name, "component": component}),
                   file=sys.stderr, flush=True)
         stop.set()
@@ -400,7 +412,7 @@ def run_fenced_child(
             process.terminate()
             process.wait()
             return None
-        return process.wait()
+        return requested_stop_exit_code(process.wait(), stop_signals[0] if stop_signals else None)
     finally:
         if process is not None and process.poll() is None:
             process.terminate()

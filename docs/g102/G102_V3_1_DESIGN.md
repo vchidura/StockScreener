@@ -106,6 +106,25 @@ market-state containers can share shards by lease. Needed changes:
 - The trigger-time facts on alerts (R33: spot, day volume, prior OI) come from the same as-of state and the rolling
   state, stored with the evaluation when it is created.
 
+**Step 5 design note (Nov 12 night, V3-1.5).** The gap: `rt.consumer_checkpoints` keeps only the current checkpoint per
+shard, so the checkpoint that met the barrier is gone when the window runs; the shard state keeps 8 quotes per
+contract, which on a busy contract cover well under a second, not the 40-78 s between the cutoff and the window's run.
+Two ways to give the window the as-of-cutoff quote set:
+
+| | (b) Read the journal by offset (chosen first) | (a) Store the set at the barrier |
+|---|---|---|
+| How | The window reads, per selected contract, the newest Q event with `event_offset <= barrier offset` from the session's Options journal (`normalized_events`; the market-state member's `ending_offset` in `rt.advanced_options_resident_completions` is the barrier offset). Query: `WHERE instrument_id=? AND event_kind='Q' AND event_offset<=? ORDER BY source_timestamp DESC, event_offset DESC LIMIT 1` on the existing index `(instrument_id, source_timestamp, event_offset)`: it walks back only over the quotes after the barrier (a few hundred on a busy contract) | Market-state writes the per-contract quote set when its processing first crosses a window cutoff (before later quotes push it out of the 8-quote history): one row per contract and window in a new table `rt.advanced_options_cutoff_quotes (target_window_id, instrument_id, event_offset, event_at, bid, ask, sizes, exchanges, source_offset, payload_sha256)` |
+| Migration | None. The p8-window container already mounts the journal volume (this read opens it read-only, WAL-aware) | New table, grants, registry entry: the user's yes |
+| Determinism | Same marks whenever the window runs; age measured as cutoff minus the quote's event time | Same |
+| Cost | 72 indexed lookups per window (216 at V4) on a local file | 72 inserts per window in the market-state loop |
+| Limits | The journal must be on the window's host (true today: one host). A missing or unreadable journal falls back to today's `rt.quote_current` read with reason `MARKS_JOURNAL_UNAVAILABLE` | Works across hosts |
+
+Delivery: (b) behind `REALTIME_V3_MARKS_AT_CUTOFF=JOURNAL` (default OFF = today's `rt.quote_current` read). Check
+before turning it on: replay the Nov 12 windows on the copy with both reads and compare the marks contract by contract
+(differences expected only on contracts that quoted between the cutoff and the window's run); then one session with the
+comparison logged (record-only: the window computes both, publishes today's). (a) only if the platform moves to more than
+one host. The R33 trigger-time facts follow the same switch.
+
 ### Folded into V3-1 (no P8 patch)
 - R32: past-deadline windows closed as MISSED (self-heal MARK_MISSED, R38) once the barrier is checkpoint-based.
 - R37: a role stop finishes its current pass and records the stop instead of raising after a fixed bound.

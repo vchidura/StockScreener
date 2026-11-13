@@ -2053,3 +2053,454 @@ pending/processing; back to 1-19% at 19:57-19:58. Checkpoint size unchanged (925
 record rate 183/s (lower than 18:20). A 60 s py-spy sample 19:56 (`p8-market-state-20261112T1956-spot.txt`): 278
 active samples; journal read 32.4%, `_persist_quote_materialization` 29.1% (restore/decode check 21.2%, the V3-1.6c
 row), encode 6.5%. Window-time load, not a regression; 0 mismatch/error lines since 18:13.
+
+### Nov 12 (20:47-20:57 UTC): V3-1 profile **#4** (busy end of day; all of today's switches on) and the day's comparison
+
+`runner/profile_options_roles.sh 180`; log `scratchpad/profile4.log`; data `data-audit/profiles/p8-<role>-20261112T2047.txt`.
+Compared with Nov 11 **V3 #2** (20:47, market-state V3 loop with whole-state hashing, Flow on P8). **market-state**
+(V3 loop + HASH=CHECKPOINT + ENCODE=CACHED): **1,002** active samples (Nov 11 1,857): journal read (SQLite) **63.6%**
+(inclusive `read_normalized_after` 67.1%; leaf `<genexpr>` 33.6%, `read_normalized_after` 20.4%), DB write 13.4%
+(persist path 13.4%: restore/decode check 9.2%, V3-1.6c), **hash/JSON 8.4%** (Nov 11 **62.1%**), window stages 5.5%;
+encode 3.4%, `_slice_identity` 0.2%. Docker CPU mean **14.0%**, median 6.4%, max 49.3% (Nov 11 23.8 / 20.6 / 49.0).
+**flow** (V3 loop): 569 samples (Nov 11 4,756), flow 45.2%, hash/JSON 26.0%, DB other 18.3%; CPU mean **7.3%**, median
+5.9%, max 24.3% (Nov 11 43.4 / 42.1 / 57.0). **window**: 840 samples, hash/JSON 66.5% (`persist_flow_package_evidence_cursor`
+9.4%), CPU mean 8.8%, median 1.0%, max 97.4% (Nov 11 8.9 / 1.6 / 97.2): unchanged by today's switches.
+
+| Profile (UTC, Nov 12) | Switches on | market-state CPU mean / median | ms hash/JSON | ms journal read | flow CPU mean | window CPU mean |
+|---|---|---|---|---|---|---|
+| #1 14:53 | V3 loop | 31.6 / 26.9 | 29.5% | 49.8% | 15.0 (P8) | 10.0 |
+| #2 15:43 | + Flow V3 | 23.2 / 19.2 | 31.2% | 46.5% | 7.7 | 5.3 |
+| #3 17:59 | + V3-1.6 | 26.3 / 30.4 | 23.5% | 24.7% | 7.8 | 1.7 |
+| #4 20:47 | + V3-1.6b | **14.0 / 6.4** | **8.4%** | 63.6% | **7.3** | 8.8 |
+| Nov 11 V3 #2 20:47 | V3 loop | 23.8 / 20.6 | 62.1% | 9.5% | 43.4 (P8) | 8.9 |
+
+**Reading:** at the busiest hour market-state now spends most of its (smaller) time reading the journal (the per-pass
+SQLite read and record construction), not hashing; Flow is ~6x cheaper than Nov 11. For V4 (3x the stream) the next
+cost to cut is the journal read (`read_normalized_after` generator) and the persist-path check (V3-1.6c); this is the
+input for tonight's V3-1.3 capacity replay. V3-1.6b VERIFIED (0 mismatches all evening, hash/JSON 62% -> 8%).
+
+### Nov 12 (21:50 UTC): close - session COMPLETE; B items closed; faults; live state for Nov 13
+
+**Close check** (`runner/close_check.sh`, SESSION 2026-11-12): Equity 78 cutoffs COMPLETE, 0 not complete (21:00 close
+COMPLETE on retry 4 after 4 `CLOSING_DAILY_INPUTS_PENDING` attempts, G103 pattern, last step 166 s); daily bars 25/25
+ADJUSTED (NATIVE_REST) and 25/25 RAW_UNADJUSTED (DERIVED); Options 77 windows COMPLETE (last 21:01), 0 FAILED, 0 run-time
+alarms (13-40% of the budget). Stocks stream STOPPED at the close; Options stream `3d3997c3` stays LIVE until the next
+registration ends it (B14a). Alerts: OPTION 12 OPEN (NVDA 6, AAPL 2, AMZN, QQQ, SPY, TSLA 1 each), STOCK 5; O1 packages 457,
+O1 SELECTED not stored 0. Nov 13 Options preparation PREPARING at CATALOG_QUOTE ('history ready', provider window not
+open) - normal. Journal registrations: Stocks Nov 11/12 DRAINED; Options Nov 11 `bf6b9c4d` and Nov 12 `e3e11560` DRAINING
+(new row R54). **Services at the close**: API r98 `1200f917a4d2`, market-state r97 `cbf553160d29`, frontend f34
+`f46357d6a987`, the other 17 on r96 `2aa3e4d95810`; restarts only the morning deploy's lease handover (capability-refresh,
+detectors, scheduler, options-scheduler x8) and options-lifecycle x1 at 21:32:39 (R19.1); 0 error lines elsewhere.
+Switches on: Flow `REALTIME_V3_FLOW_LOOP=V3`; API `REALTIME_V2_FLOW_BREADTH_CACHE=ON`, `REALTIME_V2_OPTIONS_ALERT_VALUATION=ON`,
+`PYTHONFAULTHANDLER=1`; market-state `REALTIME_V3_MARKET_STATE_LOOP=V3`, `_HASH=CHECKPOINT`, `_ENCODE=CACHED`.
+**Faults** (`data-audit/faults/faults-2026-11-12.md`, 16 fingerprints): WINDOW_FAILED x7 = the 21:00 close attempts
+(G103, completed); CRASH_LOOP x3 = deploy lease handover; STREAM_STALE (ERROR 14:33 pre-attach, DEGRADED 21:50
+post-stop) = B14a; WINDOW_PAST_DEADLINE = R32/R38 (55 closed 15:18); LANE_NOT_EVALUATED = R44; CLOCK_OFFSET /
+CLOCK_CHECK_FAILED = host SNTP (services' clock fine, R34); EXCEPTION + RESTARTED options-lifecycle 21:32 = **R19.1 (new)**.
+Not in the journal: chain capture failures 19:08-19:38 = **R53**. **B items closed**: B20 (not exercised), R9, R20, R40
+(audit/dry run PASS), R14, R15, R16, R19 (-> R19.1), R21, R23, R25, R29, R30 VERIFIED, R31 VERIFIED, R34, R35, R36, R42,
+R45, R46, R47 VERIFIED, R48 VERIFIED (fallback live), R49, R50, R52, OF1-OF3, PH1, TP1/2/7/11/14/15, RF1 (f33 confirmed;
+f34 awaits a look), OA1/OA2 VERIFIED (user), V3-1.F, V3-1.6, V3-1.6b VERIFIED, G7/G8/G41 and G60 (not exercised), Close
+check VERIFIED. Profile comparison: see the 20:47 entry (market-state CPU mean 14.0% vs Nov 11 23.8%, hash/JSON 8% vs 62%;
+Flow 7.3% vs 43.4%).
+
+### Nov 12-13 night (from 22:17 UTC, this session; user unavailable): bulk r99 + f35 work log
+
+Tests run offline in the r98 image with the worktree mounted (`runner/run_tests_ww.sh`).
+- **V3-1.6c** (22:17-22:22): `materialization_repository.py`: `REALTIME_V3_MARKET_STATE_PERSIST_CHECK` = FULL (default,
+  today's behaviour: decode + compare every persist) | SAMPLED (full round-trip check on the first 20 persists and every
+  200th; a mismatch still raises; the lineage-boundary check stays on every persist). New
+  `tests/realtime/test_market_state_persist_check_nov12.py` (5); with `test_materialization_repository.py` and
+  `test_market_state_encode_cache_nov12.py`: 17 passed.
+- **R19.1** (22:17-22:22): `advanced_options_lifecycle.run_advanced_options_preparation_cycle`: the expire / mark stale
+  ledger / claim SERIALIZABLE transaction (one unit, no provider work) now runs under `retry_transient` on 40001/40P01
+  (5 attempts, 0.1-0.8 s); other errors raise at once. New `test_lifecycle_claim_retry_nov12.py` (3); lifecycle suite
+  29 passed + 1 failure that fails identically on r98's own code (`test_options_preparation_budget_has_local_and_shared_ceilings`,
+  `_capture_after_open_seconds` fixture gap; pre-existing).
+- **R53** (22:17-22:22): `advanced_options_breadth.py` emits a DEGRADED `BREADTH_CAPTURE_FAILED` fault (action
+  LAST_GOOD_CHAIN, service options-scheduler) per underlying and window whose capture is FAILED/PARTIAL or fails to
+  persist (reporting only); `self_heal.check_breadth_stale` (record-only) reports names without a COMPLETE capture for
+  15 minutes while captures run. New `test_breadth_capture_fault_nov12.py` (2); with `test_options_breadth.py` and
+  `test_fault_journal_self_heal.py`: all pass.
+- **G106 A3** (22:22-22:30): gamma / OI-wall read on the API behind `REALTIME_V2_OPTIONS_GAMMA_READ` (off: the route
+  answers 404); see G106 evidence. While building it: the current-rows table keeps rows of contracts that left the band
+  in earlier captures (new row R55); the gamma read uses the latest capture only.
+- **R55** (22:30-22:33): `load_breadth_screener_rows_cursor` reads only each underlying's latest capture when
+  `REALTIME_V2_BREADTH_LATEST_CAPTURE_ONLY=ON` (default OFF = every current row, as today). New
+  `test_breadth_latest_capture_r55_nov12.py` (2); breadth suites (R47 cache, R48 fallback, breadth, R53): 27 passed.
+- **R54 diagnosis** (22:33-22:41; live read-only: registry, consumer checkpoints, the sealed journals on a read-only
+  mount, the acquisition status file). Four findings:
+  1. **Nothing marks an Options journal DRAINED.** Equity: `advanced_journal_replay` marks DRAINED when the bridge
+     catches up. Options: the ingress role seals (WRITING -> DRAINING) and no code moves it further. Every Options
+     journal since Nov 3 is DRAINING (Nov 3, 4, 9, 11, 12) or WRITING (Nov 5, 6, 10: never sealed).
+  2. **The seal is taken from an early status.** Nov 12: sealed raw 4,709,376 / normalized 8,050,491 at 21:05:41;
+     the journal (with its WAL) ends at 4,709,417 / 8,050,560 (69 events committed 21:04:59.33-.87, after the sealed
+     offset's commit at 21:04:59.25); the acquisition status file has the exact end, but it says COMPLETE only at
+     21:07:14 (after a full integrity check of the 6 GB file). The role sealed with the last progress offsets it had
+     read. Nov 11: 60 events past the seal; Nov 10/6: 71/204 past the last recorded offsets. Consumers are not short:
+     market-state and Flow checkpoints are at the true end every day (Nov 12: 8,050,560 / 4,709,417).
+  3. **The sealed checksum covers the main SQLite file only**, read whole into memory (`path.read_bytes()`, 6 GB on
+     Nov 12) while 100 MB of WAL is not checkpointed; Equity uses `journal.journal_files_sha256` (main + WAL,
+     streamed). So the Options seal does not identify the full journal.
+  4. **Impact is small today:** the only reader of the Options DRAINED state is the operator `status` command (final
+     barrier WAITING_INPUT, `journal_drained` false every day); no stage waits on it (the close-coverage stage is not
+     on the V3 path) and no journal cleanup exists (26 GB of Options journals, 846 GB free; the user keeps journals
+     for the Model Lab).
+  Fix design (Nov 13 night, with a session-end rehearsal): seal from the journal's own end once the acquisition says
+  COMPLETE (wait for it, bounded) with `journal_files_sha256`; then mark DRAINED when market-state >= normalized and
+  Flow >= raw; past sessions: one backfill with the user's yes (registry edit). Not in r99.
+- **R56 / R57 corrupted bytes in memory, not on disk** (22:34-22:49): the V3-1.3 replay stopped at 5.17 M records on an
+  undecodable `payload_sha256` (row 5,253,127) in the copy volume's Nov 11 journal (`g102svc-journals`). A buffered block
+  compare against live showed one 16-byte, 16-byte-aligned run different (offset 3,914,573,104, page 955,706); live read
+  correct (with and without its WAL). I rewrote the 16 bytes on the copy (read back correct) and restarted the replay; it
+  stopped on the same row with the **same 16 bytes** ~9 minutes later. Then: O_DIRECT reads (bypassing the page cache)
+  returned the **correct** bytes from disk, while a buffered read returned the bad ones even right after an fsync'd
+  rewrite; after evicting that range from the page cache (`posix_fadvise DONTNEED`) every read path (buffered, direct 4K /
+  1M, sequential 1M / 4M) returned the correct bytes. So the disk is fine and a page-cache page in the Docker VM's memory
+  held 16 foreign bytes, put there again after a repair by something other than the file write. VM kernel log (3,752
+  lines): no I/O, ext4 or machine-check messages; `HardwareCorrupted: 0 kB`. Host: Windows bugcheck **0x12B
+  FAULTY_HARDWARE_CORRUPTED_PAGE** (memory manager found a corrupted page) with WHEA-Logger "fatal hardware error" on
+  **Sep 8 23:42 UTC and Oct 11 01:04 UTC** (minidumps in `C:\WINDOWS\Minidump`). Live Postgres runs natively on this host
+  (17.11, x86_64-windows) with **`data_checksums=off`** (so a flipped page reaching disk would not be detected; 0
+  checksum failures counted because none can be). Taken together: a likely RAM fault on the host (row R57). Nothing on
+  live was changed; the replay restarted 22:49. Recommendations for the user (their decisions; none tonight): a memory
+  test (Windows Memory Diagnostic or MemTest86: a reboot, so a weekend); check the BIOS memory profile (XMP/EXPO
+  overclock: run at the default speed if it is on); Postgres data checksums at a planned downtime (`pg_checksums
+  --enable` with the cluster stopped); a periodic hash check of sealed journals (`raw_messages.payload_sha256`); the
+  copy kit compares each copied journal with its source before a rehearsal.
+- **V3-1.3 capacity replay** (22:49-22:59, third run after R56/R57; copy volume, read-only, `--cpus=1`, r98 image with
+  the worktree code): the whole Nov 11 Options journal (bf6b9c4d) through the market-state path as the V3 loop runs it
+  (journal read, materialize, V3-1.6b cached encode + sha256, the persist path's full decode check), one pass per second
+  of journal traffic. 6,345,604 records, 26,454 passes, 391 minutes, wall 621 s. Per record: read 0.0198 ms,
+  materialize 0.0104 ms. Per pass: cached encode 2.546 ms, decode check 12.053 ms (checkpoint payload 462,402 bytes).
+  Busiest minute 14:40 UTC, 44,844 records (747/s); day average 270/s. Share of one core: busiest minute x1 FULL 4% /
+  SAMPLED 3%; x3 (V4, 216 contracts: per-record costs x3, per-pass state costs x3) FULL 11% / SAMPLED 8%; day average
+  x3 FULL 7% / SAMPLED 3%. **Reading**: the loop's own compute is small after V3-1.6/1.6b; the rest of market-state's
+  live CPU is the database side (checkpoint persists of a ~0.46 MB payload, resident completions) and the loop around it.
+  Live busy-hour mean after V3-1.6b was 14% (profile #4); scaled x3 in full that is ~42%, under the V4 gate (p90 under
+  ~60% of a core). Not measured here: Flow (7.7% live, ~23% at x3 by the same scaling) and the Options window run time at
+  216 contracts (the window reads marks/state per contract; V4.4 measures it in the first V4 session). Gate for V4.3:
+  **met for market-state** on this evidence; SAMPLED (V3-1.6c) adds margin at x3.
+- **Regression and build** (23:03-23:29): the whole `tests/realtime` suite (5,482 tests collected) on the worktree code
+  in the r98 image, offline: 158 failed; the same 40 files on an export of the committed `b23fc1c` code: the same 158
+  fail (identical set; environment-bound tests: compose files, `.venv` interpreter, env files, retention/P7/P8
+  executors), so tonight's code adds no failure. **r99 built** 23:28: `alpha-research-realtime-v3:stable-nov5-r99-57f45389b4635c7e`
+  = `sha256:23a6e21f08bb95f4464ae47017c184be2c84e66fdf57debe03189641d23be70e`; image code == worktree (960 files);
+  role imports OK. `validate_integrated_image.py verify-live` with r99 against live (read-only): migration 052 as
+  expected, `security_passed: true` (the OA1 registry entry is kept, so hotfixes stay possible with r99 as the newest
+  candidate).
+- **Live API segfault at 00:06:4x UTC Nov 13 (R47 class; live recovered by itself)**: during the rehearsal's read-only
+  live API smoke (153 routes), the live API (r98) died with `Fatal Python error: Segmentation fault`; Docker restarted it
+  at 00:06:48 (RestartCount 1 since the 19:03 deploy, healthy 9 s later; the smoke saw status 0 on 143 routes). Stack
+  (faulthandler, PYTHONFAULTHANDLER=1): C JSON decoder in `json.loads` <- `psycopg2/_json.py typecast_json` <-
+  `extras.fetchall` <- `ticker_repository.py:1251 workspace_publication` <- `portal_api.py:1006 retained_workspace_summary`
+  <- `market_conditions`. Not the breadth path of Nov 11's R47 crashes: a different C decoder on a different query.
+  With R57 (a page-cache page in the same Docker VM held foreign bytes twice tonight; host bugchecks 0x12B), faulty
+  memory is a plausible common cause of these random C-extension crashes; a psycopg2 fault stays possible. The VM was
+  under extra memory pressure (the 19-service copy stack and the test server). No action on live; no more live smokes
+  tonight (r100 is compared with the 23:56 live smoke instead).
+- **Bulk rehearsal r99 -> r100** (23:29-00:11, copy `test_realtime_v2_r99` on g102-test-pg, isolated g102-test-net: only
+  the test server reachable; kit `rehearsal-r99/rehearse_r99.sh`). Live dump 23:28-23:40 (`stocks_db_backup_v3-r99-rehearsal-20261112T232840Z.dump`,
+  4.92 GB, 2,903 entries); restore 449 s, clean log; logins; harden 11/11 checks passed and the OA1 grant (API SELECT on
+  `rt.advanced_options_reference_states`) kept; volumes: stocks journals + the Nov 12 Options journal (e3e11560), copy
+  verified file by file after page-cache eviction (193 files, 0 different). 19 services on r99 with live's switches +
+  tonight's three: all running, 0 restarts (Equity preparation: reference request ConnectionError, expected offline).
+  API smoke copy vs live (23:56): 153 routes, 131 OK each, 0 different. Gamma read SPY/QQQ/NVDA available at the Nov 12
+  close (all NEGATIVE_GAMMA: SPY spot 756.75 flip 761.50, QQQ 687.81 / 690.92, NVDA 165.45 / 174.34), 0 API errors.
+  Flow: R47 cache on1 == on2; ON vs live switches differ, and ON == live switches + R55 only (every difference is R55:
+  SPY expiry contract counts 254 vs 256, TSLA 128 vs 134, stale rows out). **Found: R55's correlated subquery took 24 s
+  on a cold SPY read** (no observed_at index: the subquery rescanned the underlying per row); rewritten as one
+  uncorrelated `(underlying, observed_at) IN (SELECT underlying, max(observed_at) ... GROUP BY underlying)`: same rows
+  (5,046, same hash) in 17 ms against 5.5 s in SQL; tests 27 passed. **r100** built 00:03 =
+  `alpha-research-realtime-v3:stable-nov5-r100-e8d056ae620ce616` = `sha256:48fb2db35f92260069a0f819a9ba6601d392bd7a8b809e4bbae3949ed828e912`
+  (= r99 + that query). The stack moved to r100 (the window role's first start met the r99 container's lease and exited
+  1; restarted once the lease freed: the lease handover live covers with its restart policy). r100: cold SPY Flow read
+  1.34 s with R55 ON, bodies == r99's; smoke r100 == live 23:56 == r99 copy (0 different); gamma as above; Options
+  Alerts valuation on the Nov 12 dataset LATEST 5/5 and HISTORY 11/11 valued, model exit on all, AVAILABLE, 0 API errors.
+  Live switches only (tonight's OFF, the default deploy): market-state and API recreated, running, env == live's, gamma
+  route 404. Whole-stack stop 3 s: all exit 0 except Options lifecycle and market-state 241 (cause in the Stack stop row:
+  the child ends by SIGTERM). Cleanup done (database renamed back, test logins NOLOGIN).
+- **R57 follow-up: live sealed journals verified** (00:11-00:12, read-only mount, `scratchpad/v313/journal_verify.py`): every
+  raw message's sha256(payload) against its stored hash (the journal reader's own check) and every normalized event's hash
+  format. Nov 12 `e3e11560`: 4,709,417 raw (1,021 MB of payload) and 8,050,560 normalized, 0 bad. Nov 11 `bf6b9c4d`:
+  3,732,678 raw and 6,345,604 normalized, 0 bad. The live journals (Model Lab / backtest inputs) are intact on disk; the
+  check takes ~20 s per day and could run after each close.
+- **After r100 (00:12-00:15; next package, not in r100)**: Stack stop fix: `run_fenced_child` reports 0 when a
+  requested stop (SIGTERM/SIGINT to the wrapper) ended the child by the wrapper's SIGTERM; a lost lease (no stop signal)
+  and the child's own codes pass through; `test_fenced_stop_exit_code_nov13.py` (2) + the sleep suite: 22 passed. To verify
+  by a whole-stack stop in the next rehearsal (lifecycle and market-state 241 -> 0). Gamma read: spot printed plainly
+  (`756.7514`, was `756.75140000`). R44 stays one block for the Nov 13 night: its legs need full contract snapshots (IV
+  solve per leg at the cutoff under the valuation policy), the dual-origin stock decision and 30m levels - the porting
+  map's one-night estimate.
+- **R44 O3 inputs, night 2** (02:29-02:59 Nov 13; worktree, for the next package, not in r100; switch
+  `REALTIME_V3_O3_INPUTS` off by default = today's behaviour). Built `realtime/advanced_options_o3_producer.py`
+  (porting map steps a-e): legs valued at the cutoff NBBO midpoint (`rt.option_mark_evidence`) with IV/Greeks by OA1's
+  solver and the reference state's rate/dividend per expiry, spot = last realtime 1m close; candidate = SPREAD_RANGE_LOCATOR
+  via the strategy engine's own payoff and identity (`strategy_o3_credit_v2`); decision = the real
+  `assess_options_credit_canonical_trend` on the window's O1 activity source of a leg + canonical 30m trend evidence
+  (202 RTH 30m + 21 daily bars from `rt.bar_revisions`, split coverage from `ref.corporate_action_coverage`);
+  invalidation = 30m structural levels (`materialize_equity_evidence` -> `bind_direct_structural_levels`). Every record
+  is run through `assess_o3_credit` before it is stored (the O3 executor does not catch per-invocation errors). Writes
+  in one transaction before the native preflight (so the frozen input identity includes them): two-leg package, detector
+  version `ADVANCED_OPTIONS_O3_INPUT`, CONFIRMED event at `trigger_at = cutoff` + `O3_NATIVE_INVOCATION` input; ids from
+  cohort/candidate/cutoff (retry writes nothing); per underlying with nothing qualifying, one `NO_INPUT` row with the
+  reasons. Lane (switch on): marks gate on the judged legs only; NO_INPUT rows -> evaluated with zero inputs instead of
+  `O3_ACCEPTED_INPUT_EVIDENCE_ABSENT` (no row at all, e.g. a producer failure, keeps today's reason). Decoder accepts the
+  v6 trend decision. The producer never fails the window (any error: log line, O3 as today).
+  Tests: `test_o3_producer_nov13.py` 14 + night 1's 15 + native adapters/loader + stack stop: 43 passed.
+  **Read-only dry run on live data** (every 5-min window Nov 10, 11, 12, worktree code in a read-only session, ~0.7 s
+  per window): 0 qualifying inputs in 234 windows; 702 candidate verticals, each stopped by O3's own policy: O1
+  participation on the leg below baseline 425, 30m trend against the vertical 350, a leg under 500 OI / 50 contracts
+  317, no O1 event on either leg in the window 256 (counts overlap). The 72-contract slot set (8 per name) yields 3-6
+  verticals per window.
+  **Write path on the isolated copy** (`test_realtime_v2_r99` on g102-test-pg, as the app role): all 78 Nov 12 windows,
+  702 NO_INPUT rows in 28 s; second pass 0 new rows; lane read with the switch on at 13 windows: all evaluated with zero
+  inputs. Forced pass (decision stubbed CONFIRMED, leg floors relaxed; copy only): one AAPL call credit vertical
+  357.5/360 at 19:05 stored (package + event + input), again 0 new, the lane read returned 1 invocation, not blocked
+  (judged-leg marks, package, decode, scope checks). Found and fixed on the copy: the package repository reads rows
+  back as tuples, so a dict cursor made every write an 'identity conflict' (the producer now hands it a plain cursor);
+  O3's clock rule surfaced as an unnamed refusal (now `O3_LEG_MARK_STALE` / `O3_SESSION_CLOSED_AT_DECISION`).
+  Not yet: a window-level replay with the switch on (window wiring before the preflight, O3 lane through the executor
+  and projection) - the next copy rehearsal before any live turn-on.
+- **R54 fix, part 1: finalize tool** (03:00-03:10 Nov 13; worktree, next package; no live role changed). Read-only
+  check first: the registry has Nov 9, 11, 12 Options journals DRAINING with short seals and Nov 10 WRITING (never
+  sealed); Nov 12 sealed 4,709,376 raw / 8,050,491 normalized while `option_flow_stream_v1` = 4,709,417 and
+  `market-state-materializer-v1` = 8,050,560 (Nov 11: sealed 3,732,651 / 6,345,544; consumers 3,732,678 / 6,345,604).
+  Built `realtime/advanced_options_journal_finalize.py` + `scripts/finalize_advanced_options_journal.py`: read the
+  journal's own end (SQLite read-only, WAL-aware), hash main + WAL (`journal_files_sha256`, as Equity), compare the two
+  consumers, then re-seal with the exact end (the registry seal keeps the greater offsets) and mark DRAINED (bridge =
+  market-state's offset). Dry run by default (read-only transaction, one JSON line per registration); `--apply` only
+  for generations named with `--generation` (past sessions: the user's yes). Tests
+  `test_options_journal_finalize_r54_nov13.py` 10 passed (WAL read, plan rules, seal-then-drain order).
+  Part 2 (not built): the ingress role's own end-of-session seal (wait for COMPLETE, bounded; main + WAL hash) needs a
+  session-end rehearsal; until then the tool can run after each close.
+  Live dry run (03:20-03:21, read-only session, journal volume mounted read-only, 53 s for 8 journals): every Options
+  registration since Nov 3 would be finalized (SEAL_AND_DRAIN) and both consumers are exactly at each journal's end:
+  Nov 3, 4, 9 offsets exact, hash of the main file only; Nov 5, 6, 10 never sealed (WRITING); Nov 11 short by 27 raw /
+  60 normalized, Nov 12 by 41 / 69. Apply rehearsed on the isolated copy (Nov 12 registration, journal read-only):
+  DRAINED with 4,709,417 / 8,050,560, bridge 8,050,560, main + WAL hash `04f622585d9a`; second run ALREADY_DRAINED,
+  no write. **Applying it on live (8 registry rows, past sessions) is the user's decision.**
+- **Regression on the worktree (03:00-03:17)**: whole `tests/realtime` 159 failed / 4,928 passed / 411 skipped: the 158 of
+  the r99 baseline + one new, `test_bar_head` (the O3 producer's spot query named `rt.bar_revisions`; it now reads
+  through `equity_bar_repository.load_known_bar_revisions_cursor`; bar-head + O3 + R54 + native suites 61 passed; Nov 12
+  dry run again: 232 verticals, 0 qualifying, 0 errors, 21 s for the day).
+- **V4.1 merged into this worktree** (03:18): the five C6 files unchanged here since `b23fc1c` taken from the v4-profile
+  worktree, plus the v4 policy and its test (portal_api and the container wrapper not taken: newer here). C6 / selection /
+  pre-session / lifecycle suites: 112 passed, 1 failed (the baseline's lifecycle budget test). Default profile stays v2.
+- **User back ~03:40 Nov 13**: "lets take O3 ... window replay with the switch on; the ticker changes are minor, lets
+  apply them; ... taking V4 [today], if any issues arise can be fixed during live run, lets do whatever is needed to
+  rehearse it; ... increase equity tickers to 50, so lets plan for a backfill". Plan G102_EQUITY50_PLAN_20261113.md.
+- **V4 end-to-end preparation, read-only (03:48-04:01)**: the R20 dry run's options step (live provider REST capture,
+  read-only DB) with the worktree code and `REALTIME_V3_OPTIONS_ADMISSION_PROFILE=c6_activity_momentum_v4`, session
+  Nov 13: capture 9/9, 67 provider requests (max 19 per name, limit 32), 14,906 candidates, 0 invalid; allocation
+  refused before the open as designed (stale quotes). With only the quote-age limit relaxed in the driver
+  (`scratchpad/r44/v4_alloc*.py`): 216 = 24 x 9 through the executor. **Found: no 0-5 DTE contract at all** (SPY got
+  Nov 19/20/27/30, Dec 4): the scheduled preparation passed `conventions={}`, so the v3 family drops every 0-5 DTE
+  candidate (`SHORT_EXPIRY_PRODUCT_CONVENTION_UNSUPPORTED`); only the manual pre-session script took conventions. Fix:
+  `scheduled_last_trading_conventions` gives every underlying `US_EQUITY_STANDARD_PM` (the profile's supported value;
+  `REALTIME_V3_OPTIONS_LAST_TRADING_CONVENTION` overrides); test 3. After the fix (Friday Nov 13): SPY/QQQ/IWM 6 same
+  day, 2 Mon + 4 Wed near, 8-9 next Friday weekly, rest core; stocks 4 same day, 5-8 next weekly, core, 3-4 extension
+  Dec 18. Call/put: TSLA 23/1, QQQ 21/3 (no side quota, the user's open point). Transient provider ConnectionErrors on
+  paged REST (IWM, MSFT) at night: the live preparation retries them; the dry run driver now retries too.
+- **Ticker page fixes applied (user's go)**: TP9 (DI/ADX Wilder smoothing seeded with the mean of the first 14 when
+  there are 28+ completed bars, else the EWM as before; hourly HV with 252 x 7), TP10 (intraday RVOL and 5-bar trend
+  against the same New York time-of-day slot of the prior 20 sessions, at least 5; else the previous method), TP6
+  (30m/1h setups and patterns withheld with `RAW_SPLIT_WINDOW_REVIEW` when a split is inside the raw window; none
+  today), TP13 (zones: ATR projections no longer evidence, one reference per interval/family/price, width at most max
+  of 0.5 daily ATR or 1% of price, candle confirmations only from the zone's own timeframes). Scope checked: the Stock
+  Alerts rules and the screener do not read these fields; the O1/O3/OS trend calculators use only the EMA helper.
+  Tests `test_ticker_tp_fixes_nov13.py` 9 + confluence 3: 12 passed.
+- **r101 built 04:06:59**: `alpha-research-realtime-v3:stable-nov5-r101-e529b8ea056e00c3` =
+  `sha256:b506261dd5f5814f2970005c026f8e3aea7b2319b652864f3b83a07288cabb4f` (r100 + stack stop + gamma formatting + R44
+  O3 producer (off) + R54 tool + V4.1 + the conventions fix + TP6/TP9/TP10/TP13).
+- **O3 window replay**: the DB integration tests that drive an O3 input through input-ready (`*_v2_db.py`, run on a
+  disposable database on g102-test-pg) fail before O3 on r100 too (rolling producer `SOURCE_WATERMARK_OR_CLOCK_MISMATCH`:
+  stale fixtures), and a completed Nov 12 window cannot be re-run on the copy without clearing its stored outputs. Plan:
+  deploy with O3 off, turn it on by a window-role hotfix after the first clean V4 windows and watch the next windows
+  (fallback: remove the switch, same hotfix).
+- **Regression r101 (04:10-04:27)**: 159 failed / 4,958 passed: the 158 baseline + `test_ticker_projection_golden`
+  (pinned ticker workspace digests; TP9/TP10/TP13 change them on purpose). Regenerated and compared section by
+  section: only the 9 workspaces' `evidence` and `payload` changed; screening, Pattern Watch, summary, summary charts
+  and every manifest identical (the fixes stay on the ticker page). Digests updated in the test (not in the r101
+  image's tests folder; no runtime effect).
+- **r101 copy rehearsal (04:29-04:35, copy `test_realtime_v2_r99`, g102-test-net)**: harden 11/11 PASS; journals copied
+  and verified (see R57 below); 19 services on r101 with live's switches + tonight's (V4 profile on the lifecycle, O3
+  producer on the window role, SAMPLED persist check, R55, gamma read): all running, 0 restarts, 0 errors; lifecycle
+  at CATALOG_QUOTE for Nov 13. API smoke copy vs live: 153 routes, same status on every route, 131 OK each; 4 OK
+  routes differ in size (3 by 5-6 bytes of time fields; `/options/flow` smaller with R55 ON). **Whole-stack stop: all 19
+  exit 0** (the stack stop fix; Options lifecycle and market-state were 241 before). Cleanup done.
+- **R57, third occurrence, the first written to disk (04:30)**: the rehearsal's copy of the Nov 12 Options journal
+  (`options.sqlite`, 5.98 GB) differed from its source in 16 bytes at offset 1,497,658,673 after page-cache eviction;
+  the source (mtime Nov 12 21:04:59, unchanged) holds ASCII digits there, the copy garbage. A second copy verified 0
+  different. Same 16-byte shape as R56 (Nov 12 night). Data passing through this host's memory is corrupted
+  occasionally; live writes go through the same memory. Live's Nov 12 journal is intact (payload check 00:11).
+- **Equity 50 (user's go ~04:40: "backfill the proposed 25 ... update universe details as needed all places")**:
+  no ticker list in the code or the frontend (screening `UNIVERSE` is a label); the universe is the desired revision.
+  META review: G86 (Nov 6) - before 2022-06-09 the ticker META was the Roundhill Metaverse ETF and Meta Platforms
+  traded as FB, so the 5-year weekly/monthly coverage new-member preparation requires cannot complete; same for SNDK
+  (lists from Feb 2025; the earlier SNDK was SanDisk, delisted 2016). Both stay in the list (a failing new member does
+  not block activation; a later list change would restart every warming member, G91); they join when the G86 fix
+  ships. Tool `runner/recovery_steps_nov13.py` (show | desired50 | desired25 fallback, base revision `ca37942e` read
+  from the database with its kinds and priorities). **Rehearsed on the copy (04:38)**: revision `14b250d3`, effective
+  Nov 13, ACTIVATION_PENDING 14:15, 25 READY + 25 WARMING (all new names); the Nov 13 Options preparation moved to the
+  new revision at CATALOG_QUOTE (the old one DEGRADED `SUPERSEDED_BY_REVISION`), same 9 underlyings. **Live apply not
+  run**: the session's permission check refused the live database write; waiting for the user.
+- **Equity 50 applied on live (user's go)**: 04:46 UTC revision `14b250d3` (the proposed 25), 05:08 `7813000f` (+ ROKU,
+  SOFI; provider check: 61 monthly / 261-262 weekly bars from Nov 2021), 05:09 `8c82d267` (META and SNDK removed for
+  a later batch after G86): 50 equity-type members (43 EQUITY, 7 SECTOR_ETF) + the 9 Options underlyings, effective
+  2026-11-13, activation 14:15 UTC. The Nov 13 Options preparation moved to each new revision at CATALOG_QUOTE (old
+  sessions DEGRADED `SUPERSEDED_BY_REVISION`); completed preparation stages were kept across the list changes.
+  Activation with fewer READY names than a rung is supported: `profile_for_target` builds `exact-N-capacity-50` from the
+  50 rung (stream settings identical across rungs 25/50/100) and `promotion_ladder_for_target(N)` = (1, 9, 25, N); the
+  controller registers the exact runtime profile itself (`ensure_exact_advanced_runtime_profile_cursor`).
+- **Preparation of the new 25 (05:09-05:32)**: 20 progressing (native intraday chunks, ~1 s each, round robin). Stuck:
+  DIA, ZS, MA, CRM at `NATIVE_INTRADAY_COVERAGE_INCOMPLETE` - preparation requires all 390 one-minute bars per session
+  (`advanced_equity_preparation.py:1578-1584`) and the provider has no bar for no-trade minutes (read-only check: DIA
+  Nov 6 13:56, ZS Nov 6 four minutes, MA Nov 9 10:47, CRM Nov 11 13:30); ROKU at `REFERENCE_SOURCE_REQUEST_FAILED`
+  (provider `/v3/reference/tickers/ROKU` 404 while its aggregates are complete). The CRWD fix (r88) covers stream-derived
+  quiet minutes in screening and the workspace, not this REST history check. **User (~05:40): start today with 45 (25 +
+  20 new, rung 50 as exact-45); preparation's quiet-minute rule ships in the Nov 13 night package with the designed
+  CRWD version (gap repair records provider-confirmed empty minutes; screening, input gate, 1m chart and preparation
+  accept only recorded minutes); DIA, ZS, MA, CRM join Monday; ROKU's reference 404 investigated tonight.**
+- **f35 built (07:11, user request ~07:05)**: ticker page chart bar without the "Developing candle" pill (the developing
+  bar still draws on the chart); the close and period stats stay on the interval row (`.tk-stats` no inner wrap,
+  tighter gaps). `alpha-research-realtime-v2-frontend:stable-nov5-f35` = `sha256:0fc57aada1ee079d00cd7d53b12613ef08d5c35c1e91ba54cdf57eb7543b2996`.
+  Frontend tests 323: same failures as f34 except one test file whose Node process ended with **SIGSEGV** during the
+  run; rerun twice: identical to f34 (1 pass, 1 known failure), no crash - another one-off crash on this host (R57:
+  memory corruption 04:30, API segfault 00:06, this). Held for the user's go (frontend deploy `g102-frontend`).
+- **f36 / f37 built (07:14-07:17, user requests ~07:13)**: every page with session navigation picks its session from a
+  dropdown of stored sessions (as the ticker pages did) with "Historical" under it on a past session (as the Options
+  pages' button did); the alert pages' dropdown gets the same label (`AppShell.tsx` SessionStepper /
+  AlertSessionStepper, `AppShell.css` `.tm-session__pick`). f37 adds: the Options Screener has no session picker (the
+  header shows the latest stored session as a fixed date) and its in-results "Options session" date field is removed
+  (an old link with `session_date` still shows its return-to-latest button). **f37 =
+  `alpha-research-realtime-v2-frontend:stable-nov5-f37` = `sha256:5b814ca7f1245cbd976f5b73b4f9eb939176a7665068709f567fd5bdd33c80d9`**
+  (f34 + the ticker chart pill removal + these). Tests 324 / pass 279 / fail 40: identical failure set to f34. (f36's
+  first full run reported one test file as failed; rerun identical to f34.) Held for the user's go.
+- **f37 live 07:18, f38 live 07:25 (user's go to validate; frontend only, others_changed none)**: f38 = f37 without the
+  "Historical" label under the session dropdown (did not fit) and with one explicit session-date style on every page
+  (`.tm-session select.tm-session__value`: page font family, 11px, 600, tabular; a select does not inherit the page
+  font, and the alert pages' select rule set another weight/border/width). `sha256:8b446f09102d99428727582d2ec2bc0f1c4c380e7c5f19caadc30ccafc94f175`;
+  tests identical to f34. Fallback f34 `sha256:f46357d6a987`.
+- **Options Alerts shows only the current session (user question)**: not OA1/OA2. The realtime Options Alerts page reads
+  the latest Options publication, whose `datasets()` lists only its own session and whose `evaluations()` serves only
+  its own rows (`advanced_options_projection.AdvancedOptionsAlertsPagePublication`, since `355b3ab`). Past sessions need
+  a backend read: list sessions with a retained closing Options alerts publication and serve a past `session_date`
+  from that session's retained publication. Tonight's package (matrix row OA3).
+- **Backfill of the 20 new names complete 07:26 UTC**: reference, 283/261/60 adjusted daily/weekly/monthly, 90-session
+  5m + 5-session 1m native intraday, derived 15m/30m/1h/raw 1d, technical warm-up (daily and hourly screening, Stock
+  Alerts, portal history). Readiness: 45 READY (25 + AAOI ADBE AMAT BA BAC COIN CVX DIS GS HD LRCX PANW QCOM SOFI UBER
+  V WFC WMT XOM XLV), WARMING CRM DIA MA ZS (R58), ROKU unbound (delisted 2026-11-09).
+- **Live list to 45 at 07:27 UTC (user's go, after the backfill so nothing was interrupted)**: revision
+  `2d1e2667-e9fe-5202-b07f-1a4905629699`, effective 2026-11-13, 54 members (38 EQUITY + 7 SECTOR_ETF + 9 Options
+  underlyings), ready 45, warming none, no preparation work on the revision (nothing re-fetched); ACTIVATION_PENDING
+  14:15 UTC at rung 50 (exact-45). The Nov 13 Options preparation followed to the new revision at CATALOG_QUOTE. ROKU
+  is out for good (delisted); DIA, ZS, MA, CRM (R58) and META, SNDK (G86) return in the weekend list change.
+- **Earnings dates and Financials for the 45-member list (R60, 07:44-07:52 UTC, user: "if not resolved, fetch the
+  data")**: the 07:26 maintenance slot failed on both (earnings ForeignKeyViolation: ROKU was still on the list then;
+  fundamentals ValueError). After the list change, earnings still came back PARTIAL (WFC, WMT, XOM not answered) and
+  fundamentals still failed. Causes: transport caps sized for 25 names. Earnings asks Finnhub per company over a 47-day
+  window in 30-day chunks (2 requests each); 35 companies = 70 requests against the default cap of 64, so the 33rd
+  company onward was refused. Fundamentals sent one request per endpoint for all 35 companies, and the
+  income-statement page passed the 2 MB per-response cap ("reference response exceeded its byte limit"). In
+  8-company groups, the unfiltered filing index still passed the 16-page limit: it returns every form (AAPL+MSFT:
+  1,250 rows, 824 of them Form 4), while the normalizer matches only 10-K/10-Q (filtered: 40 rows). One-off run
+  (`runner/refresh_reference_once.py`, the role's own `refresh_earnings_calendar` / `refresh_fundamentals` and
+  persistence, with a 256-request cap, groups of 8, and `form_type.any_of=10-K,10-Q`): earnings REFRESHED 35/35
+  (70 requests, valid to Nov 16 07:49); fundamentals REFRESHED 35 companies, 2,832 reports, none without reports
+  (20 requests; per group about 0.47 MB income, 0.25 MB balance, 0.57 MB cash flow, 0.04 MB filings). Readiness
+  (`ticker_readiness.py 2026-11-13`, 07:52): all 45 have 283/283 adjusted daily, 20/20 raw daily, weekly
+  2026-11-06, monthly 2026-10-30, Nov 12 intraday 390/78/26/13/7, 1h 20/20, split/dividend ok; earnings and
+  fundamentals on all 35 companies. Remaining flags are expected: the 20 new names have no Nov 12 workspace or
+  Dashboard row (not members then), ETFs have no sector/industry, and the CRWD Nov 9 minute (R58/CRWD).
+  Code fix in the worktree for tonight's package (live r96 preparation will fail the same way after today's close,
+  harmless: today's coverage is valid to Nov 16 07:49): fundamentals fetched in groups of 8 (`FUNDAMENTALS_BATCH`)
+  with a refresh transport sized for 400 names; filing index filtered to 10-K/10-Q (`FUNDAMENTAL_FILING_FORMS`);
+  earnings transport cap 1024 requests. Tests `test_reference_refresh_caps_r60_nov13.py` (6) + reference suites pass.
+- **R61 first-window Dashboard (08:00-08:28 UTC, user: "deeply look into what it does for dashboard refresh in first
+  window, and optimize its purpose")**. Stage times (read-only, rt.stage_runs): the first window E:14:35 finished
+  189-203 s after the cutoff on Nov 10-12 (gate ~15 s, EQUITY_PROJECTION 91-96 s cold, PORTAL_PUBLISH 80-91 s with the
+  Dashboard); E:14:40 36-41 s (projection 18-22 s warm, publish 0.5 s). The close E:21:00 is not in the 5-minute
+  cycle: it waits ~36 min (BLOCKED_POLICY until the closing data settles) and then runs once (88 s + 73-91 s). The
+  orchestrator cancels a lane at the window deadline + 30 s grace, and a window that does not complete drops the warm
+  state, so an overrun first window would leave E:14:40 cold too (rebuilding the Dashboard again). **Purpose**: before
+  the close the Dashboard is built from daily bars through the previous session (`history_session`), so all intraday
+  Dashboards of a day carry the same content (Nov 10: byte-identical overview, scan, scanners, references); the first
+  window binds that content to the new session's cohort and member list. **Where the time went** (cProfile, Nov 12
+  E:14:35 inputs, 25 names): the window input is 439,475 bars (144k 1m, 58k 15m, ...) for the ticker pages; the
+  Dashboard reads only daily bars and 20 sessions of 1h, but validated (`_validate_bars` 20 s), clock-checked (5 s)
+  and hashed all of them (`canonical_sha256(inputs)` for the setup run id, ~10 s), and rescanned the whole list per
+  ticker (setup summary, frames): cost grows with tickers x bars (~3x at 45, not 1.8x). **Change (R61)**:
+  `dashboard_inputs` / `dashboard_input_bars` keep the daily bars, each ticker's last-20-session and today's raw 1h
+  bars and every bar they derive from (transitively, so validation sees the same causal chain); the setup run id uses
+  the memoized `inputs_sha256`; bars grouped by ticker once. **Equivalence on live data** (read-only rebuilds of Nov 12
+  E:14:35 and E:21:00 with the image's code and the changed code, `runner/dashboard_equivalence_readonly.py`): payload
+  content identical (overview, scan, six scanners, setup results and evidence payloads, references, tickers, context
+  rows); only ids and digests differ (setup run/evidence ids, screening generation id - not a stored row - and the
+  input/lineage/code digests), which already change every window. Build time 36.6 -> 16.1 s (first window) and
+  37.3 -> 13.9 s (close). Tests: `test_dashboard_inputs_r61_nov13.py` (5 new) + Dashboard/All Tickers/daily
+  scanner/stage runner/window script/strategy/golden suites 406 passed; 3 failures are pre-existing (they fail on the
+  unchanged files: G102 A2 labels reference/action drift instead of refusing). `test_dashboard_manifest_bounds.py`
+  now checks the manifest digests against `dashboard_inputs` (what the Dashboard was built from; the existing code
+  already digested the filtered input). **r102** `alpha-research-realtime-v3:stable-nov5-r102-dab7e81c0709a489` =
+  `sha256:c35ac22459bf44f97b2518a2d5280729f31e0743ce2d29b18f9f3ab8508d2b7f` = r101 + R60 + R61; registered as the
+  last candidate; the image's own Dashboard for Nov 12 E:14:35 equals the tested build (16.3 s). Proposed for the
+  12:35 `g102-services` step in place of r101 (needs the user's go).
+- **r102 copy rehearsal (08:42-08:45 UTC, copy `test_realtime_v2_r99`, g102-test-net)**: same steps as r101 (logins,
+  harden 11/11 PASS, compose with live's switches + tonight's: V4 profile on the lifecycle, O3 producer on the window
+  role, SAMPLED, R55, gamma read). The journal/report volumes from the r101 rehearsal were reused (not copied again
+  through this host's memory, R57), so `volumes`/`verify` were skipped. 19 services on r102: all running, 0 restarts,
+  0 errors, no SCHEMA_VERSION_MISMATCH. API smoke copy vs live: 153 routes, same status on every route, 131 OK each.
+  Whole-stack stop: all 19 exit 0 (3 s). Cleanup done (containers removed, test logins NOLOGIN, copy renamed back).
+- **Schema check for r102 (user question: would the H1 migration trip the preflight?)**: H1 is not in r102 (no
+  migration file changed in the worktree). The preflight compares the database's applied versions with the image's
+  own catalog (`realtime/preflight.py:265-270`); r102's catalogs equal those of the images live services run today
+  (r96 `2aa3e4d95810`, API r98 `1200f917a4d2`): v1 21 migrations to `020_realtime_technical_evidence_pointers`
+  (fingerprint `6e8c8d5077a0a09f`), V2 53 migrations to `052_g75_option_breadth` (fingerprint `33661ca26c34f92c`).
+  So the 14:15 capability check cannot report SCHEMA_VERSION_MISMATCH because of r102. H1 + A2 ship together with
+  their migration and a matching image in a later package (migration applied in the same step as the image move).
+- **H1 vs the Nov 12 grant (user question 08:46)**: H1 (`option_breadth_daily`, G106) was never applied: Nov 12 18:57
+  started only file copies of `rt.option_breadth_current` (read-only, no DB change); live has no `option_breadth_daily`
+  relation (read-only check 08:47). The one-time live role change on Nov 12 was the OA1/OA2 grant (18:59, user's yes):
+  `GRANT SELECT ON rt.advanced_options_reference_states TO stocks_realtime_v2_api`, recorded in the relation registry
+  from r98 on (`api=True`; present in r101 and r102). Deploy pre-check with r102 (`validate_integrated_image.py
+  verify-live`, read-only, 08:47): latest migration `052_g75_option_breadth` = expected, `security_passed: true`
+  (live privileges match r102's registry, so the 12:35 `g102-services` step will not be refused on privileges).
+- **Nov 13 live switch sequence (approved by the user earlier this morning; restated 08:50)**: after the 12:35 deploy
+  and the 14:15 activation, once the first V4 windows are clean (each Options lane as designed, window times in budget,
+  no errors or restarts), one switch at a time, each only after the windows following the previous one are clean:
+  (1) O3 producer `REALTIME_V3_O3_INPUTS=ON` on `realtime-v3-options-p8-window`; (2) SAMPLED
+  `REALTIME_V3_MARKET_STATE_PERSIST_CHECK=SAMPLED` on `realtime-v3-options-p8-market-state`; (3) gamma read
+  `REALTIME_V2_OPTIONS_GAMMA_READ=ON` on `realtime-v2-advanced-api`; (4) R55 `REALTIME_V2_BREADTH_LATEST_CAPTURE_ONLY=ON`
+  on `realtime-v2-advanced-api`. Each: `rollout/set_switch.py SERVICE KEY VALUE` (backup of compose.stable.json), then
+  `deploy_candidate.ps1 -Step hotfix -Service SERVICE -Image <r102> -InSession` (waits for 3:00-4:15 of the 5-minute
+  cycle, checks the service settles and that no other container changed). Undo: `set_switch.py SERVICE KEY --remove`
+  and the same hotfix. The switch code is unchanged between r101 and r102 (r102 adds only R60 and R61; all four keys are
+  read in the r102 image). Rehearsed ON: r101 copy 04:29 and r102 copy 08:42 (all services clean), gamma read on the
+  r99/r100 copies with Nov 12 data (SPY/QQQ/NVDA available), R55 Flow comparison on the copy. If the first V4 windows
+  run long rather than fail, SAMPLED (frees market-state CPU) is the one to try first.
+
+### Nov 13 live session (from 09:13 UTC; session 203af43c, the only session acting on live)
+
+- **Take-over checks (09:13-09:15, read-only)**: live = handover (API r98 `1200f917a4d2`, market-state r97
+  `cbf553160d29`, 17 others r96 `2aa3e4d95810`, frontend f38 `8b446f09102d`); candidates r100/r101/r102 and f34
+  present, `candidates.txt` last line r102; desired revision `2d1e2667` (38 EQUITY + 7 SECTOR_ETF + 9
+  OPTION_UNDERLYING, `recovery_steps_nov13.py show`); preparation role earnings/fundamentals/fed CURRENT; Options
+  lifecycle at CATALOG_QUOTE for 2026-11-13; compose switches as listed in the handover (no V4/O3/SAMPLED/gamma/R55).
+- **Deploy r102 (user's go ~09:16: "yes, deploy r102")**: images saved 09:16 to `rollout/pre-r102-images-20261113.txt`;
+  `set_switch.py realtime-v3-options-lifecycle REALTIME_V3_OPTIONS_ADMISSION_PROFILE c6_activity_momentum_v4` 09:17
+  (backup `compose.stable.20261113T091703Z.json`); preflight 09:17 green (pending migrations none, audit passed, no
+  legacy containers); `g102-services -Image sha256:c35ac22459bf...` 09:17-09:36, exit 0, `verify-live` before every
+  move (latest migration `052_g75_option_breadth` = expected), `others_changed: []` on every move.
+- **Verification (09:36-09:38)**: all 19 backend services on r102, running and healthy; frontend f38 unchanged. Lease
+  handover restarts only: controller, detectors, finalizer, canonical-stock-alerts restarts=8 each (8 tracebacks each,
+  all `DurableLeaseUnavailable`), last start 09:19-09:28, no restart since; frontend 2 `connect() failed` lines at
+  09:30:19 (the API restart). `session_services.sh` since 09:36:30: errors=0 on every service. LEASES 20 renewing
+  (09:36:48). Lifecycle env carries the V4 profile (applied at admission after CATALOG_QUOTE; confirm 216 contracts at
+  the first windows). Market-state env LOOP=V3, HASH=CHECKPOINT, ENCODE=CACHED, status READY_WAITING_FOR_SESSION.
+  Preparation role idle check: earnings_calendar, fundamentals, fed_calendar CURRENT. **API smoke live r102 (09:37)
+  vs live r98 (08:44): 153 routes, 131 OK each, 0 status differences, 0 size differences**
+  (`rehearsal-r99/r99-evidence/api-smoke-live-r102-live-093726.json`).
+- **Session checks scheduled (session-only crons, local = UTC-8)**: 13:01 audit, 13:31 dry run, watcher every 10 min
+  14:04-21:54 (acts 14:28-21:05), 14:17 activation, 14:41 first windows (+ switch step 1 when clean), 14:50 portal,
+  15:23 / 16:03 / 16:43 next switch step when the windows since the previous one are clean, 20:47 profile, 21:52 close.

@@ -43,6 +43,7 @@ from .advanced_options_native_adapters import (
     advanced_o3_invocation_document,
     decode_advanced_o3_invocation_document,
 )
+from .advanced_options_o3_inputs import o3_inputs_enabled
 from .advanced_options_producers import AdvancedOptionsProducerPlan
 from .advanced_options_reference_state import AdvancedOptionsReferenceState
 from .advanced_options_rolling_state import AdvancedOptionsRollingState
@@ -979,14 +980,63 @@ def _load_o1(
     return AdvancedOptionsLaneInputs(tuple(invocations)), identity
 
 
+_O3_ACCEPTED_INPUTS_SQL = (
+    "SELECT event.event_id::text,input.retained_input "
+    "FROM rt.detector_events AS event "
+    "JOIN rt.detector_versions AS version "
+    "ON version.detector_sha256=event.detector_sha256 "
+    "JOIN rt.detector_event_inputs AS input "
+    "ON input.event_id=event.event_id "
+    "AND input.input_role='O3_NATIVE_INVOCATION' "
+    "WHERE event.cohort_id=%s "
+    "AND version.detector_id='ADVANCED_OPTIONS_O3_INPUT' "
+    "AND event.trigger_at=%s AND event.disposition='CONFIRMED' "
+    "ORDER BY event.event_id"
+)
+
+
+_O3_NO_INPUT_SQL = (
+    "SELECT event.event_id::text,event.evidence_sha256 "
+    "FROM rt.detector_events AS event "
+    "JOIN rt.detector_versions AS version "
+    "ON version.detector_sha256=event.detector_sha256 "
+    "WHERE event.cohort_id=%s "
+    "AND version.detector_id='ADVANCED_OPTIONS_O3_INPUT' "
+    "AND event.trigger_at=%s AND event.disposition='NO_INPUT' "
+    "ORDER BY event.event_id"
+)
+
+
+def _o3_judged_instrument_ids(cursor, plan: AdvancedOptionsNativeInputPlan) -> tuple[int, ...]:
+    """R44 design step 6 (behind `REALTIME_V3_O3_INPUTS`): the legs of the packages O3 judges at this cutoff, so one
+    quiet watched contract without a mark no longer blocks the lane. No accepted input -> no leg -> the lane reports
+    O3_ACCEPTED_INPUT_EVIDENCE_ABSENT, as today."""
+    cursor.execute(_O3_ACCEPTED_INPUTS_SQL, (str(plan.control_plane.cohort_id), plan.cutoff))
+    candidate_ids = tuple(
+        UUID(str(row["retained_input"]["package_candidate_id"]))
+        for row in cursor.fetchall()
+    )
+    if not candidate_ids:
+        return ()
+    packages = load_realtime_option_packages_cursor(
+        cursor,
+        candidate_ids,
+        cohort_id=plan.control_plane.cohort_id,
+    )
+    return tuple(sorted({leg.instrument_id for package in packages for leg in package.legs}))
+
+
 def _load_o3(
     cursor,
     plan: AdvancedOptionsNativeInputPlan,
     evidence: list[AdvancedOptionsNativeInputEvidence],
 ) -> tuple[AdvancedOptionsLaneInputs, object, bool]:
-    instrument_ids = tuple(sorted({
-        member.instrument_id for member in plan.control_plane.slot_set.members
-    }))
+    if o3_inputs_enabled():
+        instrument_ids = _o3_judged_instrument_ids(cursor, plan)
+    else:
+        instrument_ids = tuple(sorted({
+            member.instrument_id for member in plan.control_plane.slot_set.members
+        }))
     cursor.execute(
         "SELECT evidence_id::text,instrument_id,contract_id,"
         "catalog_version_id,journal_generation::text,stream_session_id::text,"
@@ -1023,20 +1073,20 @@ def _load_o3(
     ):
         raise ValueError("native O3 mark source generation changed")
     cursor.execute(
-        "SELECT event.event_id::text,input.retained_input "
-        "FROM rt.detector_events AS event "
-        "JOIN rt.detector_versions AS version "
-        "ON version.detector_sha256=event.detector_sha256 "
-        "JOIN rt.detector_event_inputs AS input "
-        "ON input.event_id=event.event_id "
-        "AND input.input_role='O3_NATIVE_INVOCATION' "
-        "WHERE event.cohort_id=%s "
-        "AND version.detector_id='ADVANCED_OPTIONS_O3_INPUT' "
-        "AND event.trigger_at=%s AND event.disposition='CONFIRMED' "
-        "ORDER BY event.event_id",
+        _O3_ACCEPTED_INPUTS_SQL,
         (str(plan.control_plane.cohort_id), plan.cutoff),
     )
     rows = tuple(cursor.fetchall())
+    if not rows and o3_inputs_enabled():
+        # R44: the producer ran at this cutoff and nothing qualified (one NO_INPUT row per underlying, with reasons):
+        # the lane is evaluated with zero inputs instead of having no producer. No row at all (the producer failed or
+        # did not run) keeps today's ACCEPTED_INPUT_EVIDENCE_ABSENT below.
+        cursor.execute(_O3_NO_INPUT_SQL, (str(plan.control_plane.cohort_id), plan.cutoff))
+        no_input = tuple(cursor.fetchall())
+        if no_input:
+            value = tuple(tuple(row.values()) for row in no_input)
+            evidence.append(_evidence("O3", "ACCEPTED_INPUTS", value))
+            return AdvancedOptionsLaneInputs(()), {"o3_inputs": "NO_QUALIFYING_INPUT", "no_input": value}, False
     if not rows:
         reasons = ("O3_ACCEPTED_INPUT_EVIDENCE_ABSENT",)
         evidence.append(_evidence(

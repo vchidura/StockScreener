@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+import threading
 from contextlib import nullcontext
 from uuid import UUID
 
@@ -14,6 +16,34 @@ from .materialization import (
 
 
 MATERIALIZATION_BATCH_PAGE_SIZE = 100
+
+# V3-1.6c (Nov 12, profile #3: the persist check was 21% of market-state samples after V3-1.6): every persist decodes
+# the whole checkpoint payload and compares it with the in-memory state. The payload was encoded from that same state
+# a moment earlier in this process (and V3-1.6b already self-checks the encode), so SAMPLED keeps the full round-trip
+# check for the first PERSIST_CHECK_FIRST persists and every PERSIST_CHECK_EVERY-th after; a mismatch still raises.
+# FULL (the default, any other value) checks every persist as before.
+MARKET_STATE_PERSIST_CHECK_SWITCH = "REALTIME_V3_MARKET_STATE_PERSIST_CHECK"
+PERSIST_CHECK_FIRST = 20
+PERSIST_CHECK_EVERY = 200
+_PERSIST_CHECK_LOCK = threading.Lock()
+_PERSIST_CHECK = {"calls": 0, "checked": 0}
+
+
+def market_state_persist_check_mode(environment=None) -> str:
+    value = (os.environ if environment is None else environment).get(MARKET_STATE_PERSIST_CHECK_SWITCH, "FULL")
+    return "SAMPLED" if str(value).strip().upper() == "SAMPLED" else "FULL"
+
+
+def _persist_check_due() -> bool:
+    if market_state_persist_check_mode() == "FULL":
+        return True
+    with _PERSIST_CHECK_LOCK:
+        _PERSIST_CHECK["calls"] += 1
+        calls = _PERSIST_CHECK["calls"]
+        due = calls <= PERSIST_CHECK_FIRST or calls % PERSIST_CHECK_EVERY == 0
+        if due:
+            _PERSIST_CHECK["checked"] += 1
+        return due
 
 
 class _StatementBatch:
@@ -64,9 +94,10 @@ def _persist_quote_materialization(
         for instrument_id in dirty_instrument_ids
     ):
         raise ValueError("dirty instrument is assigned to a different shard")
-    restored = restore_materializer_checkpoint(checkpoint, shard_map)
-    if restored != state:
-        raise ValueError("checkpoint payload does not match materializer state")
+    if _persist_check_due():
+        restored = restore_materializer_checkpoint(checkpoint, shard_map)
+        if restored != state:
+            raise ValueError("checkpoint payload does not match materializer state")
     lineage_rows = (*state.quotes, *state.trades, *state.quote_history)
     if any(
         row.journal_generation != checkpoint.journal_generation

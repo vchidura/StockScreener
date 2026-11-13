@@ -25,6 +25,9 @@ from .reference_adapters import (
 )
 from .reference_service import ProviderEntitlementUnavailable, ReferenceSeedService
 
+# The filing forms the fundamentals normalizer matches (equity.polygon.normalize_fundamental_reports: 10-K for annual,
+# 10-Q for quarterly and trailing-twelve-month periods); other forms never reach a report.
+FUNDAMENTAL_FILING_FORMS = ("10-K", "10-Q")
 
 @dataclass(frozen=True, slots=True)
 class ReferenceHttpResponse:
@@ -273,6 +276,7 @@ class MassiveReferenceTransport(_BoundedReferenceTransport):
 
     def _fetch_fundamentals(
         self, path: str, tickers: tuple[str, ...], as_of: object, *, ticker_parameter: str,
+        extra: Mapping[str, str] | None = None,
     ) -> tuple[Mapping[str, object], ...]:
         if not tickers:
             return ()
@@ -284,6 +288,7 @@ class MassiveReferenceTransport(_BoundedReferenceTransport):
                 "filing_date.gte": (end - timedelta(days=366 * 5)).isoformat(),
                 "filing_date.lte": end.isoformat(),
                 "limit": "5000",
+                **dict(extra or {}),
             },
         )
 
@@ -306,9 +311,13 @@ class MassiveReferenceTransport(_BoundedReferenceTransport):
         )
 
     def fetch_filing_index(self, tickers, as_of):
+        """R60 (Nov 13): only the forms `normalize_fundamental_reports` matches (10-K annual, 10-Q quarterly/TTM).
+        Unfiltered, the index returns every form (Form 4 was 824 of AAPL+MSFT's 1,250 rows over five years), so eight
+        companies ran past the 16-page limit; filtered, 8 companies are about 40 KB (live, Nov 13)."""
         return self._fetch_fundamentals(
             "/stocks/filings/vX/index", tickers, as_of,
             ticker_parameter="ticker.any_of",
+            extra={"form_type.any_of": ",".join(FUNDAMENTAL_FILING_FORMS)},
         )
 
     def fetch_splits(

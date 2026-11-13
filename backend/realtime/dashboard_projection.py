@@ -77,12 +77,50 @@ def member_set_identities(lists):
     return identities
 
 
+def dashboard_input_bars(bars, session):
+    """R61 (Nov 13): the bars the Dashboard reads, with every bar they were derived from (transitively), in their
+    original order. The window input also carries the ticker pages' intraday history (Nov 12 first window, 25 names:
+    440k bars, 144k of them 1m), which the Dashboard never reads but validated, clock-checked and hashed on every
+    build (~70 s). It reads: daily bars (adjusted for history, raw for nominal price and liquidity) and the raw 1h
+    bars of each ticker's last 20 adjusted sessions (setup confirmation) and of today (screening's hourly slots lie
+    within them). Derived bars keep their sources, so `_validate_bars` and the source-clock check see the same causal
+    chain as before; a source missing from the window input is still refused there, unchanged."""
+    daily_sessions = {}
+    for row in bars:
+        if row["interval"] == "1d" and row["adjustment_basis"] == "ADJUSTED":
+            daily_sessions.setdefault(row["ticker"], []).append((row["bar_start"], row["session_date"]))
+    hourly_sessions = {
+        ticker: {session_date for _start, session_date in sorted(values)[-20:]} | {session}
+        for ticker, values in daily_sessions.items()
+    }
+    indexed = {str(row["bar_revision_id"]): row for row in bars}
+    keep = {
+        key for key, row in indexed.items()
+        if row["interval"] == "1d" or (
+            row["interval"] == "1h" and row["adjustment_basis"] == "RAW_UNADJUSTED"
+            and row["session_date"] in hourly_sessions.get(row["ticker"], {session})
+        )
+    }
+    pending = list(keep)
+    while pending:
+        for source in indexed[pending.pop()].get("source_revision_ids") or ():
+            key = str(source)
+            if key in indexed and key not in keep:
+                keep.add(key)
+                pending.append(key)
+    return tuple(row for row in bars if str(row["bar_revision_id"]) in keep)
+
+
 def dashboard_frames(inputs):
     """Use one historical price basis; nominal quotes/liquidity remain separate."""
     frames, raw = {}, {}
+    daily_by_ticker = {}
+    for row in inputs.bars:
+        if row["interval"] == "1d":
+            daily_by_ticker.setdefault(row["ticker"], []).append(row)
     for member in sorted(inputs.members, key=lambda row: row["ticker"]):
         ticker = member["ticker"]
-        own = [row for row in inputs.bars if row["ticker"] == ticker and row["interval"] == "1d"]
+        own = daily_by_ticker.get(ticker, [])
         adjusted = sorted((row for row in own if row["adjustment_basis"] == "ADJUSTED"),
                           key=lambda row: row["session_date"])
         raw[ticker] = sorted((row for row in own if row["adjustment_basis"] == "RAW_UNADJUSTED"),
@@ -115,7 +153,10 @@ def _overview(ticker, frame, raw):
     )
 
 
-def produce_realtime_dashboard(inputs: RealtimeScreeningInput):
+def dashboard_inputs(inputs: RealtimeScreeningInput) -> RealtimeScreeningInput:
+    """The window input narrowed to what the Dashboard is built from (and what its manifest digests describe):
+    no weekly/monthly bars, adjusted daily bars only in the portal history plan's sessions, and (R61) only the bars
+    `dashboard_input_bars` keeps."""
     calendar = exchange_calendars.get_calendar("XNYS")
     history_session = (
         calendar.previous_session(str(inputs.session)).date()
@@ -127,9 +168,9 @@ def produce_realtime_dashboard(inputs: RealtimeScreeningInput):
         equity_ticker_count=len(inputs.members),
     )
     adjusted_sessions = set(history_plan.adjusted_sessions)
-    inputs = replace(
+    return replace(
         inputs,
-        bars=tuple(
+        bars=dashboard_input_bars(tuple(
             row for row in inputs.bars
             if row["interval"] not in {"1wk", "1mo"}
             and not (
@@ -137,8 +178,12 @@ def produce_realtime_dashboard(inputs: RealtimeScreeningInput):
                 and row["adjustment_basis"] == "ADJUSTED"
                 and row["session_date"] not in adjusted_sessions
             )
-        ),
+        ), inputs.session),
     )
+
+
+def produce_realtime_dashboard(inputs: RealtimeScreeningInput):
+    inputs = dashboard_inputs(inputs)
     screening = produce_realtime_screening(inputs)
     # Per-ticker outcome (G102 A2, Nov 7): members screening could not compute are left out of every Dashboard
     # list (overview, scanners, setups, context, references) and listed as unavailable, instead of failing the

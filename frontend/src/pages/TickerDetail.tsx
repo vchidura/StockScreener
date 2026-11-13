@@ -41,7 +41,6 @@ import {
   INTERVAL_NOUN,
   LABEL,
   LINE,
-  MARKET_TIME_ZONE,
   MUTED,
   NEG,
   NEG_SOFT,
@@ -98,17 +97,6 @@ export type TickerView = 'overview' | 'timeframes' | 'levels' | 'fibonacci' | 'f
 
 const DEVELOPING_CANDLE_INTERVALS = new Set(['15m', '30m', '1h', '1d'])
 const FORMING_BAR_INTERVALS = new Set(['5m', '15m', '30m', '1h', '1d', '1wk', '1mo'])
-
-function formatDevelopingThrough(unixSeconds: number): string {
-  return new Intl.DateTimeFormat(undefined, {
-    timeZone: MARKET_TIME_ZONE,
-    month: 'short',
-    day: 'numeric',
-    hour: 'numeric',
-    minute: '2-digit',
-    timeZoneName: 'short',
-  }).format(new Date(unixSeconds * 1000))
-}
 
 function TickerDetail({ view, publication, readsEnabled = true, publicationLoading = false, availabilityError, onRefreshPublication, onAnalysisIntervalChange, onAnalysisSetupChange }: {
   view: TickerView
@@ -939,16 +927,8 @@ function TickerDetail({ view, publication, readsEnabled = true, publicationLoadi
           >
             {chartCollapsed ? 'Show chart' : 'Hide chart'}
           </button>
-          {chartData[chartData.length - 1]?.provisional && (
-            <Pill
-              text="Developing candle"
-              tone={WARN}
-              title={`Built from finalized ${chartData[chartData.length - 1].source_interval ?? '5m'} bars through ${formatDevelopingThrough(
-                (chartData[chartData.length - 1].available_through
-                  ?? chartData[chartData.length - 1].time),
-              )}`}
-            />
-          )}
+          {/* Nov 13 (user): no "Developing candle" pill; the developing bar still draws on the chart, and the close and
+              period stats stay on the interval row. */}
           {visibleChartData.length > 0 && (
             <div className="tk-stats">
               {/* Nov 12 (user): the close price, moved here from the page header, comes before Period high. */}

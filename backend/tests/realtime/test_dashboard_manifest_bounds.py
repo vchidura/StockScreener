@@ -7,7 +7,7 @@ import pytest
 
 from realtime.contracts import canonical_json, canonical_sha256
 from realtime.dashboard_projection import (
-    DAILY_SCANNER_CONTRACTS, MEMBER_LISTS, member_set_identities, produce_realtime_dashboard,
+    DAILY_SCANNER_CONTRACTS, MEMBER_LISTS, dashboard_inputs, member_set_identities, produce_realtime_dashboard,
 )
 from realtime.lineage_head import (
     BOUNDED_MANIFEST_BYTES, inputs_bar_lineage_sha256, inputs_sha256, reference_set, rows_identity,
@@ -65,8 +65,10 @@ def test_manifest_has_no_per_bar_or_per_member_list_and_carries_digests():
     for key in ("lineage", *MEMBER_LISTS):
         assert key not in manifest
     assert list(nested_lists(manifest)) == [list(DAILY_SCANNER_CONTRACTS.values())]
-    assert manifest["input_sha256"] == inputs_sha256(inputs)
-    assert manifest["bar_lineage_sha256"] == inputs_bar_lineage_sha256(inputs)
+    # The digests describe what the Dashboard was built from (R61: `dashboard_inputs`, not the whole window input).
+    built_from = dashboard_inputs(inputs)
+    assert manifest["input_sha256"] == inputs_sha256(built_from)
+    assert manifest["bar_lineage_sha256"] == inputs_bar_lineage_sha256(built_from)
     assert manifest["screening_generation"] == payload["context"]["cohort"]["generation"]
     assert manifest["expected_members"] == len(payload["tickers"]) == 9
 

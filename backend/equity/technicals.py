@@ -317,6 +317,61 @@ def exponential_moving_average(values: np.ndarray, span: int) -> np.ndarray:
     return result
 
 
+_WILDER_PERIOD = 14
+_INTRADAY_INTERVALS = frozenset({"5m", "15m", "30m", "1h"})
+_SLOT_SESSIONS = 20
+_SLOT_MINIMUM_SESSIONS = 5
+
+
+def _ewm_smooth(values) -> np.ndarray:
+    return pd.Series(values).ewm(alpha=1 / _WILDER_PERIOD, adjust=False).mean().to_numpy()
+
+
+def _wilder_smooth(values) -> np.ndarray:
+    """Wilder's running moving average: the mean of the first 14 values, then x[t-1] + (v[t] - x[t-1]) / 14."""
+    values = np.asarray(values, dtype=float)
+    out = np.full(len(values), np.nan)
+    if len(values) < _WILDER_PERIOD:
+        return out
+    out[_WILDER_PERIOD - 1] = float(np.mean(values[:_WILDER_PERIOD]))
+    for index in range(_WILDER_PERIOD, len(values)):
+        out[index] = out[index - 1] + (values[index] - out[index - 1]) / _WILDER_PERIOD
+    return out
+
+
+def _same_slot_volume(frame, completed_slice, completed_volume, interval):
+    """(relative volume, 5-bar volume trend ratio) of intraday bars against the same New York time-of-day slot of the
+    prior 20 sessions, or None when the frame has no bar times or a bar has fewer than 5 prior sessions in its slot."""
+    if interval not in _INTRADAY_INTERVALS or not isinstance(frame.index, pd.DatetimeIndex):
+        return None
+    index = frame.index[completed_slice]
+    if len(index) != len(completed_volume) or len(index) < 2:
+        return None
+    local = index.tz_localize("UTC") if index.tz is None else index
+    local = local.tz_convert("America/New_York")
+    slots = local.strftime("%H:%M")
+    sessions = local.date
+    by_slot: dict[str, list[tuple[object, float]]] = {}
+    for position in range(len(completed_volume)):
+        by_slot.setdefault(slots[position], []).append((sessions[position], float(completed_volume[position])))
+
+    def baseline(position):
+        prior = [value for session, value in by_slot[slots[position]] if session < sessions[position]][-_SLOT_SESSIONS:]
+        return float(np.mean(prior)) if len(prior) >= _SLOT_MINIMUM_SESSIONS else None
+
+    last = len(completed_volume) - 1
+    last_baseline = baseline(last)
+    recent = range(max(0, last - 4), last + 1)
+    recent_baselines = [baseline(position) for position in recent]
+    if last_baseline is None or last_baseline <= 0 or any(value is None for value in recent_baselines):
+        return None
+    total_baseline = float(sum(recent_baselines))
+    relative = round(float(completed_volume[last]) / last_baseline, 2)
+    trend = (float(sum(completed_volume[position] for position in recent)) / total_baseline
+             if total_baseline > 0 else None)
+    return relative, trend
+
+
 def compute_trade_setup_technicals(
     frame: pd.DataFrame,
     interval: str,
@@ -473,15 +528,13 @@ def compute_trade_setup_technicals(
                 np.abs(completed_low[1:] - completed_close[:-1]),
             ),
         )
-        smoothed_tr = pd.Series(directional_tr).ewm(
-            alpha=1 / 14, adjust=False
-        ).mean().to_numpy()
-        smoothed_plus_dm = pd.Series(plus_dm).ewm(
-            alpha=1 / 14, adjust=False
-        ).mean().to_numpy()
-        smoothed_minus_dm = pd.Series(minus_dm).ewm(
-            alpha=1 / 14, adjust=False
-        ).mean().to_numpy()
+        # TP9 (T3): Wilder's smoothing seeded with the mean of the first 14 values; an EWM seeded at the first bar does
+        # not converge on short series (60 monthly bars read ADX 2-7 points high). Short histories keep the EWM.
+        wilder = len(directional_tr) >= 2 * _WILDER_PERIOD - 1
+        smooth = _wilder_smooth if wilder else _ewm_smooth
+        smoothed_tr = smooth(directional_tr)
+        smoothed_plus_dm = smooth(plus_dm)
+        smoothed_minus_dm = smooth(minus_dm)
         plus_di = np.divide(
             100 * smoothed_plus_dm, smoothed_tr,
             out=np.zeros_like(smoothed_plus_dm), where=smoothed_tr > 0,
@@ -495,7 +548,10 @@ def compute_trade_setup_technicals(
             100 * np.abs(plus_di - minus_di), directional_sum,
             out=np.zeros_like(directional_sum), where=directional_sum > 0,
         )
-        adx = pd.Series(dx).ewm(alpha=1 / 14, adjust=False).mean().to_numpy()
+        adx = (
+            _wilder_smooth(dx[_WILDER_PERIOD - 1:]) if wilder
+            else pd.Series(dx).ewm(alpha=1 / 14, adjust=False).mean().to_numpy()
+        )
         plus_di_value = round(float(plus_di[-1]), 1)
         minus_di_value = round(float(minus_di[-1]), 1)
         adx_value = round(float(adx[-1]), 1)
@@ -505,7 +561,7 @@ def compute_trade_setup_technicals(
     historical_volatility_state = "UNAVAILABLE"
     if len(completed_close) >= 21 and np.all(completed_close > 0):
         periods_per_year = {
-            "1mo": 12, "1wk": 52, "1d": 252, "1h": 252 * 6.5,
+            "1mo": 12, "1wk": 52, "1d": 252, "1h": 252 * 7,  # TP9 (T4): 7 hourly bars per session
             "30m": 252 * 13, "15m": 252 * 26, "5m": 252 * 78,
         }.get(interval, 252)
         log_returns = pd.Series(np.diff(np.log(completed_close)))
@@ -547,6 +603,11 @@ def compute_trade_setup_technicals(
         float(np.mean(volume_5)) / completed_volume_baseline
         if len(volume_5) > 0 and completed_volume_baseline > 0 else None
     )
+    # TP10 (T5): intraday volume compared with the same time-of-day slot of the prior 20 sessions; against the previous
+    # 20 bars of any slot the closing-auction bar read 1.9-3.6x when it was 0.7-0.9x of its own slot.
+    slot_relative = _same_slot_volume(frame, completed_slice, completed_volume, interval)
+    if slot_relative is not None:
+        relative_volume, volume_trend_ratio = slot_relative
     volume_trend_pct = (
         round((volume_trend_ratio - 1) * 100, 1)
         if volume_trend_ratio is not None else None

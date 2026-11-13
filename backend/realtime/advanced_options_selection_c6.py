@@ -1609,6 +1609,7 @@ class C6SelectionPlan:
                     "c6_activity_momentum_v1",
                     "c6_activity_momentum_v2",
                     "c6_activity_momentum_v3",
+                    "c6_activity_momentum_v4",
                 }
                 and (
                     allocation_document.get(

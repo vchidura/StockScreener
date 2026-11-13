@@ -13,6 +13,7 @@ from uuid import UUID
 from options.domain import ContractType, OptionContractSnapshot
 from options.dual_origin import (
     ActivitySource,
+    CanonicalTrendSignalDecision,
     LatestCompletedSignalDecision,
     assess_canonical_stock_first,
 )
@@ -330,9 +331,15 @@ def decode_advanced_o3_invocation_document(
         return value
 
     if document["decision_model"] == "LATEST_COMPLETED_SIGNAL_DECISION":
-        decision = LatestCompletedSignalDecision.model_validate(
-            document["decision"]
+        # R44 (Nov 13): the O3 input producer retains the O1 canonical-trend decision (schema v6), the decision the
+        # developer path gives O3 (`assess_options_credit_canonical_trend`); any other model document is v4 as before.
+        decision_model = (
+            CanonicalTrendSignalDecision
+            if isinstance(document["decision"], Mapping)
+            and document["decision"].get("schema_version") == "dual_origin_signal_decision_v6"
+            else LatestCompletedSignalDecision
         )
+        decision = decision_model.model_validate(document["decision"])
     else:
         decision_document = dict(document["decision"])
         decision_document["decision_at"] = datetime.fromisoformat(

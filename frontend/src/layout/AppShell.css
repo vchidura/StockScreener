@@ -805,6 +805,34 @@
   cursor: pointer;
 }
 
+/* Nov 13 (user): one session dropdown on every page, with "Historical" under it on a past session. */
+.tm-session__pick {
+  display: grid;
+  align-content: center;
+  justify-items: center;
+  border-inline: 1px solid var(--tm-line);
+}
+
+.tm-session__pick > .tm-session__value {
+  border-inline: 0 !important;
+}
+
+/* Nov 13 (user): the session date reads the same on every page (a select does not inherit the page font by default, and
+   the alert pages' own select rule set another weight, border and width). */
+.tm-session select.tm-session__value,
+.tm-session--static .tm-session__value {
+  height: 100%;
+  width: auto;
+  min-width: 124px;
+  border: 0;
+  border-radius: 0;
+  color: var(--tm-ink);
+  font-family: inherit;
+  font-size: 11px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
 .tm-content {
   flex: 1;
   min-width: 0;
