@@ -3050,3 +3050,13 @@ Tests run offline in the r98 image with the worktree mounted (`runner/run_tests_
     are routes this API does not register.
   - Not yet seen live (Monday): the PRE_OPEN preparation, the publish-only run after the first window, windows without
     the Dashboard, Pattern Watch light frames in windows.
+- **R78 commit (Nov 14 23:19-23:21 UTC, user: "yes, commit all changes")**:
+  - Secrets scan of the staged diff: the only match was a ContextVar `token` variable; no keys, connection strings or
+    personal details.
+  - `f0f722d` (R78: code, tests, docs) committed on `r78-daily-products`, fast-forwarded `v3-live-fixes` and `main`,
+    pushed.
+  - `8d6e23d` on the new branch `r118-api-reader-fix` (r102's d573f43 plus the reader fix: the API image r118),
+    pushed.
+  - The `v3-stable-nov5` worktree (v3-live-fixes) now equals the live r119 image file for file (0 differences), so
+    `runner/build_candidate.sh` builds the live scheduler code again.
+  - The ops folder (handover, runner tools, rollout) is gitignored, as before.

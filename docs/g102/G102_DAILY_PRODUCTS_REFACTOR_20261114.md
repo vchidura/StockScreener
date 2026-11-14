@@ -1,7 +1,8 @@
 # G102 R78: daily products after the close (Dashboard, strategies and daily frames out of the Equity window)
 
 - **Status:** LIVE since Nov 14 23:16 UTC (user's go), from worktree `r78-daily-products` (branch
-  `r78-daily-products` from `v3-live-fixes` ea76dd5; not committed).
+  `r78-daily-products` from `v3-live-fixes` ea76dd5). Committed `f0f722d` on `v3-live-fixes` and `main` (Nov 14
+  23:20, user's word); r118's source is branch `r118-api-reader-fix` (`8d6e23d`).
   - Scheduler r119 with `REALTIME_V2_DAILY_PRODUCTS=JOB`, `REALTIME_V2_PATTERN_WATCH=LIGHT` and
     `REALTIME_V2_DAILY_STRATEGY_SESSIONS=1`.
   - API r118 (r102 + the strategy reader fix).
