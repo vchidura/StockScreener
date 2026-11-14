@@ -213,6 +213,19 @@ def _authorized_windows(windows, *, first_cutoff, started, ended):
     return selected
 
 
+LIVE_RETRY_HORIZON = timedelta(0)  # R72: no retry during the session (a same-slot retry collided with the next live window)
+
+
+def _new_report_path(path):
+    """R70 (Nov 13): a retry attempt re-run after its scheduler stopped finds its own earlier report; the window script
+    refuses an existing --report-path (argparse error), and that exit ended the whole scheduler: a restart and a cold
+    window each time (15:17, 15:29, 18:0x, 18:18 UTC). Write the new report beside the old one instead."""
+    if not path.exists():
+        return path
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    return path.with_name(f"{path.stem}.rerun-{stamp}{path.suffix}")
+
+
 def _window_arguments(
     args,
     scope,
@@ -248,13 +261,12 @@ def _window_arguments(
             args.authorization_reference,
         ),
         "--report-path",
-        str(
-            args.report_directory
-            / retry.report_relative_path
-        ),
+        str(_new_report_path(args.report_directory / retry.report_relative_path)),
         "--execute",
     ]
-    if retry.attempt:
+    if retry.attempt or retry.reused_input_receipt or retry.reused_portal_receipt:
+        # R74 (Nov 13): a first attempt resumed with stored receipts (its earlier run was killed) also needs the retry
+        # identity; without it the window step refused `--reuse-input-receipt` and that exit ended the scheduler.
         window_args.extend((
             f"--window-key-suffix=-retry{retry.attempt}",
             "--retry-release-now",
@@ -341,7 +353,6 @@ def _recover_completed_session_window(
     if row is None:
         state["finished"] = session
         return False
-    first_recovery_attempt = settings.scheduler_window_retry_max_attempts + 1
     last_recovery_attempt = (
         settings.scheduler_window_retry_max_attempts
         + COMPLETED_SESSION_EXTRA_ATTEMPTS
@@ -349,7 +360,10 @@ def _recover_completed_session_window(
     if row["next_attempt"] > last_recovery_attempt:
         state["finished"] = session
         return False
-    if not row["ready"] or row["next_attempt"] < first_recovery_attempt:
+    # R77 (Nov 14): this runs only IDLE/BEFORE_OPEN, i.e. past the drain deadline, when the ordinary retries are over
+    # whatever they spent. It used to wait for them to be spent (next_attempt > max_attempts): since R72 skips them in
+    # the session, the Nov 13 close, MISSED at attempt 1, was never recovered nor marked finished.
+    if not row["ready"]:
         return False
     with provider.transaction(APP_ROLE) as unit:
         recovery = discover_advanced_window_recovery_cursor(
@@ -762,6 +776,21 @@ def main(
                     )
                     if recovery.complete:
                         next_progress_check_at = now
+                        continue
+                    # R72 (Nov 13): during the session a retry of a window more than LIVE_RETRY_HORIZON old is
+                    # skipped (later windows have published; it runs after the close). Its cold rebuild of an older
+                    # cutoff replaced, or when cancelled dropped, the live window's retained state, so each retry
+                    # pushed the next live window cold (18:20-18:55 UTC).
+                    if (
+                        (
+                            recovery.next_attempt > 0
+                            or recovery.input_receipt is not None
+                            or recovery.portal_receipt is not None
+                        )
+                        and now <= session_close
+                        and now - window.cutoff >= LIVE_RETRY_HORIZON
+                    ):
+                        # R74: a resumed window (stored receipts from a killed run) waits for the close as well.
                         continue
                     if now < recovery.retry_not_before:
                         pending_retry_not_before = (

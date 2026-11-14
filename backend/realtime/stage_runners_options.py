@@ -97,6 +97,9 @@ from .orchestration_repository import (
     CycleReceiptSpec,
 )
 from .runner_environment import RunnerEnvironment
+from .options_late_start import (
+    WARMING_LATE_START, options_checkpoint_stale, options_late_start_enabled, options_late_start_point,
+)
 from .stage_orchestrator import StageCancelled, StageContext, StageOutcome, StageRunner
 from .stage_runners_equity import STAGE_CANCELLED
 from .stage_graph import STAGE_CATALOG_VERSION_V4, STAGE_CATALOG_VERSION_V5
@@ -630,6 +633,7 @@ class _Session:
     start: StartInfo
     generation: UUID
     consumer_name: str
+    late_cutoff: datetime | None = None  # R67: set when the session started late (windows cut before it are skipped)
 
 
 class OptionsFlowState:
@@ -885,8 +889,27 @@ def _start_session(environment: RunnerEnvironment, settings: OptionsFlowSettings
     restored: RestoredCheckpoint | None = None
     warming: str | None = None
     start_offset = 0
+    late_cutoff = None
+    source_path = getattr(source, "path", None)
+    if rows and source_path is not None and options_late_start_enabled():
+        stored = min(row.committed_offset for row in rows)
+        if options_checkpoint_stale(source_path, stored):
+            # R67: a checkpoint far behind the journal is set aside: start late (below) and let the first write
+            # replace it with a full checkpoint (a forward move, so the regression guard holds).
+            logger.warning("options flow stale checkpoint offset=%s set aside for a late start", stored)
+            rows = []
+            store.must_write_full = True
     if not rows:
         warming = None if settings.initial_baseline is BaselineKind.SESSION_COMPLETE else WARMING_NO_CHECKPOINT
+        # R67 (Nov 13): bound late with no checkpoint, start at the journal point two minutes before now (WARMING;
+        # session volume baselines reconcile from the chain snapshot) instead of replaying from the stream's first frame.
+        if source_path is not None and options_late_start_enabled():
+            point = options_late_start_point(source_path)
+            if point[1] > 0:
+                start_offset = point[1]
+                late_cutoff = point[0]
+                warming = WARMING_LATE_START
+                logger.warning("options flow late start cutoff=%s raw=%s", point[0].isoformat(), point[1])
     else:
         try:
             restored = store.restore(engine, rows, source_tail=tail)
@@ -940,7 +963,8 @@ def _start_session(environment: RunnerEnvironment, settings: OptionsFlowSettings
             None if settings.initial_baseline is BaselineKind.SESSION_COMPLETE else WARMING_NEW_SESSION))
     start = StartInfo("RESTORED" if restored is not None else "WARMING", warming,
                       consumer.fed_offset, 0 if restored is None else restored.payload_bytes)
-    return _Session(consumer, connection, context.plan.session_date, start, generation, settings.consumer_name)
+    return _Session(consumer, connection, context.plan.session_date, start, generation, settings.consumer_name,
+                    late_cutoff)
 
 
 def _outcome(session: _Session, settings: OptionsFlowSettings) -> StageOutcome:

@@ -318,7 +318,8 @@ class ScreeningInputLoader:
              include_portal_history: bool = False,
              include_strategy_action_details: bool = False,
              known_by: datetime | None = None,
-             allow_late_identity_continuity: bool = False) -> RealtimeScreeningInput:
+             allow_late_identity_continuity: bool = False,
+             bar_shard: tuple[int, int] | None = None) -> RealtimeScreeningInput:
         with self._lock:
             return load_screening_input(
                 cursor, cohort_id=cohort_id, session=session, cutoff=cutoff, source_generation=source_generation,
@@ -326,6 +327,7 @@ class ScreeningInputLoader:
                 include_strategy_action_details=include_strategy_action_details,
                 known_by=known_by, bar_loader=self._load_bars,
                 allow_late_identity_continuity=allow_late_identity_continuity,
+                bar_shard=bar_shard,
             )
 
     def reset(self) -> None:

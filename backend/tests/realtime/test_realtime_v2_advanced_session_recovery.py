@@ -76,7 +76,7 @@ def _recover(monkeypatch, tmp_path, rows, *, now=LATE_EVENING, state=None, **kwa
         scheduler,
         "discover_advanced_window_recovery_cursor",
         lambda *_args, **_kwargs: SimpleNamespace(
-            next_attempt=4,
+            next_attempt=kwargs.get("recovery_attempt", 4),
             input_receipt=None,
             portal_receipt=None,
         ),
@@ -184,17 +184,34 @@ def test_attempts_stay_bounded(monkeypatch, tmp_path):
     assert _state["finished"] == SESSION
 
 
-def test_recovery_waits_until_ordinary_retries_are_exhausted(
+@pytest.mark.parametrize("attempt", [1, 3])
+def test_a_close_whose_ordinary_retries_did_not_run_is_recovered(
     monkeypatch,
     tmp_path,
+    attempt,
 ):
+    """R77 (Nov 14): recovery runs only past the drain deadline, when no ordinary retry can run any more. The Nov 13
+    close was MISSED at attempt 1 (R72 skips in-session retries) and waited here for attempt 4 forever."""
+    cutoff = datetime(2026, 11, 2, 21, 0, tzinfo=UTC)
+    ran, runner, state = _recover(
+        monkeypatch,
+        tmp_path,
+        [_row(cutoff, attempt=attempt)],
+        recovery_attempt=attempt,
+    )
+
+    assert ran is True
+    runner.assert_called_once()
+    assert f"--window-key-suffix=-retry{attempt}" in runner.call_args.args[0]
+    assert state.get("finished") != SESSION
+
+
+def test_recovery_still_waits_for_the_drain(monkeypatch, tmp_path):
     ran, runner, _state = _recover(
         monkeypatch,
         tmp_path,
-        [_row(
-            datetime(2026, 11, 2, 21, 0, tzinfo=UTC),
-            attempt=3,
-        )],
+        [_row(datetime(2026, 11, 2, 21, 0, tzinfo=UTC), attempt=1)],
+        lifecycle=_lifecycle(AdvancedEquityLifecyclePhase.DRAINING),
     )
 
     assert ran is False

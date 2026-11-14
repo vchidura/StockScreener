@@ -91,7 +91,7 @@ from .advanced_options_reference_repository import (
 from .advanced_options_flow_policy import load_advanced_options_flow_policy
 from .equity_bar_repository import KNOWN_BY_OBSERVED, load_known_bar_revisions_cursor
 from .option_flow.conditions import load_default_live_semantics
-from .contracts import MarketChannel
+from .contracts import MarketChannel, UniverseManifest
 from .database_access import (
     RealtimeDatabasePrincipal,
     RealtimeDatabaseRole,
@@ -1031,6 +1031,13 @@ def _production_binding_payload(
             )
             for name in identity.__dataclass_fields__
         }
+        # R63 (Nov 13): the effective (prepared) Options universe travels with the binding, so every loader rebuilds
+        # the control plan against the same stored scope.
+        value["control"]["stored_universe"] = {
+            "version": control.universe.version,
+            "equity_tickers": list(control.universe.equity_tickers),
+            "option_underlyings": list(control.universe.option_underlyings),
+        }
     value["binding_sha256"] = canonical_sha256(value)
     return value
 
@@ -1227,6 +1234,15 @@ def p8_production_binding_from_payload(value):
                 name: UUID(item) if name.endswith("_id") else item
                 for name, item in control_value["stored_identity"].items()
             })
+        ),
+        stored_universe=(
+            None
+            if control_value.get("stored_universe") is None
+            else UniverseManifest(
+                version=str(control_value["stored_universe"]["version"]),
+                equity_tickers=tuple(control_value["stored_universe"]["equity_tickers"]),
+                option_underlyings=tuple(control_value["stored_universe"]["option_underlyings"]),
+            )
         ),
     )
     selection = option_activity_selection_from_payload(
@@ -1964,6 +1980,10 @@ class _P8ProductionCapture:
             stored_identity=(
                 None if continuous is None else continuous.identity
             ),
+            stored_universe=(
+                None if continuous is None
+                else getattr(continuous, "stored_universe", None)
+            ),
         )
         enrollment = build_advanced_options_enrollment_plan(
             control_plane=control,
@@ -2093,6 +2113,37 @@ class _P8ProductionCapture:
                               SlotSetPurpose(item[2]), int(item[3]), int(item[4]))
                 for item in unit.cursor.fetchall()
             )
+            # R63 (Nov 13): the prepared Options universe, rebuilt exactly as preparation built it: the desired
+            # revision's Equity members that are AM members of the preparation's source Equity cohort (the history
+            # binding's source). The control plan accepts it only when it hashes to the stored scope.
+            stored_universe = None
+            history_source = (self._package.get("history_binding") or {}).get("source_cohort_id")
+            underlyings = tuple(self._package["cohort"]["underlyings"])
+            if history_source:
+                unit.cursor.execute(
+                    "SELECT intent.ticker FROM rt.advanced_options_continuous_sessions AS session "
+                    "JOIN rt.realtime_desired_member_intents AS intent "
+                    "ON intent.revision_id=session.desired_revision_id "
+                    "JOIN rt.realtime_desired_member_bindings AS binding USING(intent_id) "
+                    "WHERE session.options_cohort_id=%s AND session.session_date=%s "
+                    "AND intent.member_kind IN ('EQUITY','SECTOR_ETF') "
+                    "AND EXISTS (SELECT 1 FROM rt.cohorts AS source "
+                    "JOIN rt.subscription_members AS member USING(manifest_id) "
+                    "WHERE source.cohort_id=%s AND member.instrument_id=binding.instrument_id "
+                    "AND member.channel='AM')",
+                    (
+                        str(acquisition.authority.cohort_id),
+                        acquisition.authority.session_date,
+                        str(history_source),
+                    ),
+                )
+                prepared = tuple(sorted({str(item[0]) for item in unit.cursor.fetchall()}))
+                if prepared and set(underlyings) <= set(prepared):
+                    stored_universe = UniverseManifest(
+                        version=f"market-options-{len(prepared)}-{len(underlyings)}-v1",
+                        equity_tickers=prepared,
+                        option_underlyings=underlyings,
+                    )
         reference = PostgresAdvancedOptionsReferenceStateRepository(
             self._provider
         ).load_for_session(acquisition.authority.session_date, known_at=checked_at)
@@ -2115,7 +2166,7 @@ class _P8ProductionCapture:
             reserved_option_quote_contracts=0,
         )
         continuous = SimpleNamespace(
-            identity=identity, policy=policy, slots=slots,
+            identity=identity, stored_universe=stored_universe, policy=policy, slots=slots,
             slot_effective_at=row[11], reference=reference, budget=budget,
             model_bundle_sha256=row[9], acquisition=acquisition,
             stream_session_ids=(acquisition.stream_session_id,),

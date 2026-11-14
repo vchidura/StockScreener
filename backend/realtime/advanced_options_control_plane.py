@@ -1005,6 +1005,7 @@ def build_advanced_options_control_plane_plan(
     authorized_cohort_id: UUID | None = None,
     authorized_plan_id: UUID | None = None,
     stored_identity: AdvancedOptionsStoredControlIdentity | None = None,
+    stored_universe: UniverseManifest | None = None,
 ) -> AdvancedOptionsControlPlanePlan:
     _validate_equity_source(equity_plan)
     if (
@@ -1146,6 +1147,19 @@ def build_advanced_options_control_plane_plan(
             )
             if narrowed.sha256 == stored_identity.universe_sha256:
                 universe = narrowed
+    if (
+        isinstance(stored_identity, AdvancedOptionsStoredControlIdentity)
+        and stored_identity.universe_sha256 != universe.sha256
+        and isinstance(stored_universe, UniverseManifest)
+        and stored_universe.sha256 == stored_identity.universe_sha256
+        and stored_universe.option_underlyings == universe.option_underlyings
+        and set(stored_universe.equity_tickers) <= set(equity_plan.universe.equity_tickers)
+    ):
+        # R63 (Nov 13): the Options cohort was prepared (07:27) against the READY Equity source of its preparation
+        # time (the 25 Nov 12 names); the session's Equity plan grew to 45 at the 14:15 activation. The caller rebuilds
+        # that exact prepared universe (desired revision members in the preparation's source cohort); accept it when
+        # it hashes to the stored scope, keeps the same underlyings and is a subset of the current Equity members.
+        universe = stored_universe
     if stored_identity is not None and (
         not isinstance(stored_identity, AdvancedOptionsStoredControlIdentity)
         or stored_identity.universe_sha256 != universe.sha256

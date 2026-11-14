@@ -597,15 +597,41 @@ def load_realtime_canonical_stock_alert_input(
     )
 
 
+def shard_tickers(tickers, index: int, count: int) -> tuple[str, ...]:
+    """R75-v2 (Nov 14): ticker group `index` of `count` - contiguous blocks of the sorted tickers, sizes differing by
+    at most one, so the groups concatenated in index order are the serial projection's ticker order."""
+    ordered = sorted(tickers)
+    if type(count) is not int or type(index) is not int or count < 1 or not 0 <= index < count:
+        raise ValueError("ticker shard index/count is invalid")
+    if len(set(ordered)) != len(ordered):
+        raise ValueError("ticker shard members are duplicated")
+    size, extra = divmod(len(ordered), count)
+    start = index * size + min(index, extra)
+    return tuple(ordered[start:start + size + (1 if index < extra else 0)])
+
+
+def _bar_tickers(members, bar_shard) -> tuple[str, ...]:
+    tickers = tuple(m["ticker"] for m in members)
+    if bar_shard is None:
+        return tickers
+    group = frozenset(shard_tickers(tickers, *bar_shard))
+    return tuple(ticker for ticker in tickers if ticker in group)
+
+
 def load_screening_input(cursor, *, cohort_id: UUID, session: date,
                          cutoff: datetime, source_generation: int,
                          include_portal_history: bool,
                          include_strategy_action_details: bool,
                          known_by: datetime | None,
                          bar_loader: Callable[[object, BarRequest], tuple],
-                         allow_late_identity_continuity: bool = False) -> RealtimeScreeningInput:
+                         allow_late_identity_continuity: bool = False,
+                         bar_shard: tuple[int, int] | None = None) -> RealtimeScreeningInput:
     """The screening input with the bar set supplied by `bar_loader` (the full read or a retained one).
-    Manifest, members, actions and coverage are read on every call, with the cutoff."""
+    Manifest, members, actions and coverage are read on every call, with the cutoff.
+
+    `bar_shard=(index, count)` (R75-v2, a ticker-group projection worker): only the bars of that group of the members
+    (`shard_tickers`) are read; members, actions and coverage stay the whole cohort's. Not a screening input: the
+    cross-sectional screening needs every member's bars."""
     start, history_params = screening_history_window(
         session,
         include_portal_history=include_portal_history,
@@ -696,7 +722,7 @@ def load_screening_input(cursor, *, cohort_id: UUID, session: date,
         raise ValueError("Exact realtime screening reference membership is incomplete")
     scope = BarScope(
         cohort_id=cohort_id, provider_tier=manifest["provider_tier"],
-        tickers=tuple(m["ticker"] for m in members),
+        tickers=_bar_tickers(members, bar_shard),
         include_portal_history=include_portal_history, history_params=history_params,
         history_source_cohort_id=(
             UUID(str(history_source_cohort_id))

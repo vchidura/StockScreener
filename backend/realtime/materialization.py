@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import threading
+import zlib
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from decimal import Decimal, InvalidOperation
@@ -24,6 +25,8 @@ from .journal import NormalizedJournalRecord
 MATERIALIZER_STATE_CODEC = "realtime-materializer-shard-json-v2"
 MAX_CHECKPOINT_STATE_BYTES = 1_048_576
 MAX_QUOTE_HISTORY_PER_INSTRUMENT = 8
+MAX_INFLATED_STATE_BYTES = 64 * 1_048_576  # R68: the bound on a compressed checkpoint's JSON
+_ZLIB_HEADER = b"\x78"
 
 
 def _utc(value: datetime, name: str) -> datetime:
@@ -779,7 +782,13 @@ def encode_materializer_state(
     else:
         payload = _encode_state_full(state)
     if len(payload) > maximum_bytes:
-        raise ValueError("materializer checkpoint exceeds its byte limit")
+        # R68 (Nov 13): V4 admits 216 contracts; one current quote, one trade and 8 recent quotes each encode to ~2.5 MB
+        # of JSON, past the 1 MiB checkpoint bound (also a DB CHECK on rt.consumer_checkpoints). Store that state
+        # zlib-compressed (deterministic); a state within the bound is stored exactly as before.
+        compressed = zlib.compress(payload, 6)
+        if len(compressed) > maximum_bytes:
+            raise ValueError("materializer checkpoint exceeds its byte limit")
+        return compressed
     return payload
 
 
@@ -911,6 +920,15 @@ def decode_materializer_state(
         raise ValueError("materializer checkpoint payload must be nonempty bytes")
     if len(payload) > maximum_bytes:
         raise ValueError("materializer checkpoint exceeds its byte limit")
+    if payload[:1] == _ZLIB_HEADER:
+        # R68: an oversized state is stored zlib-compressed (JSON always starts with "{").
+        inflater = zlib.decompressobj()
+        try:
+            payload = inflater.decompress(payload, MAX_INFLATED_STATE_BYTES)
+        except zlib.error as exc:
+            raise ValueError("materializer checkpoint is not a valid compressed state") from exc
+        if inflater.unconsumed_tail or not inflater.eof:
+            raise ValueError("materializer checkpoint inflates past its limit")
     try:
         document = json.loads(payload.decode("ascii"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:

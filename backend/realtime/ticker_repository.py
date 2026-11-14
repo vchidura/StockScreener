@@ -48,6 +48,7 @@ from .ticker_projection import (
     project_realtime_ticker_workspace,
 )
 from .ticker_projection import TICKER_WORKSPACE_SUMMARY_VERSION, produce_realtime_ticker_workspace_summary
+from .ticker_projection_shards import shard_pool
 from .ticker_projection import PATTERN_WATCH_PUBLICATION_VERSION, produce_realtime_pattern_watch_publication
 from .ticker_references import (
     BarLineageChanged, chart_group_ranges, chart_points, compose_charts, evidence_expectations,
@@ -290,27 +291,37 @@ def _project_ticker_cycle(
     loader,
     scope,
     should_stop,
+    shards=None,
 ):
-    """Read-only half shared by compute and rehydration: load the inputs and project the cycle."""
+    """Read-only half shared by compute and rehydration: load the inputs and project the cycle.
+
+    `shards` (R75-v2, compute only): a `TickerProjectionShardPool`; its workers load and project their ticker groups
+    while this process loads the full input and computes the screening (`ticker_projection_shards`)."""
     load_inputs = loader.load if loader is not None else load_realtime_screening_input
     _projection_checkpoint(should_stop)
+    if shards is not None:
+        shards.prepare(scope)
     with database.transaction(
         read_only=True, dict_cursor=True, isolation_level="REPEATABLE READ",
     ) as cursor:
         _projection_checkpoint(should_stop)
         inputs = load_inputs(cursor, **scope, include_portal_history=True)
         _projection_checkpoint(should_stop)
-        market_events, market_event_coverage = _load_ticker_calendar_inputs(
-            cursor, inputs.members, inputs.cutoff,
-        )
-        fundamental_reports, fundamental_coverage = _load_ticker_fundamental_inputs(
-            cursor, inputs.members, inputs.cutoff,
-        )
-        projection = project_realtime_ticker_workspace(
-            inputs, market_events=market_events, market_event_coverage=market_event_coverage,
-            fundamental_reports=fundamental_reports, fundamental_coverage=fundamental_coverage,
-            state=state, should_stop=should_stop,
-        )
+        if shards is not None:
+            # Each worker loads its own members' calendar and fundamental rows.
+            projection = shards.project(inputs, state=state, should_stop=should_stop)
+        else:
+            market_events, market_event_coverage = _load_ticker_calendar_inputs(
+                cursor, inputs.members, inputs.cutoff,
+            )
+            fundamental_reports, fundamental_coverage = _load_ticker_fundamental_inputs(
+                cursor, inputs.members, inputs.cutoff,
+            )
+            projection = project_realtime_ticker_workspace(
+                inputs, market_events=market_events, market_event_coverage=market_event_coverage,
+                fundamental_reports=fundamental_reports, fundamental_coverage=fundamental_coverage,
+                state=state, should_stop=should_stop,
+            )
         _projection_checkpoint(should_stop)
         snapshots = projection.snapshots
         if projection.unavailable_members:
@@ -382,6 +393,7 @@ def compute_realtime_ticker_cycle(
         loader=loader,
         scope=scope,
         should_stop=should_stop,
+        shards=shard_pool(),
     )
     _projection_checkpoint(should_stop)
     snapshots = projection.snapshots

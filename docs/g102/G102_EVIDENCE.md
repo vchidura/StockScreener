@@ -2504,3 +2504,393 @@ Tests run offline in the r98 image with the worktree mounted (`runner/run_tests_
 - **Session checks scheduled (session-only crons, local = UTC-8)**: 13:01 audit, 13:31 dry run, watcher every 10 min
   14:04-21:54 (acts 14:28-21:05), 14:17 activation, 14:41 first windows (+ switch step 1 when clean), 14:50 portal,
   15:23 / 16:03 / 16:43 next switch step when the windows since the previous one are clean, 20:47 profile, 21:52 close.
+- **Commit (user ~09:57: "lets commit the changes in repo")**: secrets scan clean (patterns, the three secret files'
+  contents, the DSN password, personal details); `d573f43` on `v3-live-fixes` (59 files: r99-r102 code, f35-f38,
+  tests, G102/G106 docs, `G102_EQUITY50_PLAN_20261113.md` force-added), pushed; `main` fast-forwarded and pushed.
+  No code changed after the r102 build (08:26:38), so the commit = live r102 + f38.
+- **45-name first-window replay (user ~09:45: "would be better perform rehearsal on 45 universe?")**: a copy rehearsal
+  cannot run a market window, and r102's services were rehearsed and are verified live; the unmeasured item was the
+  first window's time at 45. New read-only tool `runner/replay45_first_window_readonly.py` (r102 image, one REPEATABLE
+  READ read-only transaction, nothing persisted): cold input load, ticker workspace projection (cold state), workspace
+  summary + Pattern Watch, Dashboard, for a past cutoff at the cohort's 25 members or today's 45 desired members
+  (member list substituted; bars known by now; reference-side stamps after the cutoff read as of the cutoff, both
+  modes alike). At Nov 12 14:35 the 20 new names stop at screening (their 283-session daily window ends Nov 12, one
+  session later than a Nov 12 intraday cutoff needs), so the ratio comes from the Nov 12 21:00 cutoff, where all 45
+  project: 25 names load 33.2 s / projection 48.0 s / Dashboard 12.6 s (450k bars); **45 names 51.6 / 87.6 / 22.3 s
+  (726k bars, 45 workspaces, none unavailable)**: x1.55 load, x1.83 projection, x1.77 Dashboard. First window at 25
+  (14:35 replay): 32.9 / 51.7 / 12.9 s. Real Nov 12 E:14:35 (`rt.stage_runs`): gate done +16.0 s, materialize 1.5 s,
+  EQUITY_PROJECTION 96.4 s, PORTAL_PUBLISH 82.9 s (old Dashboard 36.6 s of it), complete +196.9 s (Nov 10 202.7,
+  Nov 11 188.5). **Projection for Nov 13 E:14:35 at 45 on r102**: gate ~16 s + materialize ~2 s + projection
+  (32.9 x 1.55 + 51.7 x 1.83 + 11.8 s writes x 1.8) ~167 s + publish ((82.9 - 36.6) x 1.8 + 12.9 x 1.77) ~106 s =
+  **~290 s after the cutoff** (previous estimate 255 s): inside the 300 s deadline by ~10 s and the 330 s cancel point
+  by ~40 s; Options V4 load at the open is not in the replay. Kept 45 (user's choice at the deploy go); not a capacity
+  failure, so the desired25 rule was not applied. Watch: E:14:35 stage times at the 14:41 check.
+- **Pre-open audit 13:01 (`runner/preopen_audit.sh 2026-11-13`, report `data-audit/preopen-audit-2026-11-13.txt`)
+  PASS**: CLOCK OK +0.124 s; all 19 backend services on r102 `c35ac22459bf` running healthy (frontend f38
+  `8b446f09102d`); restarts=8 on controller/detectors/finalizer/stock-alerts all within ~90 s of their 09:17-09:27
+  re-create (deploy lease handover), none since; coverage 45 members, DIVIDEND_THROUGH_CLOSE 45/45, 20 leases;
+  G94 PASS (45/45); read flags: charts 199 OK + 1 REFUSED (CRWD 1m, accepted), screener Nov 12 COMPLETE 25 rows,
+  hourly 25 VERIFIED, Dashboard READY; ticker readiness 45 x 283/283 adjusted, 61 ISSUES all in the accepted set
+  (20 new names without a Nov 12 workspace/Dashboard row = 40, 9 funds without sector/industry = 18, CRWD Nov 9 1m = 3).
+  Options preparation: 5 rows for Nov 13, the 4 DEGRADED are the superseded overnight desired revisions
+  (expiration_state SUPERSEDED); the current revision 2d1e2667 is PREPARING at CATALOG_QUOTE, 9 underlyings in RETRY
+  "target-session provider window is not open; history ready" (normal pre-open). r102 live, so V4/R60/R61 are live.
+- **Pre-open dry run 13:31 (`runner/preopen_dry_run.sh 2026-11-13`, report `data-audit/preopen-dry-run-2026-11-13.txt`)
+  PASS, exit 0**: CLOCK OK +0.057 s; READINESS PASS (desired 38 EQUITY + 7 SECTOR_ETF + 9 OPTION_UNDERLYING;
+  preparation PREPARING at CATALOG_QUOTE; capability profile valid to 11-14 07:27); OPTIONS PASS: CATALOG_QUOTE capture
+  OK for all 9 underlyings (69 requests, 0 rejected rows), 15006 candidates / 0 invalid, CAPACITY_SHARDS allocation
+  216 contracts (24 x 9); STOCK_ALERTS PASS (19 evaluations, 2.9 s); WORKSPACE PASS (Nov 12 20:55, 25/25, 84 s,
+  largest GOOGL 131009 B of 131072, over 0; payloads peak at 130.8-131.0 KB in every dry run since Nov 10: the
+  projection fits to the bound). Known WARN only: O2 UNAVAILABLE / O3 BLOCKED 77/77 on Nov 12 (O3 still off;
+  O2 by design). Previous Options windows 77 COMPLETE, max 40% / p90 29% of budget. Live 13:33: 19 backend services
+  on r102 `c35ac22459bf` (18 healthy + preparation, no healthcheck), frontend f38 `8b446f09102d`, no restarts since
+  the deploy's lease handover. **GO, user's pre-given go ~09:45** ("record my GO after pre open audit"): the 13:01
+  audit and this dry run both pass. 45 names stay (first-window replay ~290 s projected; check at 14:41).
+- **Activation check 14:17: FAIL, controller crash-loop (R62)**. `session_services.sh 2026-11-13T14:10:00Z`: controller
+  restarts 8 -> 18 (21 by 14:19), state restarting, 10 errors; every other service on r102 healthy, no new errors.
+  Every start since the 14:15 activation raises `psycopg2.errors.InsufficientPrivilege: permission denied for table
+  advanced_ingress_runtime_profiles` in `ensure_exact_advanced_runtime_profile_cursor` (controller line 877,
+  repository line 162): the 45-name activation needs an exact-45 runtime profile; the 1/9/25 profiles were registered
+  by the admin role and the app role has SELECT only. Not a hardware capacity issue; desired25 after 14:15 applies to
+  the next session only, so it does not restore today. Fix prepared: `runner/register_exact_profile_nov13.py` (same
+  function, same arguments, admin role; writes one INSERT + one UPDATE on that table only); dry run 14:19:17 rolled
+  back: exact-45 `9917e7e7...` `advanced-equity-ingress-v1-exact-45-capacity-50`, ladder [1, 9, 25, 45], position 3,
+  capacity 50, ACTIVE beside 1/9/25. Waiting on the user's yes (durable admin write). session_health 14:19: MEMBERS 45,
+  Options preparation PREPARING at CATALOG_QUOTE (provider window not open yet), Options stream LIVE, no runtime alarm.
+- **R62 fix 14:35:52 (user ~14:35: "go ahead")**: `register_exact_profile_nov13.py --commit` (admin role): exact-45
+  `9917e7e7af3f...` `advanced-equity-ingress-v1-exact-45-capacity-50` ACTIVE, ladder [1, 9, 25, 45]. Controller
+  started 14:35:54 (restarts 36 total), healthy, no log errors since. 14:37 watcher: STOCKS stream `529056c3` LIVE,
+  STREAM_GAPS 135 / ADVANCED_HISTORICAL_1M 135 COMPLETE (the 14:30-14:36 gap repaired), Options stream LIVE,
+  OPTPREP ACTIVE COMPLETE, no OPT_RUNTIME_ALARM. Knock-on: the scheduler crash-looped 14:3x (restarts 0 -> 10) with
+  `ValueError: Advanced reference readiness is unavailable` (cohort `e2ad1a24` and its desired snapshot were
+  materialized at 14:35:26, after the early cutoffs, so `_continuous_reference_evidence_cursor` returned None and the
+  stale global seed path raised; the window raises instead of skipping); windows 14:32-14:35 then completed and the
+  scheduler has run without error since 14:38:31. First projection window for the 45 cohort is E:14:40 (gate 0.1 s,
+  materialize 2.8 s, projection running at 14:41). Lost: Equity 14:15-14:36 (no first window at 14:35).
+- **First windows 14:41-15:0x**: Equity (45 names, cohort `e2ad1a24`): the gap windows `adv-hybrid` 14:32-14:35
+  COMPLETE (14:35 had no projection: the cohort materialized 14:35:26); **E:14:40 = first projection window, cold:
+  gate +15.6 s, materialize 2.8 s, EQUITY_PROJECTION 123.2 s, PORTAL_PUBLISH 92.4 s, COMPLETE +234 s** (300 s budget;
+  replay projection ~290 s; Nov 12 at 25: projection 96.4 s, publish 82.9 s, +197 s). **E:14:45 warm: projection
+  29.3 s, publish 0.9 s, COMPLETE +50 s** (Nov 12 at 25: +41 s). TICKER_WORKSPACE_V1 45 at 14:40 and 14:45, all 20 new
+  names included; Dashboard 14:40 "Selected realtime cohort: 45 tickers". Options: preparation ACTIVE COMPLETE,
+  stream LIVE, but no Options window ran: the scheduler failed every cycle from 14:43:57 with `stored Options control
+  scope changed` (R63: Options cohort `ca0e528d` stored universe `market-options-25-9-v1` `bc7bc1...` from the Nov 12
+  READY source; today's plan `market-options-45-9-v1` `3937c4...`; G96 narrowing `d9e017...`), then
+  `Options snapshot interval deadline expired` exited the process (user pasted it ~14:50). Switch step 1 (O3) NOT made:
+  the first Options windows did not run.
+- **R63 fix forward**: r103 `sha256:d39c6a38c83c...` (built 14:53, scheduler only, hotfix 14:58:03) accepted the
+  rebuilt prepared universe in `bind_continuous_selection` but the binding's round-trip rebuild
+  (`p8_production_binding_from_payload`) still lacked it (cycles failed the same way). r104 `sha256:d402bf161b72...`
+  (built 15:02:45) also carries `control.stored_universe` in the binding payload; hotfix order p8-window, p8-flow,
+  p8-market-state, p8-ingress (the payload loaders), then the scheduler; fallback for each: r102
+  `sha256:c35ac22459bf...` (same hotfix). Heavy build in session: code-only layer, ~20 s each.
+- **Portal check 15:04 (f38, read-only, light)**: `/api/tickers/overview?cohort_id=e2ad1a24...` 45 rows (all 45
+  desired names); `/api/stock/{AAOI,WMT,XLV,GS}/workspace-publication` 200; Dashboard published 14:40 for cohort
+  `e2ad1a24` ("Selected realtime cohort: 45 tickers"; next Dashboard at the close: Nov 12 also had 3 per day, first
+  window + close); served bundle (frontend :5174) holds the f38 rules: `.tm-session select.tm-session__value,
+  .tm-session--static .tm-session__value{...font-family:inherit;font-size:11px;font-weight:600...}` (one font for
+  the session dropdowns and the static date), the static `tm-session--static` "Latest stored trading session" (Options
+  Screener, no picker), and the ticker chunk `.tk-stats{display:flex;flex-wrap:nowrap;gap:4px 14px}` (stats on one
+  row). No portal issue to batch. Watcher 15:04: Equity COMPLETE 5/5 since 14:53 (47-57 s), 45 workspaces per
+  cutoff, no service errors; Options PENDING (R63 rollout), OPT_RUNTIME_ALARM 0, O1_SELECTED_NOT_STORED 0.
+- **R63 r104 rollout done 15:13:40** (p8-window 15:03:17, p8-flow 15:03:59, p8-market-state 15:08:03, p8-ingress ~15:08:48,
+  scheduler 15:13:02; each waited for minute 3:00-4:15 of the cycle). Scheduler cycle 15:13:59 captured breadth and bound
+  E:15:10 (`ALREADY_ATTACHED`): the scope check passes. The window role then DEFERRED with
+  `RESIDENT_ROLE_NOT_COMPLETE:MARKET_STATE/FLOW`: ingress completes each window, market-state and flow (idle until the first
+  binding) replay the Options journal from the 14:35 stream start (`1bc4c1b3`, 1.9M frames by 15:18, ~730/s; Nov 12 whole
+  day 4.7M) at ~90-117% CPU. No Options window COMPLETE yet at 15:43 (E:15:00-15:40 PENDING).
+- **R64 Equity cold loop 15:15-15:30 and mitigation**: see the matrix row. E:15:15 MISSED, E:15:20 FAILED (324 s), E:15:25
+  MISSED; scheduler restarts 10 -> 12 (15:17:15, ~15:29, exit 0, no OOM); `docker update --cpus 0.3` on p8-flow and
+  p8-market-state 15:31:11; E:15:30 cold COMPLETE +299 s (projection 151 s, publish 107 s), E:15:35 warm +74 s; cap lifted
+  15:37:34; E:15:40 warm +113 s under full Options load. User pasted the `cursor already closed` EQUITY_PROJECTION
+  traceback (15:30:26 and 15:35:31: the cancelled cold retries of E:15:25, not the live windows). Host/VM checked: 16 CPUs,
+  host CPU 37-60%, VM MemAvailable 7.9-8.8 GB, PSI memory 0, Postgres ~76 commits/s; heavy parallel bar-selection queries
+  from the Options Equity-input readers during the catch-up.
+- **Watcher 15:44 + switch step (15:23 cron) SKIPPED**: Equity COMPLETE 10 since 15:33 (E:15:30-15:40), bad rows are the
+  15:15-15:25 windows and their retries (R64); Options 9 windows PENDING, none COMPLETE (market-state/flow catch-up), so
+  no switch: the step needs >= 3 clean Options windows. Note for the next step: the Options P8 roles and the scheduler
+  run r104 `sha256:d402bf161b72...` (R63); a switch hotfix on them must use `-Image sha256:d402bf161b72...`, not r102
+  (r102 would remove the R63 fix). New faults: scheduler pool-closed / cursor-closed / visibility-seal (R64 row),
+  STREAM_STALE 3d3997c3 (B14a, known), CLOCK_CHECK_FAILED SNTP timeout once (re-check 15:45: CLOCK OK +0.077 s).
+  OPTIONS_LAG 16 s on stream `1bc4c1b3`; STOCK alerts UNAVAILABLE 35 at 15:30 (the cold window).
+- **Status 15:52-15:55 (user: "lets check the status")**: Equity warm and in budget since 15:35 (E:15:35 +74 s, 15:40
+  +113 s, 15:45 +71 s, 15:50 +65 s; 45 workspaces each); old-cutoff retries (15:15/15:20/15:25) keep failing between
+  live windows (scheduler errors 12, noise). Options: 11 windows PENDING, none COMPLETE; ingress completes every
+  window, market-state and flow none. Journal (`options-acquisition/db09f898.../options.sqlite`, SQLite WAL): 4.7 GB +
+  593 MB WAL at 15:54; **6.59M events in 80 min (~1,370/s) from 216 instruments (V4 24 x 9); Nov 12 whole day 8.05M
+  events / 6.5 h (~340/s) from 72 instruments**. Growth measured 26,462 events / 21 s. Flow read 4.1 GB in 21 s (rchar
+  ~197 MB/s, 48k reads/s; 441 GB since 15:04), market-state ~14 MB/s; neither has completed E:15:05 (~2.5M events to
+  replay) after ~42 min, i.e. below the ~1,370/s arrival rate: they cannot catch up today at V4 volume. New matrix item
+  for tonight (R65): P8 market-state/flow throughput at V4 volume (per-read connection on a 593 MB WAL; flow re-reading),
+  and the V4 admission profile (216 contracts) vs single-threaded consumers.
+- **Options P8 cap 15:57:10 (user ~15:56 "yes, go ahead")**: `docker update --cpus 0.3` on p8-flow and p8-market-state
+  (no restart, running), to keep Equity's headroom for the rest of the session (R65: Options cannot catch up today; the
+  catch-up load slowed Equity 15:15-15:30, R64). Acquisition untouched (keeps journaling the full day for tonight's R65
+  work). Undo: `docker update --cpus 8 <both>`. The cap lives in the container config: it survives a restart but not a
+  recreate (hotfix); LIFT IT AT THE CLOSE so Monday's session does not start capped.
+- **Switch step 16:03: SKIPPED** (none done yet; O3 not set on p8-window). Gate not met: 0 Options windows COMPLETE today,
+  market-state/flow resident completions none (R65; P8 roles capped 0.3 CPU since 15:57 with the user's go). The 16:43
+  step will skip for the same reason; the switch sequence moves to Monday after the R63/R65 fixes.
+- **R66 opening-slot derived bars 16:05-16:18**: Stock alerts UNAVAILABLE 35 at 15:30 and 16:00, all
+  `TRIGGER_WARMUP_REQUIRED` (policy `3-research`; Nov 10-12 OPEN alerts existed). Cause: no 5m/15m/30m/1h bars at 14:30
+  for any of the 45 names (5m from 14:35, 15m from 14:45, 30m from 15:00); the 1m 14:30-14:34 exist as NATIVE_REST
+  (gap repair), 14:35+ REALTIME_STREAM; Nov 12 had all four 14:30 bars x 45. The research history cuts at a missing bar.
+  User asked whether the R61 Dashboard fix caused it: no (R61 = `dashboard_input_bars` read filter; r102's other
+  materialization change is the Options persist-check switch). Repair (user "ok, go ahead"):
+  `runner/repair_opening_bars_nov13.py`; dry runs rolled back (first two exposed the tuple-cursor writer and the
+  known-by read stamp), final dry run 45 x 4 intervals, 0 skipped; `--commit` 16:15:05; check 16:15: 5m/15m/30m/1h 14:30
+  present for 45. E:16:15 COMPLETE +165 s (projection 131.5 s absorbing the bars). Stock alerts re-check at 16:30.
+- **R66 verified 16:30**: no STOCK alert rows UNAVAILABLE at 16:30 (35 at 15:30 and 16:00); the rules evaluated (no
+  match stored). Equity E:16:20-16:55 COMPLETE 62-82 s (E:16:30 177 s at the half-hour), scheduler restarts 12 since 15:29.
+- **R67 late start (user ~16:28 "ok, go ahead" to resume Options today)**: user challenged "every window must be
+  reproducible from the journal": code check showed it is not a rule (checkpoint + rows commit together for crash
+  consistency; flow already starts at the tail after a rejected checkpoint and has WARMING; market-state state is
+  point-in-time). r105 `sha256:ac3abd892dc7...` (16:31) = late start + flow snapshot reader/throttle; the router state was
+  found already at the tail (8,512,224 at 16:31) and flow had checkpoints at raw 1,614,610 (~1 h behind), so r106
+  `sha256:eeba30046743...` (16:57) adds the stale-checkpoint late start for flow. Switch set 16:57:20 on p8-market-state
+  and p8-flow (backup compose.stable.20261113T165720Z.json); hotfix to r106 started 16:57 (in-session slot).
+- **Switch step (16:43 cron) SKIPPED 16:58**: still 0 Options windows COMPLETE; R67 r106 rollout on p8-market-state and
+  p8-flow in progress. The switch sequence (O3/SAMPLED/gamma/R55) moves to Monday. R66 check (16:33 cron): PASS, see the
+  "R66 verified 16:30" line above.
+- **R68 market-state checkpoint byte limit (found 17:08)**: after the r106 late start market-state committed 9,673,258 then
+  every slice failed `MARKET_STATE_VALUEERROR` (shard state FAILED). Offline replay of the same journal records:
+  `ValueError: materializer checkpoint exceeds its byte limit` (1 MiB `MAX_CHECKPOINT_STATE_BYTES`, also a DB CHECK on
+  rt.consumer_checkpoints.state_payload); V4's ~205-216 contracts x (quote + trade + 8 quote history) encode > 1 MiB of
+  JSON (Nov 12 max 889 KB at 72 contracts). Likely also why market-state never progressed 15:13-16:58. Fix r107
+  `sha256:8ab5e807c5a8...`: an oversized state is stored zlib-compressed (decode detects the zlib header; within-limit
+  states unchanged). Offline: 30k events, 205 instruments -> 158 KB, round-trip equal; materializer ~21k events/s.
+  Tests: materialization suites 327 passed, 2 pre-existing Dashboard-suite failures. Hotfix p8-market-state 17:23
+  (fallback r106); 17:25 committed 10,613,258, shard WARMING, completes each window within ~1 s of ingress.
+- **Flow hold and reconciler (17:27-18:05)**: flow held at the barrier of a window market-state could not complete (by
+  design consumers wait at the earliest open window); then crawled (~4 msgs/s, ~175 MB/s reads):
+  `_FlowVolumeBaselineReconciler.apply` called `offsets_at(snapshot_at)` per pending baseline per pass on a new connection
+  (thousands pending since 15:13; cost grows with events after an old snapshot). r108 `sha256:4014d97bfd31...` (17:45):
+  cache per snapshot time + drop baselines older than a late start: E:17:40 FLOW COMPLETE 17:44:43 (first full resident
+  barrier of the day), flow events resumed. 17:48:41 `RuntimeError: P8 volume baseline remained incomplete` (89 of 210
+  contracts not accepted) crashed the role; r109 `sha256:7954dbd877d0...` (18:00): newest baseline per contract only,
+  rejections logged instead of stopping the role. 18:04:33: 192 SNAPSHOT_RECONCILED; 18 WARMING rows left from the
+  16:58-17:48 runs (updated 17:48:51; the current engine does not reconcile them) block every window with
+  `OPTION_VOLUME_CHECKPOINT_INCOMPLETE` (E:17:55, E:18:00). Proposed unblock (user "yes"): set those 18 rows
+  WARMING -> INCOMPLETE (the window accepts INCOMPLETE by design); the live write was refused by the session permission
+  check, not applied; the user can apply it.
+- **E:18:05 Equity FAILED +16 s**: EQUITY_INPUT_GATE `ADVANCED_INPUT_NOT_READY` x3: GS (instrument 19383) AM minute
+  18:04-18:05 missing; two REST repairs WAIVED (`Advanced hybrid repair blocked: BLOCKED_GAP`); E:18:10 gate COMPLETE.
+  Stock alerts: 2 OPEN at 18:00 (first matches today).
+- **Options resumed 18:13-18:20 (user "retry the update")**: first attempt refused by the session permission check;
+  retried on the user's word. The script guard (commit only at the expected count) rolled back the first run (17 rows:
+  flow had reconciled one of the 18 itself); re-run with `1 <= count <= 18`: committed 18:13:36, 17 rows WARMING ->
+  INCOMPLETE (`rt.option_volume_checkpoints`, session 2026-11-13, updated_at < 17:57:41); 193 SNAPSHOT_RECONCILED, 0
+  WARMING. **First Options window of the day: E:18:10 (options cutoff 18:15:00) COMPLETE 18:16:05 (65 s)**, every stage
+  COMPLETE; marks 47 (169 NBBO stale/noncausal, 1 underlying), 6 contracts unpackaged (volume INCOMPLETE, DEGRADED fault
+  by design); lanes O1 COMPLETE_SELECTED (3 packages), O2 UNAVAILABLE (model not accepted), O3 BLOCKED (R44), OS1/OS2
+  BLOCKED `*_E_CONTEXT_INCOMPLETE` (the AAPL 5m 18:00 bar was observed 18:15:15: the GS 18:04 gap held 5m finalization;
+  every other 5m bar ~16 s after its end). **E:18:15 (18:19) COMPLETE 65 s: O1 COMPLETE_SELECTED (5 packages total), O2
+  UNAVAILABLE, O3 BLOCKED CANONICAL_MARKS_UNAVAILABLE, OS1 COMPLETE_ZERO (as Nov 12), OS2 BLOCKED
+  OS2_BAR_MEMBERSHIP_UNAVAILABLE** (3-bar window still spans the late 18:00 bar). Images: p8-market-state r107, p8-flow
+  r109, p8-window/ingress/scheduler r104, lifecycle/acquisition r102; switch REALTIME_V3_OPTIONS_LATE_START=ON on
+  market-state and flow.
+- **R70 Equity scheduler exits = retry report path (found 18:23)**: scheduler log 18:18:57 `run_realtime_v2_advanced_equity_scheduler.py:
+  error: --report-path must be new` (argparse error in the window step when a retry attempt re-runs and finds its own
+  earlier report) ends the whole scheduler: restart, cold window. Explains R64's exit-0 restarts (15:17, 15:29) and
+  13-15 (after the E:18:05 GS-gap retries). r110 `sha256:25012adbd804...` (built 18:25): `_new_report_path` writes a
+  re-run's report beside the old one; tests 106 passed + 1 pre-existing compose test failure (same without the change).
+  Hotfix realtime-v2-advanced-scheduler 18:29:33 (fallback r102 `sha256:c35ac22459bf...`); Options P8 roles capped
+  0.3 CPU again 18:25:59.
+- **R71 Postgres predicate-lock exhaustion (18:35, user pasted the Stock alerts traceback)**: canonical stock alerts
+  crash-looped (restarts 8 -> 16) on `psycopg2.errors.OutOfMemory: out of shared memory` (HINT max_pred_locks_per_transaction;
+  live setting 64, max_connections 100); its batch runs SERIALIZABLE and since the R66 repair evaluates every rule over
+  45/60/330 sessions of 30m/1h/1d history for 38 members: one session held 8,664 -> 38,598 SIReadLocks. Equity slowed
+  (materialize 49 s) and fell into a cold loop: E:18:20 FAILED 326 s, E:18:25 FAILED, E:18:30 MISSED (projection
+  STAGE_TIMEOUT), E:18:35 FAILED (input gate), E:18:40 FAILED 327 s (publish 120.6 s). Stopped the Stock alerts service
+  18:37:33 (`docker stop`; undo `docker start stock-screener-realtime-v2-canonical-stock-alerts`): SIReadLocks 38,598 ->
+  110. E:18:45 COMPLETE 322 s (cold), **E:18:50 COMPLETE 126 s warm**: Equity recovered. Stock alerts stays stopped
+  for the session (a restart re-fills the lock table); fix after the close: max_pred_locks_per_transaction (Postgres
+  restart) and/or the batch's reads outside SERIALIZABLE.
+- **R72 retries off during the session**: a retry of an older cutoff rebuilt cold into the live slot (`_rebuild` remembers
+  the older cutoff; a cancelled retry leaves the slot empty), so every retry pushed the next live window cold. r111
+  `sha256:6b36ccbbba0e...` (19:04, retries > 10 min old skipped in session), then r112 `sha256:7b979561de92...` (19:19,
+  no retry during the session; they run after the close). E:19:00 warm 86 s; E:19:05/19:10/19:20 cold FAILED
+  (projection 216-226 s + cold publish ~120 s > 300 s; E:19:10 also hit Postgres `cache lookup failed for type
+  466160518` once). Host not contended (CPU 34-37%, disk 25%, 9 GB free); Postgres temp spill 108 GB cumulative.
+  Portal (user 19:2x): chart shows "Market data is not current; displaying the retained publication." = the designed
+  label while Equity windows fail (last good E:19:00).
+- **R73 450 s budget attempt reverted (user "ok, raise to 450")**: r113 `sha256:e09bfa3df9eb...` + switch
+  REALTIME_V2_EQUITY_COMPLETION_BUDGET_SECONDS=450 on the scheduler (backup compose.stable.20261113T192911Z.json), hotfix
+  ~19:30 (script exit 1 during lease handover); the scheduler then crash-looped on `Advanced Equity lifecycle timing is
+  invalid` (advanced_equity_lifecycle.py:118 bound 300). Reverted 19:34:29 (switch removed, backup
+  compose.stable.20261113T193429Z.json) + hotfix r112, running 19:38:02. Not retried today: the 300 s bound is a shared
+  invariant (session_windows.MAX_BUDGET_SECONDS: window deadline = release + budget; serving expiry = release + 5 min +
+  lag; controller/session recovery/lifecycle compute the same windows) -> a design change for tonight (user agrees Options
+  may start later on the last completed E).
+- **R74 scheduler exit on a resumed first attempt (19:44:56-19:45:14, x3)**: `run_realtime_v2_advanced_equity_scheduler.py:
+  error: receipt reuse requires a durable retry identity` (the window step requires a `-retry<N>` suffix with
+  `--reuse-input-receipt`; a first attempt resumed with stored receipts from a run killed by the r113 crash loop had none);
+  each exit restarted the scheduler -> E:19:45 cold. E:19:40 COMPLETE 294 s (cold fit). r114 `sha256:c23825997b5b...`
+  (built 19:48 = r112 + suffix whenever receipts are reused + such resumptions wait for the close; r113 budget edits
+  removed): NOT deployed now (a deploy costs a cold window; the trigger needs another killed window, and after the close
+  retries carry their suffix); goes with tonight's package.
+- **R75 parallel ticker projection (user ~20:00 "lets implement parallelism quickly to test during remaining market
+  hour")**: prototype replay (`runner/parallel_projection_readonly.py`, 19:55 cutoff, 45 members, 743,413 bars): serial
+  cold projection 167.3 s, load 112.5 s; its subset workers failed `Screening bars extend beyond the exact manifest`
+  (screening must run once on the whole universe). r115 `sha256:5bebad60b7b6...` (switch
+  REALTIME_V2_TICKER_PROJECTION_WORKERS, default off; parent computes screening once, forked workers project contiguous
+  ticker blocks, results concatenated in serial order). Parity replay (`runner/parity_parallel_projection_readonly.py`
+  19:55 4, read-only): **outputs identical** (45/45 workspaces, order, materializations, pattern materializations,
+  charts, unavailable, screening) but **parallel 350.6 s vs serial 130.0 s (x0.37)**: each worker re-runs the shared
+  prologue over all bars (and the parent's screening pass too), results (incl. full summary chart points) are pickled
+  back, forked copy-on-write of a multi-GB input. NOT enabled live. Tonight: prologue once in the parent before the
+  fork, per-worker row slices, compact results; gate = this parity test. Same cold projection: 130 s in a fresh replay
+  process vs 216-226 s in the live scheduler (heap/GC of an 8-10 GB process). The replays' heavy loads coincided with
+  E:20:05 MISSED 344 s and E:20:10 MISSED 320 s.
+- **R76 VM stall 20:16:51-20:22 (caused by my parity replay)**: the 12 GB-capped parity container (4 forked workers on a
+  multi-GB input) next to the ~10 GB Equity scheduler exhausted the 24 GB Docker VM: swap-outs 0.65M -> 2.7M pages, Docker
+  API 500, last good lease renewals 20:16:51. Lease heartbeats died (`Advanced V3 service state is invalid`: lease_until
+  < observed): restarts 20:21:56-20:22:15 of Equity scheduler, controller, capability-refresh, Options acquisition,
+  lifecycle, p8-flow, p8-market-state, p8-window, p8-ingress; Options scheduler and publication-retry kept running
+  without a lease (unhealthy since 20:17), restarted by me 20:27:23 (healthy). Stocks stream 529056c3 FAILED 20:16,
+  new session 72e0e4b6 LIVE; 1m bars 20:16-20:20 missing for all 45 (gap UNRESOLVED, hybrid repair
+  `REPAIR_RETRIES_USED`); E:20:20 FAILED, E:20:25 FAILED (input gate); E:20:30 gate COMPLETE (MISSED_FIVE_MINUTE_BARS_REQUEUED).
+  Options stream 1bc4c1b3 watermark stuck 20:16:56: acquisition gateway closed 1006 at 20:22:33, then `Advanced journal
+  pump did not stop` (left as is to the close; journal holds 14:35-20:16 for tonight's replay). Clock OK +0.17 s; VM
+  MemAvailable back to 19.9 GB. User ~20:28: unavailable for authorizations; close smoothly -> no further data writes
+  today; tonight: repair the 20:16-20:20 minutes and their derived 5m/15m/30m/1h/1d (Monday warmup), user's go.
+  No more test containers during a session (memory).
+- **Options role profile 20:47-20:51 (60 s per role, shortened; not comparable with Nov 12 #4)**: conditions: market-state
+  and flow capped `--cpus 0.3` (since 18:25:59) and catching up after the 20:17-20:22 stall; Options stream 1bc4c1b3
+  flowing again (watermark 20:47:08, frames 8.18M -> 8.38M: acquisition recovered by itself); switches: V4 profile,
+  late start ON (market-state, flow), market-state LOOP=V3 / HASH=CHECKPOINT / ENCODE=CACHED, Flow V3 loop; O3/SAMPLED
+  off. market-state CPU 18-31% (cap), 67.0% journal read (SQLite `read_normalized_after`, genexpr 38.4%), hash/JSON
+  7.0%, materialize 6.9%, window stages 6.2%, detector routing 5.9%, DB write 4.4%. Flow CPU 9-17%, flow 54.5%, hash/JSON
+  24.4%, DB other 9.8%, journal read 6.2%. Nov 12 #4: market-state 14% CPU, hash/JSON 8%; Flow 7%. For R65 tonight:
+  at V4 volume market-state is journal-read bound (per-record object building in the shared read).
+- **Options P8 cap lifted 21:16 UTC** (`docker update --cpus 8` on p8-flow and p8-market-state; NanoCpus 8000000000,
+  both running). Monday does not start capped. E:21:00 close window MISSED 21:05:06 (no stage started,
+  WINDOW_DEADLINE_PASSED; Nov 12's close completed on retry 4); scheduler idle at 21:16, close check at 21:52.
+- **CLOSE Nov 13 (21:52 UTC, `runner/close_check.sh`)**: Equity windows COMPLETE 55 (last 20:55 +43 s), FAILED 25 (14
+  cutoffs), MISSED 15 (9), RUNNING 7 (orphans of killed processes), cutoffs not complete 22; **E:21:00 close window MISSED
+  (no stage started, never retried: the scheduler stayed idle after 21:05)**. Daily: ADJUSTED NATIVE_REST 13/45 at 21:50
+  (after-close refresh running alphabetically; Nov 12: 51 by 05:10, RAW DERIVED 45 at 07:24 Nov 13); Nov 13 5m bars 75/78
+  per ticker (missing 20:15 and 20:20 = the stall hole, and 20:55 = the close), so the RAW daily (derived from 5m) cannot
+  be complete until the hole is repaired. Options windows COMPLETE 8 (last 19:59), PENDING 43; O1 packages 46 today;
+  alerts OPTION OPEN 11, STOCK OPEN 2 (STOCK UNAVAILABLE 70 = the 15:30/16:00 warmup rows). Journals: Equity 5b477edf
+  and 0b7d0b60 DRAINED; Options Nov 13 db09f898 WRITING, Nov 12 e3e11560 DRAINING (R54). API restarts 0. **R60
+  VERIFIED**: preparation after-close `earnings_calendar REFRESHED` companies 35 facts 56, `fundamentals REFRESHED`
+  companies 35 reports 2832. Options cap lifted 21:16. Stock alerts service still STOPPED (R71).
+- **Day summary**: r102 + V4 + 45 names deployed pre-open on the user's go; the session found and fixed live R62
+  (exact-45 runtime profile, admin), R63 (Options universe at prep, r104), R66 (opening-slot derived bars, repair), R67
+  (late start, r106), R68 (market-state checkpoint > 1 MiB, r107), R69 (flow reconciler, r108/r109), R70 (scheduler
+  exit on a retry report path, r110), R72 (in-session retries, r111/r112), R74 (resumed first attempt, r114); mitigated
+  R64/R71 (Options CPU cap; Stock alerts stopped); open R65 (V4 volume vs P8 consumers), R73 (cold window at 45 names
+  vs 300 s), R75 (parallel projection prototype), R76 (VM stall from my parity replay; 1m 20:16-20:20 hole). Equity at
+  45 names ran warm 55-130 s; cold windows late in the day 290-340 s. Options produced windows only 18:16-19:59 (O1
+  COMPLETE_SELECTED, OS1 COMPLETE_ZERO).
+- **Nov 13 data repair (Nov 14 00:48-00:57 UTC, user: "lets address the missing equity data today")**, R76:
+  - 1m 20:16-20:20: the platform's own tool `scripts/run_realtime_v2_advanced_gap_repair.py` (the controller's hybrid
+    repair subprocess), run by `docker exec` in the controller container under the wrapper's `--health-probe` (secrets
+    loaded, no lease), plan 8b6ff5ca, `--gap-start 20:16 --gap-end 20:21`: `--plan` clean, then `--execute` 00:53:03-16:
+    COMPLETE, 45/45 REPAIRED, 45 provider requests, 2,983,472 bytes, 225 NATIVE_REST bars (quality
+    EXPLICIT_ADVANCED_REST_REPAIR_V1); stream-wide gap f018f997 (20:16:01-20:21:30) closed REPAIRED. Budget after: plan
+    repair requests 237/360. Report `/var/lib/realtime-v2-reports/manual-nov13-gap-repair-20261114T0053Z.json`.
+  - 5m 20:15/20:20/20:55 and the bars over them: `runner/repair_close_bars_nov13.py` (r102), the product's path as a
+    window's EQUITY_MATERIALIZE runs it (the Nov 6 B20 fill): finalizer jobs for the ORIGINAL window attempts
+    (advanced-20261113T202000Z, ...T202500Z, ...T210000Z; policy 4c7ca091, build advanced-equity-window-v2), then
+    `enqueue_interval_derivation_jobs_cursor` at the DB clock and the derivation worker. Dry run (read only, 00:55:22):
+    135/135 outcome LATE (complete inputs past the deadline), every derived 5m equal to an independent 1m aggregate;
+    would add exactly 15m 20:15/20:45, 30m 20:00/20:30, 1h 19:30/20:30 and the RAW 1d x 45. Apply 00:55:36-00:56:06:
+    finalizer 135 claimed/135 output, derivation 315/315, failed 0. After: Nov 13 RTH RAW 1m 390 slots (17,549 = all
+    but GS 18:04), 5m 78x45, 15m 26x45, 30m 13x45, 1h 7x45, 1d 45.
+  - GS 18:04 1m stays absent: the controller tried it by REST 12 times 18:08-18:35 (all STREAM_GAP_REPAIR_FAILED, the
+    provider returns no bar); GS's 5m 18:00 volume is ~7,750 shares: a no-trade minute (like CRWD Nov 9), accepted.
+  - Readiness for Nov 16 (`runner/ticker_readiness.py 2026-11-16`, 00:56): all 45 adjusted 283/283, raw 20/20, weekly
+    2026-11-13, monthly 2026-10-30, Nov 13 intraday 390/78/26/13/7 (GS 389), 1h 20/20, earnings valid to Nov 16 21:07,
+    fundamentals current. Flags: dividend coverage on all 45 (the rule wants it received within a day of Monday's close;
+    the preparation role refreshes it Monday morning: recheck at the 13:01 audit), funds without sector (known), and no
+    workspace/Dashboard at the Nov 13 close on all 45 (the close window never ran: R77).
+  - **R77 found**: the close window was MISSED (21:05:06, attempt 1) and never retried. On other days the close fails
+    while waiting for the daily bars, retries 1-3 in session, and the completed-session recovery completes it as retry
+    4 (~21:40). R72 removed the in-session retries, and `_recover_completed_session_window` only starts at
+    `next_attempt >= scheduler_window_retry_max_attempts + 1`, so a close at attempt 1 is never recovered (and never
+    marked finished). Last published Equity window: E:20:55.
+- **R77 fixed and the Nov 13 close published (Nov 14 01:07-01:20 UTC, user: "yes, lets close the daily properly")**:
+  - Fix (`scripts/run_realtime_v2_advanced_equity_scheduler.py`): `_recover_completed_session_window` no longer waits for
+    `next_attempt > scheduler_window_retry_max_attempts`; it runs only IDLE/BEFORE_OPEN (past the drain deadline) anyway;
+    the cap `max_attempts + COMPLETED_SESSION_EXTRA_ATTEMPTS` stays. Tests: `test_realtime_v2_advanced_session_recovery.py`
+    (old "waits until ordinary retries are exhausted" replaced: attempts 1 and 3 are recovered; DRAINING still waits);
+    `-k "scheduler or recovery or retry or session_window"` 221 passed, 2 failed - both fail the same on the live r114
+    image (gateway delayed-pong simulation, a compose-file read), unrelated.
+  - Read-only check with r116 before the deploy: `plan_session_windows` for Nov 13 -> close row next_attempt 1, MISSED,
+    ready True (1m, 5m and adjusted daily present).
+  - r116 `alpha-research-realtime-v3:stable-nov5-r116-900f81eacb21037e` = `sha256:523cae4a0174...` (r115 + R77; the R75
+    projection code is in, switch unset = serial path unchanged) hotfixed on realtime-v2-advanced-scheduler 01:12:44-48
+    (pre-images `rollout/pre-r116-images-20261114.txt`; others unchanged). Fallback r114 `c23825997b5b`.
+  - The scheduler recovered the close at once: `advanced-20261113T210000Z-retry1` COMPLETE 01:17:2x - INPUT_GATE 0.1 s,
+    MATERIALIZE 9.5 s, PROJECTION 163.0 s (cold), PORTAL_PUBLISH 87.0 s; no reason codes; scheduler healthy, peak ~7.5
+    GiB, no restarts.
+  - Readiness for Nov 16 again (01:18): workspace and Dashboard ok at the Nov 13 close for all 45 (SUMMARY/DASHBOARD
+    unavailable []). Left: dividend coverage x45 (Monday-morning refresh), funds without sector, GS 18:04 and CRWD Nov 9
+    no-trade minutes (their ticker pages lack the 1m chart: NATIVE_1M_HISTORY_INCOMPLETE, as CRWD already did).
+- **R75 decision and R75-v2 build (Nov 14 01:20-02:40 UTC, user: analyze revert vs evolve; then "building in that
+  line on the current code, validate and run a quick rehearsal")**:
+  - Profile (read only, E:20:55 input, 9 GB cap): cold projection 190.9 s under cProfile, peak 5.25 GB; per-ticker
+    work ~89% (interval materialization 48%, bar facts 19%, derived-bar verification 17%), screening 7%. Live Nov 13:
+    warm windows project in 25-33 s (publish ~1 s), cold ones 123-163 s (publish 87-96 s = the Dashboard rebuild,
+    which re-reads every bar through its own loader slot). R75's 0.37x was measured during the VM stall it caused.
+  - R75 (fork pool) removed from `ticker_projection.py`; kept the seam `member_filter` / `screening_override`.
+  - R75-v2 built, switch `REALTIME_V2_TICKER_PROJECTION_SHARDS` (unset = serial, unchanged): `realtime/
+    ticker_projection_shards.py` (K spawned long-lived workers; worker i owns sorted block i (`shard_tickers`), loads
+    only its group's bars (`load_screening_input(bar_shard=)`) and reference rows with its own delta loader, keeps its
+    pair warm with the `_WarmProjection` rule, projects its group with the coordinator's screening; the coordinator
+    loads, screens once and merges; cycle-numbered protocol; cancellation/dead worker resets the pool);
+    `ticker_repository._project_ticker_cycle(shards=)` (compute only; rehydration serial). Tests
+    `test_ticker_projection_shards_r75v2.py` 25 passed (groups, switch, warm rule, in-process protocol: serial
+    equality, warm across windows and through a retry, unavailable merge, worker error keeps the pool, cancel resets);
+    the 34 projection/loader/repository suites: 584 passed, 12 failed = the same 12 that fail on live r116 code.
+  - Rehearsal (read only, worktree mounted on the r116 image, 10 GB cap, no swap; `runner/
+    rehearse_shards_r75v2_readonly.py`): serial E:20:45 cold 149.6 s (full load 60.0 s), E:20:50/20:55 warm 20.4/20.6 s
+    (delta 0.7 s), peak 5.69 GB. Shards K=4 and K=2: **OOM-killed at 10 GB in the first (cold) window**. Sampled K=2:
+    each worker 2.8 GB after loading half the bars while the coordinator loaded all of them (2.7 GB -> 4.2 GB). Probe:
+    the group filter works (group 0/2: 376,231 bars, 23 tickers, 29.7 s) but a load's transient peak is ~7 KB/row
+    (full 746k rows: 5.35 GB; half: 2.8 GB) - the load, not the projection, sets the peak, and the coordinator's full
+    load running beside the workers' loads doubles it. Parity and speed of the sharded path: NOT yet measured.
+  - Blocker for a memory-neutral design: the coordinator must stop holding every bar, but each cycle's receipt
+    records `inputs_sha256(cycle.inputs)` (lineage heads of every bar; rehydration recomputes it from a full load), so
+    the workers must return their tickers' lineage heads for the coordinator to rebuild the same digest; plus a
+    streamed bar fetch to cut the load's transient peak (helps serial too). Nothing deployed; switch off.
+- **Strategy pages and the hourly question (Nov 14 19:03-19:36 UTC, read only; user: strategy production after the
+  close; hourly refresh later)**:
+  - Path today: the pages call `/api/strategies/daily` first (503 every time since Nov 10: no independent strategy
+    publication exists; STRATEGY_PUBLISH is not in the Advanced live graph), then fall back to the Dashboard:
+    `/api/latest-price-date` + `/api/scan/<strategy>?snapshot_id=`. 1h strategies and past dates have no fallback.
+  - Cadence: the Dashboard is rebuilt on a process's first window, on every cold window and at the close
+    (`REALTIME_V2_DASHBOARD_REFRESH=SESSION`): Nov 12 twice, Nov 13 eleven times (PORTAL_PUBLISH 87-119 s each). The
+    intraday Dashboards carry the previous session's daily analysis (Nov 13 14:40-18:45: overview dated 2026-11-12),
+    stamped with the window time.
+  - One Dashboard build (close input, 9 GB cap): load 56.6 s (743,872 bars, peak 5.2 GB); build 20.9 s = screening
+    re-run 11.0 s, daily setups 5.0 s, narrowing 1.9 s, **all six scanners 0.6 s**, rest ~2.3 s; payload 2.95 MB.
+  - The dormant strategy producer (`materialize_realtime_daily_strategies`, cutoff after the inputs exist): its
+    validation fails on current live data (`Strategy split/action coverage is unavailable or inconsistent`, after
+    6.7 s). With validation stubbed (measurement only): load 60.0 s, peak 6.2 GB; daily projection 33.5 s (scanners
+    0.84 s, daily setups 7.1 s, rest ~25.5 s); hourly projection 91.2 s (scanners 0.7 s, hourly setups 36.2 s, rest
+    ~54 s). The rest is mostly per-member scans of every bar (`[row for row in inputs.bars if row["ticker"] == ...]`
+    in `_validate_strategy_inputs`, `hourly_strategy_inputs`, `produce_hourly_setup_summary`): O(members x bars).
+- **Pattern Watch and the other Equity pages (Nov 14 20:02-20:12 UTC, read only; user: review cadence and cost)**:
+  - Pattern Watch (`runner`-style script in the session scratchpad, worktree code on the r116 image, 9 GB cap), one
+    long-lived state over consecutive windows:
+    - E:20:50 cold: load 62.1 s, projection 101.6 s; setup runs 225 / 24.6 s, Pattern Watch runs 225 / 24.2 s.
+    - E:20:55 warm: load 0.9 s, projection 17.9 s; setup 0.4 s, patterns 0.2 s; 450 reused.
+    - E:21:00 close: the close changes the history window, so the input reloads in full (69.5 s) and 405 runs rebuild
+      (setups 46.8 s, patterns 40.2 s).
+    - Collecting the publication: 0.01 s. Rows: 30m 7-11, 1h 15-16, 1d 7-9, 1wk 10-11, 1mo 14; 201-204 KB.
+    - Published every window (`PATTERN_WATCH_V1`: 212 snapshots Nov 11-13).
+  - API reads (internal network, `realtime-v2-advanced-api:8002`, twice each):
+    - `/api/stocks/market-conditions` 0.35-0.45 s (57 KB);
+    - `/api/sector-intelligence` 0.36-0.38 s (4.8 KB);
+    - `/api/market-regime` 0.34-0.46 s;
+    - `/api/tickers/workspace-publication` 0.37 s (92 KB);
+    - `/api/chart-patterns/scan` 0.18-0.21 s (37 KB);
+    - `/api/latest-price-date` 0.34-0.41 s;
+    - `/api/strategies/daily?view=sessions...` 503 in 0.1 s.
+  - Market Conditions, Sector Intelligence and Market Regime are built at request time from the retained workspace
+    summary (`retained_market_context.py`). Stock Persistence and Strategy Overview read `/api/strategies/daily` only
+    (no Dashboard fallback), so they are unavailable on live until the daily products job publishes strategies.
+    Recommendations: `G102_DAILY_PRODUCTS_REFACTOR_20261114.md`, "The other Equity pages".

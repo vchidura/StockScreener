@@ -8,7 +8,7 @@ import hashlib
 import json
 import os
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace as dataclass_replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -34,6 +34,7 @@ from .advanced_journal_registry import (
 )
 from .advanced_options_consumers import (
     AdvancedOptionsBoundedDetectorRouter,
+    AdvancedOptionsDetectorRoutingState,
     AdvancedOptionsMarketStateConsumer,
     load_advanced_options_detector_routing_state_cursor,
     load_advanced_options_market_state_cursor,
@@ -119,7 +120,8 @@ from .database_access_v2 import (
     V2AccessConfig,
     V2ConnectionProvider,
 )
-from .materialization import MaterializerShardMap
+from .materialization import MaterializerShardMap, initial_materializer_state
+from .options_late_start import options_late_start_enabled, options_late_start_point
 from .journal import PersistentRawJournalReader, RawJournalReader
 from .migrations import EXPECTED_V2_DATABASE_NAME
 from .normalizer import InstrumentAdmission, NORMALIZER_VERSION
@@ -266,6 +268,7 @@ def _snapshot_v3_resident_windows(
     shard_map_sha256_value: str | None = None,
     shard_ids_value: tuple[int, ...] | None = None,
     evidence_ref: str | None = None,
+    minimum_cutoff: datetime | None = None,
 ) -> int:
     if (
         bundle.get("orchestration", {}).get("catalog_version")
@@ -287,6 +290,10 @@ def _snapshot_v3_resident_windows(
         )
     recorded = 0
     for target in targets:
+        # R67: a consumer that started late never read a window cut before its start point; leave that window missed
+        # (and skip its offset lookup, whose cost grows with the events after an old cutoff).
+        if minimum_cutoff is not None and target.options_cutoff <= minimum_cutoff:
+            continue
         target_raw, target_event = reader.offsets_at(
             target.options_cutoff
         )
@@ -1695,16 +1702,50 @@ def _run_market_state(
                 ),
             )
         )
+    # R67: with REALTIME_V3_OPTIONS_LATE_START=ON, shards and the router that have no checkpoint start at the journal
+    # point two minutes before now instead of offset 0 (see realtime/options_late_start.py).
+    late_point = (
+        options_late_start_point(source.path)
+        if v3_loop and options_late_start_enabled(environment)
+        else None
+    )
+    if late_point is not None and late_point[2] > 0:
+        _LOGGER.warning(
+            "advanced_options_market_state_late_start cutoff=%s raw=%s event=%s",
+            late_point[0].isoformat(), late_point[1], late_point[2],
+        )
+    else:
+        late_point = None
+    late_started = {"cutoff": None}
     detector_router = None
     if (
         selection_plan is not None
         and selection_plan.admission_profile_version
         in _ROUTED_ADMISSION_PROFILES
     ):
+        routing_allocation = activity_momentum_allocation_from_payload(
+            selection_plan.allocation_document
+        )
+        if detector_routing_state is None and late_point is not None:
+            detector_routing_state = AdvancedOptionsDetectorRoutingState(
+                allocation_sha256=routing_allocation.allocation_sha256,
+                committed_event_offset=late_point[2],
+                quote_contract_tickers=(),
+                factual_volume=(),
+                cadence_clocks_ns=(),
+                detector_invocation_counts=(),
+                scanned_event_count=0,
+                processed_detail_bytes=0,
+                first_event_ns=None,
+                last_event_ns=None,
+                irrelevant_event_count=0,
+                cadence_skip_count=0,
+                readiness_skip_count=0,
+                suppressed_output_count=0,
+            )
+            late_started["cutoff"] = late_point[0]
         detector_router = AdvancedOptionsBoundedDetectorRouter(
-            allocation=activity_momentum_allocation_from_payload(
-                selection_plan.allocation_document
-            ),
+            allocation=routing_allocation,
             state=detector_routing_state,
         )
     shard_ids = tuple(range(layout.shard_map.shard_count))
@@ -1743,6 +1784,12 @@ def _run_market_state(
                     shard_map=layout.shard_map,
                     shard_ids=(shard_id,),
                 )
+            if not restored and late_point is not None:
+                restored = (dataclass_replace(
+                    initial_materializer_state(layout.shard_map, shard_id),
+                    scanned_offset=late_point[2],
+                ),)
+                late_started["cutoff"] = late_point[0]
             consumer = AdvancedOptionsMarketStateConsumer(
                 source=source,
                 cohort_id=control.cohort_id,
@@ -2029,6 +2076,7 @@ def _run_market_state(
                     normalized_offset=completed_offset,
                     shard_map_sha256_value=layout.shard_map.sha256,
                     shard_ids_value=shard_ids,
+                    minimum_cutoff=late_started["cutoff"],
                 )
                 last_snapshot_offset = completed_offset
                 next_snapshot_at = (
@@ -2241,7 +2289,13 @@ class _FlowVolumeBaselineReconciler:
             if session_state is None
             else session_state.load_preopen_session_binding(bundle)
         )
+        # R69 (Nov 13): the journal point of each snapshot time computed once it is fixed (and reused).
+        # Every pending baseline used to cost an `offsets_at` on a new connection on every pass; that lookup walks the
+        # events after an old snapshot time, so with thousands of baselines pending (216 contracts x every window
+        # since a late bind) flow read ~175 MB/s and crawled at ~4 messages/s.
         self._reader = RawJournalReader(source.path)
+        self._snapshot_offsets = {}
+        self.minimum_snapshot_at = None  # R69: set after a late start; older baselines are dropped
         self._refresh_seconds = refresh_seconds
         self._next_refresh = 0.0
         self._seen_sequence = 0
@@ -2338,17 +2392,44 @@ class _FlowVolumeBaselineReconciler:
                     baseline["contract_ticker"],
                     baseline["snapshot_at"],
                 )
+                # R69: only the newest snapshot per contract is pending; an older one is superseded (and replaying
+                # every binding since a late bind queued thousands of stale baselines that could only be rejected).
+                for older in [
+                    item for item in self._pending
+                    if item[0] == key[0] and item[1] <= key[1]
+                ]:
+                    self._pending.pop(older)
+                if any(
+                    item[0] == key[0] and item[1] > key[1]
+                    for item in self._pending
+                ):
+                    continue
                 self._pending[key] = baseline
             self._seen_sequence = binding.sequence
             self._seen_sha256 = getattr(binding, "binding_sha256", None)
         self._next_refresh = now + self._refresh_seconds
+
+    def _snapshot_offset(self, snapshot_at):
+        cached = self._snapshot_offsets.get(snapshot_at)
+        if cached is not None:
+            return cached
+        raw_offset = self._reader.offsets_at(snapshot_at)[0]
+        # The point is fixed once later events are durable; keep it only for snapshot times well in the past.
+        if snapshot_at < datetime.now(UTC) - timedelta(minutes=2):
+            self._snapshot_offsets[snapshot_at] = raw_offset
+            if len(self._snapshot_offsets) > 512:
+                self._snapshot_offsets.pop(next(iter(self._snapshot_offsets)))
+        return raw_offset
 
     def apply(self, consumer):
         self._refresh()
         # Nov 9: the baselines name every selected contract, the engine routes only its contract scope. A baseline
         # for a contract outside the scope has nothing to reconcile; raising on it put the flow role in a crash loop.
         for key, row in tuple(self._pending.items()):
-            if not consumer.routes_contract(row["contract_ticker"]):
+            if not consumer.routes_contract(row["contract_ticker"]) or (
+                self.minimum_snapshot_at is not None
+                and row["snapshot_at"] <= self.minimum_snapshot_at
+            ):
                 self._pending.pop(key)
         if not self._pending:
             return ()
@@ -2361,7 +2442,7 @@ class _FlowVolumeBaselineReconciler:
                     item[1]["contract_ticker"],
                 ),
             )
-            if self._reader.offsets_at(row["snapshot_at"])[0]
+            if self._snapshot_offset(row["snapshot_at"])
             <= consumer.fed_offset
         )
         if not ready:
@@ -2376,15 +2457,27 @@ class _FlowVolumeBaselineReconciler:
         )
         for key, _row in ready:
             self._pending.pop(key)
-        if not self._pending and all(result.accepted for result in results):
-            if not consumer.mark_reconciled():
-                raise RuntimeError(
-                    "P8 volume baseline remained incomplete"
-                )
-            consumer.flush(
-                reason="SNAPSHOT_RECONCILE",
-                full=True,
+        rejected = [result for result in results if not result.accepted]
+        if rejected:
+            # R69: a rejected snapshot leaves that contract WARMING until a newer snapshot reconciles it; log why
+            # instead of stopping the role (the window's volume check still waits for every contract).
+            reasons = {}
+            for result in rejected:
+                reasons[str(result.reason)] = reasons.get(str(result.reason), 0) + 1
+            _LOGGER.warning(
+                "advanced_options_flow_volume_reconcile_rejected count=%s reasons=%s",
+                len(rejected), reasons,
             )
+        if not self._pending and not rejected:
+            if consumer.mark_reconciled():
+                consumer.flush(
+                    reason="SNAPSHOT_RECONCILE",
+                    full=True,
+                )
+            else:
+                _LOGGER.warning(
+                    "advanced_options_flow_volume_baseline_incomplete accepted=%s", len(results),
+                )
         return results
 
 
@@ -2777,6 +2870,11 @@ def _run_flow(
     )
     volume_reconciliations = []
     outcome = None
+    # R65 (Nov 13): one kept-open reader for the barrier snapshot and a throttle (offsets moved, else once a second), as
+    # the V3 market-state loop does; a new connection per pass re-read the journal index for every pending window.
+    flow_snapshot_reader = PersistentRawJournalReader(source.path)
+    flow_last_snapshot = None
+    flow_next_snapshot_at = 0.0
     while True:
         current = _registration(
             provider,
@@ -2796,6 +2894,12 @@ def _run_flow(
                 + ",".join(outcome.reason_codes)
             )
         session = runner_environment.options_flow_state.session
+        if (
+            session is not None
+            and volume_reconciler is not None
+            and getattr(session, "late_cutoff", None) is not None
+        ):
+            volume_reconciler.minimum_snapshot_at = session.late_cutoff
         if session is not None and volume_reconciler is not None:
             volume_reconciliations.extend(
                 volume_reconciler.apply(session.consumer)
@@ -2806,14 +2910,28 @@ def _run_flow(
                 hold,
                 checked_at=datetime.now(UTC),
             )
-        if session is not None and outcome.evidence_ref is not None:
+        flow_snapshot_key = (
+            None if session is None
+            else (session.consumer.fed_offset, session.consumer.checkpointed_offset)
+        )
+        if (
+            session is not None
+            and outcome.evidence_ref is not None
+            and (
+                flow_snapshot_key != flow_last_snapshot
+                or time.monotonic() >= flow_next_snapshot_at
+            )
+        ):
+            flow_last_snapshot = flow_snapshot_key
+            flow_next_snapshot_at = time.monotonic() + 1.0
             _snapshot_v3_resident_windows(
                 provider,
                 binding,
                 bundle=bundle,
                 member=ResidentCompletionMember.FLOW,
                 owner_epoch=owner_epoch,
-                reader=RawJournalReader(source.path),
+                reader=flow_snapshot_reader,
+                minimum_cutoff=getattr(session, "late_cutoff", None),
                 raw_offset=session.consumer.fed_offset,
                 normalized_offset=(
                     source.registration.normalized_committed_offset

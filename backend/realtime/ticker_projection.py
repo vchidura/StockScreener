@@ -794,23 +794,28 @@ def _ticker_code_sha256():
 def project_realtime_ticker_workspace(
     inputs: RealtimeScreeningInput, *, market_events=(), market_event_coverage=(),
     fundamental_reports=(), fundamental_coverage=(), state: TickerProjectionState | None = None,
-    should_stop: Callable[[], bool] | None = None,
+    should_stop: Callable[[], bool] | None = None, member_filter=None, screening_override=None,
 ):
     """Pass a long-lived `state` to reuse unchanged facts, derivation checks and interval
-    materializations across cycles. The result is identical with or without it."""
+    materializations across cycles. The result is identical with or without it.
+
+    R75-v2 (Nov 14, `ticker_projection_shards`): `member_filter` projects only those tickers' workspaces (an empty
+    set: the shared prologue and the screening only), and `screening_override` supplies the cycle's screening
+    generation instead of computing it. Both default to the serial cycle, unchanged."""
     state = TickerProjectionState() if state is None else state
     _check_cancelled(should_stop)
     with state.cycle():
         return _project_realtime_ticker_workspace(
             inputs, market_events=market_events, market_event_coverage=market_event_coverage,
             fundamental_reports=fundamental_reports, fundamental_coverage=fundamental_coverage,
-            state=state, should_stop=should_stop,
+            state=state, should_stop=should_stop, member_filter=member_filter,
+            screening_override=screening_override,
         )
 
 
 def _project_realtime_ticker_workspace(
     inputs, *, market_events, market_event_coverage, fundamental_reports, fundamental_coverage, state,
-    should_stop,
+    should_stop, member_filter=None, screening_override=None,
 ):
     _check_cancelled(should_stop)
     calendar = exchange_calendars.get_calendar("XNYS")
@@ -861,7 +866,7 @@ def _project_realtime_ticker_workspace(
                 selected.add(key)
                 pending.append(key)
     # Reuse the established exact-reference, action, split, scale and daily-cohort gates.
-    screening = produce_realtime_screening(replace(
+    screening = screening_override if screening_override is not None else produce_realtime_screening(replace(
         inputs, bars=tuple(row for key, row in zip(keys, inputs.bars) if key in selected),
     ))
     _check_cancelled(should_stop)
@@ -902,6 +907,8 @@ def _project_realtime_ticker_workspace(
     }
     unavailable_members = []
     for member in sorted(inputs.members, key=lambda row: row["ticker"]):
+        if member_filter is not None and member["ticker"] not in member_filter:
+            continue  # R75: another worker's block (or the parent's screening-only pass)
         _check_cancelled(should_stop)
         if member["ticker"] in screening_unavailable:
             unavailable_members.append(dict(
@@ -1425,7 +1432,7 @@ def _project_realtime_ticker_workspace(
                 reason=str(error)[:300],
             ))
             continue
-    if unavailable_members and len(unavailable_members) == len(inputs.members):
+    if member_filter is None and unavailable_members and len(unavailable_members) == len(inputs.members):
         first = unavailable_members[0]
         raise ValueError(f"Ticker workspaces have no available member: {first['ticker']}: {first['reason']}")
     _check_cancelled(should_stop)
