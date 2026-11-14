@@ -18,7 +18,9 @@ from .lineage_head import (
 from .portal_projection import build_portal_snapshot
 from .preflight import ProviderTier
 from .reference_continuity import source_manifest_continuity_fields
-from .screening_projection import RealtimeScreeningInput, produce_realtime_screening
+from .screening_projection import (
+    SOURCE_LINEAGE_LOADED, STORED_LINEAGE_ACCEPTED, RealtimeScreeningInput, produce_realtime_screening,
+)
 from .setup_summary_projection import produce_daily_setup_summary
 
 
@@ -168,21 +170,51 @@ def dashboard_inputs(inputs: RealtimeScreeningInput) -> RealtimeScreeningInput:
         equity_ticker_count=len(inputs.members),
     )
     adjusted_sessions = set(history_plan.adjusted_sessions)
-    return replace(
-        inputs,
-        bars=dashboard_input_bars(tuple(
-            row for row in inputs.bars
-            if row["interval"] not in {"1wk", "1mo"}
-            and not (
-                row["interval"] == "1d"
-                and row["adjustment_basis"] == "ADJUSTED"
-                and row["session_date"] not in adjusted_sessions
-            )
-        ), inputs.session),
+    kept = tuple(
+        row for row in inputs.bars
+        if row["interval"] not in {"1wk", "1mo"}
+        and not (
+            row["interval"] == "1d"
+            and row["adjustment_basis"] == "ADJUSTED"
+            and row["session_date"] not in adjusted_sessions
+        )
+    )
+    if getattr(inputs, "source_lineage", SOURCE_LINEAGE_LOADED) == STORED_LINEAGE_ACCEPTED:
+        # R78: the daily products input holds only daily bars and the last 20 sessions of raw 1h (what
+        # `dashboard_input_bars` keeps) and no sources to walk.
+        return replace(inputs, bars=tuple(
+            row for row in kept if row["interval"] == "1d"
+            or (row["interval"] == "1h" and row["adjustment_basis"] == "RAW_UNADJUSTED")
+        ))
+    return replace(inputs, bars=dashboard_input_bars(kept, inputs.session))
+
+
+_SETUP_EVIDENCE_DEPENDENCY_KEYS = ("dependency_evidence_ids", "dependency_payload_sha256")
+
+
+def _reusable_setups(inputs, unavailable, setups):
+    """R78: the daily setup rows another producer computed over the same input (the daily products job's latest
+    strategy evaluation: same daily bars, same 20-session 1h confirmations), used when they cover exactly the members
+    `produce_daily_setup_summary` would evaluate here. Their evidence keeps its own run id; the strategy-only dependency
+    fields are dropped (this document never carried them). None means: compute them."""
+    if setups is None:
+        return None
+    rows, evidence, missing = setups
+    with_daily = {row["ticker"] for row in inputs.bars if row["interval"] == "1d" and row["adjustment_basis"] == "ADJUSTED"}
+    expected = [member["ticker"] for member in sorted(inputs.members, key=lambda row: row["ticker"])
+                if member["ticker"] not in unavailable and member["ticker"] in with_daily]
+    if not rows or [row["ticker"] for row in rows] != expected or [row["ticker"] for row in evidence] != expected:
+        return None
+    return (
+        list(rows),
+        [{key: value for key, value in row.items() if key not in _SETUP_EVIDENCE_DEPENDENCY_KEYS} for row in evidence],
+        {ticker: reason for ticker, reason in missing.items() if ticker not in unavailable},
     )
 
 
-def produce_realtime_dashboard(inputs: RealtimeScreeningInput):
+def produce_realtime_dashboard(inputs: RealtimeScreeningInput, *, setups=None):
+    """`setups` (R78, optional): (rows, evidence, missing) of the daily setups already computed over this input; see
+    `_reusable_setups`."""
     inputs = dashboard_inputs(inputs)
     screening = produce_realtime_screening(inputs)
     # Per-ticker outcome (G102 A2, Nov 7): members screening could not compute are left out of every Dashboard
@@ -203,11 +235,18 @@ def produce_realtime_dashboard(inputs: RealtimeScreeningInput):
     # observed_at, created_at, replay_available_at, provider_published_at and the provider-delayed end of a bar
     # are recording clocks (checked against `recorded_by`: known_by, else the cutoff); bar_end is a market time.
     recorded_by = inputs.recorded_by
+    # R78: the daily products job reads daily and 1h bars without their 5m/1m sources (stored lineage accepted,
+    # `select_daily_product_bars`); a derived bar is then held to its own recording clocks.
+    lineage_accepted = getattr(inputs, "source_lineage", SOURCE_LINEAGE_LOADED) == STORED_LINEAGE_ACCEPTED
     for row in inputs.bars:
         available_at = source_clock(row)
         if row["source_kind"] == "DERIVED":
-            sources = tuple(indexed[str(source)] for source in row["source_revision_ids"])
-            available_at = max(available_at, *(source_clock(source) for source in sources))
+            sources = tuple(
+                indexed[str(source)] for source in row["source_revision_ids"]
+                if not lineage_accepted or str(source) in indexed
+            )
+            if sources:
+                available_at = max(available_at, *(source_clock(source) for source in sources))
         if available_at > recorded_by or row["bar_end"] > inputs.cutoff:
             raise ValueError("Dashboard source availability is beyond cutoff")
     start = min(row["session_date"] for row in inputs.bars if row["interval"] == "1d"
@@ -228,7 +267,8 @@ def produce_realtime_dashboard(inputs: RealtimeScreeningInput):
     )
     scan = scanner_snapshots["SCAN_ALL_1D_5"]
     missing = dict(MISSING_PRODUCERS)
-    setup_rows, setup_evidence, missing_confirmations = produce_daily_setup_summary(
+    reused = _reusable_setups(inputs, frozenset(unavailable), setups)
+    setup_rows, setup_evidence, missing_confirmations = reused or produce_daily_setup_summary(
         inputs, excluded_tickers=frozenset(unavailable),
     )
     if missing_confirmations:

@@ -49,6 +49,10 @@ from realtime.advanced_ingress_plan import (  # noqa: E402
     advanced_ingress_provider_deadline,
     is_advanced_canary_window,
 )
+from realtime.daily_products_launcher import (  # noqa: E402
+    DailyProductsLauncher,
+    discover_due_daily_products,
+)
 from realtime.database_access_v2 import APP_ROLE  # noqa: E402
 from realtime.equity_pipeline_config import (  # noqa: E402
     RealtimeV2PipelineConfig,
@@ -407,6 +411,12 @@ def _recover_completed_session_window(
     return True
 
 
+def _close_window_complete(cursor, *, cohort_id, cutoff, checked_at) -> bool:
+    return discover_advanced_window_recovery_cursor(
+        cursor, cohort_id=cohort_id, cutoff=cutoff, checked_at=checked_at,
+    ).complete
+
+
 def _retry_completion_budget(
     args,
     windows,
@@ -498,6 +508,9 @@ def main(
     next_progress_check_at = None
     pending_retry_not_before = None
     completed_session_recovery = {}
+    # R78 (Nov 14): the daily products job (REALTIME_V2_DAILY_PRODUCTS=STRATEGIES|JOB), a separate limited process
+    # started between windows; unset, the launcher does nothing.
+    daily_products = DailyProductsLauncher(report_directory=args.report_directory)
     try:
         while not stop.is_set():
             now = utc_now()
@@ -513,6 +526,11 @@ def main(
                     ),
                 )
                 session_date = lifecycle.target_session_date
+                daily_products.tick(now, lambda at, lifecycle=lifecycle: discover_due_daily_products(
+                    provider, lifecycle=lifecycle, calendar=calendar, now=at,
+                    load_scope=load_continuous_advanced_scheduler_scope_cursor,
+                    recovery_complete=_close_window_complete, app_role=APP_ROLE,
+                ))
                 if _recover_completed_session_window(
                     provider,
                     args,
@@ -916,6 +934,9 @@ def main(
                         checked_at=utc_now(),
                     )
                 next_progress_check_at = now
+                # R78: a window just finished; the daily products check runs at the next tick (the publish-only run
+                # follows the new cohort's first window at once).
+                daily_products.check_soon()
                 # Rediscover after one executed window, so a new live slot
                 # always runs ahead of the rest of the backlog.
                 break

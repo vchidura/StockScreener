@@ -1,4 +1,6 @@
 """Daily setup evidence for the original All Tickers published read contract."""
+from contextlib import contextmanager
+from contextvars import ContextVar
 from datetime import timedelta
 import json
 from uuid import NAMESPACE_URL, uuid5
@@ -14,6 +16,25 @@ from .lineage_head import inputs_sha256
 from .ticker_projection import _fact, _security
 
 
+# R78 (Nov 14): an optional executor (`concurrent.futures`, e.g. a spawned process pool owned by the daily products job)
+# for the per-member evidence materialization, the dominant cost of a daily evaluation (~0.25 s per member). None runs
+# the members in order in this process, as before; with an executor the results come back in member order, unchanged.
+_SETUP_EXECUTOR: ContextVar = ContextVar("daily_setup_executor", default=None)
+
+
+@contextmanager
+def setup_executor(executor):
+    token = _SETUP_EXECUTOR.set(executor)
+    try:
+        yield
+    finally:
+        _SETUP_EXECUTOR.reset(token)
+
+
+def _materialize_request(request):
+    return materialize_realtime_equity_evidence(**request)
+
+
 def produce_daily_setup_summary(inputs, *, materializations=None, excluded_tickers=()):
     """R61 (Nov 13): the run id is keyed by `inputs_sha256` (the memoized digest written to replace
     `canonical_sha256(inputs)`: identity fields, members, actions, coverage and per-ticker bar lineage heads) instead of
@@ -26,6 +47,7 @@ def produce_daily_setup_summary(inputs, *, materializations=None, excluded_ticke
     bars_by_ticker = {}
     for row in inputs.bars:
         bars_by_ticker.setdefault(row["ticker"], []).append(row)
+    selected, requests = [], []
     for member in sorted(inputs.members, key=lambda row: row["ticker"]):
         ticker = member["ticker"]
         if ticker in excluded_tickers:
@@ -51,14 +73,19 @@ def produce_daily_setup_summary(inputs, *, materializations=None, excluded_ticke
         if [(row["bar_start"], row["bar_end"]) for row in hourly] != expected:
             hourly = []
             missing[ticker] = "EXACT_20_SESSION_1H_CONFIRMATION_UNAVAILABLE"
-        result = materialize_realtime_equity_evidence(
+        selected.append(ticker)
+        requests.append(dict(
             analysis_run_id=analysis_run_id,
             security=_security(member), bars=tuple(_fact(row, inputs) for row in daily),
             confirmation_bars=tuple(_fact(row, inputs) for row in hourly), observed_at=inputs.cutoff,
             target_cohort_id=inputs.cohort_id,
             target_provider_tier=inputs.provider_tier,
             target_instrument_id=member["instrument_id"],
-        )
+        ))
+    executor = _SETUP_EXECUTOR.get()
+    results = (list(executor.map(_materialize_request, requests, chunksize=max(1, len(requests) // 16)))
+               if executor is not None and len(requests) > 1 else [_materialize_request(request) for request in requests])
+    for ticker, result in zip(selected, results):
         if materializations is not None:
             materializations.append(result)
         setup = next(row for row in result.materialization.evidence if row.evidence_type is EvidenceType.TRADE_SETUP)

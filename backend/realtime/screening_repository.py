@@ -19,7 +19,9 @@ from .reference_continuity import (
     load_reference_continuity_rows_cursor,
     source_manifest_identity,
 )
-from .screening_projection import RealtimeScreeningInput, produce_realtime_screening
+from .screening_projection import (
+    STORED_LINEAGE_ACCEPTED, RealtimeScreeningInput, produce_realtime_screening,
+)
 from .worker_database import RealtimeProcessDatabase
 
 MAX_SOURCE_LINEAGE_ROUNDS = 8
@@ -595,6 +597,85 @@ def load_realtime_canonical_stock_alert_input(
             )
         ),
     )
+
+
+DAILY_PRODUCT_RAW_DAILY_SESSIONS = 90
+DAILY_PRODUCT_HOURLY_SESSIONS = 20
+
+
+def daily_product_bar_window(session: date) -> tuple[date, date, date, date]:
+    """R78 (Nov 14): the sessions the daily products read for a completed `session`: (adjusted daily start, raw daily
+    start, raw 1h start, session). Adjusted daily covers the portal history plan's adjusted sessions (what the
+    Dashboard keeps, `dashboard_inputs`); raw daily the window input's 90 sessions (the screening's nominal price
+    and volume over its 253-session history read every raw daily bar present); raw 1h the last 20 sessions (setup
+    confirmation, `produce_daily_setup_summary`; the screening's 23 hourly slots lie within them)."""
+    calendar = exchange_calendars.get_calendar("XNYS")
+    if not calendar.is_session(str(session)):
+        raise ValueError("Daily products require an exchange session")
+    plan = build_realtime_equity_portal_history_plan(session)
+    return (
+        plan.adjusted_sessions[0],
+        calendar.session_offset(str(session), -(DAILY_PRODUCT_RAW_DAILY_SESSIONS - 1)).date(),
+        calendar.session_offset(str(session), -(DAILY_PRODUCT_HOURLY_SESSIONS - 1)).date(),
+        session,
+    )
+
+
+def select_daily_product_bars(cursor, request: BarRequest, *, session: date, source_closure: bool = False):
+    """R78: the daily products' narrow bar read - adjusted daily, raw daily and raw 1h winners of a completed
+    session, with the window input's columns and source precedence (portal history), grouped by the database in
+    (ticker, interval, basis, bar_start) order. No 1m/5m/15m/30m history and no weekly/monthly bars.
+
+    `source_closure=False` (the job's default, decision 7.3): derived bars (raw daily and raw 1h, from 5m, from 1m)
+    are accepted by their stored lineage; their 5m and 1m sources are not read (they are the bulk of the bars: the
+    window's projection re-verifies every derived aggregate it loads). True reads the source closure as the window
+    load does (measured fallback)."""
+    scope, clocks = request.scope, request.clocks
+    adjusted_start, raw_start, hourly_start, last = daily_product_bar_window(session)
+    candidate = (
+        "ticker=ANY(%s) AND session_scope='RTH' AND is_final AND " + _BAR_VISIBLE_AT
+        + "AND ((interval='1d' AND adjustment_basis='ADJUSTED' AND session_date BETWEEN %s AND %s) "
+        "OR (interval='1d' AND adjustment_basis='RAW_UNADJUSTED' AND session_date BETWEEN %s AND %s) "
+        "OR (interval='1h' AND adjustment_basis='RAW_UNADJUSTED' AND session_date BETWEEN %s AND %s)) "
+    )
+    cursor.execute(
+        "SELECT DISTINCT ON (ticker, interval, adjustment_basis, bar_start) "
+        + bar_columns(True) + " FROM rt.bar_revisions WHERE " + candidate
+        + "ORDER BY ticker, interval, adjustment_basis, bar_start, "
+        + source_precedence_case(True) + " DESC, observed_at DESC, created_at DESC, bar_revision_id",
+        (list(scope.tickers), *clocks.params(), adjusted_start, last, raw_start, last, hourly_start, last),
+    )
+    rows = share_bar_values([dict(row) for row in cursor.fetchall()])
+    if not source_closure:
+        return tuple(rows)
+    indexed = {str(row["bar_revision_id"]): row for row in rows}
+    tail = close_source_lineage(
+        (source for source in referenced_source_ids(rows) if source not in indexed), indexed,
+        lambda ids: select_source_bars(cursor, scope, ids, clocks),
+    )
+    return (*rows, *tail)
+
+
+def load_daily_products_input(cursor, *, cohort_id: UUID, session: date, cutoff: datetime,
+                              source_generation: int, known_by: datetime | None = None,
+                              source_closure: bool = False) -> RealtimeScreeningInput:
+    """R78: the daily products job's input for completed `session` (cutoff at or after its close): the cohort's
+    members, actions (with strategy details) and split coverage as `load_screening_input` reads them, and the narrow
+    bars of `select_daily_product_bars`. Without the source closure the input is marked
+    `source_lineage=STORED_ACCEPTED`, which `_validate_bars` and the Dashboard's clock check honour."""
+    from dataclasses import replace
+
+    calendar = exchange_calendars.get_calendar("XNYS")
+    if cutoff < calendar.session_close(str(session)).to_pydatetime():
+        raise ValueError("Daily products require a completed session")
+    inputs = load_screening_input(
+        cursor, cohort_id=cohort_id, session=session, cutoff=cutoff, source_generation=source_generation,
+        include_portal_history=True, include_strategy_action_details=True, known_by=known_by,
+        bar_loader=lambda active, request: select_daily_product_bars(
+            active, request, session=session, source_closure=source_closure,
+        ),
+    )
+    return inputs if source_closure else replace(inputs, source_lineage=STORED_LINEAGE_ACCEPTED)
 
 
 def shard_tickers(tickers, index: int, count: int) -> tuple[str, ...]:

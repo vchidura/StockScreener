@@ -2894,3 +2894,159 @@ Tests run offline in the r98 image with the worktree mounted (`runner/run_tests_
     summary (`retained_market_context.py`). Stock Persistence and Strategy Overview read `/api/strategies/daily` only
     (no Dashboard fallback), so they are unavailable on live until the daily products job publishes strategies.
     Recommendations: `G102_DAILY_PRODUCTS_REFACTOR_20261114.md`, "The other Equity pages".
+- **R78 build and rehearsal (Nov 14 20:24-21:40 UTC, separate build session; user: `BUILD_PROMPT_R78_DAILY_PRODUCTS_20261114.md`;
+  nothing deployed, no image built, no live write)**:
+  - Worktree `StockScreener.worktrees/r78-daily-products`, branch `r78-daily-products` from `v3-live-fixes` ea76dd5;
+    uncommitted. Plan updated: decisions (section 7), as-built table (section 4), gate results (section 6), rollout
+    (section 8), scale note (section 9).
+  - Live facts read for the decisions (read-only SQL, `runner/audit_live.ps1`):
+    - lineage (AAPL, Nov 13): raw 1d is DERIVED from 78 5m bars, 1h from 12 5m bars, 5m from 5 1m bars;
+    - Equity cohorts are per session (Nov 9-13: a new cohort every session, bound to the previous one as history);
+    - split coverage: the refresh after each close writes one row per member, window from 283 sessions back to one
+      year ahead (Nov 13's: Nov 14 18:35 UTC);
+    - Nov 13 PORTAL_PUBLISH: 10 windows with the Dashboard 87.0-118.8 s (median 105.5), 46 without 0.9-2.2 s (median
+      1.4).
+  - Code:
+    - `realtime/daily_products.py`, `realtime/daily_products_launcher.py`, `scripts/run_realtime_v2_daily_products.py`
+      (new);
+    - `screening_repository.py` (narrow loader), `screening_projection.py` (`source_lineage` InitVar, accepted
+      lineage in `_validate_bars`), `strategy_projection.py` (grouped lookups, memoized input digest),
+      `strategy_repository.py` (evidence and snapshot persistence split), `setup_summary_projection.py` (optional
+      executor), `dashboard_projection.py` (setup reuse, accepted lineage);
+    - `stage_runners_equity.py` and `run_realtime_v2_advanced_equity_window.py` (no Dashboard in JOB mode),
+      `run_realtime_v2_advanced_equity_scheduler.py` (launcher tick).
+  - Tests:
+    - `tests/realtime/test_daily_products_r78.py` 41 passed (loader scope, accepted lineage, grouped validation equal
+      to the pre-R78 code, kept verbatim as the oracle, coverage rule, narrow vs window-input parity of both products,
+      setup reuse, executor parity (threads and spawned processes), input identity, ALREADY_STORED, supersede, one
+      release, forced failure, launcher retries, deadline, NO_RELEASE, switch off, discovery order, the window switch);
+    - the 25 touched suites, final code: 906 passed, 10 failed, exactly the 10 that fail on ea76dd5 (= r116 code) on
+      the same files: two daily-scanner gap-page tests, one all-tickers freshness test, four Pattern Watch reader tests,
+      three ticker vertical-slice tests. (The "12 failures" of the build prompt were counted over the R75-v2 suite
+      set; on this set the baseline is 10.)
+  - Rehearsal (worktree mounted on the r116 scheduler image `523cae4a0174`, DSN secret mounted, read-only connections,
+    one heavy run at a time, MemAvailable checked first: 9.4-11.3 GB; caps 2-6.5 GB):
+    - Dry runs of the job (`--dry-run`, Nov 13 cohort, Nov 13 close):
+      - first build: 118 s (strategies 86 s, Dashboard 25.8 s), maxrss 517 MB;
+      - profile (cProfile, ~2x): the per-member setup evidence pipeline is 145 of 227 s (6 passes x 45 members);
+      - after the Dashboard reuses the latest evaluation's setups and the source-id shortcut: Dashboard 9-11 s, total
+        94-126 s single process; with 4 spawned setup workers 65 s (VmPeak 967 MB).
+    - Gate 1 (`runner/rehearse_daily_products_r78_readonly.py`, `data-audit/r78-20261114/gates123.json`): PASS.
+      - The six scanner lists equal the stored Nov 13 close Dashboard `3a3533c0` row for row (33 / 521 / 45 / 4 / 4 / 43).
+      - Scan, overview (45), setup rows (45) and context (45) are equal; only `scan_datetime` differs.
+      - The strategies' latest evaluation gives the same six lists.
+    - Gate 2: load 4.4-9.3 s for 23,085 bars, peak RSS 516-552 MB, VmPeak 847-967 MB: PASS on memory. Time: 94-100 s
+      (one process) or 65 s (4 workers), NOT the "seconds" target: five reconstructed sessions of the per-member
+      pipeline.
+    - Gate 3: PASS. The Nov 13 cohort builds the Nov 12 session at 14:45 UTC. Read back through the real readers (served
+      snapshots after a jsonb-like round trip, every other query on live) and the ported frontend checks, all are
+      accepted, status STALE (read on Nov 14 for the Nov 12 session):
+      - the five strategy pages;
+      - Strategy Overview (45 members);
+      - Stock Persistence (270 rows, 1,350 evaluated cells, sessions Nov 6-12);
+      - the 11 Dashboard contracts.
+    - Gate 4: PASS (`gate4-*.json`). The R75-v2 serial replay ran E:20:45 cold, then 20:50 and 20:55 warm (known_by
+      Nov 14 02:00) with the switch JOB, three times:
+      - The cold window takes 181-253 s, as in R75-v2. With the switch, no Dashboard is due (cold, close), and one
+        loader slot holds 742,693-743,233 bars.
+      - R78 code vs ea76dd5 with the switch unset: screening, workspaces, summary and Pattern Watch differ, and
+        materializations and charts are equal. The screening manifest stamps `projection_code_sha256` (a digest of
+        `screening_projection.py`, which R78 edits).
+      - With that one digest mapped to the old file, every fingerprint of all three windows is equal (`all_equal`
+        true).
+      - ea76dd5 today equals the 02:00 R75-v2 baseline (`serial.json`) exactly, so the replay is deterministic, and the
+        chain is serial.json = ea76dd5 = R78 with JOB (code digest mapped).
+    - Gate 5: not run (Pattern Watch items deferred, plan section 4).
+    - Gate 6: PASS. A forced failure (session not complete at the cutoff) exits 1 in 0.7 s with
+      `FAULT DAILY_PRODUCTS_FAILED`, and nothing is written. Without BLAS threads 1 the job's VmPeak is 1.7 GB (16
+      CPUs); the launcher sets them.
+  - Not done in this session: any write to live (a real after-close run waits for the deploy), the closure fallback's
+    timing (`--source-closure`), Pattern Watch items.
+  - Observed, not caused by this work: the stock-alert containers (results, intraday, swing) were stopped by SIGTERM
+    (exit 143) ~21:23 UTC; this session's containers were separate and memory-capped.
+- **R78 round 2 and candidate r117 (Nov 14 21:50-22:40 UTC, same build session; user: "yes" to preparing before the
+  open, "complete Pattern Watch", then a candidate for the final rehearsal)**:
+  - Prepared before the open (plan decision 2, revised):
+    - PRE_OPEN computes and stores at activation (no release).
+    - After the first window, a publish-only SESSION_COHORT run finds the stored products by input identity and
+      releases them.
+    - Cutoff = max(now, the cohort's effective time, its creation time). The first rehearsal with a forced 14:30
+      cutoff on the Nov 13 cohort failed (cohort created 14:35:26, the R62 late activation), which led to the creation
+      time being added.
+    - Rehearsed on the Nov 12 cohort (normal activation 14:15): Nov 11 products at the 14:30 open, COMPUTED in 23 s,
+      385 MB; the stored-products lookups ran on live.
+  - Pattern Watch:
+    - 30m/1h light frames behind `REALTIME_V2_PATTERN_WATCH=LIGHT` (`runner/rehearse_pattern_watch_light_r78_readonly.py`,
+      `gate5-pattern-watch-light.json`): all rows equal for 45 members x 5 frames, 30m/1h RELEASE_ONLY, evidence rows
+      -23%, cold projection compute 87.7 -> 79.6 s.
+    - "Publish only on change" not built: Pattern Watch rows open ticker pages pinned to the publication's workspaces.
+  - Tests:
+    - R78 file: 51 passed.
+    - 25 touched suites: 916 passed, 10 failed, the same 10 as on ea76dd5, with the same errors.
+  - Candidate r117 `sha256:f7d9fc75a520...` (from the R78 worktree, `runner/build_candidate_from.sh`), rehearsed read
+    only on the image's own code:
+    - the job via the service wrapper: COMPUTED in 39.5 s, 849 MB;
+    - gates 1 and 3: PASS, 40-41 s;
+    - the pre-open dry run's `workspace` step with JOB and LIGHT: PASS (largest payload 109 KB);
+    - `readiness`: the capability profile is not yet refreshed for Nov 16, the same on the live image (live state).
+  - Nothing deployed; no live write.
+- **R78 deploy and live check (Nov 14 22:52-23:10 UTC, user: "yes" to deploy r117 with JOB and LIGHT and check the
+  pages)**:
+  - Deploy:
+    - Scheduler hotfix 22:53:18-58 (`deploy_candidate.ps1 -Step hotfix`): verify-live passed (migration 052, security
+      passed); recreated, settled, no other service changed. Switches in compose.stable.json: `REALTIME_V2_DAILY_PRODUCTS=JOB`,
+      `REALTIME_V2_PATTERN_WATCH=LIGHT` (backup `compose.stable.before-r117-daily-products-20261114T225307Z.json`;
+      pre-images `pre-r117-images-20261114.txt`). Fallback r116 `523cae4a0174`.
+    - Within seconds the launcher started AFTER_CLOSE for the Nov 13 cohort. PUBLISHED 22:54:20, release `49f52859` at
+      cutoff 21:00, `DAILY_STRATEGY_HISTORY_V1` `e2130904`, `DASHBOARD_V1` `0ccde85c`.
+    - Total 54.7 s (load 3.1, strategies 30.4, Dashboard 4.5, evidence 5.3, publish 11.2), maxrss 665 MB, VmPeak
+      999 MB; no fault.
+  - Live API check (`runner/check_daily_products_api_r78.py`, internal network, `data-audit/r78-20261114/live-api-check-20261114.txt`):
+    - Dashboard reads served by the job's Dashboard, all 200 READY in 0.34-0.62 s: latest, overview 45, setup summary
+      45, scan, context 45, the six scanners 33/521/45/4/4/43, materialization status.
+    - Pattern Watch (5 frames), workspace publication, market conditions, sector intelligence and market regime: 200.
+  - **Found: every `/api/strategies/daily` read is 503 "Strategy reference changed; new reviewed release required"
+    (3-5 s).**
+    - 10+ tickers have two current `ref.security_revisions` (overlapping validity after a refresh), and the published
+      revision is one of them.
+    - `RealtimeDailyStrategyRepository` requires exactly one (`_reference_matches`). The Dashboard reader was fixed
+      for this on Nov 6 (G97b); the strategy reader, dormant since Nov 1, was not.
+    - Gate 3 missed it: its products were stamped Nov 13 14:45, before the overlapping refresh.
+    - Effect: Strategy Overview and Stock Persistence stay unavailable (as before). The strategy pages fall back to
+      the Dashboard after waiting for the 503 (~3-5 s, the API reads the release first).
+  - **Found: the 5-session release is 26 MB of manifest and 6 MB of payload (JSON).** With the reader fixed, every
+    strategy view passes the frontend checks on live but takes 2.7-3.9 s per read (fetch, parse and checksum of
+    32 MB; the per-process validation cache does not help).
+    - A latest-session DAILY_STRATEGIES_V1 release is 4.6 MB (3.35 + 1.25), computes in 6.4 s, and checksums and
+      parses in ~0.1 s.
+  - Built and rehearsed read only, NOT deployed:
+    - r118 `sha256:95d19be2b4bf...` for the API: r102's code (commit d573f43 matches the r102 image file for file)
+      plus the reader fix. Strategy views all pass on the live publication.
+    - r119 `sha256:2a2e825828f4...` for the scheduler: r117 plus the reader fix plus
+      `REALTIME_V2_DAILY_STRATEGY_SESSIONS` (1 = latest session). The job via the service wrapper computes in 16.1 s,
+      438 MB.
+    - Tests: R78 file 53 passed; r102 + fix: the strategy/Dashboard/API suites have the same 2 baseline failures.
+  - Handover: `HANDOVER-20261116-LIVE.md` section 2 (images) and section 11 (R78 behaviour, faults, fallback, the
+    pending decision).
+- **R78 r118/r119 deploy (Nov 14 23:15-23:18 UTC, user: "yes" to r118 on the API and r119 on the scheduler with the
+  latest-session setting)**:
+  - Deploy:
+    - Backup `compose.stable.before-r118-r119-20261114T231510Z.json`, pre-images `pre-r118-r119-images-20261114.txt`;
+      `REALTIME_V2_DAILY_STRATEGY_SESSIONS=1` added to the scheduler only.
+    - API hotfix 23:15:20-59 onto r118 `95d19be2b4bf` (verify-live passed; settled; no other service changed; fallback
+      r102 `c35ac22459bf`).
+    - Scheduler hotfix 23:16:06-45 onto r119 `2a2e825828f4` (same checks; fallback r117 `f7d9fc75a520`).
+  - The restarted launcher ran AFTER_CLOSE for the Nov 13 cohort again: the new input identity (one session) made it
+    compute. PUBLISHED 23:16:29, release `e396fd58`, `DAILY_STRATEGIES_V1` `e708264e`, `DASHBOARD_V1` `93a16a5f`.
+    - Total 16.9 s (load 3.2, strategies 5.9, Dashboard 4.3, evidence 1.0, publish 2.4), maxrss 438 MB, VmPeak 770 MB;
+      no fault.
+  - Live API check (`live-api-check-r118-r119-20261114.txt`): 30/30 reads 200, 0 failures.
+    - Strategies 0.39-0.88 s: five pages (33/45/4/4/43 signals), Strategy Overview (45 members), Stock Persistence
+      (latest session, the frontend's single-session form), sessions, ticker research.
+    - Dashboard: the 11 reads 0.30-0.39 s, the six scanners 33/521/45/4/4/43.
+    - Pattern Watch (five frames), workspace publication and the three market pages.
+  - Broader route smoke on r118: 28/30 routes 200 (tickers, sessions, ticker workspace/chart/patterns/setups for AAPL,
+    NVDA and SPY, Options flow, discovery and alerts, canary). Two 404s, `/equity/health` and `/scan/streak-summary`,
+    are routes this API does not register.
+  - Not yet seen live (Monday): the PRE_OPEN preparation, the publish-only run after the first window, windows without
+    the Dashboard, Pattern Watch light frames in windows.

@@ -58,6 +58,7 @@ from realtime.advanced_scheduler import (  # noqa: E402
     ADVANCED_WINDOW_BUILD_ID,
     discover_advanced_window_recovery_cursor,
 )
+from realtime.daily_products import window_builds_dashboard  # noqa: E402
 from realtime.runner_environment import RunnerEnvironment  # noqa: E402
 from realtime.screening_delta_loader import ScreeningInputLoader  # noqa: E402
 from realtime.ticker_projection import TickerProjectionState  # noqa: E402
@@ -563,7 +564,11 @@ def dashboard_due(cutoff, *, warm: bool) -> bool:
     R39 (Nov 11): ``REALTIME_V2_DASHBOARD_REFRESH=SESSION`` drops the hourly rebuild and keeps the first window and
     the close. Its page content (overview, scan, the six daily scanners the strategy pages read, references) comes
     from daily bars through the previous session and was byte-identical in all eight Nov 10 intraday publications,
-    while each rebuild cost ~95 s of PORTAL_PUBLISH (median, Nov 10). Unset or HOURLY keeps the hourly rule."""
+    while each rebuild cost ~95 s of PORTAL_PUBLISH (median, Nov 10). Unset or HOURLY keeps the hourly rule.
+
+    R78 (Nov 14): ``REALTIME_V2_DAILY_PRODUCTS=JOB`` - the daily products job builds the Dashboard; never due here."""
+    if not window_builds_dashboard():
+        return False
     if not warm:
         return True
     hourly = os.environ.get(DASHBOARD_REFRESH_SWITCH, "HOURLY").strip().upper() != "SESSION"

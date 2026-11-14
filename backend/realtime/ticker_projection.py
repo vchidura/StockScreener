@@ -7,6 +7,7 @@ from datetime import datetime, time, timedelta, timezone
 from decimal import Decimal
 from functools import lru_cache
 import json
+import os
 from math import isfinite
 from pathlib import Path
 from types import SimpleNamespace
@@ -20,13 +21,14 @@ from equity.domain import (
     EvidenceType, SecurityReferenceRevision,
 )
 from equity.derivation import derive_advanced_sparse_minute_window
-from equity.materialization import CHANNEL_VERSION, SETUP_VERSION, _json_safe, bars_to_frame
+from equity.materialization import CHANNEL_VERSION, PATTERN_VERSION, SETUP_VERSION, _json_safe, bars_to_frame
+from equity.polygon import canonical_json as evidence_canonical_json
 from equity.ticker_contracts import (
     PATTERN_WATCH_INTERVALS, PATTERN_WATCH_POLICY, RETIRED_PATTERN_WATCH_INTERVALS,
     build_ticker_confluence_zones, setup_summary_row,
     sort_pattern_watch_rows,
 )
-from research.forming_patterns import summarize_cross_frame_patterns
+from research.forming_patterns import detect_forming_patterns, summarize_cross_frame_patterns
 from research.price_channels import detect_price_channel
 
 from .contracts import canonical_json, canonical_sha256
@@ -53,6 +55,29 @@ TICKER_WORKSPACE_VERSION = "TICKER_WORKSPACE_V1"
 TICKER_WORKSPACE_SUMMARY_VERSION = "TICKER_WORKSPACE_SUMMARY_V1"
 PATTERN_WATCH_PUBLICATION_VERSION = "PATTERN_WATCH_V1"
 SETUP_INTERVALS = ("30m", "1h", "1d", "1wk", "1mo")
+# R78 (Nov 14): REALTIME_V2_PATTERN_WATCH=LIGHT - Pattern Watch's 30m and 1h frames run pattern and price-channel
+# detection only on their 300-bar window, not the full evidence pipeline (features, scanners, portal strategies, EMA
+# confirmation) a second time beside the 500-bar setup of the same interval. The rows are the same functions on the
+# same frame, serialized as the evidence payloads were. They are not stored as evidence: the view becomes RELEASE_ONLY
+# like the retired 5m/15m frames (its rows live in the release). Unset: today's behaviour.
+PATTERN_WATCH_SWITCH = "REALTIME_V2_PATTERN_WATCH"
+LIGHT_PATTERN_INTERVALS = ("30m", "1h")
+
+
+def pattern_watch_light(environ=None) -> bool:
+    return (os.environ if environ is None else environ).get(PATTERN_WATCH_SWITCH, "").strip().upper() == "LIGHT"
+
+
+def light_pattern_rows(window):
+    """Pattern Watch rows of one interval window without the evidence pipeline: `detect_forming_patterns` and
+    `detect_price_channel` on the frame `materialize_equity_evidence` builds (revisions ordered by bar start), each
+    payload normalized as an evidence payload is (`_json_safe`, canonical JSON), so the rows equal the full path's."""
+    revisions = tuple(fact.revision for fact in sorted(window, key=lambda fact: fact.revision.bar_start))
+    frame = bars_to_frame(revisions)
+    patterns = [json.loads(evidence_canonical_json(_json_safe(dict(pattern))))
+                for pattern in detect_forming_patterns(frame, input_includes_forming_bar=False)]
+    channel = detect_price_channel(frame)
+    return patterns, (json.loads(evidence_canonical_json(_json_safe(dict(channel)))) if channel else None)
 # The chart bodies the summary reads. They are not part of the stored workspace payload, which carries only
 # references; the projection hands them to the summary producer in process.
 SUMMARY_CHART_INTERVALS = ("1d", "1wk")
@@ -1246,6 +1271,7 @@ def _project_realtime_ticker_workspace(
                     observed_at=setup_evidence.observed_at.isoformat(), published_at=inputs.cutoff.isoformat(),
                     is_serveable=True, price_basis=basis,
                 )
+            light_patterns = pattern_watch_light()
             for interval in PATTERN_WATCH_INTERVALS:
                 _check_cancelled(should_stop)
                 bars = available.get(interval, ())
@@ -1254,6 +1280,21 @@ def _project_realtime_ticker_workspace(
                     continue
                 if len(bars) < 50:
                     missing[f"patterns:{interval}"] = "PATTERN_HISTORY_UNAVAILABLE"
+                    continue
+                if light_patterns and interval in LIGHT_PATTERN_INTERVALS:
+                    window = bars[-300:]
+                    key = canonical_sha256((security.security_revision_id, interval, PATTERN_VERSION, CHANNEL_VERSION,
+                                            _fact_chain(window)))
+                    patterns, channel = state.remember("light_patterns", key, lambda window=window: light_pattern_rows(window))
+                    last_close = round(float(window[-1].revision.close_price), 2)
+                    pattern_results[interval] = dict(
+                        ticker=security.ticker, interval=interval, status="FORMING_RESEARCH",
+                        last_close=last_close, patterns=patterns, computed_at=inputs.cutoff.isoformat(),
+                    )
+                    channels[interval] = dict(
+                        ticker=security.ticker, interval=interval, status="CHANNEL_RESEARCH",
+                        last_close=last_close, channel=channel, computed_at=inputs.cutoff.isoformat(),
+                    )
                     continue
                 basis = "ADJUSTED" if interval in {"1d", "1wk", "1mo"} else "RAW_UNADJUSTED"
                 result = compute(interval, bars[-300:], basis=basis, persisted=interval in SETUP_INTERVALS)
@@ -1476,6 +1517,15 @@ def produce_realtime_pattern_watch_publication(
     without_workspace = member_tickers - snapshot_tickers
     views = {}
     for interval in PATTERN_WATCH_INTERVALS:
+        # R78: a light 30m/1h frame (REALTIME_V2_PATTERN_WATCH=LIGHT) carries no stored analysis receipt; its rows live
+        # in the release (RELEASE_ONLY), as the retired frames' do. Decided from the workspaces themselves (not the
+        # switch), so a rehydration or reconstruction reads what the cycle produced; a mix is refused.
+        with_patterns = [snapshot for snapshot in snapshots if interval in snapshot.payload["patterns"]]
+        light = (interval in LIGHT_PATTERN_INTERVALS and bool(with_patterns)
+                 and not any(snapshot.payload["pattern_evidence_refs"].get(interval) for snapshot in with_patterns))
+        if light and not all(interval not in snapshot.payload["pattern_evidence_refs"] for snapshot in with_patterns):
+            raise ValueError("Pattern Watch light and stored frames are mixed in one cycle")
+        receipts = interval in SETUP_INTERVALS and not light
         _check_cancelled(should_stop)
         rows, missing, market_times, analysis_refs = [], [], [], {}
         for snapshot in snapshots:
@@ -1487,7 +1537,7 @@ def produce_realtime_pattern_watch_publication(
                 missing.append(snapshot.snapshot_key)
                 continue
             market_times.append(payload["chart_market_times"][interval])
-            if interval in SETUP_INTERVALS:
+            if receipts:
                 refs = payload["pattern_evidence_refs"].get(interval, ())
                 if sum(ref["evidence_type"] == EvidenceType.FEATURE_SNAPSHOT.value for ref in refs) != 1:
                     raise ValueError("Pattern Watch completed analysis receipt is missing")
@@ -1502,7 +1552,7 @@ def produce_realtime_pattern_watch_publication(
             scanned=len(snapshots), matched_tickers=len({row["ticker"] for row in rows}),
             results=rows, cross_frame=None, computed_at=inputs.cutoff.isoformat(),
             market_time=min(market_times) if market_times else None, analysis_refs=analysis_refs,
-            evidence_storage="IMMUTABLE_EVIDENCE" if interval in SETUP_INTERVALS else "RELEASE_ONLY",
+            evidence_storage="IMMUTABLE_EVIDENCE" if receipts else "RELEASE_ONLY",
         )
     references = [snapshot.source_manifest["reference"] for snapshot in snapshots]
     workspaces = [dict(ticker=snapshot.snapshot_key, snapshot_id=str(snapshot.snapshot_id),

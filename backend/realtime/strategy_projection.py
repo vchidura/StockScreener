@@ -15,6 +15,7 @@ from equity.portal_scanners import compute_default_scanner_snapshots, default_sc
 
 from .contracts import canonical_sha256
 from .dashboard_projection import DAILY_SCANNER_CONTRACTS, SCANNER_BASIS, dashboard_frames, _overview
+from .lineage_head import inputs_sha256
 from .portal_projection import build_portal_snapshot
 from .preflight import ProviderTier
 from .reference_continuity import source_manifest_continuity_fields
@@ -74,9 +75,19 @@ def _validate_strategy_inputs(inputs):
     if market_time > inputs.cutoff:
         raise ValueError("Strategy session is not completed at cutoff")
     members = inputs.members
+    # R78 (Nov 14): bars, actions and coverage grouped once (a per-member scan of every bar was ~25 s of a 33.5 s
+    # daily projection at 45 names, O(members x bars)); each group keeps the input order, so every check below sees
+    # exactly the rows it saw before.
+    bars_by_ticker, actions_by_security, coverage_by_security = {}, {}, {}
+    for row in inputs.bars:
+        bars_by_ticker.setdefault(row["ticker"], []).append(row)
+    for row in inputs.actions:
+        actions_by_security.setdefault(str(row["security_id"]), []).append(row)
+    for row in inputs.coverage:
+        coverage_by_security.setdefault(str(row["security_id"]), []).append(row)
     if (not 0 < len(members) <= 1000 or len({row["ticker"] for row in members}) != len(members)
             or len({str(row["security_id"]) for row in members}) != len(members)
-            or set(row["ticker"] for row in inputs.bars) - {row["ticker"] for row in members}):
+            or set(bars_by_ticker) - {row["ticker"] for row in members}):
         raise ValueError("Strategy exact unique cohort membership is required")
     delay = timedelta(minutes=15 if inputs.provider_tier is ProviderTier.MASSIVE_DEVELOPER else 0)
     unavailable_members = {}
@@ -85,8 +96,8 @@ def _validate_strategy_inputs(inputs):
         if (not member.get("security_revision_id") or member.get("security_type") not in {"CS", "ETF", "ETV"}
                 or member["observed_at"] > inputs.cutoff):
             raise ValueError("Strategy reference identity/availability drift")
-        own = [row for row in inputs.bars if row["ticker"] == member["ticker"]
-               and row["interval"] not in {"1wk", "1mo"}]
+        own = [row for row in bars_by_ticker.get(member["ticker"], ())
+               if row["interval"] not in {"1wk", "1mo"}]
         _validate_bars(own, member, inputs)
         for row in own:
             clocks = [row["bar_end"] + delay, row["observed_at"], row["created_at"]]
@@ -98,7 +109,7 @@ def _validate_strategy_inputs(inputs):
                 raise ValueError("Strategy source availability is beyond cutoff")
         daily = sorted((row for row in own if row["interval"] == "1d"
                         and row["adjustment_basis"] == "ADJUSTED"), key=lambda row: row["session_date"])
-        actions = [row for row in inputs.actions if str(row["security_id"]) == str(member["security_id"])]
+        actions = actions_by_security.get(str(member["security_id"]), [])
         if any(row["ticker"] != member["ticker"] or row["received_at"] > inputs.cutoff for row in actions):
             raise ValueError("Strategy action identity/availability drift")
         if not daily:
@@ -115,8 +126,8 @@ def _validate_strategy_inputs(inputs):
             action_context[member["ticker"]] = context
             if reason:
                 unavailable_members[member["ticker"]] = context
-        coverage = [row for row in inputs.coverage if str(row["security_id"]) == str(member["security_id"])
-                    and row["action_type"] == "SPLIT" and row["window_start"] <= sessions[0]
+        coverage = [row for row in coverage_by_security.get(str(member["security_id"]), ())
+                    if row["action_type"] == "SPLIT" and row["window_start"] <= sessions[0]
                     and row["window_end"] >= inputs.session and row["received_at"] <= inputs.cutoff
                     and row["response_action_count"] == sum(action["action_type"] == "SPLIT"
                         and row["window_start"] <= action["effective_date"] <= row["window_end"] for action in actions)
@@ -169,15 +180,22 @@ def project_realtime_daily_strategies(inputs, *, reconstructed=False, interval="
     evidence_refs = {ticker: {} for ticker in tickers}
     receipts = {ticker: {} for ticker in tickers}
     results = []
+    # R78: per-contract member analyses and result rows grouped by ticker once (same rows, same order).
+    analysis_by_ticker = {contract: {row["ticker"]: row for row in analysis[contract]["members"]} for contract in scanners}
+    results_by_ticker = {}
+    for contract in scanners:
+        grouped = results_by_ticker[contract] = {}
+        for row in scanners[contract]["results"]:
+            grouped.setdefault(row["ticker"], []).append(row)
     for result in materializations:
         ticker = result.materialization.evidence[0].ticker
         feature = result.materialization.evidence[0]
         extra = []
         for contract in scanners:
-            member = next(row for row in analysis[contract]["members"] if row["ticker"] == ticker)
+            member = analysis_by_ticker[contract][ticker]
             receipt = dict(contract=contract, analysis=member, scanner_basis=basis,
                            input_sha256=result.input_sha256,
-                           results=[row for row in scanners[contract]["results"] if row["ticker"] == ticker])
+                           results=list(results_by_ticker[contract].get(ticker, ())))
             if reconstructed:
                 receipt.update(interpretation="RECONSTRUCTED_RESEARCH_NOT_ORIGINAL_ON_TIME_DECISIONS",
                     reconstruction_at=inputs.cutoff.isoformat())
@@ -202,7 +220,9 @@ def project_realtime_daily_strategies(inputs, *, reconstructed=False, interval="
         source_generation=inputs.source_generation, source_manifest_sha256=inputs.source_manifest_sha256,
         session=str(inputs.session), market_time=market_time.isoformat(), generated_at=inputs.cutoff.isoformat(),
         expected_members=len(tickers), tickers=tickers, references=[dict(references[ticker]) for ticker in tickers],
-        input_sha256=canonical_sha256(inputs), scanner_basis=basis,
+        # R78: the memoized input digest (identity, members, actions, coverage, per-ticker lineage heads) instead of
+        # serializing every bar (R61 made the same change for the setup summary).
+        input_sha256=inputs_sha256(inputs), scanner_basis=basis,
         scanner_contracts=list(scanners), evidence_refs=evidence_refs, receipts=receipts,
         unavailable_members=unavailable_members,
         action_context=action_context, action_policy="DAILY_STRATEGY_ACTION_CONTEXT_V1",
@@ -255,12 +275,19 @@ def project_realtime_strategy_history(inputs, *, interval="1d", market_time=None
         truncated = replace(inputs, session=session.date(), source_generation=inputs.source_generation + ordinal,
             bars=tuple(row for row in inputs.bars if row["bar_end"] <= session_cutoff))
         unavailable = set()
+        # R78: daily bars grouped by ticker once per session (was a scan of every bar per member).
+        daily_by_ticker, raw_by_ticker = {}, {}
+        for row in truncated.bars:
+            if row["interval"] != "1d":
+                continue
+            if row["adjustment_basis"] == "ADJUSTED":
+                daily_by_ticker.setdefault(row["ticker"], []).append(row["session_date"])
+            elif row["adjustment_basis"] == "RAW_UNADJUSTED" and row["session_date"] == session.date():
+                raw_by_ticker.setdefault(row["ticker"], []).append(row)
         for member in inputs.members:
             ticker = member["ticker"]
-            daily = sorted(row["session_date"] for row in truncated.bars if row["ticker"] == ticker
-                           and row["interval"] == "1d" and row["adjustment_basis"] == "ADJUSTED")
-            raw = [row for row in truncated.bars if row["ticker"] == ticker and row["interval"] == "1d"
-                   and row["adjustment_basis"] == "RAW_UNADJUSTED" and row["session_date"] == session.date()]
+            daily = sorted(daily_by_ticker.get(ticker, ()))
+            raw = raw_by_ticker.get(ticker, [])
             expected = [stamp.date() for stamp in calendar.sessions_in_range(str(daily[0]), session)] if daily else []
             if interval == "1d" and (not daily or daily != expected or not raw):
                 unavailable.add(ticker)

@@ -28,6 +28,7 @@ from .advanced_scheduler import (
     split_advanced_input_gate_build_id,
 )
 from .contracts import canonical_sha256
+from .daily_products import window_builds_dashboard
 from .dashboard_repository import (
     compute_realtime_dashboard,
     persist_realtime_dashboard_cursor,
@@ -1144,6 +1145,8 @@ def portal_publish_runner(
                 if context.is_cancelled():
                     return StageOutcome.failed(STAGE_CANCELLED)
             session_close = _is_session_close(context)
+            # R78 (Nov 14): with REALTIME_V2_DAILY_PRODUCTS=JOB the daily products job builds the Dashboard; the window
+            # never does (not even at the close), so its second loader slot is never created.
             dashboard = (
                 compute_realtime_dashboard(
                     V2StageDatabase(context, RealtimeDatabaseRole.COMPUTE),
@@ -1157,7 +1160,8 @@ def portal_publish_runner(
                         environment.allow_late_identity_continuity
                     ),
                 )
-                if is_split_graph and (environment.dashboard_due or session_close) else None
+                if is_split_graph and window_builds_dashboard() and (environment.dashboard_due or session_close)
+                else None
             )
             if context.is_cancelled():
                 return StageOutcome.failed(STAGE_CANCELLED)

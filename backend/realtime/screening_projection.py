@@ -28,6 +28,13 @@ from .preflight import ProviderTier
 from .reference_continuity import source_manifest_continuity_fields
 
 SCREENING_LINEAGE_VERSION = "screening_lineage_head_v1"
+# R78 (Nov 14): how the derived bars of an input were checked. LOADED: their sources are in the input and
+# `_validate_bars` re-verifies every derived aggregate (the window load). STORED_ACCEPTED: the daily products job
+# reads daily and 1h bars without their 5m/1m sources and accepts the stored lineage (the window projection
+# verifies those aggregates every window); a derived bar must still name its sources.
+SOURCE_LINEAGE_LOADED = "LOADED"
+STORED_LINEAGE_ACCEPTED = "STORED_ACCEPTED"
+SOURCE_LINEAGE_MODES = (SOURCE_LINEAGE_LOADED, STORED_LINEAGE_ACCEPTED)
 DAILY_ADJUSTED_GROUP = "1d:ADJUSTED"
 DAILY_RAW_GROUP = "1d:RAW_UNADJUSTED"
 HOURLY_RAW_GROUP = "1h:RAW_UNADJUSTED"
@@ -88,8 +95,13 @@ class RealtimeScreeningInput:
     identity_continuity_sha256: str | None = None
     known_by: InitVar[datetime | None] = None
     history_scopes: InitVar[tuple[EquityHistoryScope, ...]] = ()
+    # R78: an InitVar like known_by (out of equality and every hash, carried by `replace`).
+    source_lineage: InitVar[str] = SOURCE_LINEAGE_LOADED
 
-    def __post_init__(self, known_by, history_scopes):
+    def __post_init__(self, known_by, history_scopes, source_lineage):
+        if source_lineage not in SOURCE_LINEAGE_MODES:
+            raise ValueError("Screening source lineage mode is invalid")
+        object.__setattr__(self, "source_lineage", source_lineage)
         if self.cutoff.tzinfo is None or self.cutoff.utcoffset() is None:
             raise ValueError("Screening cutoff must be timezone-aware")
         object.__setattr__(self, "cutoff", self.cutoff.astimezone(timezone.utc))
@@ -160,6 +172,7 @@ def _validate_bars(rows, member, inputs):
     if len(indexed) != len(rows):
         raise ValueError("Screening bar revisions are duplicated")
     recorded_by = inputs.recorded_by
+    lineage_accepted = getattr(inputs, "source_lineage", SOURCE_LINEAGE_LOADED) == STORED_LINEAGE_ACCEPTED
     for row in rows:
         target_identity = (
             str(row["cohort_id"]) == str(inputs.cohort_id)
@@ -194,8 +207,12 @@ def _validate_bars(rows, member, inputs):
         if row["source_kind"] in {"DERIVED", "RECONCILED"} and not row["source_revision_ids"]:
             raise ValueError("Derived screening source lineage is missing")
         if row["source_kind"] == "DERIVED":
+            if lineage_accepted and str(row["source_revision_ids"][0]) not in indexed:
+                continue  # R78: sources not read (stored lineage accepted); skip resolving every source id
             sources = [indexed.get(str(source)) for source in row["source_revision_ids"]]
             if any(source is None for source in sources):
+                if lineage_accepted:
+                    continue
                 raise ValueError("Derived screening causal source is missing")
             sources.sort(key=lambda source: source["bar_start"])
             contiguous = not any(a["bar_end"] != b["bar_start"] for a, b in zip(sources, sources[1:]))

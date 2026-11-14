@@ -270,25 +270,12 @@ def persist_realtime_strategy_projection(compute_database, publication_database,
             or publication_database.process_plan.role is not RealtimeDatabaseRole.PUBLICATION):
         raise ValueError("Strategy persistence requires target-local COMPUTE and PUBLICATION roles")
     snapshot = projection.snapshot
-    _validate_strategy_snapshot(snapshot.source_manifest, snapshot.payload)
     if expected_snapshot_id is not None and str(snapshot.snapshot_id) != str(expected_snapshot_id):
-        raise ValueError("Strategy inputs changed after the checked release; refusing evidence writes")
-    writes = _strategy_materialization_writes(projection)
-    with compute_database.transaction() as cursor:
-        persist_realtime_equity_materialization_batch_cursor(cursor, writes)
-    if progress is not None:
-        progress.update(target_writes=bool(writes), strategy_evidence_committed=True,
-            strategy_evidence_members=len(writes), release_generated_at=snapshot.generated_at.isoformat())
-    with publication_database.transaction(dict_cursor=True) as cursor:
         _validate_strategy_snapshot(snapshot.source_manifest, snapshot.payload)
-        # The snapshot is known at its own `generated_at` (its evidence is observed then): a producer running
-        # before that instant (a window's deadline) must not fail the durability check on the wall clock.
-        durable_by = max(datetime.now(timezone.utc), snapshot.generated_at)
-        if snapshot.snapshot_type in {ROLLING_VERSION, HOURLY_ROLLING_VERSION}:
-            _validate_rolling_sources(cursor, snapshot.source_manifest, known_by=durable_by)
-        for manifest in _evaluation_manifests(snapshot.source_manifest):
-            _validate_durable(cursor, manifest, known_by=durable_by)
-        persist_portal_snapshot_cursor(cursor, snapshot, retention=RETENTION_KEPT)
+        raise ValueError("Strategy inputs changed after the checked release; refusing evidence writes")
+    write_strategy_evidence(compute_database, projection, progress=progress)
+    with publication_database.transaction(dict_cursor=True) as cursor:
+        persist_strategy_snapshot_cursor(cursor, snapshot)
         if receipt is not None:
             publish_portal_release_cursor(cursor, receipt, (snapshot,))
             session = portal_session_date(snapshot)
@@ -296,6 +283,39 @@ def persist_realtime_strategy_projection(compute_database, publication_database,
                     "XNYS").session_close(str(session)).to_pydatetime():
                 publish_portal_release_cursor(cursor, receipt, (snapshot,),
                     release_class=RELEASE_CLASS_SESSION_CLOSE, session_date=session)
+    return snapshot
+
+
+def write_strategy_evidence(compute_database, projection, *, progress=None):
+    """The per-member evidence (scanner receipts, features, setups) of a strategy projection, in its own COMPUTE
+    transaction (append-only rows; nothing becomes current). R78: split out so the daily products job can publish the
+    strategy snapshot and the Dashboard in one publication transaction."""
+    if (not isinstance(compute_database, RealtimeProcessDatabase)
+            or compute_database.process_plan.role is not RealtimeDatabaseRole.COMPUTE):
+        raise ValueError("Strategy evidence requires the target-local COMPUTE role")
+    snapshot = projection.snapshot
+    _validate_strategy_snapshot(snapshot.source_manifest, snapshot.payload)
+    writes = _strategy_materialization_writes(projection)
+    with compute_database.transaction() as cursor:
+        persist_realtime_equity_materialization_batch_cursor(cursor, writes)
+    if progress is not None:
+        progress.update(target_writes=bool(writes), strategy_evidence_committed=True,
+            strategy_evidence_members=len(writes), release_generated_at=snapshot.generated_at.isoformat())
+    return len(writes)
+
+
+def persist_strategy_snapshot_cursor(cursor, snapshot):
+    """Validates the snapshot against its durable evidence and stores it KEPT (self-contained for readers). The
+    caller's transaction names it in a release."""
+    _validate_strategy_snapshot(snapshot.source_manifest, snapshot.payload)
+    # The snapshot is known at its own `generated_at` (its evidence is observed then): a producer running
+    # before that instant (a window's deadline) must not fail the durability check on the wall clock.
+    durable_by = max(datetime.now(timezone.utc), snapshot.generated_at)
+    if snapshot.snapshot_type in {ROLLING_VERSION, HOURLY_ROLLING_VERSION}:
+        _validate_rolling_sources(cursor, snapshot.source_manifest, known_by=durable_by)
+    for manifest in _evaluation_manifests(snapshot.source_manifest):
+        _validate_durable(cursor, manifest, known_by=durable_by)
+    persist_portal_snapshot_cursor(cursor, snapshot, retention=RETENTION_KEPT)
     return snapshot
 
 
@@ -614,9 +634,11 @@ def _validate_durable(cursor, manifest, *, known_by):
 
 
 def _reference_matches(reference, revisions):
-    return (len(revisions) == 1
-            and str(revisions[0]["revision_id"]) == str(reference["security_revision_id"])
-            and revisions[0]["payload_sha256"] == reference["payload_sha256"])
+    """G97b (Nov 6, the Dashboard reader's rule; R78 Nov 14 for this reader): reference refreshes leave overlapping
+    validity windows, so the published revision must be one of the current revisions with the same payload, not the
+    only one. Requiring exactly one refused every daily strategy release after a refresh ("Strategy reference changed")."""
+    return any(str(revision["revision_id"]) == str(reference["security_revision_id"])
+               and revision["payload_sha256"] == reference["payload_sha256"] for revision in revisions)
 
 
 class RealtimeDailyStrategyRepository(_RealtimeCompatibilityRepository):
