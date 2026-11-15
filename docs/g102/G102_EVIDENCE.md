@@ -3159,3 +3159,13 @@ copy of live. Nothing deployed, nothing written to live, nothing committed.
   Follow-up (user, Nov 15, future iteration): a per-underlying cut-off for Options preparation (an underlying not
   prepared a few minutes after the open is dropped for the day), so one failing option chain cannot block the
   session activation for the others.
+- **Options V4 review (user, Nov 15 ~05:40 UTC; matrix R81):** the Nov 13 V4 failures are fixed and live (R67, R68, R69
+  r105-r109) except stale WARMING volume rows blocking windows (R69 open): fixed in `universe-sizing` (a WARMING
+  baseline no longer blocks; the contract is left unpackaged as VOLUME_WARMING). Measured on live (read-only): market-
+  state checkpoint 183,636 bytes (18% of 1 MiB), flow checkpoints 23-127 KB per shard (busiest 127,473), flow events
+  4,276 for the whole Nov 13 session, acquisition usage 8,747,115 messages / 2,124,007,209 bytes against live ceilings
+  40,000,000 / 8 GiB (stored in the binding). Code sweep of limits as contracts grow (estimates): market-state binds
+  first at ~480-500 contracts (one process loops over 250-contract shards), then acquisition ceilings (~800-900), the
+  V4 policy's 900 contracts, breadth REST at ~21 underlyings (degrades only); journal disk has no cleanup and Options
+  has no free-space guard. V4 at 216 stays for Monday.
+

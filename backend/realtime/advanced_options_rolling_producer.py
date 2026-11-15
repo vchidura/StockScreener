@@ -1874,9 +1874,12 @@ def _volumes(
         # A gap or a bad print leaves a total short until the next provider snapshot
         # re-anchors it (about every 5 minutes). The contract's state says
         # VOLUME_INCOMPLETE; it does not stop the window (user, Nov 9 2026, G68, G72).
+        # R69 (Nov 15 review): a WARMING baseline (no provider snapshot has anchored it yet, or a crashed run left it
+        # behind: 17 such rows blocked every window from 17:55 on Nov 13 until a manual write) is the same case: the
+        # contract's state says VOLUME_WARMING and the window leaves it unpackaged; it no longer blocks the window.
         if (
             baseline not in COMPLETE_BASELINES
-            and baseline is not BaselineKind.INCOMPLETE
+            and baseline not in {BaselineKind.INCOMPLETE, BaselineKind.WARMING}
         ):
             reasons.append("OPTION_VOLUME_CHECKPOINT_INCOMPLETE")
         if (
