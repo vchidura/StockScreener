@@ -980,7 +980,10 @@ def test_an_incomplete_contract_does_not_stop_the_window():
     )
 
 
-def test_a_warming_contract_still_stops_the_window():
+def test_a_warming_contract_does_not_stop_the_window():
+    """R69/R81 (Nov 15, 52845b0): a WARMING baseline (not yet anchored by a provider snapshot, or left by a crashed
+    flow run: 17 such rows blocked every Options window on Nov 13 from 17:55 until a manual write) no longer stops the
+    window; like INCOMPLETE, the contract is left unpackaged by the window (R31). This test asserted the old rule."""
     plan = producer._plan()
     contracts = tuple(
         {"contract_ticker": row.contract_ticker}
@@ -995,8 +998,8 @@ def test_a_warming_contract_still_stops_the_window():
         plan,
         contracts,
         evidence,
-    ) is None
-    assert "OPTION_VOLUME_CHECKPOINT_INCOMPLETE" in (
+    ) is not None
+    assert "OPTION_VOLUME_CHECKPOINT_INCOMPLETE" not in (
         evidence[-1].reason_codes
     )
 
@@ -1472,3 +1475,25 @@ def test_b14a_new_session_ends_stale_sessions_before_registering(
     run()
 
     assert order[:3] == ["end_stale", ("record", None), "register"]
+
+
+def test_the_window_leaves_a_warming_contract_unpackaged():
+    """R69/R81: the window runs with the WARMING contract and keeps it out of packages (R31's baseline rule), so a
+    detection on it stays an OBSERVATION; complete contracts are packaged as before."""
+    from types import SimpleNamespace
+
+    from realtime.advanced_options_p8_window import _baseline_incomplete_instruments
+    from realtime.option_flow.volume import BaselineKind
+
+    rolling = SimpleNamespace(contract_volumes=(
+        SimpleNamespace(checkpoint=SimpleNamespace(contract_ticker="O:A"), completeness=BaselineKind.WARMING),
+        SimpleNamespace(checkpoint=SimpleNamespace(contract_ticker="O:B"), completeness=BaselineKind.SESSION_COMPLETE),
+        SimpleNamespace(checkpoint=SimpleNamespace(contract_ticker="O:C"), completeness=BaselineKind.SNAPSHOT_RECONCILED),
+        SimpleNamespace(checkpoint=SimpleNamespace(contract_ticker="O:D"), completeness=BaselineKind.INCOMPLETE),
+    ))
+    contracts = tuple(
+        SimpleNamespace(contract_ticker=ticker, instrument_id=index)
+        for index, ticker in enumerate(("O:A", "O:B", "O:C", "O:D"), start=1)
+    )
+
+    assert _baseline_incomplete_instruments(rolling, contracts, {1, 2, 3, 4}) == (1, 4)
