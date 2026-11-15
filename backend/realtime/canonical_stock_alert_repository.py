@@ -62,6 +62,81 @@ def load_due_canonical_stock_alert_receipts_cursor(
     session_date: date,
     limit: int = 8,
 ) -> tuple[Mapping[str, object], ...]:
+    return _due_receipts_cursor(
+        cursor,
+        cohort_id=cohort_id,
+        session_date=session_date,
+        limit=limit,
+        lock=True,
+    )
+
+
+def list_due_canonical_stock_alert_receipts_cursor(
+    cursor,
+    *,
+    cohort_id: UUID,
+    session_date: date,
+    limit: int = 8,
+) -> tuple[Mapping[str, object], ...]:
+    """R71 (Nov 15): the due receipts without the row lock, for a READ ONLY snapshot transaction. The receipt is
+    claimed later, by `claim_canonical_stock_alert_receipt_cursor`, in the short SERIALIZABLE write transaction."""
+    return _due_receipts_cursor(
+        cursor,
+        cohort_id=cohort_id,
+        session_date=session_date,
+        limit=limit,
+        lock=False,
+    )
+
+
+def claim_canonical_stock_alert_receipt_cursor(
+    cursor,
+    *,
+    receipt_id: str,
+    cohort_id: UUID,
+    session_date: date,
+) -> Mapping[str, object] | None:
+    """R71: lock one receipt that is still due (no batch yet, not locked by another claimer). None = not claimable."""
+    rows = _due_receipts_cursor(
+        cursor,
+        cohort_id=cohort_id,
+        session_date=session_date,
+        limit=1,
+        lock=True,
+        receipt_id=str(UUID(str(receipt_id))),
+    )
+    return rows[0] if rows else None
+
+
+def canonical_stock_alert_state_fingerprint_cursor(
+    cursor,
+    *,
+    detector_sha256: str,
+    cohort_id: UUID,
+) -> str:
+    """R71: identity of the detector state a batch was built from (key, revision, payload hash of every row). The
+    write transaction compares it with the snapshot's, so a batch built from a state that changed since is never
+    written (the state upsert would otherwise skip it silently by revision)."""
+    cursor.execute(
+        "SELECT state_key,revision,state_sha256 FROM rt.detector_state "
+        "WHERE detector_sha256=%s AND cohort_id=%s ORDER BY state_key",
+        (detector_sha256, str(cohort_id)),
+    )
+    return canonical_sha256([
+        [str(value) for value in _values(row, ("state_key", "revision", "state_sha256"))]
+        for row in cursor.fetchall()
+    ])
+
+
+def _due_receipts_cursor(
+    cursor,
+    *,
+    cohort_id: UUID,
+    session_date: date,
+    limit: int,
+    lock: bool,
+    receipt_id: str | None = None,
+) -> tuple[Mapping[str, object], ...]:
     if not 1 <= limit <= 32:
         raise ValueError("canonical Stock Alert claim limit is invalid")
     cursor.execute(
@@ -74,7 +149,8 @@ def load_due_canonical_stock_alert_receipts_cursor(
         "ON window_run.window_id=receipt.window_id "
         "JOIN rt.service_plans AS plan ON plan.plan_id=window_run.plan_id "
         "WHERE receipt.cohort_id=%s AND plan.session_date=%s "
-        "AND receipt.receipt_kind='INPUT_READY' "
+        + ("AND receipt.receipt_id=%s " if receipt_id is not None else "")
+        + "AND receipt.receipt_kind='INPUT_READY' "
         "AND EXISTS (SELECT 1 FROM rt.stage_runs AS stage "
         "WHERE stage.window_id=receipt.window_id "
         "AND stage.stage_id='EQUITY_MATERIALIZE' "
@@ -82,9 +158,13 @@ def load_due_canonical_stock_alert_receipts_cursor(
         "AND NOT EXISTS (SELECT 1 "
         "FROM rt.canonical_stock_alert_batches AS batch "
         "WHERE batch.input_receipt_id=receipt.receipt_id) "
-        "ORDER BY receipt.cutoff,receipt.created_at LIMIT %s "
-        "FOR UPDATE OF window_run SKIP LOCKED",
-        (str(cohort_id), session_date, limit),
+        "ORDER BY receipt.cutoff,receipt.created_at LIMIT %s"
+        + (" FOR UPDATE OF window_run SKIP LOCKED" if lock else ""),
+        (
+            (str(cohort_id), session_date, receipt_id, limit)
+            if receipt_id is not None
+            else (str(cohort_id), session_date, limit)
+        ),
     )
     names = (
         "receipt_id",

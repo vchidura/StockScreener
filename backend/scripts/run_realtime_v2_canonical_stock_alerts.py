@@ -32,6 +32,9 @@ from realtime.canonical_stock_alert_publication import (  # noqa: E402
 from realtime.canonical_stock_alert_repository import (  # noqa: E402
     build_canonical_stock_alert_batch_cursor,
     canonical_stock_alert_health_cursor,
+    canonical_stock_alert_state_fingerprint_cursor,
+    claim_canonical_stock_alert_receipt_cursor,
+    list_due_canonical_stock_alert_receipts_cursor,
     load_due_canonical_stock_alert_receipts_cursor,
     persist_canonical_stock_alert_batch_cursor,
 )
@@ -73,6 +76,153 @@ def should_retry_conflict(error: DatabaseError, consecutive_conflicts: int) -> b
         error.pgcode in _RETRYABLE_POSTGRES_SQLSTATES
         and consecutive_conflicts <= MAXIMUM_CONSECUTIVE_CONFLICTS
     )
+
+
+# R71 (Nov 13-15): the whole batch ran SERIALIZABLE, so every bar, reference and context row it read took a predicate
+# lock. At 38 members with every rule evaluated one batch held ~38,600 SIReadLocks and exhausted Postgres
+# max_pred_locks_per_transaction (64): "out of shared memory", a crash loop, and a database-wide slowdown that pushed
+# Equity into cold windows. SNAPSHOT (default) builds each batch in a READ ONLY REPEATABLE READ snapshot (one consistent
+# view, no predicate locks; the inputs are as-of reads bounded by the receipt's cutoff and known_by), then claims the
+# receipt and writes the batch in a short SERIALIZABLE transaction that first checks the detector state is still the one
+# the batch was built from. SERIALIZABLE is the r102 behaviour (one transaction for claim, reads and writes), kept as a
+# switch-only fallback. The rule module is not touched (its source is the detector version: memory stock-alerts-version-reset).
+STOCK_ALERT_BATCH_READS_ENV = "REALTIME_V2_STOCK_ALERT_BATCH_READS"
+BATCH_READS_SNAPSHOT = "SNAPSHOT"
+BATCH_READS_SERIALIZABLE = "SERIALIZABLE"
+
+
+class StockAlertBatchInputsChanged(RuntimeError):
+    """The detector state changed between the snapshot build and the write: the batch is rebuilt on the next poll."""
+
+    pgcode = "40001"
+
+
+def batch_reads(environ=None) -> str:
+    value = (environ if environ is not None else os.environ).get(
+        STOCK_ALERT_BATCH_READS_ENV,
+        BATCH_READS_SNAPSHOT,
+    ).strip().upper() or BATCH_READS_SNAPSHOT
+    if value not in {BATCH_READS_SNAPSHOT, BATCH_READS_SERIALIZABLE}:
+        raise ValueError(
+            f"{STOCK_ALERT_BATCH_READS_ENV} must be "
+            f"{BATCH_READS_SNAPSHOT} or {BATCH_READS_SERIALIZABLE}"
+        )
+    return value
+
+
+def run_due_batches(
+    provider,
+    *,
+    cohort_id,
+    session_date,
+    claim_limit: int,
+    reads: str = BATCH_READS_SNAPSHOT,
+) -> list:
+    """Build and persist the due batches in cutoff order; returns the persisted batch documents."""
+    if reads == BATCH_READS_SERIALIZABLE:
+        reports = []
+        with provider.transaction(
+            APP_ROLE,
+            dict_cursor=True,
+            isolation_level="SERIALIZABLE",
+        ) as unit:
+            receipts = load_due_canonical_stock_alert_receipts_cursor(
+                unit.cursor,
+                cohort_id=cohort_id,
+                session_date=session_date,
+                limit=claim_limit,
+            )
+            for receipt in receipts:
+                batch = build_canonical_stock_alert_batch_cursor(
+                    unit.cursor,
+                    receipt,
+                    session_date=session_date,
+                )
+                reports.append(
+                    persist_canonical_stock_alert_batch_cursor(
+                        unit.cursor,
+                        batch,
+                    )
+                )
+        return reports
+    if reads != BATCH_READS_SNAPSHOT:
+        raise ValueError("canonical Stock Alert batch read mode is invalid")
+    with provider.transaction(
+        APP_ROLE,
+        dict_cursor=True,
+        read_only=True,
+        isolation_level="REPEATABLE READ",
+    ) as unit:
+        receipts = list_due_canonical_stock_alert_receipts_cursor(
+            unit.cursor,
+            cohort_id=cohort_id,
+            session_date=session_date,
+            limit=claim_limit,
+        )
+    reports = []
+    for receipt in receipts:
+        # A receipt whose window row another transaction holds is skipped by the claim (SKIP LOCKED): probe that in
+        # a tiny transaction first, so a held receipt does not cost a full build on every poll.
+        with provider.transaction(
+            APP_ROLE,
+            dict_cursor=True,
+        ) as unit:  # the server default, READ COMMITTED
+            claimable =claim_canonical_stock_alert_receipt_cursor(
+                unit.cursor,
+                receipt_id=str(receipt["receipt_id"]),
+                cohort_id=cohort_id,
+                session_date=session_date,
+            ) is not None
+        if not claimable:
+            break
+        # One snapshot per receipt, taken after the previous receipt's write committed: the next batch's prior state
+        # is the state the previous batch wrote, exactly as in the single SERIALIZABLE transaction.
+        with provider.transaction(
+            APP_ROLE,
+            dict_cursor=True,
+            read_only=True,
+            isolation_level="REPEATABLE READ",
+        ) as unit:
+            batch = build_canonical_stock_alert_batch_cursor(
+                unit.cursor,
+                receipt,
+                session_date=session_date,
+            )
+            built_from = canonical_stock_alert_state_fingerprint_cursor(
+                unit.cursor,
+                detector_sha256=batch.version.detector_sha256,
+                cohort_id=batch.cohort_id,
+            )
+        with provider.transaction(
+            APP_ROLE,
+            dict_cursor=True,
+            isolation_level="SERIALIZABLE",
+        ) as unit:
+            claimed = claim_canonical_stock_alert_receipt_cursor(
+                unit.cursor,
+                receipt_id=str(receipt["receipt_id"]),
+                cohort_id=cohort_id,
+                session_date=session_date,
+            )
+            if claimed is None:
+                # Written meanwhile or held by another claimer: later receipts depend on its state, so stop here
+                # and start again from a fresh snapshot on the next poll.
+                break
+            if canonical_stock_alert_state_fingerprint_cursor(
+                unit.cursor,
+                detector_sha256=batch.version.detector_sha256,
+                cohort_id=batch.cohort_id,
+            ) != built_from:
+                raise StockAlertBatchInputsChanged(
+                    "canonical Stock Alert detector state changed after the snapshot build"
+                )
+            reports.append(
+                persist_canonical_stock_alert_batch_cursor(
+                    unit.cursor,
+                    batch,
+                )
+            )
+    return reports
 
 
 def parse_args(argv=None):
@@ -356,30 +506,14 @@ def main(argv=None) -> int:
                 continue
             reports = []
             try:
-                with provider.transaction(
-                    APP_ROLE,
-                    dict_cursor=True,
-                    isolation_level="SERIALIZABLE",
-                ) as unit:
-                    receipts = load_due_canonical_stock_alert_receipts_cursor(
-                        unit.cursor,
-                        cohort_id=cohort_id,
-                        session_date=session_date,
-                        limit=args.claim_limit,
-                    )
-                    for receipt in receipts:
-                        batch = build_canonical_stock_alert_batch_cursor(
-                            unit.cursor,
-                            receipt,
-                            session_date=session_date,
-                        )
-                        reports.append(
-                            persist_canonical_stock_alert_batch_cursor(
-                                unit.cursor,
-                                batch,
-                            )
-                        )
-            except DatabaseError as error:
+                reports = run_due_batches(
+                    provider,
+                    cohort_id=cohort_id,
+                    session_date=session_date,
+                    claim_limit=args.claim_limit,
+                    reads=batch_reads(),
+                )
+            except (DatabaseError, StockAlertBatchInputsChanged) as error:
                 conflicts += 1
                 if not should_retry_conflict(error, conflicts):
                     raise
