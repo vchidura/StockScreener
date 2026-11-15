@@ -3060,3 +3060,22 @@ Tests run offline in the r98 image with the worktree mounted (`runner/run_tests_
   - The `v3-stable-nov5` worktree (v3-live-fixes) now equals the live r119 image file for file (0 differences), so
     `runner/build_candidate.sh` builds the live scheduler code again.
   - The ops folder (handover, runner tools, rollout) is gitignored, as before.
+- **R78 review round (Nov 15 00:40-01:30 UTC; user: "review and fix if valid")**. Five findings from an external
+  review, all valid. Plan section 10 has the table.
+  - Checked read only on live:
+    - Equity cohorts' first releases are at generation 13 (13 READY seeds, the last Oct 30).
+    - A new cohort's prepared products had generation 1 under the old rule, 14 under the new one (the worktree's SQL
+      on live rows; the Nov 13 cohort: 20).
+    - The receipts' `build_id` (`advanced-equity-window-v2`, 25 of 96 characters).
+    - A cohort without products on the live API: Dashboard reads 503 "Dashboard has no retained publication for
+      this cohort", strategy reads 503 "No retained independent daily strategy release".
+  - Fixed in worktree `r78-daily-products` (uncommitted):
+    - `daily_products.py`: generation rule, OUTRANKED, compute again over outranked prepared products, session-close
+      kept Dashboard and SESSION_CLOSE release.
+    - `daily_products_launcher.py` and the scheduler: watchdog timer, process group, `stop()` at shutdown.
+    - `ticker_projection.py` and `stage_runners_equity.py`: Pattern Watch mode bound to the receipt and used by
+      recovery.
+  - Tests: `test_daily_products_r78.py` 72 passed (19 new: the real publisher for P1 and P2-3, a real process tree
+    for P2-5). The 27 touched suites (the 25 of the build plus the two scheduler suites): 978 passed, 11 failed. Ten are the baseline failures of ea76dd5. The eleventh, test_equity_full_session_services_are_long_lived_until_stopped, fails the same way on the committed 60da29d: it reads docker-compose.realtime-v2.yml from the repository root, which the test container does not mount. No new failures.
+  - Live r119 still has P1: without a fixed image, Monday's new cohort has no Dashboard or strategies in the
+    session. Handover section 11 has the finding and the switch fallback.

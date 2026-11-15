@@ -337,3 +337,41 @@ or the live data it rests on.
   - Matrix row R79.
 - **30m and 1h Pattern Watch outside the window:** not needed; the warm projection already refreshes them when their
   bars complete.
+
+## 10. Review round (Nov 15): five integration findings
+
+An external review raised five findings. All five were checked against the code and live rows (read only) and are
+valid. Fixed in worktree `r78-daily-products`: uncommitted, not built, not deployed.
+
+| # | Finding | Checked | Fix |
+|---|---|---|---|
+| P1 | Prepared products can fail to publish after the first window | Live: a new Equity cohort's first window publishes at generation 13 (13 READY reference seeds, the last Oct 30). The old rule gives products prepared before it generation 1. At the same cutoff the publisher records them HISTORICAL_STALE, the job raises, and every retry finds the same prepared products. With r119, Monday's new cohort would have no Dashboard and no strategies for the whole session. | The job's generation is above the cohort's snapshots and features, its current release, and the READY seed count (a fresh cohort: 14 on live). Prepared products below the current release are not released; the run computes again (in the load, and once more if a window outranks them at publication). Refused before anything is written (`OUTRANKED`). |
+| P2-2 | A Pattern Watch switch change breaks recovery | Recovery (rehydration) projected in the current switch. FULL to LIGHT rebuilds other workspaces; LIGHT to FULL names evidence never written. | The stage that projects the cycle records its mode on the receipt (`build_id` + `+pattern-watch-light`; FULL receipts unchanged). Recovery projects in the recorded mode. Reusing a PORTAL_READY receipt compares the producer build without the suffix. |
+| P2-3 | No session-close Dashboard is kept | JOB mode: the window builds no close Dashboard, and the job stored its Dashboard HOT only, in an INTRADAY release. The strategy producer's SESSION_CLOSE release was dropped too. | When the products describe the cohort's own session and attach to its closing release (AFTER_CLOSE): the Dashboard is HOT and KEPT, and a SESSION_CLOSE release names the kept Dashboard and the (KEPT) strategy snapshot, as before. |
+| P2-4 | The deadline only applies between windows | The scheduler runs a window synchronously; the launcher polls between windows. | A watchdog timer thread kills the run at its deadline; the tick stays as a fallback. |
+| P2-5 | A kill reaches only the job, not its workers | `running.kill()` on the parent only; shutdown only closed the pool. | The job starts in its own session (`start_new_session`); deadline, failure and scheduler shutdown kill the process group. Address-space and CPU limits are per process: with N workers up to (N + 1) times the limit, so workers stay at 1 (the default; live does not set it). |
+
+- **Fresh-cohort behaviour (the review's first rehearsal priority), live API, Nov 15 01:05.** For a cohort whose
+  release names no products:
+  - `/api/latest-price-date`, `/api/tickers/overview` and `/api/scan/all` answer 503 "Dashboard has no retained
+    publication for this cohort";
+  - `/api/strategies/daily` answers 503 "No retained independent daily strategy release".
+  - So "the previous publications stay served" holds for a cohort that has products. A new cohort, which the portal
+    reads from the open, has none of its own until a run publishes: normally seconds after its first window. If
+    every attempt fails, it has none all session; the operator fallback is the switch (handover section 11).
+- **Recovery across a switch change (the second rehearsal priority).** Tests, both directions:
+  - the projection under a bound mode equals the original (snapshot ids and pattern materializations);
+  - the projection stage records its mode;
+  - the publish stage rehydrates in the receipt's mode whatever the switch;
+  - a retry reuses a bound receipt.
+
+  A live read-only rehydration of a recorded window under the other switch is part of the candidate rehearsal.
+- **Tests:**
+  - `test_daily_products_r78.py`: 72 passed (19 new). P1 and P2-3 are tested through the real publisher
+    (`publish_portal_release_cursor` over in-memory rows): generations 1, 5 and 8 against 7 reproduce the review's
+    table, and the session-close release names the kept products. P2-5 kills a real process tree.
+  - The 27 touched suites (the 25 of the build plus the two scheduler suites): 978 passed, 11 failed. Ten are the baseline failures of ea76dd5. The eleventh, test_equity_full_session_services_are_long_lived_until_stopped, fails the same way on the committed 60da29d: it reads docker-compose.realtime-v2.yml from the repository root, which the test container does not mount. No new failures.
+- **Residual (by design, unchanged):** a lane that republishes at the same cutoff after the job, below the job's
+  generation, records HISTORICAL_STALE and keeps the job's release current (the after-close run already behaved
+  this way).
+
