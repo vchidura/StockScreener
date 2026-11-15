@@ -465,8 +465,12 @@ class PostgresContinuousSessionStateRepository(SessionRuntimeStatePort):
             for row in cursor.fetchall()
             if str(row[0]) in ticker_by_security
         }
+        # G102 universe sizing (O-4/O-5, Nov 15): the session runs the configured underlyings that were READY and
+        # activated at contract selection and received contracts; the rest are UNAVAILABLE for the day. So the
+        # admitted set is a non-empty subset of the configured one (it was equal before Nov 15).
         if (
-            option_underlyings != configured_option_underlyings
+            not configured_option_underlyings
+            or not configured_option_underlyings.issubset(option_underlyings)
             or not configured_option_underlyings.issubset(
                 effective_equity_members
             )

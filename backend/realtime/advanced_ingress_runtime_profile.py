@@ -2,14 +2,19 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Mapping
 
 from .advanced_equity_scale import (
     AdvancedScalePolicy,
     load_advanced_scale_policy,
 )
-from .contracts import canonical_sha256
+from .contracts import canonical_json, canonical_sha256
+from .universe_limits import SCHEMA_MAX_UNIVERSE_NAMES, max_universe_names
+
+# The pre-053 catalog's range: legacy exact-size profile SHAs exist only up to it (history, not a limit).
+_LEGACY_MAX_TARGET = 400
 
 
 ADVANCED_RUNTIME_PROFILE_STATUSES = frozenset(
@@ -177,8 +182,8 @@ class AdvancedIngressRuntimeProfile:
         if not normalized_version or len(normalized_version) > 96:
             raise ValueError("runtime profile version is invalid")
         object.__setattr__(self, "version", normalized_version)
-        if not 1 <= self.universe_target <= 400:
-            raise ValueError("runtime profile target must be in [1, 400]")
+        if not 1 <= self.universe_target <= SCHEMA_MAX_UNIVERSE_NAMES:
+            raise ValueError(f"runtime profile target must be in [1, {SCHEMA_MAX_UNIVERSE_NAMES}]")
         if (
             self.provider_tier != "MASSIVE_ADVANCED"
             or (self.feed, self.channels)
@@ -226,90 +231,100 @@ class AdvancedIngressRuntimeProfile:
         })
 
 
+def _legacy_profile_for_target(
+    catalog_version: str,
+    legacy_profiles: tuple[AdvancedIngressRuntimeProfile, ...],
+    universe_target: int,
+) -> AdvancedIngressRuntimeProfile:
+    """The pre-R62 identity of a size: the reviewed ladder profile, or an exact-size copy of the next one."""
+    matches = tuple(
+        profile
+        for profile in legacy_profiles
+        if profile.universe_target == universe_target
+    )
+    if len(matches) == 1:
+        return matches[0]
+    if matches:
+        raise ValueError(
+            "runtime profile catalog contains duplicate target profiles"
+        )
+    capacity = next(
+        (
+            profile
+            for profile in legacy_profiles
+            if profile.universe_target >= universe_target
+        ),
+        None,
+    )
+    if capacity is None:
+        raise ValueError("runtime profile target exceeds reviewed capacity")
+    return AdvancedIngressRuntimeProfile(
+        version=(
+            f"{catalog_version}-exact-{universe_target}"
+            f"-capacity-{capacity.universe_target}"
+        ),
+        universe_target=universe_target,
+        provider_tier=capacity.provider_tier,
+        feed=capacity.feed,
+        channels=capacity.channels,
+        settings=capacity.settings,
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class AdvancedIngressRuntimeCatalog:
+    """G102 R62 (Nov 15): one size-independent profile serves every universe size up to
+    REALTIME_UNIVERSE_MAX_NAMES (`universe_limits`).
+
+    The seven reviewed ladder profiles (1, 9, 25, 50, 100, 200, 400) carried identical settings and the controller
+    satisfied the promotion ladder with back-dated approvals of its own, so per-size profiles guarded nothing while
+    every new size needed a profile row the app role cannot write (R62: the Nov 13 activation crash-looped). New plans
+    pin `profile`; the legacy ladder and its exact-size copies stay resolvable by SHA only, so plans, cohorts and
+    capability profiles stored before the change keep loading.
+    """
+
     version: str
     path: Path
     scale_policy: AdvancedScalePolicy
-    profiles: tuple[AdvancedIngressRuntimeProfile, ...]
+    profile: AdvancedIngressRuntimeProfile
+    legacy_profiles: tuple[AdvancedIngressRuntimeProfile, ...]
+    legacy_by_sha: Mapping[str, AdvancedIngressRuntimeProfile] = field(
+        default_factory=dict, compare=False, repr=False,
+    )
+
+    @property
+    def profiles(self) -> tuple[AdvancedIngressRuntimeProfile, ...]:
+        """The profiles new plans may pin (registered ACTIVE by migration 053)."""
+        return (self.profile,)
 
     def profile_for_target(
         self,
         universe_target: int,
     ) -> AdvancedIngressRuntimeProfile:
-        if type(universe_target) is not int or not 1 <= universe_target <= 400:
-            raise ValueError("runtime profile target must be in [1, 400]")
-        matches = tuple(
-            profile
-            for profile in self.profiles
-            if profile.universe_target == universe_target
-        )
-        if len(matches) == 1:
-            return matches[0]
-        if matches:
-            raise ValueError(
-                "runtime profile catalog contains duplicate target profiles"
-            )
-        capacity = next(
-            (
-                profile
-                for profile in self.profiles
-                if profile.universe_target >= universe_target
-            ),
-            None,
-        )
-        if capacity is None:
+        maximum = max_universe_names()
+        if type(universe_target) is not int or not 1 <= universe_target <= maximum:
+            raise ValueError(f"runtime profile target must be in [1, {maximum}] (REALTIME_UNIVERSE_MAX_NAMES)")
+        if universe_target > self.profile.universe_target:
             raise ValueError("runtime profile target exceeds reviewed capacity")
-        return AdvancedIngressRuntimeProfile(
-            version=(
-                f"{self.version}-exact-{universe_target}"
-                f"-capacity-{capacity.universe_target}"
-            ),
-            universe_target=universe_target,
-            provider_tier=capacity.provider_tier,
-            feed=capacity.feed,
-            channels=capacity.channels,
-            settings=capacity.settings,
-        )
-
-    def capacity_target_for(self, universe_target: int) -> int:
-        profile = self.profile_for_target(universe_target)
-        return next(
-            known.universe_target
-            for known in self.profiles
-            if known.settings == profile.settings
-            and known.universe_target >= universe_target
-        )
-
-    def promotion_ladder_for_target(
-        self,
-        universe_target: int,
-    ) -> tuple[int, ...]:
-        self.profile_for_target(universe_target)
-        return tuple(
-            target
-            for target in self.scale_policy.universe_ladder
-            if target < universe_target
-        ) + (universe_target,)
+        return self.profile
 
     def profile_for_sha(
         self,
         profile_sha256: str,
     ) -> AdvancedIngressRuntimeProfile:
-        matches = tuple(
-            self.profile_for_target(target)
-            for target in range(1, 401)
-            if self.profile_for_target(target).sha256 == profile_sha256
-        )
-        if len(matches) != 1:
+        if profile_sha256 == self.profile.sha256:
+            return self.profile
+        profile = self.legacy_by_sha.get(profile_sha256)
+        if profile is None:
             raise ValueError("runtime profile SHA is unavailable")
-        return matches[0]
+        return profile
 
 
 _CATALOG_KEYS = frozenset({
     "version",
     "ladder_policy_file",
-    "profiles",
+    "profile",
+    "legacy_profiles",
 })
 _PROFILE_KEYS = frozenset({
     "version",
@@ -340,49 +355,115 @@ def load_advanced_ingress_runtime_catalog(
         raise ValueError("Advanced ingress runtime catalog version changed")
     scale_path = resolved.parent / str(value["ladder_policy_file"])
     scale_policy = load_advanced_scale_policy(scale_path)
-    raw_profiles = value["profiles"]
+    profile = _load_profile(value["profile"])
+    raw_profiles = value["legacy_profiles"]
     if not isinstance(raw_profiles, list):
-        raise ValueError("runtime profiles must be a list")
-    profiles = []
-    for raw_profile in raw_profiles:
-        if (
-            not isinstance(raw_profile, dict)
-            or frozenset(raw_profile) != _PROFILE_KEYS
-        ):
-            raise ValueError("Advanced ingress runtime profile keys changed")
-        settings = raw_profile["settings"]
-        if (
-            not isinstance(settings, dict)
-            or frozenset(settings) != _SETTINGS_KEYS
-        ):
-            raise ValueError(
-                "Advanced ingress technical setting keys changed"
-            )
-        channels = raw_profile["channels"]
-        if not isinstance(channels, list):
-            raise ValueError("runtime profile channels must be a list")
-        profiles.append(
-            AdvancedIngressRuntimeProfile(
-                version=str(raw_profile["version"]),
-                universe_target=int(raw_profile["universe_target"]),
-                provider_tier=str(raw_profile["provider_tier"]),
-                feed=str(raw_profile["feed"]),
-                channels=tuple(str(channel) for channel in channels),
-                settings=AdvancedIngressTechnicalSettings(**settings),
-            )
-        )
-    targets = tuple(profile.universe_target for profile in profiles)
+        raise ValueError("legacy runtime profiles must be a list")
+    legacy = tuple(_load_profile(raw_profile) for raw_profile in raw_profiles)
+    targets = tuple(item.universe_target for item in legacy)
     if (
         targets != scale_policy.universe_ladder
-        or len({profile.version for profile in profiles}) != len(profiles)
-        or len({profile.sha256 for profile in profiles}) != len(profiles)
+        or len({item.version for item in legacy}) != len(legacy)
+        or len({item.sha256 for item in legacy}) != len(legacy)
     ):
         raise ValueError(
-            "runtime profiles must exactly cover the versioned scale ladder"
+            "legacy runtime profiles must exactly cover the versioned scale ladder"
         )
+    if (
+        profile.feed != "STOCKS"
+        or profile.channels != ("AM",)
+        or profile.universe_target != SCHEMA_MAX_UNIVERSE_NAMES
+        or profile.version in {item.version for item in legacy}
+    ):
+        raise ValueError(
+            f"the size-independent runtime profile must be a new STOCKS AM profile covering 1..{SCHEMA_MAX_UNIVERSE_NAMES}"
+        )
+    legacy_by_sha: dict[str, AdvancedIngressRuntimeProfile] = {}
+    for target in range(1, _LEGACY_MAX_TARGET + 1):
+        item = _legacy_profile_for_target(version, legacy, target)
+        if item.sha256 in legacy_by_sha or item.sha256 == profile.sha256:
+            raise ValueError("runtime profile catalog has an ambiguous profile SHA")
+        legacy_by_sha[item.sha256] = item
     return AdvancedIngressRuntimeCatalog(
         version,
         resolved,
         scale_policy,
-        tuple(profiles),
+        profile,
+        legacy,
+        legacy_by_sha,
     )
+
+
+def _load_profile(raw_profile: object) -> AdvancedIngressRuntimeProfile:
+    if (
+        not isinstance(raw_profile, dict)
+        or frozenset(raw_profile) != _PROFILE_KEYS
+    ):
+        raise ValueError("Advanced ingress runtime profile keys changed")
+    settings = raw_profile["settings"]
+    if (
+        not isinstance(settings, dict)
+        or frozenset(settings) != _SETTINGS_KEYS
+    ):
+        raise ValueError(
+            "Advanced ingress technical setting keys changed"
+        )
+    channels = raw_profile["channels"]
+    if not isinstance(channels, list):
+        raise ValueError("runtime profile channels must be a list")
+    return AdvancedIngressRuntimeProfile(
+        version=str(raw_profile["version"]),
+        universe_target=int(raw_profile["universe_target"]),
+        provider_tier=str(raw_profile["provider_tier"]),
+        feed=str(raw_profile["feed"]),
+        channels=tuple(str(channel) for channel in channels),
+        settings=AdvancedIngressTechnicalSettings(**settings),
+    )
+
+
+SIZE_INDEPENDENT_PROFILE_APPROVAL_REFERENCE = (
+    "g102-r62-migration-053-size-independent-runtime-profile"
+)
+
+
+def size_independent_profile_registration(
+    catalog: AdvancedIngressRuntimeCatalog,
+) -> dict[str, object]:
+    """The exact row migration 053 registers ACTIVE for `catalog.profile` (also used by the admin check script).
+
+    The evidence hashes are deterministic: the profile's settings are the reviewed ladder's settings unchanged, which
+    is the stability and capacity basis it inherits.
+    """
+    profile = catalog.profile
+    policy = catalog.scale_policy.sha256
+    reviewed = tuple(item.sha256 for item in catalog.legacy_profiles)
+    if any(item.settings != profile.settings for item in catalog.legacy_profiles):
+        raise ValueError(
+            "the size-independent profile must keep the reviewed ladder settings"
+        )
+    return {
+        "runtime_profile_sha256": profile.sha256,
+        "runtime_profile_version": profile.version,
+        "universe_target": profile.universe_target,
+        "ladder_position": 0,
+        "previous_universe_target": None,
+        "provider_tier": profile.provider_tier,
+        "feed": profile.feed,
+        "channels": profile.channels,
+        "profile_document": canonical_json(profile.identity),
+        "configuration_sha256": profile.configuration_sha256(policy),
+        "runtime_policy_sha256": policy,
+        "stability_evidence_sha256": canonical_sha256({
+            "contract": "size-independent-runtime-profile-stability-v1",
+            "profile_sha256": profile.sha256,
+            "reviewed_ladder_profile_sha256s": reviewed,
+            "basis": "identical settings to every reviewed ladder profile",
+        }),
+        "capacity_evidence_sha256": canonical_sha256({
+            "contract": "size-independent-runtime-profile-capacity-v1",
+            "profile_sha256": profile.sha256,
+            "covers_universe_targets": (1, profile.universe_target),
+            "reviewed_capacity_profile_sha256": reviewed[-1],
+        }),
+        "activation_approval_reference": SIZE_INDEPENDENT_PROFILE_APPROVAL_REFERENCE,
+    }

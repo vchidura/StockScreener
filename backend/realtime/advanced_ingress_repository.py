@@ -30,6 +30,7 @@ from .provider_budget import (
     ProviderBudgetScope,
     reserve_coordinated_provider_request_cursor,
 )
+from .universe_limits import max_universe_names
 
 
 class AdvancedIngressAdmissionError(RuntimeError):
@@ -310,104 +311,6 @@ def activate_advanced_runtime_profile_cursor(
     )
 
 
-def ensure_exact_advanced_runtime_profile_cursor(
-    cursor,
-    runtime_catalog: AdvancedIngressRuntimeCatalog,
-    *,
-    universe_target: int,
-    activated_at: datetime,
-) -> AdvancedRuntimeProfileRegistration:
-    profile = runtime_catalog.profile_for_target(universe_target)
-    cursor.execute(
-        "SELECT runtime_profile_version,configuration_sha256,"
-        "runtime_policy_sha256,status "
-        "FROM rt.advanced_ingress_runtime_profiles "
-        "WHERE runtime_profile_sha256=%s",
-        (profile.sha256,),
-    )
-    stored = cursor.fetchone()
-    expected_configuration = profile.configuration_sha256(
-        runtime_catalog.scale_policy.sha256
-    )
-    if stored is not None:
-        if tuple(str(value) for value in stored) != (
-            profile.version,
-            expected_configuration,
-            runtime_catalog.scale_policy.sha256,
-            "ACTIVE",
-        ):
-            raise ValueError(
-                "stored exact-target runtime profile conflicts"
-            )
-        return AdvancedRuntimeProfileRegistration(
-            profile.sha256,
-            profile.version,
-            profile.universe_target,
-            expected_configuration,
-            runtime_catalog.scale_policy.sha256,
-            "ACTIVE",
-        )
-    if universe_target in runtime_catalog.scale_policy.universe_ladder:
-        raise ValueError(
-            "reviewed ladder runtime profile is not ACTIVE"
-        )
-    capacity_target = runtime_catalog.capacity_target_for(universe_target)
-    capacity = runtime_catalog.profile_for_target(capacity_target)
-    cursor.execute(
-        "SELECT stability_evidence_sha256,capacity_evidence_sha256 "
-        "FROM rt.advanced_ingress_runtime_profiles "
-        "WHERE runtime_profile_sha256=%s AND status='ACTIVE'",
-        (capacity.sha256,),
-    )
-    evidence = cursor.fetchone()
-    stability_evidence_sha256 = (
-        str(evidence[0])
-        if evidence is not None
-        else canonical_sha256({
-            "contract": "reviewed-capacity-settings-v1",
-            "catalog_version": runtime_catalog.version,
-            "capacity_profile_sha256": capacity.sha256,
-            "runtime_policy_sha256": (
-                runtime_catalog.scale_policy.sha256
-            ),
-        })
-    )
-    capacity_evidence_sha256 = (
-        str(evidence[1])
-        if evidence is not None
-        else canonical_sha256({
-            "contract": "exact-target-capacity-bound-v1",
-            "universe_target": universe_target,
-            "capacity_target": capacity_target,
-            "capacity_profile_sha256": capacity.sha256,
-        })
-    )
-    promotion_ladder = runtime_catalog.promotion_ladder_for_target(
-        universe_target
-    )
-    register_advanced_runtime_profile_cursor(
-        cursor,
-        profile,
-        runtime_policy_sha256=runtime_catalog.scale_policy.sha256,
-        ladder_position=len(promotion_ladder) - 1,
-        previous_universe_target=(
-            None if len(promotion_ladder) == 1
-            else promotion_ladder[-2]
-        ),
-    )
-    return activate_advanced_runtime_profile_cursor(
-        cursor,
-        profile.sha256,
-        stability_evidence_sha256=stability_evidence_sha256,
-        capacity_evidence_sha256=capacity_evidence_sha256,
-        approval_reference=(
-            "derived-exact-target:"
-            f"{capacity.sha256}:{universe_target}"
-        ),
-        activated_at=activated_at,
-    )
-
-
 def _authorization_from_row(row) -> AdvancedStreamAuthorization:
     budgets = AdvancedIngressBudgets(
         int(row[7]),
@@ -471,58 +374,35 @@ def load_advanced_stream_authorization_cursor(
 def create_advanced_stream_authorization_cursor(
     cursor,
     authorization: AdvancedStreamAuthorization,
-    *,
-    promotion_ladder: tuple[int, ...] | None = None,
-    calendar=None,
 ) -> AdvancedStreamAuthorization:
+    """Store one standing authorization (idempotent by scope).
+
+    R62 (migration 053): no promotion ladder. The database requires an ACTIVE product runtime profile covering the
+    authorized size; a parent is optional and, when given, must be READY, the same product and policy, and end before
+    this authorization starts.
+    """
     cursor.execute(
         "SELECT pg_advisory_xact_lock(hashtextextended(%s,0))",
         (f"v2-advanced-authorization:{authorization.scope_sha256}",),
     )
-    parent = None
     if authorization.parent_authorization_id is not None:
         parent = load_advanced_stream_authorization_cursor(
             cursor,
             authorization.parent_authorization_id,
             for_update=True,
         )
-    if promotion_ladder is not None:
-        target = authorization.allowed_universe_targets[0]
-        if target not in promotion_ladder:
-            raise ValueError("authorization target is outside ladder policy")
-        position = promotion_ladder.index(target)
-        if position == 0:
-            if parent is not None:
-                raise ValueError(
-                    "initial ladder authorization cannot have a parent"
-                )
-        else:
-            if parent is None:
-                raise ValueError(
-                    "promotion requires a parent authorization"
-                )
-            if (
-                parent.status != "READY"
-                or parent.feed != authorization.feed
-                or parent.channel != authorization.channel
-                or parent.allowed_universe_targets[0]
-                != promotion_ladder[position - 1]
-                or parent.runtime_policy_sha256
-                != authorization.runtime_policy_sha256
-            ):
-                raise ValueError(
-                    "promotion must follow one configured ladder rung"
-                )
-            if calendar is None:
-                from options.calendar import OptionExchangeCalendar
-
-                calendar = OptionExchangeCalendar("XNYS")
-            if authorization.valid_from != calendar.next_session_date(
-                parent.valid_through
-            ):
-                raise ValueError(
-                    "promotion must become effective next market session"
-                )
+        if (
+            parent.status != "READY"
+            or parent.feed != authorization.feed
+            or parent.channel != authorization.channel
+            or parent.runtime_policy_sha256
+            != authorization.runtime_policy_sha256
+            or authorization.valid_from <= parent.valid_through
+        ):
+            raise ValueError(
+                "a parent authorization must be READY, the same product "
+                "and policy, and end before its child starts"
+            )
     cursor.execute(
         "INSERT INTO rt.advanced_stream_authorizations ("
         "authorization_id,authorization_reference,scope_sha256,"
@@ -616,6 +496,50 @@ def revoke_advanced_stream_authorization_cursor(
     return current.with_status("REVOKED")
 
 
+def covering_advanced_runtime_profiles_cursor(
+    cursor,
+    runtime_catalog: AdvancedIngressRuntimeCatalog,
+    *,
+    universe_target: int,
+) -> dict[str, AdvancedIngressRuntimeProfile]:
+    """ACTIVE STOCKS AM runtime profiles that cover `universe_target`, by configuration SHA.
+
+    R62: one size-independent profile (registered ACTIVE by migration 053) covers every size up to REALTIME_UNIVERSE_MAX_NAMES. Legacy exact-size and ladder
+    profiles stay valid for cohorts provisioned with them (a same-size day keeps its source cohort's configuration).
+    A stored row the catalog does not know is ignored; a known SHA whose stored identity differs is an error.
+    """
+    maximum = max_universe_names()
+    if type(universe_target) is not int or not 1 <= universe_target <= maximum:
+        raise ValueError(f"runtime profile target must be in [1, {maximum}] (REALTIME_UNIVERSE_MAX_NAMES)")
+    runtime_policy_sha256 = runtime_catalog.scale_policy.sha256
+    cursor.execute(
+        "SELECT runtime_profile_sha256,runtime_profile_version,"
+        "configuration_sha256,profile_document "
+        "FROM rt.advanced_ingress_runtime_profiles "
+        "WHERE status='ACTIVE' AND provider_tier='MASSIVE_ADVANCED' "
+        "AND feed='STOCKS' AND channels=ARRAY['AM']::text[] "
+        "AND runtime_policy_sha256=%s AND universe_target>=%s "
+        "ORDER BY universe_target,runtime_profile_sha256",
+        (runtime_policy_sha256, universe_target),
+    )
+    covering: dict[str, AdvancedIngressRuntimeProfile] = {}
+    for row in cursor.fetchall():
+        try:
+            profile = runtime_catalog.profile_for_sha(str(row[0]))
+        except ValueError:
+            continue
+        if (
+            str(row[1]) != profile.version
+            or str(row[2]) != profile.configuration_sha256(runtime_policy_sha256)
+            or canonical_sha256(row[3]) != profile.sha256
+        ):
+            raise ValueError(
+                "stored Advanced runtime profile conflicts with source catalog"
+            )
+        covering[str(row[2])] = profile
+    return covering
+
+
 def resolve_advanced_ingress_plan_cursor(
     cursor,
     request: AdvancedIngressPlanRequest,
@@ -627,31 +551,15 @@ def resolve_advanced_ingress_plan_cursor(
         cursor,
         request.authorization_id,
     )
-    source_profile = runtime_catalog.profile_for_target(
-        request.universe_target
-    )
     runtime_policy_sha256 = runtime_catalog.scale_policy.sha256
-    configuration_sha256 = source_profile.configuration_sha256(
-        runtime_policy_sha256
-    )
     if authorization.runtime_policy_sha256 != runtime_policy_sha256:
         raise AdvancedCohortResolutionError("RUNTIME_POLICY_MISMATCH")
-    cursor.execute(
-        "SELECT runtime_profile_version,configuration_sha256,"
-        "runtime_policy_sha256,status,profile_document "
-        "FROM rt.advanced_ingress_runtime_profiles "
-        "WHERE runtime_profile_sha256=%s",
-        (source_profile.sha256,),
+    covering = covering_advanced_runtime_profiles_cursor(
+        cursor,
+        runtime_catalog,
+        universe_target=request.universe_target,
     )
-    stored_profile = cursor.fetchone()
-    if (
-        stored_profile is None
-        or str(stored_profile[0]) != source_profile.version
-        or str(stored_profile[1]) != configuration_sha256
-        or str(stored_profile[2]) != runtime_policy_sha256
-        or stored_profile[3] != "ACTIVE"
-        or canonical_sha256(stored_profile[4]) != source_profile.sha256
-    ):
+    if not covering:
         raise AdvancedCohortResolutionError("RUNTIME_PROFILE_NOT_ACTIVE")
     if calendar is None:
         from options.calendar import OptionExchangeCalendar
@@ -668,11 +576,11 @@ def resolve_advanced_ingress_plan_cursor(
     if request.canary_start_at is not None:
         advanced_ingress_provider_deadline(
             authorized_start_at, authorized_end_at,
-            drain_seconds=source_profile.settings.drain_deadline_seconds,
-            shutdown_seconds=source_profile.settings.shutdown_deadline_seconds,
+            drain_seconds=runtime_catalog.profile.settings.drain_deadline_seconds,
+            shutdown_seconds=runtime_catalog.profile.settings.shutdown_deadline_seconds,
         )
     cursor.execute(
-        "SELECT cohort.cohort_id,cohort.manifest_id "
+        "SELECT cohort.cohort_id,cohort.manifest_id,cohort.configuration_sha256 "
         "FROM rt.cohorts AS cohort "
         "JOIN rt.subscription_manifests AS manifest USING(manifest_id) "
         "JOIN rt.capability_profiles AS capability USING(profile_id) "
@@ -680,9 +588,10 @@ def resolve_advanced_ingress_plan_cursor(
         "WHERE manifest.session_date=%s AND manifest.stock_count=%s "
         "AND capability.provider_tier='MASSIVE_ADVANCED' "
         "AND capability.status='PASS' AND capability.expires_at>=%s "
-        "AND capability.config_sha256=%s "
-        "AND cohort.configuration_sha256=%s "
-        "GROUP BY cohort.cohort_id,cohort.manifest_id,manifest.member_count "
+        "AND capability.config_sha256=cohort.configuration_sha256 "
+        "AND cohort.configuration_sha256=ANY(%s) "
+        "GROUP BY cohort.cohort_id,cohort.manifest_id,manifest.member_count,"
+        "cohort.configuration_sha256 "
         "HAVING COUNT(member.instrument_id)=%s "
         "AND COUNT(member.instrument_id) FILTER "
         "(WHERE member.channel='AM')=%s "
@@ -691,16 +600,15 @@ def resolve_advanced_ingress_plan_cursor(
             request.session_date,
             request.universe_target,
             authorized_end_at,
-            configuration_sha256,
-            configuration_sha256,
+            sorted(covering),
             request.universe_target,
             request.universe_target,
         ),
     )
-    candidates = tuple(
-        (UUID(str(row[0])), UUID(str(row[1])))
-        for row in cursor.fetchall()
-    )
+    configurations = {}
+    for row in cursor.fetchall():
+        configurations[(UUID(str(row[0])), UUID(str(row[1])))] = str(row[2])
+    candidates = tuple(configurations)
     if request.preferred_cohort_id is not None:
         candidates = tuple(
             candidate
@@ -712,6 +620,8 @@ def resolve_advanced_ingress_plan_cursor(
     if len(candidates) > 1:
         raise AdvancedCohortResolutionError("COHORT_AMBIGUOUS")
     cohort_id, manifest_id = candidates[0]
+    configuration_sha256 = configurations[candidates[0]]
+    source_profile = covering[configuration_sha256]
     if request.canary_start_at is not None:
         cursor.execute(
             "SELECT DISTINCT reference.ticker "

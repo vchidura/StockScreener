@@ -34,7 +34,6 @@ from .advanced_options_v3_authority import (
 from .buffer import BufferLimits, RawMessageBuffer
 from .contracts import (
     AssetClass,
-    EQUITY_VALIDATION_UNIVERSE,
     MarketChannel,
     MarketFeed,
     SubscriptionManifest,
@@ -80,6 +79,7 @@ ZERO_FORBIDDEN_EFFECTS = {
     "trading": 0,
 }
 _OPTION_UNDERLYING = re.compile(r"^O:([A-Z]{1,6})")
+_EQUITY_SYMBOL = re.compile(r"^[A-Z]{1,6}$")
 
 
 def _utc(value: datetime, name: str) -> datetime:
@@ -133,9 +133,10 @@ class AdvancedOptionsAcquisitionBinding:
     connection_attempt_ceiling: int
     decoded_message_ceiling: int
     decoded_byte_ceiling: int
-    equity_tickers: tuple[str, ...] = (
-        EQUITY_VALIDATION_UNIVERSE.equity_tickers
-    )
+    # G102 universe sizing (O-1, Nov 15): the Equity names this session's Options reads, i.e. its underlyings. Empty
+    # means "the contracts' underlyings". Bindings written before Nov 15 carry the October validation nine; they stay
+    # valid because their contracts' underlyings are among those nine.
+    equity_tickers: tuple[str, ...] = ()
     maximum_message_bytes: int = 2_097_152
     buffer_event_limit: int = 128
     buffer_byte_limit: int = 8_388_608
@@ -146,10 +147,6 @@ class AdvancedOptionsAcquisitionBinding:
             str(value).strip().upper()
             for value in self.contract_tickers
         ))
-        equities = tuple(sorted(
-            str(value).strip().upper()
-            for value in self.equity_tickers
-        ))
         membership = {
             (_contract_underlyer(ticker), _contract_side(ticker))
             for ticker in contracts
@@ -157,6 +154,10 @@ class AdvancedOptionsAcquisitionBinding:
         underlyings = {
             underlyer for underlyer, _ in membership
         }
+        equities = tuple(sorted(
+            str(value).strip().upper()
+            for value in (self.equity_tickers or underlyings)
+        ))
         if (
             not isinstance(self.binding_id, UUID)
             or not self.binding_id.int
@@ -170,10 +171,14 @@ class AdvancedOptionsAcquisitionBinding:
             or not self.stream_session_id.int
             or not contracts
             or len(set(contracts)) != len(contracts)
-            or equities
-            != tuple(sorted(EQUITY_VALIDATION_UNIVERSE.equity_tickers))
+            or not equities
+            or len(set(equities)) != len(equities)
+            or any(
+                not _EQUITY_SYMBOL.fullmatch(value) for value in equities
+            )
             or not membership
             or not underlyings
+            or not underlyings.issubset(equities)
             or type(self.connection_attempt_ceiling) is not int
             or self.connection_attempt_ceiling <= 0
             or type(self.decoded_message_ceiling) is not int
@@ -275,17 +280,25 @@ def build_acquisition_binding(
     connection_attempt_ceiling: int,
     decoded_message_ceiling: int,
     decoded_byte_ceiling: int,
-    equity_tickers: tuple[str, ...] = (
-        EQUITY_VALIDATION_UNIVERSE.equity_tickers
-    ),
+    equity_tickers: tuple[str, ...] | None = None,
 ) -> AdvancedOptionsAcquisitionBinding:
+    """`equity_tickers`: the session's underlyings (O-1, Nov 15); None derives them from the contracts."""
+    contracts = tuple(sorted(
+        str(value).strip().upper() for value in contract_tickers
+    ))
+    equities = tuple(sorted({
+        str(value).strip().upper()
+        for value in (
+            equity_tickers
+            if equity_tickers
+            else (_contract_underlyer(ticker) for ticker in contracts)
+        )
+    }))
     values = {
         "source_sha256": source_sha256,
         "backend_image_id": backend_image_id,
         "authority": authority,
-        "contract_tickers": tuple(sorted(
-            str(value).strip().upper() for value in contract_tickers
-        )),
+        "contract_tickers": contracts,
         "owner_id": uuid5(
             NAMESPACE_URL,
             (
@@ -303,7 +316,7 @@ def build_acquisition_binding(
         "connection_attempt_ceiling": connection_attempt_ceiling,
         "decoded_message_ceiling": decoded_message_ceiling,
         "decoded_byte_ceiling": decoded_byte_ceiling,
-        "equity_tickers": equity_tickers,
+        "equity_tickers": equities,
     }
     unsigned = AdvancedOptionsAcquisitionBinding.__new__(
         AdvancedOptionsAcquisitionBinding
@@ -348,8 +361,10 @@ def acquisition_binding_from_payload(
         or not isinstance(budgets, Mapping)
         or not isinstance(runtime, Mapping)
         or not isinstance(membership, Mapping)
+        or not isinstance(membership.get("equity_tickers"), list)
+        # O-1 (Nov 15): any number of underlyings; the count must match the list.
         or membership.get("equity_target")
-        != len(EQUITY_VALIDATION_UNIVERSE.equity_tickers)
+        != len(membership["equity_tickers"])
         or value.get("owner_name") != ACQUISITION_OWNER_NAME
         or runtime.get("normalizer_version") != NORMALIZER_VERSION
     ):

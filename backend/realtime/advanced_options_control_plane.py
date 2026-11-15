@@ -931,6 +931,23 @@ def _receipt_identity(
     )
 
 
+def advanced_options_market_universe(
+    option_underlyings: tuple[str, ...] | list[str],
+) -> UniverseManifest:
+    """G102 universe sizing (O-2, Nov 15): the continuous Options scope. Options reads Equity data only for its
+    underlyings (the Options stream subscribes option contracts only; the Equity context loads only the underlyings),
+    so the scope is the underlyings alone. Preparation stores it and every control plan rebuilds it from the same
+    rule; the Equity list may grow or shrink between days without changing it."""
+    underlyings = tuple(sorted({str(value).strip().upper() for value in option_underlyings}))
+    if not underlyings:
+        raise ValueError("Advanced Options requires exact underlying membership")
+    return UniverseManifest(
+        version=f"market-options-{len(underlyings)}-{len(underlyings)}-v1",
+        equity_tickers=underlyings,
+        option_underlyings=underlyings,
+    )
+
+
 def _validate_equity_source(plan: AdvancedEquityControlPlanePlan) -> None:
     if not isinstance(plan, AdvancedEquityControlPlanePlan):
         raise TypeError("equity control-plane source is invalid")
@@ -1118,14 +1135,26 @@ def build_advanced_options_control_plane_plan(
     if authorization.any_authorized:
         raise ValueError("P1 does not authorize Advanced Options runtime actions")
 
-    universe = UniverseManifest(
-        version=(
-            f"market-options-{len(equity_plan.universe.equity_tickers)}-"
-            f"{len(option_underlyings)}-v1"
-        ),
-        equity_tickers=equity_plan.universe.equity_tickers,
-        option_underlyings=option_underlyings,
-    )
+    if not option_underlyings:
+        raise ValueError("Advanced Options requires exact underlying membership")
+    if set(option_underlyings) - set(equity_plan.universe.equity_tickers):
+        # The underlyings are the only Equity names Options reads (spot, bars, Equity context): each must be a member
+        # of today's activated Equity plan.
+        raise ValueError("Advanced Options underlyings are not members of today's Equity plan")
+    if stored_identity is not None:
+        # G102 universe sizing (O-2, Nov 15): the continuous Options scope is the underlyings only, exactly as
+        # preparation stores it (`advanced_options_market_universe`), so a change of the Equity list between
+        # preparation and activation (G96 Nov 6, R63 Nov 13) can no longer change the scope.
+        universe = advanced_options_market_universe(option_underlyings)
+    else:
+        universe = UniverseManifest(
+            version=(
+                f"market-options-{len(equity_plan.universe.equity_tickers)}-"
+                f"{len(option_underlyings)}-v1"
+            ),
+            equity_tickers=equity_plan.universe.equity_tickers,
+            option_underlyings=option_underlyings,
+        )
     if not universe.option_underlyings:
         raise ValueError("Advanced Options requires exact underlying membership")
     if (

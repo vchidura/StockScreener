@@ -391,7 +391,7 @@ def main(argv=None):
     runtime_catalog = load_advanced_ingress_runtime_catalog(
         BACKEND_DIR / "realtime" / "policies" / "advanced_equity_ingress_v1.json",
     )
-    profile = runtime_catalog.profile_for_target(1)
+    profile = runtime_catalog.legacy_profiles[0]  # live-024 qualification: the reviewed size-1 profile (pre-053)
     runtime_identity = source_bundle_identity(BACKEND_DIR, RUNTIME_PATHS)
     if manifest.get("runtime_bundle_sha256") != runtime_identity["sha256"]:
         raise RuntimeError("qualification image source differs from the frozen plan")

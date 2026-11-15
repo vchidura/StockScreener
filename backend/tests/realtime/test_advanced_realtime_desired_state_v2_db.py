@@ -685,7 +685,10 @@ def test_same_session_revisions_select_one_current_without_erasing_evidence():
         ("QQQ", DesiredMemberKind.OPTION_UNDERLYING),
     ),
 )
-def test_failed_existing_source_member_blocks_reduced_snapshot(ticker, kind):
+def test_failed_existing_source_member_is_left_out_without_blocking(ticker, kind):
+    """Universe sizing (Nov 15): a FAILED member of the previous session's cohort no longer BLOCKS the session; it is
+    left out with MEMBER_EXCLUDED:<ticker>:<kind>:BASELINE_FAILED and the others activate. (It used to return BLOCKED
+    with BASELINE_MEMBER_FAILED and no snapshot.)"""
     with disposable_v2_database(
         f"test_realtime_v2_c2_block_{ticker.lower()}_{uuid4().hex[:8]}"
     ) as pool:
@@ -711,24 +714,48 @@ def test_failed_existing_source_member_blocks_reduced_snapshot(ticker, kind):
                 checked_at=AFTER_CLOSE + timedelta(minutes=1),
             )
 
-            blocked = reconcile_desired_state(
+            pending = reconcile_desired_state(
                 connection,
                 revision.revision_id,
                 materialized_at=AFTER_CLOSE + timedelta(minutes=2),
             )
+            assert pending.state == "ACTIVATION_PENDING"
+            assert pending.snapshot is None
 
-            assert blocked.state == "BLOCKED"
-            assert blocked.snapshot is None
-            assert blocked.reason_codes == (
-                f"BASELINE_MEMBER_FAILED:{ticker}:{kind.value}",
+            activation_at = (
+                OptionExchangeCalendar("XNYS").session_open(revision.effective_session_date)
+                - timedelta(minutes=15)
             )
             with connection.cursor() as cursor:
-                cursor.execute(
-                    "SELECT count(*) FROM rt.realtime_desired_session_snapshots "
-                    "WHERE revision_id=%s",
-                    (str(revision.revision_id),),
+                activated = reconcile_desired_state_revision_cursor(
+                    cursor,
+                    revision.revision_id,
+                    materialized_at=activation_at,
+                    allow_partial_activation=True,
                 )
-                assert cursor.fetchone()[0] == 0
+            connection.commit()
+
+            # Leaving an Equity member out changes the stream subscription, so the session first needs the capability
+            # refresh (REFRESH_REQUIRED, handled by the capability-refresh service before the open); an underlying
+            # left out activates directly. Neither blocks.
+            assert activated.state in {"READY", "REFRESH_REQUIRED"}
+            assert not any(code.startswith("BASELINE_MEMBER_FAILED") for code in activated.reason_codes)
+            if activated.state == "READY":
+                assert f"MEMBER_EXCLUDED:{ticker}:{kind.value}:BASELINE_FAILED" in activated.reason_codes
+            with connection.cursor() as cursor:
+                if activated.snapshot is not None:
+                    failed = next(
+                        row for row in activated.preparations if row.ticker == ticker and row.kind is kind
+                    )
+                    member_kind = "true" if kind is DesiredMemberKind.OPTION_UNDERLYING else "false"
+                    cursor.execute(
+                        "SELECT count(*) FROM rt.subscription_members AS member "
+                        "JOIN rt.instruments AS instrument USING (instrument_id) "
+                        f"WHERE member.manifest_id=%s AND member.option_underlying={member_kind} "
+                        "AND instrument.security_id=%s",
+                        (str(activated.snapshot.manifest_id), str(failed.security_id)),
+                    )
+                    assert cursor.fetchone()[0] == 0
                 cursor.execute(
                     "SELECT count(*) FROM rt.subscription_members "
                     "WHERE manifest_id=%s",

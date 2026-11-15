@@ -386,14 +386,8 @@ def main(argv=None) -> int:
             raise ValueError(
                 "standing authorization requires one universe target"
             )
+        # R62 (migration 053): any size 1..400 is covered by the size-independent profile; no promotion ladder.
         catalog.profile_for_target(target[0])
-        ladder_index = catalog.scale_policy.universe_ladder.index(target[0])
-        if (ladder_index == 0) != (
-            args.parent_authorization_id is None
-        ):
-            raise ValueError(
-                "only the first ladder target omits a parent authorization"
-            )
         authorization = build_advanced_stream_authorization(
             parent_authorization_id=args.parent_authorization_id,
             allowed_universe_targets=target,
@@ -405,16 +399,10 @@ def main(argv=None) -> int:
             approval_reference=args.approval_reference,
         )
         if args.execute:
-            from options.calendar import OptionExchangeCalendar
-
             with _admin_cursor(settings, database=args.database) as cursor:
                 authorization = create_advanced_stream_authorization_cursor(
                     cursor,
                     authorization,
-                    promotion_ladder=(
-                        catalog.scale_policy.universe_ladder
-                    ),
-                    calendar=OptionExchangeCalendar("XNYS"),
                 )
         report = _authorization_report(
             authorization,
@@ -427,14 +415,12 @@ def main(argv=None) -> int:
         if targets is not None:
             for target in targets:
                 catalog.profile_for_target(target)
-        selected = tuple(
-            (index, profile) for index, profile in enumerate(catalog.profiles)
-            if targets is None or profile.universe_target in targets
-        )
+        # R62: one size-independent profile (migration 053 registers it ACTIVE); no ladder positions.
+        selected = tuple(enumerate(catalog.profiles))
         registrations = []
         if args.execute:
             with _admin_cursor(settings, database=args.database) as cursor:
-                for index, profile in selected:
+                for _index, profile in selected:
                     registrations.append(
                         register_advanced_runtime_profile_cursor(
                             cursor,
@@ -442,12 +428,8 @@ def main(argv=None) -> int:
                             runtime_policy_sha256=(
                                 catalog.scale_policy.sha256
                             ),
-                            ladder_position=index,
-                            previous_universe_target=(
-                                catalog.profiles[index - 1].universe_target
-                                if index > 0
-                                else None
-                            ),
+                            ladder_position=0,
+                            previous_universe_target=None,
                         )
                     )
         report = {

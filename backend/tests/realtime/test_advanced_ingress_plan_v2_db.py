@@ -164,12 +164,6 @@ class _MissingSessionCalendar:
         ) + timedelta(hours=21)
 
 
-class _PromotionCalendar:
-    def next_session_date(self, session_date):
-        assert session_date == SESSION_DATE
-        return SESSION_DATE + timedelta(days=1)
-
-
 def _digest():
     return uuid4().hex + uuid4().hex
 
@@ -319,22 +313,14 @@ def hardened_database():
                 ),
             )
             provider.verify()
+            # R62: migration 053 registered the size-independent profile ACTIVE; no admin registration here.
             with _admin_cursor(pool, roles) as cursor:
-                register_advanced_runtime_profile_cursor(
-                    cursor,
-                    RUNTIME_PROFILE,
-                    runtime_policy_sha256=POLICY_SHA,
-                    ladder_position=0,
-                    previous_universe_target=None,
+                cursor.execute(
+                    "SELECT status FROM rt.advanced_ingress_runtime_profiles "
+                    "WHERE runtime_profile_sha256=%s",
+                    (RUNTIME_PROFILE.sha256,),
                 )
-                activate_advanced_runtime_profile_cursor(
-                    cursor,
-                    RUNTIME_PROFILE.sha256,
-                    stability_evidence_sha256="c" * 64,
-                    capacity_evidence_sha256="d" * 64,
-                    approval_reference="db-test-profile-activation",
-                    activated_at=SESSION_OPEN - timedelta(days=2),
-                )
+                assert cursor.fetchone() == ("ACTIVE",)
             yield pool, provider, roles, cohort_id, manifest_id
     finally:
         if roles_owned:
@@ -2121,83 +2107,62 @@ def test_two_controllers_reclaim_one_stale_owner_and_fence_old_writes(
     ),)
 
 
-def test_promotion_requires_active_profile_next_session_and_one_ladder_rung(
+def test_any_size_is_authorized_directly_with_a_covering_profile_and_no_ladder(
     hardened_database,
 ):
+    """R62 (migration 053): no promotion ladder; an ACTIVE product profile covering the size is the only rule."""
     pool, _provider, roles, _cohort_id, _manifest_id = hardened_database
-    parent = _create_authorization(pool, roles, "promotion-parent")
-    for target in (9, 25):
-        profile = RUNTIME_CATALOG.profile_for_target(target)
-        position = RUNTIME_CATALOG.scale_policy.universe_ladder.index(target)
-        with _admin_cursor(pool, roles) as cursor:
-            register_advanced_runtime_profile_cursor(
-                cursor,
-                profile,
-                runtime_policy_sha256=POLICY_SHA,
-                ladder_position=position,
-                previous_universe_target=(
-                    RUNTIME_CATALOG.scale_policy.universe_ladder[
-                        position - 1
-                    ]
-                ),
-            )
-            activate_advanced_runtime_profile_cursor(
-                cursor,
-                profile.sha256,
-                stability_evidence_sha256=(
-                    f"{target:064x}"[-64:]
-                ),
-                capacity_evidence_sha256=(
-                    f"{target + 1:064x}"[-64:]
-                ),
-                approval_reference=f"activate-target-{target}",
-                activated_at=SESSION_OPEN - timedelta(days=1),
-            )
-    promoted = build_advanced_stream_authorization(
-        parent_authorization_id=parent.authorization_id,
-        allowed_universe_targets=(9,),
-        valid_from=SESSION_DATE + timedelta(days=1),
-        valid_through=SESSION_DATE + timedelta(days=1),
-        maximum_budgets=parent.maximum_budgets,
-        runtime_policy_sha256=POLICY_SHA,
-        approval_source="db-test",
-        approval_reference="promotion-to-nine",
-    )
-    with _admin_cursor(pool, roles) as cursor:
-        stored = create_advanced_stream_authorization_cursor(
-            cursor,
-            promoted,
-            promotion_ladder=RUNTIME_CATALOG.scale_policy.universe_ladder,
-            calendar=_PromotionCalendar(),
+    parent = _create_authorization(pool, roles, "covering-parent")
+    for target in (9, 25, 45, 52, 400):
+        direct = build_advanced_stream_authorization(
+            parent_authorization_id=None,
+            allowed_universe_targets=(target,),
+            valid_from=SESSION_DATE,
+            valid_through=SESSION_DATE,
+            maximum_budgets=parent.maximum_budgets,
+            runtime_policy_sha256=POLICY_SHA,
+            approval_source="db-test",
+            approval_reference=f"direct-size-{target}",
         )
-    assert stored.allowed_universe_targets == (9,)
+        with _admin_cursor(pool, roles) as cursor:
+            stored = create_advanced_stream_authorization_cursor(cursor, direct)
+        assert stored.allowed_universe_targets == (target,)
+        assert stored.parent_authorization_id is None
 
-    skipped = build_advanced_stream_authorization(
+    # A parent stays optional; when given it may be any size, and must end before its child starts.
+    child = build_advanced_stream_authorization(
         parent_authorization_id=parent.authorization_id,
-        allowed_universe_targets=(25,),
+        allowed_universe_targets=(100,),
         valid_from=SESSION_DATE + timedelta(days=1),
         valid_through=SESSION_DATE + timedelta(days=1),
         maximum_budgets=parent.maximum_budgets,
         runtime_policy_sha256=POLICY_SHA,
         approval_source="db-test",
-        approval_reference="invalid-skip-to-25",
+        approval_reference="child-skips-sizes",
     )
     with _admin_cursor(pool, roles) as cursor:
-        with pytest.raises(ValueError, match="one configured ladder rung"):
-            create_advanced_stream_authorization_cursor(
-                cursor,
-                skipped,
-                promotion_ladder=(
-                    RUNTIME_CATALOG.scale_policy.universe_ladder
-                ),
-                calendar=_PromotionCalendar(),
-            )
+        assert create_advanced_stream_authorization_cursor(cursor, child).allowed_universe_targets == (100,)
+
+    # Under a policy no ACTIVE profile carries, nothing covers the size: the database refuses.
+    uncovered = build_advanced_stream_authorization(
+        parent_authorization_id=None,
+        allowed_universe_targets=(45,),
+        valid_from=SESSION_DATE,
+        valid_through=SESSION_DATE,
+        maximum_budgets=parent.maximum_budgets,
+        runtime_policy_sha256="e" * 64,
+        approval_source="db-test",
+        approval_reference="no-covering-profile",
+    )
+    with pytest.raises(psycopg2.errors.RaiseException, match="covering its size"):
+        with _admin_cursor(pool, roles) as cursor:
+            create_advanced_stream_authorization_cursor(cursor, uncovered)
 
 
-def test_promotion_rejects_same_session_child(hardened_database):
+def test_a_parent_must_end_before_its_child_starts(hardened_database):
     pool, _provider, roles, _cohort_id, _manifest_id = hardened_database
     parent = _create_authorization(pool, roles, "same-session-parent")
-    promoted = build_advanced_stream_authorization(
+    same_session = build_advanced_stream_authorization(
         parent_authorization_id=parent.authorization_id,
         allowed_universe_targets=(9,),
         valid_from=SESSION_DATE,
@@ -2209,18 +2174,8 @@ def test_promotion_rejects_same_session_child(hardened_database):
     )
 
     with _admin_cursor(pool, roles) as cursor:
-        with pytest.raises(
-            ValueError,
-            match="promotion must become effective next market session",
-        ):
-            create_advanced_stream_authorization_cursor(
-                cursor,
-                promoted,
-                promotion_ladder=(
-                    RUNTIME_CATALOG.scale_policy.universe_ladder
-                ),
-                calendar=_PromotionCalendar(),
-            )
+        with pytest.raises(ValueError, match="end before its child starts"):
+            create_advanced_stream_authorization_cursor(cursor, same_session)
 
 
 def test_exact_resolution_requires_one_candidate_or_admin_binding_and_pins_profile(

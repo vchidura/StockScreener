@@ -34,7 +34,11 @@ from .advanced_equity_preparation import (
     reconcile_equity_preparation_provider_requests_cursor,
 )
 from .advanced_realtime_desired_state import DesiredMemberKind
-from .advanced_realtime_desired_state_repository import DESIRED_STATE_SCOPE
+from .advanced_realtime_desired_state_repository import (
+    DESIRED_STATE_SCOPE,
+    latest_security_reference_cursor,
+    provider_inactive_reason_for_session,
+)
 from .advanced_realtime_fencing import (
     DurableRuntimeLease,
     claim_durable_runtime_lease_cursor,
@@ -43,7 +47,11 @@ from .advanced_realtime_fencing import (
 from .contracts import canonical_sha256
 from .database_access_v2 import APP_ROLE, WriteFenceRejected
 from .equity_bar_repository import persist_realtime_equity_bars_cursor
-from .equity_history import equity_history_coordinates, load_equity_history_cursor
+from .equity_history import (
+    adjusted_period_listed,
+    equity_history_coordinates,
+    load_equity_history_cursor,
+)
 from .equity_portal_history import build_realtime_equity_portal_history_plan
 from .provider_budget import (
     ProviderBudgetExceeded,
@@ -65,6 +73,8 @@ DIVIDEND_COVERAGE_VALIDITY = timedelta(days=1)
 DIVIDEND_COVERAGE_NEEDED_AFTER_OPEN = timedelta(hours=9)
 # Long enough to renew on a Friday evening what would expire over the weekend.
 IDENTITY_RENEWAL_MARGIN = timedelta(days=3)
+# Universe sizing 3.2 (Nov 15): how often an inactive (delisted) member's provider reference is re-checked.
+INACTIVE_REFERENCE_RECHECK = timedelta(hours=20)
 ADJUSTED_INTERVALS = {
     "ADJUSTED_1D": "1d",
     "ADJUSTED_1WK": "1wk",
@@ -329,8 +339,13 @@ def plan_equity_rollover_cursor(
     completed = calendar.previous_session_date(target)
     members = _member_rows_cursor(cursor, revision_id)
     portal_plan = build_realtime_equity_portal_history_plan(completed)
+    references = latest_security_reference_cursor(
+        cursor, {member.security_id for member in members},
+    )
     work = []
     for member in members:
+        stored = references.get(member.security_id)
+        inactive = provider_inactive_reason_for_session(stored, target) is not None
         reference = _reference_work_cursor(
             cursor,
             member,
@@ -338,8 +353,18 @@ def plan_equity_rollover_cursor(
             session_open=calendar.session_open(target),
             checked_at=checked,
         )
-        if reference is not None:
+        if reference is not None and not (
+            # An inactive member's reference is re-checked once a day (it returns if the provider reports it active
+            # again); its dividend coverage is never renewed, so without this it would be due on every pass.
+            inactive
+            and stored.get("observed_at") is not None
+            and checked - stored["observed_at"] < INACTIVE_REFERENCE_RECHECK
+        ):
             work.append(reference)
+        if inactive:
+            # Universe sizing 3.2 (Nov 15): an inactive (delisted) member gets no new bars. The activation leaves it out.
+            continue
+        listing_date = None if stored is None else stored.get("list_date")
         for action, interval, candidates in (
             ("ADJUSTED_1D", "1d", portal_plan.adjusted_sessions),
             ("ADJUSTED_1WK", "1wk", portal_plan.weekly_sessions),
@@ -350,7 +375,11 @@ def plan_equity_rollover_cursor(
                 member,
                 cohort_id=cohort_id,
                 interval=interval,
-                sessions=tuple(candidates),
+                # G86 (Nov 15): periods before the listing have no bars to keep current.
+                sessions=tuple(
+                    session for session in candidates
+                    if adjusted_period_listed(calendar, interval, session, listing_date)
+                ),
                 checked_at=checked,
                 adjustments_through=completed,
                 calendar=calendar,
@@ -615,11 +644,14 @@ class AdvancedEquityRolloverResident:
                 response_bytes=error.response_bytes,
                 next_retry_at=_rollover_retry_at(completed, attempt),
             )
+        # R59 / universe sizing 3.2 (Nov 15): an inactive (delisted) SECURITY revision is always recorded, so the next
+        # activation leaves the member out; an active one only when the identity is due for renewal.
         facts = tuple(
             fact
             for fact in chunk.reference_facts
             if work.renew_identity
             or fact.relation is not ReferenceFactRelation.SECURITY
+            or dict(fact.values).get("active") is False
         )
         with self.provider.transaction(APP_ROLE, fence=fence) as unit:
             fence.verify(unit.cursor)

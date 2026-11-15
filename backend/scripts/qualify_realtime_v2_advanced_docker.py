@@ -438,7 +438,9 @@ def exercise_stock_metadata_contract(world):
     runtime_catalog = load_advanced_ingress_runtime_catalog(
         BACKEND_DIR / "realtime" / "policies" / "advanced_equity_ingress_v1.json",
     )
-    profile = runtime_catalog.profile_for_target(1)
+    # The live-024 schema predates migration 053: its plan rule needs a profile of exactly the plan's size, so this
+    # disposable qualification registers the reviewed legacy size-1 profile, not the size-independent one.
+    profile = runtime_catalog.legacy_profiles[0]
     runtime_policy_sha256 = runtime_catalog.scale_policy.sha256
     configuration_sha256 = profile.configuration_sha256(
         runtime_policy_sha256
@@ -490,7 +492,6 @@ def exercise_stock_metadata_contract(world):
         stored_authorization = create_advanced_stream_authorization_cursor(
             cursor,
             authorization,
-            promotion_ladder=(1,),
         )
         ingress = resolve_advanced_ingress_plan_cursor(
             cursor,

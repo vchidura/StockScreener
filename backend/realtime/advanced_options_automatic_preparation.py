@@ -43,10 +43,10 @@ from .advanced_options_control_plane import (
     ADVANCED_OPTIONS_REST_LANES,
     AdvancedOptionsSocketBudget,
     advanced_options_history_binding_payload,
+    advanced_options_market_universe,
     build_advanced_options_history_binding,
 )
 from .advanced_options_flow_policy import (
-    EXPECTED_UNDERLYINGS,
     load_advanced_options_flow_policy,
 )
 from .advanced_options_activity_momentum_c6 import (
@@ -1070,6 +1070,21 @@ class PostgresAutomaticOptionsPreparationExecutor(
         document["semantic_sha256"] = canonical_sha256(document)
         return document
 
+    def _underlying_priority_order(self, claim) -> tuple[str, ...]:
+        """O-5 (Nov 15): the session's underlyings in the desired list's priority order (lower number first)."""
+        with self._provider.transaction(APP_ROLE, read_only=True) as unit:
+            unit.cursor.execute(
+                "SELECT ticker,priority FROM rt.realtime_desired_member_intents "
+                "WHERE revision_id=%s AND member_kind='OPTION_UNDERLYING' "
+                "AND enabled AND ticker=ANY(%s)",
+                (str(claim.revision_id), list(claim.option_underlyings)),
+            )
+            priorities = {str(row[0]): int(row[1]) for row in unit.cursor.fetchall()}
+        return tuple(sorted(
+            claim.option_underlyings,
+            key=lambda ticker: (priorities.get(ticker, 32768), ticker),
+        ))
+
     def _allocate_capture(self, claim, capture):
         compatibility_profile = (
             SEALED_CAPTURE_EXACT_FOUR_PROFILE
@@ -1186,6 +1201,7 @@ class PostgresAutomaticOptionsPreparationExecutor(
                 self._effective_provider_project_ceiling
             ),
             resolution=resolution,
+            priority_order=self._underlying_priority_order(claim),
         )
         selected = set(allocation.selected_contract_tickers)
         if not selected:
@@ -1567,6 +1583,9 @@ class PostgresAutomaticOptionsPreparationExecutor(
             connection_attempt_ceiling=self._connection_attempt_ceiling,
             decoded_message_ceiling=self._decoded_message_ceiling,
             decoded_byte_ceiling=self._decoded_byte_ceiling,
+            # O-1 (Nov 15): the binding carries the session's underlyings (the only Equity names Options reads),
+            # not the October validation nine.
+            equity_tickers=tuple(claim.option_underlyings),
         )
         selection_plan = self._selection_plan(
             claim,
@@ -1648,21 +1667,23 @@ class PostgresAutomaticOptionsPreparationExecutor(
                 raise AdvancedOptionsPreparationRetryable(
                     "READY Equity source cohort is unavailable"
                 )
+            # G102 universe sizing (O-4, Nov 15): each underlying needs a READY Equity member of this revision (its
+            # history is backfilled by Equity preparation), not membership in the previous session's cohort: a name
+            # onboarded and READY before the session is processed that session.
             cursor.execute(
                 "SELECT intent.ticker,binding.instrument_id "
                 "FROM rt.realtime_desired_member_intents AS intent "
                 "JOIN rt.realtime_desired_member_bindings AS binding "
                 "USING(intent_id) "
-                "WHERE intent.revision_id=%s "
+                "JOIN rt.realtime_desired_intent_readiness AS readiness "
+                "USING(intent_id) "
+                "WHERE intent.revision_id=%s AND intent.enabled "
                 "AND intent.member_kind IN ('EQUITY','SECTOR_ETF') "
-                "AND EXISTS (SELECT 1 FROM rt.cohorts AS source "
-                "JOIN rt.subscription_members AS member USING(manifest_id) "
-                "WHERE source.cohort_id=%s "
-                "AND member.instrument_id=binding.instrument_id "
-                "AND member.channel='AM')",
+                "AND readiness.status='READY' "
+                "AND intent.ticker=ANY(%s)",
                 (
                     str(claim.revision_id),
-                    str(claim.source_equity_cohort_id),
+                    list(claim.option_underlyings),
                 ),
             )
             equity_instruments = {
@@ -1670,15 +1691,14 @@ class PostgresAutomaticOptionsPreparationExecutor(
             }
             if not set(claim.option_underlyings).issubset(equity_instruments):
                 raise AdvancedOptionsPreparationRetryable(
-                    "READY Equity instrument bindings are incomplete"
+                    "READY Equity instrument bindings are incomplete: "
+                    + ",".join(sorted(
+                        set(claim.option_underlyings) - set(equity_instruments)
+                    ))
                 )
-            universe_sha256 = UniverseManifest(
-                version=(
-                    f"market-options-{len(equity_instruments)}-"
-                    f"{len(claim.option_underlyings)}-v1"
-                ),
-                equity_tickers=tuple(sorted(equity_instruments)),
-                option_underlyings=claim.option_underlyings,
+            # O-2: the scope is the underlyings only (the control plan rebuilds the same form).
+            universe_sha256 = advanced_options_market_universe(
+                claim.option_underlyings
             ).sha256
             profile_id = uuid5(
                 NAMESPACE_URL,
@@ -2336,9 +2356,10 @@ class PostgresAutomaticOptionsPreparationExecutor(
                     )
                     if value is not None
                 ),
+                # O-3 (Nov 15): every underlying has a flow tier (the policy's default tier for names it does not
+                # list), so flow eligibility depends on the DTE lane only.
                 flow_eligible=(
-                    row.underlyer in EXPECTED_UNDERLYINGS
-                    and flow_policy.lane_for(
+                    flow_policy.lane_for(
                         (row.expiration_date - claim.session_date).days
                     )
                     is not None

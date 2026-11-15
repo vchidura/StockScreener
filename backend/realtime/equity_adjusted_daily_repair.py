@@ -46,6 +46,7 @@ from .equity_validation_source import (
     EquityValidationIdentity,
     bind_equity_validation_adjustment_identity,
 )
+from .universe_limits import SCHEMA_MAX_UNIVERSE_NAMES
 
 
 POLICY = "v2-adjusted-daily-session-repair-v1"
@@ -80,7 +81,7 @@ class AdjustedDailyRepairPlan:
 
     def __post_init__(self):
         if (
-            not 1 <= len(self.identities) <= 400
+            not 1 <= len(self.identities) <= SCHEMA_MAX_UNIVERSE_NAMES
             or len({row.ticker for row in self.identities}) != len(self.identities)
             or len({row.instrument_id for row in self.identities}) != len(self.identities)
             or self.authorized_until.tzinfo is None

@@ -136,6 +136,21 @@ def equity_history_coordinates(
     return tuple(coordinates)
 
 
+def adjusted_period_listed(
+    calendar: OptionExchangeCalendar,
+    interval: str,
+    session: date,
+    listing_date: date | None,
+) -> bool:
+    """G86 (Nov 15): whether an adjusted history period contains a trading day on or after the listing date (the
+    listing week and month count: the provider's bar for them holds only the listed days). No listing date: True."""
+    if listing_date is None:
+        return True
+    if interval == "1d":
+        return session >= listing_date
+    return equity_history_coordinates(calendar, interval, session)[-1][1].date() >= listing_date
+
+
 def _history_scope_cursor(cursor, cohort_id: UUID):
     cursor.execute(
         "SELECT profile.provider_tier AS target_provider_tier,"

@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import timedelta
 from uuid import UUID
 
+from .confirmed_empty_minutes import confirmed_empty_minutes_enabled
 from .contracts import canonical_sha256
 from .database_access import RealtimeDatabaseRole
 from .runner_environment import RunnerEnvironment
@@ -100,9 +101,31 @@ def advanced_input_gate_identity(
             for instrument_id in members
             for bar_start in expected_starts
         }
+        present_keys = {(int(row[0]), row[1]) for row in bars}
+        confirmed_empty = ()
+        if confirmed_empty_minutes_enabled() and present_keys < expected_keys:
+            # Universe sizing 3.3: a member minute without a trade, recorded by the gap repair as provider-confirmed
+            # empty on a REPAIRED gap, counts as covered; the plan is checked once the ingress plan is known below.
+            missing_keys = expected_keys - present_keys
+            cursor.execute(
+                "SELECT gap.instrument_id,empty_start,gap.plan_id::text "
+                "FROM rt.stream_gaps AS gap "
+                "CROSS JOIN LATERAL unnest(gap.provider_confirmed_empty_starts) AS empty_start "
+                "WHERE gap.instrument_id=ANY(%s) AND gap.recovery_status='REPAIRED' "
+                "AND gap.gap_start<%s AND gap.gap_end>%s "
+                "AND empty_start>=%s AND empty_start<%s",
+                (list(members), window.cutoff, window_start, window_start, window.cutoff),
+            )
+            confirmed_empty = tuple(sorted({
+                (int(row[0]), row[1], str(row[2]))
+                for row in cursor.fetchall()
+                if (int(row[0]), row[1]) in missing_keys
+            }))
+        covered_keys = {(instrument_id, start) for instrument_id, start, _plan in confirmed_empty}
         if (
-            len(bars) != len(expected_keys)
-            or {(int(row[0]), row[1]) for row in bars} != expected_keys
+            len(bars) + len(covered_keys) != len(expected_keys)
+            or present_keys | covered_keys != expected_keys
+            or present_keys & covered_keys
             or any(
                 not (
                     (
@@ -183,6 +206,10 @@ def advanced_input_gate_identity(
                 "Advanced input gate spans multiple ingress plans"
             )
         ingress_plan_id = next(iter(ingress_plan_ids))
+        if any(plan_id != ingress_plan_id for _instrument, _start, plan_id in confirmed_empty):
+            raise ValueError(
+                "Advanced input gate confirmed empty minutes belong to another plan"
+            )
         maxima = {}
         for row in stream_bars:
             key = (str(row[8]), str(row[7]))
@@ -366,6 +393,12 @@ def advanced_input_gate_identity(
             "repair_evidence": repair_evidence,
             "overlapping_gap_verdict": "CLEAR",
             "bars": bars,
+            # Only present when a member minute was provider-confirmed empty, so other windows keep their identity.
+            **({
+                "provider_confirmed_empty": tuple(
+                    (instrument_id, start) for instrument_id, start, _plan in confirmed_empty
+                ),
+            } if confirmed_empty else {}),
         }
     )
 

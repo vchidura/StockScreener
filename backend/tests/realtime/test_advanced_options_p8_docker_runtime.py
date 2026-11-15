@@ -127,18 +127,22 @@ def test_flow_scope_keeps_eligible_subset_and_marks_unavailable():
     )
 
     assert resolved.scope is not None
+    # G102 universe sizing O-3 (Nov 15): an underlying the flow policy does not list (XYZ) gets the default tier,
+    # so only the contract outside the DTE lanes is unavailable.
     assert tuple(
         row.contract_ticker for row in resolved.scope.contracts
     ) == (
         binding.enrollment.activity_selection.contracts[
             0
         ].contract_ticker,
+        binding.enrollment.activity_selection.contracts[
+            2
+        ].contract_ticker,
     )
     assert {
         row.reason_code for row in resolved.unavailable
     } == {
         "FLOW_V1_DTE_UNAVAILABLE",
-        "FLOW_V1_UNDERLYING_UNAVAILABLE",
     }
 
 

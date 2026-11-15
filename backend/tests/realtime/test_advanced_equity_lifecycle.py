@@ -528,7 +528,6 @@ def test_automatic_authorization_is_finite_and_session_scoped(
         desired=desired,
         budgets=budgets,
         runtime_policy_sha256="d" * 64,
-        promotion_ladder=(9,),
     )
 
     assert authorization.valid_from == target
@@ -536,3 +535,38 @@ def test_automatic_authorization_is_finite_and_session_scoped(
     assert authorization.maximum_budgets == budgets
     assert authorization.allowed_universe_targets == (9,)
     assert authorization.parent_authorization_id is None
+    assert persist.call_count == 1
+
+
+@pytest.mark.parametrize("size", (1, 10, 45, 52, 400))
+def test_automatic_authorization_is_one_row_for_any_size_without_a_ladder(monkeypatch, size):
+    """R62: no back-dated 1 -> 9 -> 25 -> N chain; one standing authorization for the session's size."""
+    target = date(2026, 11, 16)
+    desired = EffectiveDesiredSession(
+        revision=_revision(target),
+        snapshot=_snapshot(target),
+        equity_member_count=size,
+    )
+    persist = MagicMock(side_effect=lambda _cursor, authorization, **_kwargs: authorization)
+    monkeypatch.setattr(lifecycle, "create_advanced_stream_authorization_cursor", persist)
+    budgets = AdvancedIngressBudgets(4, 12, 1024 * 1024 * 1024, 18, 18 * (1024 * 1024 + 1))
+
+    authorization = ensure_automatic_stream_authorization_cursor(
+        object(), desired=desired, budgets=budgets, runtime_policy_sha256="d" * 64,
+    )
+
+    assert persist.call_count == 1
+    assert persist.call_args.kwargs == {}
+    assert authorization.allowed_universe_targets == (size,)
+    assert authorization.parent_authorization_id is None
+    assert (authorization.valid_from, authorization.valid_through) == (target, target)
+
+
+@pytest.mark.parametrize("size", (401,))  # 0 is already refused by EffectiveDesiredSession
+def test_automatic_authorization_refuses_a_size_outside_1_to_400(size):
+    target = date(2026, 11, 16)
+    desired = EffectiveDesiredSession(revision=_revision(target), snapshot=_snapshot(target), equity_member_count=size)
+    with pytest.raises(ValueError, match=r"\[1, 400\]"):
+        ensure_automatic_stream_authorization_cursor(
+            object(), desired=desired, budgets=AdvancedIngressBudgets(1, 1, 1, 0, 0), runtime_policy_sha256="d" * 64,
+        )

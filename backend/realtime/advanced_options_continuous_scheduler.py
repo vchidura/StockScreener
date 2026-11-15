@@ -33,13 +33,13 @@ from .provider_budget import (
     MASSIVE_ADVANCED_ACCOUNT_REQUEST_CEILING,
     ProviderBudgetScope, reserve_coordinated_provider_request_cursor,
 )
+from .universe_limits import max_option_contracts_per_connection
 
 
 UTC = timezone.utc
 RESPONSE_BYTE_CEILING = 2_000_000
 ACCOUNTED_RESPONSE_BYTE_CEILING = RESPONSE_BYTE_CEILING + 1
 CONTRACTS_PER_REQUEST = 250
-MAXIMUM_FROZEN_CONTRACTS = 1000
 ATTEMPTS_PER_INTERVAL = 3
 SESSION_REQUEST_CEILING = 78 * ATTEMPTS_PER_INTERVAL
 
@@ -80,7 +80,7 @@ class _RecordedTransport:
 
 def _contract_batches(tickers):
     if (
-        not 1 <= len(tickers) <= MAXIMUM_FROZEN_CONTRACTS
+        not 1 <= len(tickers) <= max_option_contracts_per_connection()
         or len(set(tickers)) != len(tickers)
         or tuple(sorted(tickers)) != tuple(tickers)
     ):
@@ -344,6 +344,13 @@ def _run_schedule_cycle(
         )
     except OptionsSnapshotStale:
         return _stale_skip(receipt, "OPTIONS_SNAPSHOT_RETRY_BUDGET_EXHAUSTED")
+    except Timeout:
+        # R63 open item (Nov 13): past this Equity window's snapshot deadline the outcome cannot change (the
+        # request ids are fixed per window), so it is a labelled skip, not an exception that ends the scheduler.
+        # A provider timeout before the deadline still raises: the next cycle retries the window.
+        if clock() >= deadline:
+            return _stale_skip(receipt, "OPTIONS_SNAPSHOT_DEADLINE_EXPIRED")
+        raise
     observed = capture.selection.reviewed_at
     options_cutoff = min(
         p8_options_cycle_cutoff_from_capture(

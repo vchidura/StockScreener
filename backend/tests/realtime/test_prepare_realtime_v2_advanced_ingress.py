@@ -12,6 +12,7 @@ from realtime.advanced_ingress_plan import (
     build_advanced_ingress_plan,
     build_advanced_stream_authorization,
 )
+from realtime.universe_limits import SCHEMA_MAX_UNIVERSE_NAMES
 
 
 script = importlib.import_module(
@@ -224,13 +225,12 @@ def test_sync_profiles_uses_explicit_policy_without_editing_shared_environment(t
     assert report["provider_requests"] == 0
     assert all(row["status"] == "CANDIDATE" for row in report["profiles"])
     assert env_file.read_text(encoding="utf-8") == "UNCHANGED=value\n"
-    if target is not None:
-        assert [row["universe_target"] for row in report["profiles"]] == [target]
-    else:
-        assert [row["universe_target"] for row in report["profiles"]] == [1, 9, 25, 50, 100, 200, 400]
+    # R62 (migration 053): every size is served by the one size-independent profile.
+    assert [row["universe_target"] for row in report["profiles"]] == [SCHEMA_MAX_UNIVERSE_NAMES]
+    assert [row["version"] for row in report["profiles"]] == ["advanced-equity-ingress-v6"]
 
 
-def test_sync_selected_profile_keeps_its_original_ladder_position(tmp_path, monkeypatch):
+def test_sync_registers_the_size_independent_profile_at_ladder_position_zero(tmp_path, monkeypatch):
     env_file = tmp_path / ".env"
     env_file.write_text("", encoding="utf-8")
     policy = script.BACKEND_DIR / "realtime" / "policies" / "advanced_equity_ingress_v1.json"
@@ -254,6 +254,6 @@ def test_sync_selected_profile_keeps_its_original_ladder_position(tmp_path, monk
         "--universe-target", "9", "--report-path", str(tmp_path / "selected.json"), "--execute",
     ]) == 0
     assert len(seen) == 1
-    assert seen[0][0] == 9
-    assert seen[0][1]["ladder_position"] == 1
-    assert seen[0][1]["previous_universe_target"] == 1
+    assert seen[0][0] == SCHEMA_MAX_UNIVERSE_NAMES
+    assert seen[0][1]["ladder_position"] == 0
+    assert seen[0][1]["previous_universe_target"] is None

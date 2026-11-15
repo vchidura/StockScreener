@@ -106,7 +106,15 @@ def _allocation_executor():
     executor._per_underlying_contract_limit = None
     executor._measured_capacity_limit = None
     executor._effective_provider_project_ceiling = None
+    # G102 universe sizing O-5 (Nov 15): the allocation reads the underlyings' desired-list priorities.
+    executor._provider = _NoPriorityProvider()
     return executor
+
+
+class _NoPriorityProvider:
+    @contextmanager
+    def transaction(self, *_args, **_kwargs):
+        yield SimpleNamespace(cursor=SimpleNamespace(execute=lambda *a, **k: None, fetchall=lambda: []))
 
 
 def test_capture_fresh_at_review_clock_allocates_after_wall_clock_delay():

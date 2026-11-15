@@ -325,10 +325,10 @@ def test_acquisition_binding_has_no_equity_or_serving_authority():
     assert payload["authority"]["provider_socket"] is True
     assert payload["authority"]["journal"] is True
     assert payload["authority"]["publication"] is False
-    assert payload["membership"]["equity_target"] == 9
-    assert payload["membership"]["equity_tickers"] == list(
-        runtime.EQUITY_VALIDATION_UNIVERSE.equity_tickers
-    )
+    # G102 universe sizing O-1 (Nov 15): the binding carries the session's underlyings (here the contracts'), not
+    # the October validation nine.
+    assert payload["membership"]["equity_target"] == 2
+    assert payload["membership"]["equity_tickers"] == ["QQQ", "SPY"]
     assert payload["membership"]["option_contract_tickers"] == list(
         binding.contract_tickers
     )

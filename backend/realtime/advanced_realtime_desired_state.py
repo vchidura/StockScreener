@@ -9,6 +9,7 @@ from uuid import NAMESPACE_URL, UUID, uuid5
 from options.calendar import OptionExchangeCalendar
 
 from .contracts import EQUITY_VALIDATION_UNIVERSE, canonical_sha256
+from .universe_limits import max_universe_names
 
 
 _SYMBOL_PATTERN = re.compile(r"^[A-Z][A-Z0-9.-]{0,14}$")
@@ -67,8 +68,9 @@ class DesiredStateChange:
         identities = tuple(row.identity for row in members)
         if len(identities) != len(set(identities)):
             raise ValueError("desired state contains duplicate member roles")
-        if len({row.ticker for row in members}) > 400:
-            raise ValueError("desired state supports at most 400 exact names")
+        maximum = max_universe_names()
+        if len({row.ticker for row in members}) > maximum:
+            raise ValueError(f"desired state supports at most {maximum} exact names (REALTIME_UNIVERSE_MAX_NAMES)")
         if type(self.enabled) is not bool:
             raise TypeError("desired state enabled state must be boolean")
         if self.source_slot_version is not None and (

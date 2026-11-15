@@ -572,6 +572,28 @@ _INTRADAY_WIDTH_MINUTES = {
 }
 
 
+@lru_cache(maxsize=1)
+def _history_calendar():
+    from options.calendar import OptionExchangeCalendar
+
+    return OptionExchangeCalendar("XNYS")
+
+
+def _listed_periods(sessions, interval, list_date):
+    """G86 (Nov 15): the plan's adjusted periods that contain a trading day on or after the listing date (all of
+    them when the listing date is unknown or before the depth)."""
+    from .equity_history import adjusted_period_listed
+
+    sessions = tuple(sessions)
+    # Sessions ascend, so a listed first period means all are listed (the common case: one check per ticker).
+    if list_date is None or not sessions or adjusted_period_listed(_history_calendar(), interval, sessions[0], list_date):
+        return sessions
+    return tuple(
+        session for session in sessions
+        if adjusted_period_listed(_history_calendar(), interval, session, list_date)
+    )
+
+
 def _intraday_expected_count(calendar, plan, session, cutoff, interval):
     expected = plan.expected_count(interval, "RAW_UNADJUSTED")
     session_open = calendar.session_open(str(session)).to_pydatetime()
@@ -1121,11 +1143,23 @@ def _project_realtime_ticker_workspace(
             ):
                 raise ValueError("Ticker native 5m session windows are incomplete")
             adjusted_sources = tuple(sorted(buckets.get(("1d", True), ()), key=lambda fact: fact.revision.bar_start))
+            # G86 (Nov 15): a ticker listed inside the history depth (SNDK, ARM) has weekly and monthly bars from its
+            # listing period only; the periods before the listing do not exist and are not required.
+            listed_weekly = _listed_periods(plan.weekly_sessions, "1wk", security.list_date)
+            listed_monthly = _listed_periods(plan.monthly_sessions, "1mo", security.list_date)
+            monthly_dates = tuple(fact.revision.session_date for fact in monthly)
             if (
-                len(monthly) == plan.expected_count("1mo", "ADJUSTED")
-                and tuple(
-                    fact.revision.session_date for fact in monthly
-                ) == plan.monthly_sessions
+                (
+                    (
+                        len(monthly) == plan.expected_count("1mo", "ADJUSTED")
+                        and monthly_dates == plan.monthly_sessions
+                    )
+                    or (
+                        listed_monthly != plan.monthly_sessions
+                        and listed_monthly
+                        and monthly_dates == listed_monthly
+                    )
+                )
                 and all(
                     fact.revision.source_kind in (
                         *native_source_kinds,
@@ -1170,9 +1204,14 @@ def _project_realtime_ticker_workspace(
                 if interval == "1wk" and any(
                     fact.revision.source_kind in native_source_kinds for fact in stored
                 ):
-                    if (
-                        len(stored) != expected_count
-                        or tuple(fact.revision.session_date for fact in stored) != plan.weekly_sessions
+                    weekly_dates = tuple(fact.revision.session_date for fact in stored)
+                    if not (
+                        (len(stored) == expected_count and weekly_dates == plan.weekly_sessions)
+                        or (
+                            listed_weekly != plan.weekly_sessions
+                            and listed_weekly
+                            and weekly_dates == listed_weekly
+                        )
                     ):
                         raise ValueError("Ticker native adjusted weekly history drift")
                     verifier.verify_mixed_whole(

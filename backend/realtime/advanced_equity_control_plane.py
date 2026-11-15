@@ -22,6 +22,7 @@ from .tier_cohort import (
     product_capabilities,
     product_disabled_detectors,
 )
+from .universe_limits import SCHEMA_MAX_UNIVERSE_NAMES
 
 
 def _utc(value: datetime, name: str) -> datetime:
@@ -121,9 +122,9 @@ def build_advanced_equity_control_plane_plan(
     configuration_sha256: str | None = None,
 ) -> AdvancedEquityControlPlanePlan:
     symbols = tuple(sorted(security_ids))
-    if not 1 <= len(symbols) <= 400:
+    if not 1 <= len(symbols) <= SCHEMA_MAX_UNIVERSE_NAMES:
         raise ValueError(
-            "Advanced equity control plane requires 1-400 exact symbols"
+            f"Advanced equity control plane requires 1-{SCHEMA_MAX_UNIVERSE_NAMES} exact symbols"
         )
     checked = _utc(checked_at, "checked_at")
     expires = _utc(expires_at, "expires_at")

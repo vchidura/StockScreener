@@ -67,6 +67,114 @@ from .tier_cohort import (
 
 DESIRED_STATE_SCOPE = "ADVANCED_REALTIME"
 _DESIRED_MEMBER_BATCH_SIZE = 1_000
+
+
+def latest_security_reference_cursor(cursor, security_ids) -> dict[UUID, dict[str, object]]:
+    """The newest stored provider reference per security (active flag, listing and delisting dates). Works with a
+    tuple or a dictionary cursor."""
+    ids = sorted({str(value) for value in security_ids if value is not None})
+    if not ids:
+        return {}
+    cursor.execute(
+        "SELECT DISTINCT ON (security_id) security_id::text AS security_id,active,list_date,delisted_date,ticker,"
+        "observed_at "
+        "FROM ref.security_revisions WHERE security_id=ANY(%s::uuid[]) "
+        "ORDER BY security_id,observed_at DESC,effective_from DESC,revision_id DESC",
+        (ids,),
+    )
+    rows = {}
+    for row in cursor.fetchall():
+        values = (
+            dict(row) if hasattr(row, "keys")
+            else dict(zip(("security_id", "active", "list_date", "delisted_date", "ticker", "observed_at"), row))
+        )
+        rows[UUID(str(values["security_id"]))] = values
+    return rows
+
+
+def provider_excluded_members_cursor(cursor, preparations, *, session_date: date) -> dict[UUID, str]:
+    """Security -> reason for every enabled member the provider reports inactive or delisted for the session (from
+    the newest stored reference). Read-only; also the status query's source (`load_desired_member_exclusions_cursor`)."""
+    references = latest_security_reference_cursor(
+        cursor,
+        {row.security_id for row in preparations if row.enabled and row.security_id is not None},
+    )
+    excluded = {}
+    for security_id, reference in references.items():
+        reason = provider_inactive_reason_for_session(reference, session_date)
+        if reason is not None:
+            excluded[security_id] = reason
+    return excluded
+
+
+def session_base_members(preparations, excluded) -> tuple[tuple[str, UUID], ...]:
+    """(ticker, security) of the Equity and sector ETF members a session activates with: enabled, READY, bound to a
+    security and not excluded. Activation (`reconcile_desired_state_revision_cursor`) and the capability refresh
+    request use this one rule, so the capability profile is built for exactly the session's members (universe sizing,
+    Nov 15: a warming, failed, unbound or delisted member no longer stops the refresh for everyone)."""
+    return tuple(sorted(
+        (row.ticker, row.security_id)
+        for row in preparations
+        if row.enabled
+        and row.status is MemberPreparationStatus.READY
+        and row.security_id is not None
+        and row.security_id not in excluded
+        and row.kind in {DesiredMemberKind.EQUITY, DesiredMemberKind.SECTOR_ETF}
+    ))
+
+
+def load_session_base_members_cursor(cursor, revision) -> tuple[tuple[str, UUID], ...]:
+    """The session members of a stored revision for its effective session (read-only)."""
+    preparations = load_desired_member_preparations_cursor(cursor, revision.revision_id)
+    excluded = provider_excluded_members_cursor(cursor, preparations, session_date=revision.effective_session_date)
+    return session_base_members(preparations, excluded)
+
+
+def load_desired_member_exclusions_cursor(cursor, revision_id: UUID) -> tuple[dict[str, str], ...]:
+    """Status query (universe sizing 3.1-3.2): the members of a revision left out of its session, and why: provider
+    inactive or delisted, a FAILED preparation, or an Options underlying whose Equity member is not in the session.
+    Read-only; the activation applies the same rules when it materializes the session."""
+    revision = load_desired_state_revision_cursor(cursor, revision_id)
+    preparations = load_desired_member_preparations_cursor(cursor, revision_id)
+    excluded = provider_excluded_members_cursor(
+        cursor, preparations, session_date=revision.effective_session_date,
+    )
+    ready_equity = {
+        row.ticker for row in preparations
+        if row.enabled and row.status is MemberPreparationStatus.READY and row.security_id not in excluded
+        and row.kind in {DesiredMemberKind.EQUITY, DesiredMemberKind.SECTOR_ETF}
+    }
+    rows = []
+    for row in sorted(preparations, key=lambda item: (item.ticker, item.kind.value)):
+        if not row.enabled:
+            continue
+        if row.security_id in excluded:
+            reason = excluded[row.security_id]
+        elif row.status is MemberPreparationStatus.FAILED:
+            reason = "FAILED:" + ",".join(getattr(row, "reasons", ()) or ())
+        elif (
+            row.kind is DesiredMemberKind.OPTION_UNDERLYING
+            and row.status is MemberPreparationStatus.READY
+            and row.ticker not in ready_equity
+        ):
+            reason = "EQUITY_MEMBER_NOT_IN_SESSION"
+        else:
+            continue
+        rows.append({"ticker": row.ticker, "kind": row.kind.value, "reason": reason})
+    return tuple(rows)
+
+
+def provider_inactive_reason_for_session(reference, session_date: date) -> str | None:
+    """Universe sizing 3.2 (Nov 15): a member the provider reports inactive, or delisted on or before the session, is
+    left out of that session. Decided before the session from the newest stored reference; None keeps the member."""
+    if reference is None:
+        return None
+    delisted = reference.get("delisted_date")
+    if reference.get("active") is False:
+        return f"PROVIDER_INACTIVE:{delisted.isoformat() if delisted else 'UNKNOWN'}"
+    if delisted is not None and delisted <= session_date:
+        return f"PROVIDER_DELISTED:{delisted.isoformat()}"
+    return None
 CAPABILITY_REFRESH_OWNER = "REFERENCE"
 DEFAULT_ADVANCED_INGRESS_RUNTIME_POLICY = (
     Path(__file__).resolve().parent
@@ -2019,10 +2127,18 @@ def reconcile_desired_state_revision_cursor(
             ).settings.controller_warmup_seconds
         )
     )
+    # Universe sizing 3.2 (Nov 15): members the provider reports inactive or delisted for this session are left out
+    # before it starts (an Options underlying follows its Equity member, same security), with the reason.
+    excluded = provider_excluded_members_cursor(
+        cursor,
+        preparations,
+        session_date=revision.effective_session_date,
+    )
     warming_members = tuple(
         row
         for row in preparations
         if row.enabled and row.status is MemberPreparationStatus.WARMING
+        and row.security_id not in excluded
     )
     warming_reason_codes = tuple(
         f"MEMBER_WARMING:{row.ticker}:{row.kind.value}"
@@ -2033,37 +2149,28 @@ def reconcile_desired_state_revision_cursor(
         cursor,
         source,
     )
-    failed_baseline = tuple(
+    # A member that failed is left out of the session with its reason; one member never blocks the others (the
+    # universe sizing decision, Nov 15). Before: a FAILED member of the previous session's cohort BLOCKED activation.
+    failed_members = tuple(
         row
         for row in preparations
         if row.enabled
         and row.status is MemberPreparationStatus.FAILED
-        and (
-            (
-                row.kind in {
-                    DesiredMemberKind.EQUITY,
-                    DesiredMemberKind.SECTOR_ETF,
-                }
-                and row.security_id in source_base
-            )
-            or (
-                row.kind is DesiredMemberKind.OPTION_UNDERLYING
-                and row.security_id in source_underlyings
-            )
-        )
+        and row.security_id not in excluded
     )
-    if failed_baseline:
-        reason_codes = tuple(
-            f"BASELINE_MEMBER_FAILED:{row.ticker}:{row.kind.value}"
-            for row in failed_baseline
-        )
-        return DesiredStateReconciliation(
-            state="BLOCKED",
-            revision=revision,
-            preparations=preparations,
-            snapshot=None,
-            reason_codes=reason_codes,
-        )
+    exclusion_reason_codes = tuple(sorted(
+        f"MEMBER_EXCLUDED:{row.ticker}:{row.kind.value}:{excluded[row.security_id]}"
+        for row in preparations
+        if row.enabled and row.security_id in excluded
+    )) + tuple(
+        f"MEMBER_EXCLUDED:{row.ticker}:{row.kind.value}:"
+        + ("BASELINE_FAILED" if (
+            row.security_id in source_base
+            if row.kind is not DesiredMemberKind.OPTION_UNDERLYING
+            else row.security_id in source_underlyings
+        ) else "FAILED")
+        for row in failed_members
+    )
     if materialized < activation_at:
         return DesiredStateReconciliation(
             state="ACTIVATION_PENDING",
@@ -2088,6 +2195,7 @@ def reconcile_desired_state_revision_cursor(
         if row.enabled
         and row.status is MemberPreparationStatus.READY
         and row.security_id is not None
+        and row.security_id not in excluded
         and row.kind in {
             DesiredMemberKind.EQUITY,
             DesiredMemberKind.SECTOR_ETF,
@@ -2095,18 +2203,30 @@ def reconcile_desired_state_revision_cursor(
     )
     if not ready_base:
         raise ValueError("desired state has no READY Equity or sector ETF members")
+    base_tickers = tuple(sorted(row.ticker for row in ready_base))
+    # An Options underlying runs only with its Equity member in the session; otherwise it is left out with the reason
+    # instead of failing the activation (before: "READY Options underlyings require READY Equity membership").
     ready_options = tuple(
         row
         for row in preparations
         if row.enabled
         and row.status is MemberPreparationStatus.READY
         and row.security_id is not None
+        and row.security_id not in excluded
         and row.kind is DesiredMemberKind.OPTION_UNDERLYING
+        and row.ticker in base_tickers
     )
-    base_tickers = tuple(sorted(row.ticker for row in ready_base))
+    exclusion_reason_codes += tuple(
+        f"MEMBER_EXCLUDED:{row.ticker}:{row.kind.value}:EQUITY_MEMBER_NOT_IN_SESSION"
+        for row in preparations
+        if row.enabled
+        and row.status is MemberPreparationStatus.READY
+        and row.security_id is not None
+        and row.security_id not in excluded
+        and row.kind is DesiredMemberKind.OPTION_UNDERLYING
+        and row.ticker not in base_tickers
+    )
     option_tickers = tuple(sorted(row.ticker for row in ready_options))
-    if not set(option_tickers).issubset(base_tickers):
-        raise ValueError("READY Options underlyings require READY Equity membership")
     effective_at = exchange.session_open(revision.effective_session_date)
     runtime_configuration_sha256 = _runtime_configuration_sha256(
         source,
@@ -2391,7 +2511,7 @@ def reconcile_desired_state_revision_cursor(
         revision=revision,
         preparations=preparations,
         snapshot=stored_snapshot,
-        reason_codes=warming_reason_codes,
+        reason_codes=warming_reason_codes + exclusion_reason_codes,
     )
 
 

@@ -612,24 +612,20 @@ def test_warmup_accepts_recorded_sector_not_applicable_member():
     assert chunk.coverage_after["sector_not_applicable"] is True
 
 
-def test_warmup_keeps_sector_requirement_for_stocks_and_old_coverage():
-    with pytest.raises(
-        EquityPreparationUnavailableError,
-        match="SECTOR_REFERENCE_UNAVAILABLE",
+def test_warmup_accepts_a_stock_whose_provider_reference_has_no_sector():
+    """Universe sizing (Nov 15): a stored provider record without a sector (ARM, a foreign issuer without an SIC code)
+    is a provider gap accepted with a recorded reason; it no longer retries forever. Old coverage without the
+    not-applicable flag is treated the same way."""
+    for reference in (
+        {"sector_ready": False, "sector_not_applicable": False, "corporate_actions_ready": True},
+        {"sector_ready": False, "corporate_actions_ready": True},
     ):
-        _warmup_request({
-            "sector_ready": False,
-            "sector_not_applicable": False,
-            "corporate_actions_ready": True,
-        })
-    with pytest.raises(
-        EquityPreparationUnavailableError,
-        match="SECTOR_REFERENCE_UNAVAILABLE",
-    ):
-        _warmup_request({
-            "sector_ready": False,
-            "corporate_actions_ready": True,
-        })
+        chunk = _warmup_request(reference)
+        assert chunk.complete is True
+        assert chunk.coverage_after["sector_ready"] is False
+        assert chunk.coverage_after["sector_unknown"] == {"reason": "PROVIDER_REFERENCE_HAS_NO_SECTOR"}
+    with pytest.raises(EquityPreparationUnavailableError, match="CORPORATE_ACTION_COVERAGE_UNAVAILABLE"):
+        _warmup_request({"sector_ready": False, "corporate_actions_ready": False})
     chunk = _warmup_request({
         "sector_ready": True,
         "sector_not_applicable": False,

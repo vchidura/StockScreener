@@ -62,7 +62,7 @@ def image_metadata():
             {"version": migration.version, "checksum_sha256": migration.checksum_sha256}
             for migration in load_realtime_migrations(V2_MIGRATIONS_DIR)
         ],
-        "profile_sha256": catalog.profile_for_target(1).sha256,
+        "profile_sha256": catalog.legacy_profiles[0].sha256,  # the October SPY canary binds the reviewed size-1 profile
         "policy_sha256": catalog.scale_policy.sha256,
         "normalizer_version": NORMALIZER_VERSION,
         "timeout_available": shutil.which("timeout") is not None,

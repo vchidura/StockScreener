@@ -39,6 +39,12 @@ class FlowUniverseTier(str, Enum):
     HIGH_BETA_HIGH_PREMIUM = "HIGH_BETA_HIGH_PREMIUM"
 
 
+# G102 universe sizing (O-3, Nov 15): the tier of an underlying the policy file does not list (the policy names the
+# October nine). CORE_MEGA_CAP is the middle tier: its thresholds sit between the ETF and high-beta tiers.
+DEFAULT_FLOW_UNDERLYING_TIER = FlowUniverseTier.CORE_MEGA_CAP
+_UNDERLYER_PATTERN = re.compile(r"^[A-Z]{1,6}$")
+
+
 class FlowDteLane(str, Enum):
     ULTRA_SHORT = "ULTRA_SHORT"
     CORE_SWING = "CORE_SWING"
@@ -414,11 +420,15 @@ class AdvancedOptionsFlowPolicy:
         return canonical_sha256(self)
 
     def tier_for(self, underlyer: str) -> FlowUniverseTier:
+        """The policy's tier for a listed underlying; any other underlying gets the default tier (O-3, Nov 15), so
+        a name onboarded to Options runs flow detection like the rest. The policy file and its hash are unchanged."""
         normalized = underlyer.strip().upper()
+        if not _UNDERLYER_PATTERN.fullmatch(normalized):
+            raise ValueError("underlyer is invalid")
         for membership in self.universe:
             if normalized in membership.underlyings:
                 return membership.tier
-        raise ValueError("underlyer is outside the Advanced Options flow universe")
+        return DEFAULT_FLOW_UNDERLYING_TIER
 
     def lane_for(self, dte: int) -> FlowDteLane | None:
         if type(dte) is not int or not 0 <= dte <= 60:

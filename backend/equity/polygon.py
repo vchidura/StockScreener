@@ -81,6 +81,23 @@ class PolygonEquityClient:
         result = payload.get("results")
         return dict(result) if isinstance(result, dict) else None
 
+    def fetch_inactive_ticker_record(self, ticker: str) -> dict[str, Any] | None:
+        """R59 (Nov 15): the overview endpoint answers 404 for an inactive (delisted) ticker, while the list endpoint
+        still serves its record with active=false and delisted_utc (ROKU, delisted 2026-11-09). One request."""
+        symbol = ticker.upper()
+        payload = self._get_json(
+            "/v3/reference/tickers",
+            {"ticker": symbol, "market": "stocks", "active": "false", "limit": 10},
+        )
+        rows = payload.get("results") or []
+        if not isinstance(rows, list):
+            raise ValueError("Polygon results must be a list")
+        matches = [dict(row) for row in rows if str(row.get("ticker") or "").upper() == symbol]
+        if not matches:
+            return None
+        # The newest delisting first when a symbol was reused.
+        return max(matches, key=lambda row: str(row.get("delisted_utc") or ""))
+
     def fetch_tickers_as_of(
         self,
         as_of_date: date,

@@ -41,9 +41,10 @@ from .options_evidence_identity import (
     is_v2_options_evidence_identity,
 )
 from .preflight import ProviderTier
+from .universe_limits import WINDOW_MAX_OPTIONS_UNDERLYINGS
 
 OPTION_CYCLE_INPUT_VERSION = "option_cycle_input_v1"
-MAX_OPTION_CYCLE_UNDERLYINGS = 50
+MAX_OPTION_CYCLE_UNDERLYINGS = WINDOW_MAX_OPTIONS_UNDERLYINGS  # the window input bound (universe_limits)
 MAX_OPTION_CYCLE_INPUT_BYTES = 131_072
 _MAXIMUM_PAGES = 40
 _MAXIMUM_ROWS = 10_000

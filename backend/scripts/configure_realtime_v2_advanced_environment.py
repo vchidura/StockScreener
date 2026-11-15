@@ -4,15 +4,29 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
 
 from dotenv import set_key
 
 
 BACKEND_DIR = Path(__file__).resolve().parent.parent
+if str(BACKEND_DIR) not in sys.path:
+    sys.path.insert(0, str(BACKEND_DIR))
+
+from realtime.universe_limits import (  # noqa: E402
+    DEFAULT_OPTIONS_MAX_CONTRACTS,
+    DEFAULT_OPTIONS_MAX_UNDERLYINGS,
+    DEFAULT_UNIVERSE_MAX_NAMES,
+    SCHEMA_MAX_UNIVERSE_NAMES,
+)
 SAFE_SETTINGS = {
     "REALTIME_V2_EQUITY_PIPELINE": "MASSIVE_ADVANCED",
     "REALTIME_V2_OPTIONS_PIPELINE": "DISABLED",
+    # Universe limits (realtime/universe_limits.py): the env file is where they are changed.
+    "REALTIME_UNIVERSE_MAX_NAMES": str(DEFAULT_UNIVERSE_MAX_NAMES),
+    "REALTIME_OPTIONS_MAX_UNDERLYINGS": str(DEFAULT_OPTIONS_MAX_UNDERLYINGS),
+    "REALTIME_OPTIONS_MAX_CONTRACTS_PER_CONNECTION": str(DEFAULT_OPTIONS_MAX_CONTRACTS),
     "REALTIME_V2_ADVANCED_STOCK_CHANNELS": "AM",
     "REALTIME_V2_ADVANCED_CONNECTION_CEILING": "1",
     "REALTIME_V2_ADVANCED_SCALE_CONTROL": "MANUAL_GATED",
@@ -104,7 +118,7 @@ def parse_args(argv=None):
         not ladder
         or ladder[0] != 1
         or ladder != tuple(sorted(set(ladder)))
-        or ladder[-1] > 400
+        or ladder[-1] > SCHEMA_MAX_UNIVERSE_NAMES
         or args.universe_target not in ladder
         or args.stable_sessions_before_up <= 0
     ):

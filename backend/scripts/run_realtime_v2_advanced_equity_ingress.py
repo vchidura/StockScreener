@@ -209,7 +209,7 @@ def _load_runtime_scope(
     )
     if (
         runtime_profile.version != plan.runtime_profile_version
-        or runtime_profile.universe_target != plan.universe_target
+        or runtime_profile.universe_target < plan.universe_target
         or runtime_profile.configuration_sha256(
             plan.runtime_policy_sha256
         )

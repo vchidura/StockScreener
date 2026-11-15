@@ -165,6 +165,12 @@ def _security_fact(
     )
 
 
+def security_reference_fact(ticker: str, payload: Mapping[str, object], request: ReferenceSeedRequest) -> ReferenceFact:
+    """The SECURITY fact for one provider ticker record (R59, Nov 15: also built from an inactive ticker's list
+    record, which carries active=false and the delisting date)."""
+    return _security_fact(ticker, payload, request)
+
+
 def _security_revision(fact: ReferenceFact) -> SecurityReferenceRevision:
     row = dict(fact.values)
     return SecurityReferenceRevision(

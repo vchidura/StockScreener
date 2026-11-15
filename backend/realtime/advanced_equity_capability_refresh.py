@@ -26,9 +26,9 @@ from .advanced_ingress_runtime_profile import (
     AdvancedIngressRuntimeCatalog,
     load_advanced_ingress_runtime_catalog,
 )
-from .advanced_realtime_desired_state import DesiredMemberKind
 from .advanced_realtime_desired_state_repository import (
     load_current_desired_state_revision_cursor,
+    load_session_base_members_cursor,
 )
 from .buffer import BufferLimits, RawMessageBuffer
 from .contracts import (
@@ -310,22 +310,15 @@ def load_capability_refresh_request_cursor(
     revision = load_current_desired_state_revision_cursor(cursor)
     if revision is None:
         return None
-    security_ids = dict(revision.security_ids)
-    tickers = tuple(sorted(
-        member.ticker
-        for member in revision.members
-        if member.enabled
-        and member.kind
-        in {
-            DesiredMemberKind.EQUITY,
-            DesiredMemberKind.SECTOR_ETF,
-        }
-    ))
-    if not tickers:
+    # Universe sizing (Nov 15): the capability profile covers exactly the members the session activates with (READY,
+    # bound, not excluded: `session_base_members`, the activation's own rule). Before, it covered every enabled member
+    # and returned nothing while any member was unbound, so one warming or delisted name (ROKU) stopped the refresh,
+    # and with it the activation, for the whole universe.
+    base = load_session_base_members_cursor(cursor, revision)
+    if not base:
         return None
-    if set(tickers) != set(security_ids):
-        return None
-    selected_security_ids = tuple(sorted(security_ids.items()))
+    tickers = tuple(ticker for ticker, _security in base)
+    selected_security_ids = tuple((ticker, security) for ticker, security in base)
     universe = UniverseManifest(
         version=f"advanced-equity-{len(tickers)}-am-v1",
         equity_tickers=tickers,

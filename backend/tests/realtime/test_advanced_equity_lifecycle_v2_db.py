@@ -27,10 +27,7 @@ from realtime.advanced_ingress_plan import (
     automatic_advanced_ingress_budgets,
 )
 from realtime.advanced_ingress_repository import (
-    activate_advanced_runtime_profile_cursor,
-    ensure_exact_advanced_runtime_profile_cursor,
     prepare_advanced_ingress_plan_cursor,
-    register_advanced_runtime_profile_cursor,
     resolve_advanced_ingress_plan_cursor,
 )
 from realtime.advanced_ingress_runtime_profile import (
@@ -65,6 +62,7 @@ from tests.realtime.test_advanced_realtime_desired_state_v2_db import (
 from scripts.run_realtime_v2_advanced_controller import (
     _prepare_continuous_session_cursor,
 )
+from realtime.universe_limits import SCHEMA_MAX_UNIVERSE_NAMES
 from v2_database import disposable_v2_database, requires_v2_database
 
 
@@ -90,65 +88,33 @@ def _digest(label):
 
 
 def _activate_runtime_profile(cursor):
-    ladder = CATALOG.scale_policy.universe_ladder
-    for position, target in enumerate(
-        ladder[:ladder.index(PROFILE.universe_target) + 1]
-    ):
-        profile = CATALOG.profile_for_target(target)
-        register_advanced_runtime_profile_cursor(
-            cursor,
-            profile,
-            runtime_policy_sha256=POLICY_SHA256,
-            ladder_position=position,
-            previous_universe_target=(
-                None if position == 0 else ladder[position - 1]
-            ),
-        )
-        activate_advanced_runtime_profile_cursor(
-            cursor,
-            profile.sha256,
-            stability_evidence_sha256=_digest(
-                f"stability:{target}"
-            ),
-            capacity_evidence_sha256=_digest(
-                f"capacity:{target}"
-            ),
-            approval_reference=(
-                f"c3-disposable-runtime-profile:{target}"
-            ),
-            activated_at=FRIDAY_ROLLOVER,
-        )
+    """R62: migration 053 registered the size-independent profile ACTIVE; nothing to register."""
+    cursor.execute(
+        "SELECT status FROM rt.advanced_ingress_runtime_profiles "
+        "WHERE runtime_profile_sha256=%s",
+        (PROFILE.sha256,),
+    )
+    assert cursor.fetchone() == ("ACTIVE",)
 
 
-def test_non_ladder_runtime_profile_is_derived_from_reviewed_capacity():
-    database = f"test_realtime_v2_c4_exact_profile_{uuid4().hex[:8]}"
+def test_every_size_uses_the_migration_registered_profile_without_registration():
+    database = f"test_realtime_v2_c4_any_size_{uuid4().hex[:8]}"
     with disposable_v2_database(database) as pool:
         connection = pool.getconn()
         try:
             with connection.cursor() as cursor:
                 _activate_runtime_profile(cursor)
-                registration = ensure_exact_advanced_runtime_profile_cursor(
-                    cursor,
-                    CATALOG,
-                    universe_target=10,
-                    activated_at=FRIDAY_ROLLOVER,
-                )
                 cursor.execute(
                     "SELECT universe_target,ladder_position,"
-                    "previous_universe_target,status,profile_document "
-                    "FROM rt.advanced_ingress_runtime_profiles "
-                    "WHERE runtime_profile_sha256=%s",
-                    (registration.runtime_profile_sha256,),
+                    "previous_universe_target,status,count(*) OVER () "
+                    "FROM rt.advanced_ingress_runtime_profiles"
                 )
-                row = cursor.fetchone()
+                rows = cursor.fetchall()
             connection.commit()
 
-            assert row[:4] == (10, 2, 9, "ACTIVE")
-            assert row[4]["universe_target"] == 10
-            assert (
-                CATALOG.profile_for_target(10).settings
-                == CATALOG.profile_for_target(25).settings
-            )
+            assert rows == [(SCHEMA_MAX_UNIVERSE_NAMES, 0, None, "ACTIVE", 1)]
+            for size in (1, 10, 45, 52, 400):
+                assert CATALOG.profile_for_target(size) == PROFILE
         finally:
             pool.putconn(connection)
 
@@ -201,9 +167,6 @@ def test_market_hours_rollover_builds_idempotent_plan_and_progress():
                         desired=monday,
                         budgets=budgets,
                         runtime_policy_sha256=POLICY_SHA256,
-                        promotion_ladder=(
-                            CATALOG.scale_policy.universe_ladder
-                        ),
                     )
                 )
                 replayed_authorization = (
@@ -212,9 +175,6 @@ def test_market_hours_rollover_builds_idempotent_plan_and_progress():
                         desired=monday,
                         budgets=budgets,
                         runtime_policy_sha256=POLICY_SHA256,
-                        promotion_ladder=(
-                            CATALOG.scale_policy.universe_ladder
-                        ),
                     )
                 )
                 request = AdvancedIngressPlanRequest(
@@ -374,9 +334,8 @@ def test_market_hours_rollover_builds_idempotent_plan_and_progress():
                     "WHERE approval_source="
                     "'ADVANCED_EQUITY_CONTINUOUS_V3'"
                 )
-                assert cursor.fetchone()[0] == (
-                    CATALOG.scale_policy.universe_ladder.index(9) + 1
-                )
+                # R62: one authorization for the session's size, no back-dated ladder chain.
+                assert cursor.fetchone()[0] == 1
                 cursor.execute(
                     "SELECT count(*) FROM rt.advanced_ingress_plans "
                     "WHERE plan_id=%s",

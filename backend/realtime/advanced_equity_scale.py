@@ -7,6 +7,7 @@ from pathlib import Path
 
 from .contracts import canonical_sha256
 from .equity_pipeline_config import AdvancedScaleControl
+from .universe_limits import SCHEMA_MAX_UNIVERSE_NAMES
 
 
 class AdvancedScaleAction(str, Enum):
@@ -131,7 +132,7 @@ def load_advanced_scale_policy(path: Path) -> AdvancedScalePolicy:
         not ladder
         or ladder[0] != 1
         or ladder != tuple(sorted(set(ladder)))
-        or ladder[-1] > 400
+        or ladder[-1] > SCHEMA_MAX_UNIVERSE_NAMES
     ):
         raise ValueError("Advanced scale ladder is invalid")
     stable_sessions = int(value["stable_sessions_before_up"])

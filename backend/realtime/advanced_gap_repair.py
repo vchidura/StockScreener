@@ -20,6 +20,7 @@ from .acquisition_ledger import (
     load_raw_payload_cursor,
     persist_raw_payload_cursor,
 )
+from .confirmed_empty_minutes import confirmed_empty_minutes_enabled
 from .contracts import canonical_json, canonical_sha256
 from .equity_interval_derivation import derive_realtime_interval_facts
 from .gap_repair_plan import plan_gap_repair_cursor
@@ -530,9 +531,21 @@ def verify_and_close_gap_repair_cursor(
         raise ValueError("advanced repair is not ready for verification")
     seconds = int((repair[4] - repair[3]).total_seconds())
     expected_1m = seconds // 60
+    confirmed_empty = ()
+    if confirmed_empty_minutes_enabled():
+        # Universe sizing 3.3: minutes the provider confirmed empty (no trade) are covered by that record, not a bar.
+        cursor.execute(
+            "SELECT provider_confirmed_empty_starts FROM rt.stream_gaps WHERE repair_id=%s",
+            (str(repair_id),),
+        )
+        row = cursor.fetchone()
+        confirmed_empty = tuple(sorted(row[0] or ())) if row is not None else ()
+        if any(not repair[3] <= start < repair[4] for start in confirmed_empty):
+            raise ValueError("confirmed empty minutes lie outside the repair")
+        expected_1m -= len(confirmed_empty)
     expected_5m = (
         seconds // 300
-        if require_derived and seconds % 300 == 0
+        if require_derived and seconds % 300 == 0 and not confirmed_empty
         else 0
     )
     cursor.execute(
@@ -557,6 +570,7 @@ def verify_and_close_gap_repair_cursor(
         "requested_from": repair[3],
         "requested_to": repair[4],
         "counts": counts,
+        **({"provider_confirmed_empty_starts": confirmed_empty} if confirmed_empty else {}),
     })
     cursor.execute(
         "UPDATE rt.stream_gaps SET recovery_status='REPAIRED',"

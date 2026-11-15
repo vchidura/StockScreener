@@ -5181,7 +5181,12 @@ def allocate_activity_momentum(
     measured_capacity_limit: int | None = None,
     effective_provider_project_ceiling: int | None = None,
     resolution: ActivityMomentumResolution | None = None,
+    priority_order: Iterable[str] | None = None,
 ) -> ActivityMomentumAllocation:
+    """`priority_order` (G102 universe sizing O-5, Nov 15): the operator's underlying priority (first = most
+    important). Used only when the budget cannot give every eligible underlying a contract: underlyings are then
+    served in priority order, so the lowest-priority ones are the ones left without contracts (UNAVAILABLE for the
+    day) instead of a hash-rotated choice. Otherwise the allocation is unchanged."""
     if not isinstance(profile, ActivityMomentumProfile):
         raise TypeError("activity/momentum profile is invalid")
     configured_budget = (
@@ -5347,7 +5352,17 @@ def allocate_activity_momentum(
         ),
         "underlyings": eligible,
     })
-    if eligible:
+    if eligible and priority_order is not None and budget < len(eligible):
+        # O-5 (Nov 15): not every underlying can get a contract; serve them in the operator's priority order.
+        rank = {
+            str(ticker).strip().upper(): position
+            for position, ticker in enumerate(priority_order)
+        }
+        rotated = tuple(sorted(
+            eligible,
+            key=lambda ticker: (rank.get(ticker, len(rank)), ticker),
+        ))
+    elif eligible:
         offset = int(rotation_seed[:16], 16) % len(eligible)
         rotated = eligible[offset:] + eligible[:offset]
     else:

@@ -29,6 +29,7 @@ from .advanced_realtime_desired_state_repository import (
     record_desired_state_rollover_revision_cursor,
 )
 from .session_windows import advanced_session_windows
+from .universe_limits import max_universe_names
 
 
 UTC = timezone.utc
@@ -360,52 +361,33 @@ def ensure_automatic_stream_authorization_cursor(
     desired: EffectiveDesiredSession,
     budgets: AdvancedIngressBudgets,
     runtime_policy_sha256: str,
-    promotion_ladder: tuple[int, ...],
-    calendar: OptionExchangeCalendar | None = None,
 ) -> AdvancedStreamAuthorization:
-    ladder = tuple(promotion_ladder)
+    """One standing authorization for the session's activated size (R62, migration 053).
+
+    The controller used to write a back-dated chain (1 -> 9 -> 25 -> N on the previous sessions) to satisfy the
+    promotion ladder it then checked; the ladder guarded nothing and every size needed its own profile row. Any size
+    1..REALTIME_UNIVERSE_MAX_NAMES (`universe_limits`) is now authorized directly for its session, covered by the size-independent runtime profile.
+    """
     target = desired.equity_member_count
-    if (
-        not ladder
-        or tuple(sorted(set(ladder))) != ladder
-        or target not in ladder
-    ):
-        raise ValueError(
-            "automatic authorization promotion ladder is invalid"
-        )
-    exchange = calendar or OptionExchangeCalendar("XNYS")
-    targets = ladder[:ladder.index(target) + 1]
-    sessions = [desired.snapshot.session_date]
-    for _target in reversed(targets[:-1]):
-        sessions.append(exchange.previous_session_date(sessions[-1]))
-    sessions.reverse()
-    parent_id = None
-    stored = None
-    for rung_target, session_date in zip(targets, sessions):
-        authorization = build_advanced_stream_authorization(
-            parent_authorization_id=parent_id,
-            allowed_universe_targets=(rung_target,),
-            valid_from=session_date,
-            valid_through=session_date,
-            maximum_budgets=budgets,
-            runtime_policy_sha256=runtime_policy_sha256,
-            approval_source=AUTOMATIC_AUTHORIZATION_SOURCE,
-            approval_reference=(
-                "continuous-session:"
-                f"{desired.snapshot.snapshot_sha256}:"
-                f"{rung_target}:{session_date.isoformat()}"
-            ),
-        )
-        stored = create_advanced_stream_authorization_cursor(
-            cursor,
-            authorization,
-            promotion_ladder=ladder,
-            calendar=exchange,
-        )
-        parent_id = stored.authorization_id
-    if stored is None:
-        raise AssertionError("automatic authorization ladder is empty")
-    return stored
+    maximum = max_universe_names()
+    if type(target) is not int or not 1 <= target <= maximum:
+        raise ValueError(f"automatic authorization size must be in [1, {maximum}] (REALTIME_UNIVERSE_MAX_NAMES)")
+    session_date = desired.snapshot.session_date
+    authorization = build_advanced_stream_authorization(
+        parent_authorization_id=None,
+        allowed_universe_targets=(target,),
+        valid_from=session_date,
+        valid_through=session_date,
+        maximum_budgets=budgets,
+        runtime_policy_sha256=runtime_policy_sha256,
+        approval_source=AUTOMATIC_AUTHORIZATION_SOURCE,
+        approval_reference=(
+            "continuous-session:"
+            f"{desired.snapshot.snapshot_sha256}:"
+            f"{target}:{session_date.isoformat()}"
+        ),
+    )
+    return create_advanced_stream_authorization_cursor(cursor, authorization)
 
 
 def claim_lifecycle_lease_cursor(

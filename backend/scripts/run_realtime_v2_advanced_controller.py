@@ -78,7 +78,6 @@ from realtime.advanced_ingress_repository import (  # noqa: E402
     load_advanced_ingress_runtime_plan_cursor,
     load_advanced_stream_authorization_cursor,
     prepare_advanced_ingress_plan_cursor,
-    ensure_exact_advanced_runtime_profile_cursor,
     resolve_advanced_ingress_plan_cursor,
 )
 from realtime.advanced_ingress_runtime_profile import (  # noqa: E402
@@ -874,12 +873,9 @@ def _prepare_continuous_session_cursor(
         session_date=session_date,
     )
     if plan is None:
-        ensure_exact_advanced_runtime_profile_cursor(
-            cursor,
-            catalog,
-            universe_target=desired.equity_member_count,
-            activated_at=checked_at,
-        )
+        # R62 (Nov 15): no runtime profile registration here. The size-independent profile (migration 053) covers
+        # every size 1..400, and cohorts provisioned before it keep their stored profile; the app role only reads
+        # rt.advanced_ingress_runtime_profiles.
         budgets = _continuous_session_budgets(
             args,
             desired.equity_member_count,
@@ -889,12 +885,6 @@ def _prepare_continuous_session_cursor(
             desired=desired,
             budgets=budgets,
             runtime_policy_sha256=catalog.scale_policy.sha256,
-            promotion_ladder=(
-                catalog.promotion_ladder_for_target(
-                    desired.equity_member_count
-                )
-            ),
-            calendar=exchange,
         )
         plan = resolve_advanced_ingress_plan_cursor(
             cursor,

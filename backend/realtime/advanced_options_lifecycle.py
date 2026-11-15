@@ -410,7 +410,20 @@ def _ensure_work(
     option_underlyings: tuple[str, ...],
     checked_at: datetime,
 ) -> None:
-    activation_ticker = option_underlyings[0]
+    # G102 universe sizing (O-4, Nov 15): the underlying set may grow until the first stage completes (a name whose
+    # Equity becomes READY during the morning joins). The single SESSION_ACTIVATION row keeps the ticker it was
+    # created with (it only orders the work; activation reads the session's list), so growth never adds a second one.
+    cursor.execute(
+        "SELECT ticker FROM rt.advanced_options_preparation_work "
+        "WHERE revision_id=%s AND stage='SESSION_ACTIVATION'",
+        (str(revision_id),),
+    )
+    existing_activation = cursor.fetchone()
+    activation_ticker = (
+        option_underlyings[0]
+        if existing_activation is None
+        else str(existing_activation[0])
+    )
     for ticker in option_underlyings:
         cursor.execute(
             "SELECT intent_id::text "
@@ -1703,7 +1716,6 @@ def reconcile_advanced_options_lifecycle_cursor(
         }
         and row.status is MemberPreparationStatus.READY
     }
-    missing_equity = tuple(sorted(set(underlyings) - base_ready))
     reconciliation = load_effective_desired_state_reconciliation_cursor(
         cursor,
         session_date=target_session_date,
@@ -1714,6 +1726,32 @@ def reconcile_advanced_options_lifecycle_cursor(
         or reconciliation.state != "READY"
         else reconciliation.snapshot
     )
+    # G102 universe sizing (O-4, Nov 15): the session's underlyings are the configured ones whose Equity member is
+    # READY (and activated, once the session's snapshot exists). The set is re-evaluated on every pass and may grow
+    # until the first preparation stage completes (the catalog capture opens after the open), then it is frozen.
+    # A configured underlying outside it is UNAVAILABLE for the day only; the others are prepared and run.
+    configured = underlyings
+    eligible = set(base_ready)
+    if snapshot is not None:
+        eligible &= _snapshot_equity_tickers(cursor, snapshot, preparations)
+    cursor.execute(
+        "SELECT ticker,bool_or(status='COMPLETE') "
+        "FROM rt.advanced_options_preparation_work "
+        "WHERE revision_id=%s GROUP BY ticker",
+        (str(revision.revision_id),),
+    )
+    work_rows = tuple(cursor.fetchall())
+    work_tickers = {str(row[0]) for row in work_rows}
+    frozen = any(bool(row[1]) for row in work_rows)
+    effective = (
+        tuple(sorted(work_tickers))
+        if frozen
+        else tuple(sorted(work_tickers | (set(configured) & eligible)))
+    )
+    unavailable = tuple(sorted(set(configured) - set(effective)))
+    missing_equity = () if effective else configured
+    if effective:
+        underlyings = effective
     snapshot_refresh_error = None
     cursor.execute(
         "SELECT session_binding_id::text "
@@ -1939,6 +1977,12 @@ def reconcile_advanced_options_lifecycle_cursor(
                 else f"{retry_wait[1]}:{retry_wait[0]}:"
                 f"{retry_wait[2].isoformat()}"
                 if retry_wait is not None
+                else (
+                    "Options underlyings unavailable today "
+                    "(Equity not READY or not activated): "
+                    + ",".join(unavailable)
+                )
+                if unavailable
                 else None
             )
         ),
@@ -1960,5 +2004,36 @@ def reconcile_advanced_options_lifecycle_cursor(
             )
             if budget_wait is not None
             else tuple(f"FAILED_STAGE:{stage}" for stage in failed)
+        ) + tuple(
+            f"UNDERLYING_UNAVAILABLE:{ticker}" for ticker in unavailable
         ),
     )
+
+
+def _snapshot_equity_tickers(cursor, snapshot, preparations) -> set[str]:
+    """The Equity (and sector ETF) tickers activated in the session's desired snapshot (its AM members that are not
+    Options underlyings), by security."""
+    ticker_by_security = {
+        str(row.security_id): row.ticker
+        for row in preparations
+        if row.security_id is not None
+        and row.kind in {
+            DesiredMemberKind.EQUITY,
+            DesiredMemberKind.SECTOR_ETF,
+        }
+    }
+    cursor.execute(
+        "SELECT DISTINCT instrument.security_id::text "
+        "FROM rt.subscription_members AS member "
+        "JOIN rt.instruments AS instrument "
+        "ON instrument.instrument_id=member.instrument_id "
+        "WHERE member.manifest_id=%s "
+        "AND member.channel='AM' "
+        "AND member.option_underlying=false",
+        (str(snapshot.manifest_id),),
+    )
+    return {
+        ticker_by_security[str(row[0])]
+        for row in cursor.fetchall()
+        if str(row[0]) in ticker_by_security
+    }

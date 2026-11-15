@@ -6,6 +6,7 @@ from datetime import date, datetime, timedelta, timezone
 from uuid import NAMESPACE_URL, UUID, uuid5
 
 from .contracts import canonical_sha256
+from .universe_limits import SCHEMA_MAX_UNIVERSE_NAMES, max_universe_names
 
 
 ADVANCED_INGRESS_PROVIDER = "massive"
@@ -237,7 +238,7 @@ def automatic_advanced_ingress_budgets(
         universe_target,
         "universe_target",
         minimum=1,
-        maximum=400,
+        maximum=max_universe_names(),
     )
     request_ceiling = (
         target
@@ -279,7 +280,7 @@ class AdvancedStreamAuthorization:
         if (
             targets != self.allowed_universe_targets
             or len(targets) != 1
-            or not 1 <= targets[0] <= 400
+            or not 1 <= targets[0] <= SCHEMA_MAX_UNIVERSE_NAMES
         ):
             raise ValueError(
                 "standing authorization requires one exact manually "
@@ -433,8 +434,8 @@ class AdvancedIngressPlan:
     def __post_init__(self) -> None:
         if not isinstance(self.session_date, date):
             raise TypeError("session_date must be a date")
-        if not 1 <= self.universe_target <= 400:
-            raise ValueError("universe_target must be in [1, 400]")
+        if not 1 <= self.universe_target <= SCHEMA_MAX_UNIVERSE_NAMES:
+            raise ValueError(f"universe_target must be in [1, {SCHEMA_MAX_UNIVERSE_NAMES}]")
         if self.mode != ADVANCED_INGRESS_MODE:
             raise ValueError("Advanced ingress mode must remain SHADOW")
         if self.cohort_selection_reference is not None:

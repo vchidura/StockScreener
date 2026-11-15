@@ -1,0 +1,28 @@
+# Realtime universe (G102 universe sizing). Edit, then:
+#   python -B scripts/manage_realtime_universe.py diff --file config/realtime_universe.toml
+#   python -B scripts/manage_realtime_universe.py apply --file config/realtime_universe.toml            (dry run)
+#   python -B scripts/manage_realtime_universe.py apply --file config/realtime_universe.toml --commit
+# Options underlyings must also be listed under [equity] or [sector_etfs]. A change applies to the next session
+# that has not opened; names not READY by the 14:15 UTC activation join when READY.
+
+version = 1
+
+[equity]
+tickers = [
+    "AAOI", "AAPL", "ADBE", "AMAT", "AMD", "AMZN", "AVGO", "BA", "BAC", "COIN",
+    "CRWD", "CVX", "DIS", "GOOGL", "GS", "HD", "INTC", "IWM", "JPM", "LRCX",
+    "MSFT", "MSTR", "MU", "NFLX", "NVDA", "ORCL", "PANW", "PLTR", "QCOM", "QQQ",
+    "SOFI", "SPY", "TSLA", "UBER", "V", "WFC", "WMT", "XOM",
+]
+
+[sector_etfs]
+tickers = [
+    "SMH", "XLC", "XLE", "XLF", "XLK", "XLV", "XLY",
+]
+
+[options]
+underlyings = [
+    "AAPL", "AMZN", "IWM", "MSFT", "NFLX", "NVDA", "QQQ", "SPY", "TSLA",
+]
+
+[priority]

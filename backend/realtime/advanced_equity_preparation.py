@@ -10,6 +10,7 @@ from enum import Enum
 from typing import Protocol
 from uuid import NAMESPACE_URL, UUID, uuid5
 
+import requests
 from psycopg2.extras import Json
 
 from equity.domain import BarAvailabilityMode, BarSourceKind
@@ -27,6 +28,7 @@ from .advanced_realtime_desired_state import (
 from .advanced_realtime_desired_state_repository import (
     DESIRED_STATE_SCOPE,
     bind_desired_member_identity_cursor,
+    latest_security_reference_cursor,
     promote_prepared_desired_member_cursor,
     set_desired_member_preparation_cursor,
 )
@@ -55,6 +57,7 @@ from .equity_interval_derivation_worker import (
 )
 from .equity_history import (
     EquityHistoryIdentityError,
+    adjusted_period_listed,
     equity_history_coordinates,
     load_equity_history_cursor,
 )
@@ -66,7 +69,7 @@ from .provider_budget import (
     ProviderBudgetScope,
     reserve_coordinated_provider_request_cursor,
 )
-from .reference_adapters import MassiveReferenceAdapter
+from .reference_adapters import MassiveReferenceAdapter, security_reference_fact
 from .reference_facts import ReferenceFact, ReferenceFactRelation
 from .reference_repository import persist_reference_facts_cursor
 from .reference_service import ReferenceSeedRequest
@@ -120,6 +123,48 @@ class EquityPreparationBlockedError(RuntimeError):
             raise ValueError("blocked source counters cannot be negative")
         self.provider_requests = provider_requests
         self.response_bytes = response_bytes
+
+
+class _ProviderInactiveTicker(Exception):
+    """Raised inside the reference collection to stop it after the security record: an inactive ticker needs no
+    corporate-action requests."""
+
+    def __init__(self, record: Mapping[str, object]) -> None:
+        super().__init__("PROVIDER_INACTIVE")
+        self.record = dict(record)
+
+
+def provider_inactive_reason(record: Mapping[str, object]) -> str:
+    delisted = record.get("delisted_utc")
+    return f"PROVIDER_INACTIVE:{str(delisted)[:10] if delisted else 'UNKNOWN'}"
+
+
+# R58 (Nov 15): the most one-minute bars a session may lack and still count as provider-confirmed empty minutes.
+# A no-trade minute (DIA Nov 6 13:56, ZS four minutes, MA Nov 9 10:47, CRM Nov 11 13:30) is a few minutes; a larger
+# hole is a provider outage or a halt, and the session keeps failing (and retrying) as before.
+MAX_PROVIDER_EMPTY_MINUTES_PER_SESSION = 30
+
+
+def provider_empty_minutes(
+    interval: str,
+    coordinates,
+    expected_coordinates,
+) -> tuple[datetime, ...] | None:
+    """R58 (Nov 15): the one-minute bars of a session are accepted when they are a clean subset of the session's
+    minutes: the provider's full-session answer has no bar for a minute without a trade, and none is filled or
+    synthesized (INV-5). Returns the missing minute starts (empty when complete), or None when the rule does not
+    apply (another interval, a bar outside the session, nothing returned, or more missing minutes than a quiet
+    stretch explains)."""
+    if interval != "1m":
+        return None
+    expected = set(expected_coordinates)
+    returned = set(coordinates)
+    if not returned or not returned <= expected:
+        return None
+    missing = tuple(sorted(start for start, _end in expected - returned))
+    if len(missing) > MAX_PROVIDER_EMPTY_MINUTES_PER_SESSION:
+        return None
+    return missing
 
 
 class EquityPreparationUnavailableError(EquityPreparationSourceError):
@@ -236,6 +281,8 @@ class EquityPreparationFetchRequest:
     history_sessions: tuple[date, ...] = ()
     revalidate_weekly_history: bool = False
     before_provider_request: Callable[[float], None] | None = None
+    # G86 (Nov 15): the provider's listing date for the member; adjusted history before it does not exist.
+    listing_date: date | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -1142,6 +1189,22 @@ def _coverage_with_count(
     return coverage
 
 
+def _with_empty_minutes(
+    coverage: dict[str, object],
+    session: date,
+    empty_minutes: tuple[datetime, ...] | None,
+) -> dict[str, object]:
+    """R58: the stage's coverage keeps every provider-confirmed empty minute, per session, for the status report."""
+    if not empty_minutes:
+        return coverage
+    recorded = {
+        str(key): list(value)
+        for key, value in dict(coverage.get("provider_confirmed_empty_minutes") or {}).items()
+    }
+    recorded[session.isoformat()] = [start.isoformat() for start in empty_minutes]
+    return {**coverage, "provider_confirmed_empty_minutes": recorded}
+
+
 def _advanced_rest_facts(
     revisions,
     *,
@@ -1172,6 +1235,115 @@ def _advanced_rest_facts(
             ),
         )
         for revision in revisions
+    )
+
+
+ROLLOVER_CLAIM_CONTRACT = "advanced-equity-rollover-v1"
+
+
+def _before_listing_chunk(
+    request: EquityPreparationFetchRequest,
+    *,
+    interval: str,
+    intervals: tuple[str, ...],
+    sessions: tuple[date, ...],
+    interval_index: int,
+    session_index: int,
+    calendar: OptionExchangeCalendar,
+) -> EquityPreparationChunk:
+    """G86 (Nov 15): a ticker listed inside the history depth (SNDK 2025-02-13, ARM 2023-09-14) has no adjusted bars
+    before its listing. Those periods are passed without a provider request and recorded with the reason; the
+    technical warmup then requires only the listed periods."""
+    claim = request.claim
+    skipped = 0
+    while (
+        session_index + skipped < len(sessions)
+        and not adjusted_period_listed(
+            calendar, interval, sessions[session_index + skipped], request.listing_date,
+        )
+    ):
+        skipped += 1
+    next_session_index = session_index + skipped
+    next_interval_index = interval_index
+    if next_session_index == len(sessions):
+        next_interval_index += 1
+        next_session_index = 0
+    key = f"{interval}:ADJUSTED"
+    coverage = dict(claim.coverage)
+    not_listed = {
+        str(name): int(count)
+        for name, count in dict(coverage.get("not_listed_before_listing") or {}).items()
+    }
+    not_listed[key] = not_listed.get(key, 0) + skipped
+    coverage["not_listed_before_listing"] = not_listed
+    coverage["listing_date"] = request.listing_date.isoformat()
+    coverage["available_intervals"] = _interval_counts(claim.coverage)
+    return EquityPreparationChunk(
+        stage=claim.stage,
+        watermark_after={
+            "interval_index": next_interval_index,
+            "session_index": next_session_index,
+        },
+        coverage_after=coverage,
+        source_lineage={
+            "provider": "INTERNAL",
+            "owner": "advanced_equity_preparation_listing_rule",
+            "reason": f"BEFORE_LISTING:{request.listing_date.isoformat()}",
+            "request_sha256": canonical_sha256({
+                "ticker": claim.ticker,
+                "interval": interval,
+                "first": sessions[session_index],
+                "skipped": skipped,
+                "listing_date": request.listing_date,
+            }),
+            "response_sha256": canonical_sha256({"skipped": skipped}),
+        },
+        complete=next_interval_index == len(intervals),
+    )
+
+
+def _inactive_reference_chunk(
+    request: EquityPreparationFetchRequest,
+    record: Mapping[str, object],
+    seed_request: ReferenceSeedRequest,
+) -> EquityPreparationChunk:
+    """R59 / universe sizing 3.2 (Nov 15): the provider reports the ticker inactive (delisted).
+
+    A new member does not continue preparation: the stage retries later with the reason (the ticker returns by itself
+    if the provider reports it active again) and the member stays out of activation. A member already prepared (the
+    nightly rollover's reference refresh) records the inactive SECURITY revision, which the activation reads to leave
+    the member out of the next session (`reconcile_desired_state_revision_cursor`)."""
+    claim = request.claim
+    reason = provider_inactive_reason(record)
+    if claim.target.get("contract") != ROLLOVER_CLAIM_CONTRACT:
+        raise EquityPreparationUnavailableError(reason)
+    fact = security_reference_fact(claim.ticker, record, seed_request)
+    if claim.security_id is not None and dict(fact.values)["security_id"] != claim.security_id:
+        raise EquityPreparationBlockedError("STORED_SECURITY_IDENTITY_CHANGED")
+    body = json.dumps(dict(record), sort_keys=True, default=str).encode("utf-8")
+    return EquityPreparationChunk(
+        stage=claim.stage,
+        watermark_after={"complete": True},
+        coverage_after={
+            "provider_inactive": True,
+            "inactive_reason": reason,
+            "available_intervals": {},
+        },
+        source_lineage={
+            "provider": "MASSIVE",
+            "endpoint_classes": ["TICKER_OVERVIEW", "TICKER_LIST_INACTIVE"],
+            "request_sha256": canonical_sha256({
+                "ticker": claim.ticker,
+                "active": False,
+                "session_date": claim.target.get("history_through_session"),
+            }),
+            "response_sha256": canonical_sha256(json.loads(body)),
+            "reason": reason,
+        },
+        complete=True,
+        provider_requests=2,
+        response_bytes=len(body),
+        reference_facts=(fact,),
     )
 
 
@@ -1284,13 +1456,24 @@ class MassiveEquityPreparationSource:
         lookback_days = (
             session_date - date.fromisoformat(str(claim.target["window_start"]))
         ).days + 1
+        def fetch_security(ticker, as_of):
+            # R59 (Nov 15): the overview endpoint answers 404 for an inactive ticker (ROKU, delisted 2026-11-09 per
+            # the provider); its record, with active=false and the delisting date, comes from the list endpoint.
+            try:
+                record = self.client.fetch_ticker_overview(ticker, as_of_date=as_of)
+            except requests.HTTPError as error:
+                if getattr(getattr(error, "response", None), "status_code", None) != 404:
+                    raise
+                lookup = getattr(self.client, "fetch_inactive_ticker_record", None)
+                record = lookup(ticker) if lookup is not None else None
+                if record is None:
+                    raise
+            if isinstance(record, Mapping) and record.get("active") is False:
+                raise _ProviderInactiveTicker(record)
+            return record
+
         adapter = MassiveReferenceAdapter(
-            fetch_security=(
-                lambda ticker, as_of: self.client.fetch_ticker_overview(
-                    ticker,
-                    as_of_date=as_of,
-                )
-            ),
+            fetch_security=fetch_security,
             fetch_splits=(
                 lambda ticker, start, end: self.client.fetch_splits(
                     start,
@@ -1310,19 +1493,21 @@ class MassiveEquityPreparationSource:
             corporate_action_lookback_days=max(180, lookback_days),
         )
         created = request.checked_at
-        generation = adapter.collect(
-            ReferenceSeedRequest(
-                universe=UniverseManifest(
-                    version=f"advanced-equity-preparation-{claim.ticker}-v1",
-                    equity_tickers=(claim.ticker,),
-                    option_underlyings=(),
-                ),
-                session_date=session_date,
-                created_at=created,
-                effective_at=created,
-                valid_until=created + timedelta(days=7),
-            )
+        seed_request = ReferenceSeedRequest(
+            universe=UniverseManifest(
+                version=f"advanced-equity-preparation-{claim.ticker}-v1",
+                equity_tickers=(claim.ticker,),
+                option_underlyings=(),
+            ),
+            session_date=session_date,
+            created_at=created,
+            effective_at=created,
+            valid_until=created + timedelta(days=7),
         )
+        try:
+            generation = adapter.collect(seed_request)
+        except _ProviderInactiveTicker as inactive:
+            return _inactive_reference_chunk(request, inactive.record, seed_request)
         security = next(
             (
                 fact
@@ -1406,6 +1591,22 @@ class MassiveEquityPreparationSource:
             date.fromisoformat(str(value))
             for value in interval_sessions[interval]
         )
+        calendar = OptionExchangeCalendar("XNYS")
+        if (
+            request.listing_date is not None
+            and not request.history_sessions
+            and session_index < len(sessions)
+            and not adjusted_period_listed(calendar, interval, sessions[session_index], request.listing_date)
+        ):
+            return _before_listing_chunk(
+                request,
+                interval=interval,
+                intervals=intervals,
+                sessions=sessions,
+                interval_index=interval_index,
+                session_index=session_index,
+                calendar=calendar,
+            )
         selected = request.history_sessions or sessions[
             session_index:
             session_index + self.adjusted_daily_sessions_per_chunk
@@ -1575,10 +1776,19 @@ class MassiveEquityPreparationSource:
         coordinates = tuple(
             (revision.bar_start, revision.bar_end) for revision in revisions
         )
+        empty_minutes = provider_empty_minutes(
+            interval, coordinates, expected_coordinates,
+        )
         if (
             {revision.session_date for revision in revisions} != {session}
-            or len(coordinates) != len(expected_coordinates)
-            or set(coordinates) != set(expected_coordinates)
+            or len(set(coordinates)) != len(coordinates)
+            or (
+                empty_minutes is None
+                and (
+                    len(coordinates) != len(expected_coordinates)
+                    or set(coordinates) != set(expected_coordinates)
+                )
+            )
         ):
             raise EquityPreparationUnavailableError(
                 "NATIVE_INTRADAY_COVERAGE_INCOMPLETE"
@@ -1595,10 +1805,14 @@ class MassiveEquityPreparationSource:
                 "interval_index": next_interval_index,
                 "session_index": next_session_index,
             },
-            coverage_after=_coverage_with_count(
-                claim.coverage,
-                f"{interval}:RAW_UNADJUSTED",
-                len(revisions),
+            coverage_after=_with_empty_minutes(
+                _coverage_with_count(
+                    claim.coverage,
+                    f"{interval}:RAW_UNADJUSTED",
+                    len(revisions),
+                ),
+                session,
+                empty_minutes,
             ),
             source_lineage={
                 "provider": "MASSIVE",
@@ -1612,6 +1826,11 @@ class MassiveEquityPreparationSource:
                     "adjusted": False,
                 }),
                 "response_sha256": canonical_sha256(rows),
+                **({
+                    # R58: minutes the provider's full-session answer has no bar for (no trade); not filled.
+                    "quality": "PROVIDER_CONFIRMED_EMPTY_MINUTES",
+                    "missing_no_trade_starts": [start.isoformat() for start in empty_minutes],
+                } if empty_minutes else {}),
             },
             complete=complete,
             provider_requests=1,
@@ -1813,6 +2032,15 @@ class AdvancedEquityPreparationResident:
                     )
                     if adopted is None else ()
                 )
+                listing_date = None
+                if (
+                    claim.stage is EquityPreparationStage.ADJUSTED_DAILY
+                    and claim.security_id is not None
+                ):
+                    stored = latest_security_reference_cursor(
+                        unit.cursor, (claim.security_id,),
+                    ).get(claim.security_id)
+                    listing_date = None if stored is None else stored.get("list_date")
         except (ProviderBudgetExceeded, EquityHistoryIdentityError) as error:
             budget_reason = (
                 f"HISTORY_IDENTITY_DIVERGED:{error}"
@@ -1850,6 +2078,7 @@ class AdvancedEquityPreparationResident:
                     int(claim.watermark.get("interval_index", 0))
                 ] == "1wk"
             ),
+            listing_date=listing_date,
         )
         try:
             if adopted is not None:
@@ -2140,17 +2369,27 @@ class AdvancedEquityPreparationResident:
             "required adjusted intervals",
         )
         reasons = []
-        if not (
+        # Universe sizing (Nov 15): REFERENCE completed, so the provider's security record was stored; a stock whose
+        # record carries no industry (SIC) code that maps to a sector (ARM, a foreign issuer) is a provider gap, not a
+        # transient failure. It becomes READY with the sector recorded as unknown (like a fund) instead of retrying
+        # forever. Retry stays only for a record that could not be read at all.
+        sector_unknown = not (
             reference.get("sector_ready")
             or reference.get("sector_not_applicable")
-        ):
-            reasons.append("SECTOR_REFERENCE_UNAVAILABLE")
+        )
         if not reference.get("corporate_actions_ready"):
             reasons.append("CORPORATE_ACTION_COVERAGE_UNAVAILABLE")
         if daily.get("1d:ADJUSTED", 0) < required_daily:
             reasons.append("DAILY_TECHNICAL_WARMUP_INCOMPLETE")
+        # G86 (Nov 15): periods before the listing do not exist; only the listed ones are required.
+        not_listed = {
+            str(name): int(count)
+            for name, count in dict(
+                stages["ADJUSTED_DAILY"][1].get("not_listed_before_listing") or {}
+            ).items()
+        }
         for interval, required in required_adjusted.items():
-            if daily.get(interval, 0) < int(required):
+            if daily.get(interval, 0) < int(required) - not_listed.get(interval, 0):
                 reasons.append(
                     f"{interval}:PORTAL_HISTORY_INCOMPLETE"
                 )
@@ -2175,6 +2414,14 @@ class AdvancedEquityPreparationResident:
                 "derived_hourly": derived["1h:RAW_UNADJUSTED"],
             },
         }
+        if sector_unknown:
+            coverage["sector_unknown"] = {"reason": "PROVIDER_REFERENCE_HAS_NO_SECTOR"}
+        if not_listed:
+            coverage["history_shortened"] = {
+                "reason": "LISTED_INSIDE_HISTORY_DEPTH",
+                "listing_date": stages["ADJUSTED_DAILY"][1].get("listing_date"),
+                "periods_before_listing": not_listed,
+            }
         return EquityPreparationChunk(
             stage=claim.stage,
             watermark_after={"complete": True},

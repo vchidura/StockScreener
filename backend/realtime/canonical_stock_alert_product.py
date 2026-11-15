@@ -41,6 +41,7 @@ from .detector_evidence import (
 from .lineage_head import inputs_sha256
 from .portal_projection import RealtimeAlertProjection, build_alert_projection
 from .screening_projection import RealtimeScreeningInput
+from .universe_limits import SCHEMA_MAX_UNIVERSE_NAMES
 
 
 CANONICAL_STOCK_ALERT_PRODUCT = "canonical-equity-stock-alert-v1"
@@ -332,9 +333,9 @@ def canonical_stock_alert_membership(
             ),
         )
     )
-    if not 1 <= len(effective) <= 400:
+    if not 1 <= len(effective) <= SCHEMA_MAX_UNIVERSE_NAMES:
         raise ValueError(
-            "canonical Stock Alert effective membership must contain 1-400 names"
+            f"canonical Stock Alert effective membership must contain 1-{SCHEMA_MAX_UNIVERSE_NAMES} names"
         )
     if intended_members is None:
         intended = tuple({

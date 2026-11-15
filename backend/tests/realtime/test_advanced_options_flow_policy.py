@@ -325,8 +325,10 @@ def test_contract_scope_rejects_duplicate_mismatched_and_unowned_contracts():
 
 def test_invalid_scope_and_incomplete_cluster_shapes_fail_closed():
     policy = load_advanced_options_flow_policy()
-    with pytest.raises(ValueError, match="outside"):
-        policy.tier_for("META")
+    # G102 universe sizing O-3 (Nov 15): an unlisted underlying gets the default tier; a malformed one still fails.
+    assert policy.tier_for("META") is FlowUniverseTier.CORE_MEGA_CAP
+    with pytest.raises(ValueError, match="invalid"):
+        policy.tier_for("O:META")
     with pytest.raises(ValueError, match="DTE"):
         policy.lane_for(61)
 

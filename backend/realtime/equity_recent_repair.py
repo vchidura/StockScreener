@@ -33,6 +33,7 @@ from .equity_interval_derivation import REALTIME_DERIVATION_SOURCES, derive_real
 from .equity_interval_finalizer import _bar_revision
 from .equity_validation_source import EquityValidationIdentity
 from .stage_database_v2 import V2WorkerDatabase
+from .universe_limits import SCHEMA_MAX_UNIVERSE_NAMES
 
 SUPPORTED_NATIVE_INTERVALS = {
     "1m": 1,
@@ -113,7 +114,7 @@ def validate_native_repair_budget(
     intervals = tuple(dict.fromkeys(native_intervals))
     required = member_count * session_count * len(intervals)
     if (
-        not 1 <= member_count <= 400 or not 1 <= session_count <= 10
+        not 1 <= member_count <= SCHEMA_MAX_UNIVERSE_NAMES or not 1 <= session_count <= 10
         or not intervals
         or any(
             interval not in SUPPORTED_NATIVE_INTERVALS

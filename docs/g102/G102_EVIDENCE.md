@@ -3060,3 +3060,76 @@ Tests run offline in the r98 image with the worktree mounted (`runner/run_tests_
   - The `v3-stable-nov5` worktree (v3-live-fixes) now equals the live r119 image file for file (0 differences), so
     `runner/build_candidate.sh` builds the live scheduler code again.
   - The ops folder (handover, runner tools, rollout) is gitignored, as before.
+
+## Nov 15 (Sun) - Universe sizing build (R62/R63 lasting fix, R79) and V4 capacity replay
+
+Design `G102_UNIVERSE_SIZING_20261114.md` (sections 1-4); worktree `universe-sizing` from `v3-live-fixes` 60da29d
+(includes R78). Built as four packages in separate worktrees, merged without conflicts (52 files), then rehearsed on a
+copy of live. Nothing deployed, nothing written to live, nothing committed.
+
+- **What was built:**
+  - A (Equity size): migration 053 (the plan accepts an ACTIVE profile that covers its size; the stream approval needs an
+    ACTIVE product profile covering the target, no previous-size chain; 053 registers the one size-independent profile
+    `advanced-equity-ingress-v6`, size 400, the same 38 settings); `profile_for_target(1..400)` returns v6, old SHAs still
+    resolve; the controller no longer registers exact-size rows; one approval per session (no back-dated 1/9/25 chain);
+    admin script `scripts/register_realtime_v2_advanced_runtime_profile.py` (dry run by default); a static permissions
+    test (every write in live-path code vs the relation registry's app-role grants; it fails on the pre-fix controller).
+  - B (preparation): R58 provider-confirmed empty 1m minutes (<= 30 per session) accepted with a record; R59 root cause:
+    the provider marks ROKU inactive (delisted 2026-11-09) and its overview endpoint 404s for inactive tickers, so the
+    inactive record is read from the list endpoint and the member retries with `PROVIDER_INACTIVE:2026-11-09`; G86
+    listing inside the history depth (ARM, SNDK) skips pre-listing periods with a record (META's rename not built);
+    delisted/inactive members left out at activation with `MEMBER_EXCLUDED:<t>:<kind>:<reason>`; a FAILED member and an
+    underlying without its Equity member are left out instead of blocking; in-session confirmed-empty minutes behind
+    `REALTIME_V2_CONFIRMED_EMPTY_MINUTES` (default off) with migration 054 (`rt.stream_gaps.provider_confirmed_empty_starts`).
+  - C (Options): the acquisition binding carries the day's underlyings (`EQUITY_VALIDATION_UNIVERSE` off the live path);
+    the Options scope fingerprint is the underlyings only (r104's stored-universe acceptance kept one release); flow
+    default tier for any underlying; underlyings evaluated at contract selection (READY Equity, not previous-cohort
+    membership), the rest UNAVAILABLE for the day; ranking by priority when the contract budget is short; the snapshot
+    `Timeout` past the deadline is the labelled skip `OPTIONS_SNAPSHOT_DEADLINE_EXPIRED`.
+  - D: the universe file `backend/config/realtime_universe.toml` (live 45/9) and `scripts/manage_realtime_universe.py`
+    (check, diff, apply with a dry-run default, status, export).
+  - Found and fixed in the rehearsal: (1) the capability refresh request covered every enabled member and returned
+    nothing while any member was unbound, so one unbindable name (ROKU) stopped the refresh and the activation for the
+    whole universe; it now uses the activation's own member rule (`session_base_members`: READY, bound, not excluded);
+    (2) a stock whose provider record has no sector (ARM) retried TECHNICAL_WARMUP forever; it is READY with
+    `sector_unknown: PROVIDER_REFERENCE_HAS_NO_SECTOR`; (3) two DB tests asserted the old blocking rule (updated).
+- **Gate 1, tests:** full offline suite integration 265 failed / 7,434 passed / 29 errors vs baseline 60da29d 265 / 7,335
+  / 29: the same failures, 0 new, 0 fixed (environmental: DB settings, compose files, P7 lineage). DB suites on a
+  throwaway Postgres 17 container: the same 8 baseline failures, 0 new (after updating the two tests).
+- **Gates 2-5, copy rehearsal** (`test_realtime_v2_recovery_20261104us`, restored from a read-only live backup 01:25 UTC,
+  5.0 GB; migrated to 054 and hardened with the new code, security audit PASS; app role throughout, no admin step):
+  universe file applied (45 - AAOI + DIA ZS MA CRM ROKU SNDK ARM; GOOGL added as an Options underlying), revision
+  `25df138b`; the preparation backfilled with provider REST (copy only): CRM, DIA, MA, ZS READY (R58), ARM READY
+  (G86 listing + sector unknown), ROKU held `PROVIDER_INACTIVE:2026-11-09`, SNDK held `ADJUSTED_HISTORY_COVERAGE_INCOMPLETE`
+  (its provider list date 2025-02-13 is when-issued trading; bars start 2025-02-24, so the first weekly periods have no
+  bar: follow-up); capability refresh (clock Monday 14:16) READY for the 49 session members, 1 provider probe;
+  controller activation (clock Monday 14:20): session snapshot 49 members (the 5 new in; ROKU, SNDK, AAOI out), one
+  stream approval for 49 with no parent, ingress plan 49 on `advanced-equity-ingress-v6` READY. Options lifecycle took
+  the 49 session with 10 underlyings including GOOGL and ran CATALOG_QUOTE, REFERENCE_OI, HISTORY, CAPACITY_SHARDS with
+  no error; activation not reachable on a weekend (Friday quotes are stale under a Monday clock, the copy's catalog
+  budget ran out: `WAITING_PROVIDER_BUDGET:CATALOG_QUOTE`); covered by WP-C's DB test with GOOGL and Monday's live
+  pre-open.
+- **Gate 6** (in-session confirmed-empty minute): not rehearsed; the switch stays off for Monday.
+- **Gate 7, V4 capacity replay** (Nov 13 journal, offline, `runner/v4_capacity_replay.py`, results
+  `data-audit/v4-capacity-20261115/`): arrival 14:35-15:55 mean 1,389/s, p95 1,750/s, peak 1-minute 1,928/s (gate
+  2 x peak = 3,855/s); market-state 12,954 ev/s on one core (6.7x), flow 60,807 msg/s (28x), journal read 25,627 ev/s.
+  PASS: V4 stays for Monday; the 0.3 CPU cap is not a safe lever with V4 (market-state 4,356/s, 2.26x). The bound is
+  per-record Python object building, not SQLite. Database writes are not in the numbers (~5-10% expected).
+- **Host:** Modern Standby 01:15:45-01:20:18 UTC; live services restarted on resume and are healthy. Sleep must be off
+  before a session.
+- **Follow-ups:** SNDK first-trade gap after its listing date; retry reasons (e.g. `PROVIDER_INACTIVE`) are only in the
+  preparation log, not in a stored field the status reads; META rename (G86); gate 6 rehearsal before the switch;
+  paging above 50 Options underlyings.
+- **Universe limits in one place (user ~03:45 UTC; design 3.5):** `backend/realtime/universe_limits.py` reads
+  `REALTIME_UNIVERSE_MAX_NAMES` (default 400, ceiling 5,000), `REALTIME_OPTIONS_MAX_UNDERLYINGS` (50, ceiling 50: window
+  input) and `REALTIME_OPTIONS_MAX_CONTRACTS_PER_CONNECTION` (1,000, ceiling 1,000: provider) from the compose
+  `advanced-environment` anchor and the env files (`backend/.env.realtime.example`,
+  `scripts/configure_realtime_v2_advanced_environment.py`). The 15 hardcoded 400s in live modules are replaced (entry
+  points use the setting, stored-data checks the schema ceiling); `test_universe_limits.py` fails if a live module uses
+  400 as a size bound again. Migration 053 (not deployed) now also relaxes the schema's three 400 bounds (stream plans,
+  approvals, runtime profiles) to 5,000 and registers v6 covering 5,000 (new identity `ae31b5f304d0...`). Tests: full
+  offline 0 new failures, DB suites 0 new (6 test expectations of the old coverage updated). Fresh copy (restored again
+  from the same backup, 04:26 UTC): 053/054 applied, the three constraints at 5,000, v6 5,000 ACTIVE, security audit
+  PASS; Monday's path (revision 7fabaec0, 45 names, capability refresh, controller at a Monday 14:20 clock): 45-member
+  session, one approval without a parent, plan 45 READY on the existing exact-45 configuration (same size keeps the
+  source cohort's configuration). No admin step.

@@ -32,6 +32,10 @@ from .advanced_stream_control import (
     RegisteredAdvancedStreamSession,
     record_advanced_stream_gap_cursor,
 )
+from .confirmed_empty_minutes import (
+    MAX_CONFIRMED_EMPTY_MINUTES_PER_HOLE,
+    confirmed_empty_minutes_enabled,
+)
 from .contracts import MarketFeed, canonical_sha256
 from .database_access_v2 import APP_ROLE
 from .equity_bar_adapter import RealtimeEquityBarFact
@@ -282,7 +286,7 @@ def _reserve_member_repair_cursor(
     return repair, request_id
 
 
-def _repair_facts(
+def _repair_hole_facts(
     scope: StreamGapRepairScope,
     member: StreamGapMember,
     rows,
@@ -291,7 +295,7 @@ def _repair_facts(
     hole_start: datetime,
     hole_end: datetime,
     observed_at: datetime,
-) -> tuple[tuple[RealtimeEquityBarFact, ...], UUID]:
+) -> tuple[tuple[RealtimeEquityBarFact, ...], UUID, tuple[datetime, ...]]:
     segment = uuid5(
         NAMESPACE_URL,
         f"advanced-stream-gap-rest:{scope.cohort_id}:{request_id}",
@@ -317,7 +321,9 @@ def _repair_facts(
             int((hole_end - hole_start).total_seconds() // 60)
         )
     }
-    if {revision.bar_start for revision in selected} != expected:
+    returned = {revision.bar_start for revision in selected}
+    empty_starts = confirmed_empty_starts(revisions, returned, expected, hole_end=hole_end)
+    if returned | set(empty_starts) != expected or not returned <= expected:
         raise ValueError("provider did not return every missing minute")
     return (
         tuple(
@@ -342,7 +348,48 @@ def _repair_facts(
             for revision in selected
         ),
         segment,
+        empty_starts,
     )
+
+
+def _repair_facts(
+    scope: StreamGapRepairScope,
+    member: StreamGapMember,
+    rows,
+    *,
+    request_id: UUID,
+    hole_start: datetime,
+    hole_end: datetime,
+    observed_at: datetime,
+) -> tuple[tuple[RealtimeEquityBarFact, ...], UUID]:
+    """The repaired bars of a hole that the provider answered in full (every missing minute has a bar)."""
+    facts, segment, empty_starts = _repair_hole_facts(
+        scope,
+        member,
+        rows,
+        request_id=request_id,
+        hole_start=hole_start,
+        hole_end=hole_end,
+        observed_at=observed_at,
+    )
+    if empty_starts:
+        raise ValueError("provider did not return every missing minute")
+    return facts, segment
+
+
+def confirmed_empty_starts(revisions, returned, expected, *, hole_end: datetime) -> tuple[datetime, ...]:
+    """Universe sizing 3.3 (switch `REALTIME_V2_CONFIRMED_EMPTY_MINUTES`): the hole minutes the provider's
+    full-session one-minute answer has no bar for, accepted as no-trade minutes only when the answer is healthy (it
+    holds bars after the hole, so the provider is not merely behind) and the stretch is short. Otherwise none."""
+    missing = tuple(sorted(set(expected) - set(returned)))
+    if (
+        not missing
+        or not confirmed_empty_minutes_enabled()
+        or len(missing) > MAX_CONFIRMED_EMPTY_MINUTES_PER_HOLE
+        or not any(revision.bar_start >= hole_end for revision in revisions)
+    ):
+        return ()
+    return missing
 
 
 def _record_repair_batch_cursor(
@@ -418,7 +465,7 @@ def _repair_member(
         )
         requests, response_bytes = client.chunk_metrics()
         completed = _utc(clock(), "gap repair clock")
-        facts, segment = _repair_facts(
+        facts, segment, empty_starts = _repair_hole_facts(
             scope,
             member,
             rows,
@@ -434,21 +481,32 @@ def _repair_member(
                 json.dumps(rows, sort_keys=True).encode("utf-8"),
                 sealed_at=completed,
             )
-            _record_repair_batch_cursor(
-                unit.cursor,
-                scope,
-                segment=segment,
-                request_id=request_id,
-                facts=facts,
-                started_at=checked,
-                completed_at=completed,
-            )
-            persist_realtime_equity_bars_cursor(unit.cursor, facts)
-            unit.cursor.execute(
-                "UPDATE rt.stream_gaps SET repair_status='REPLAYED' "
-                "WHERE repair_id=%s",
-                (str(repair.repair_id),),
-            )
+            if facts:
+                # A hole whose every minute is provider-confirmed empty has no bars and no batch.
+                _record_repair_batch_cursor(
+                    unit.cursor,
+                    scope,
+                    segment=segment,
+                    request_id=request_id,
+                    facts=facts,
+                    started_at=checked,
+                    completed_at=completed,
+                )
+                persist_realtime_equity_bars_cursor(unit.cursor, facts)
+            if empty_starts:
+                # Universe sizing 3.3: the provider-confirmed no-trade minutes of this hole (switch on only).
+                unit.cursor.execute(
+                    "UPDATE rt.stream_gaps SET repair_status='REPLAYED',"
+                    "provider_confirmed_empty_starts=%s::timestamptz[] "
+                    "WHERE repair_id=%s",
+                    (list(empty_starts), str(repair.repair_id)),
+                )
+            else:
+                unit.cursor.execute(
+                    "UPDATE rt.stream_gaps SET repair_status='REPLAYED' "
+                    "WHERE repair_id=%s",
+                    (str(repair.repair_id),),
+                )
             # The 5m bars come from the window this repair unblocks, so
             # requiring them here could never succeed for a 5m-sized hole.
             verify_and_close_gap_repair_cursor(
