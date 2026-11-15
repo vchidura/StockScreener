@@ -1,7 +1,9 @@
 """Canonical PostgreSQL producer for Advanced NBBO option marks."""
 from __future__ import annotations
 
+import os
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -18,6 +20,7 @@ from .advanced_options_control_plane import (
     AdvancedOptionsEnrollmentPlan,
     advanced_options_enrollment_plan_payload,
 )
+from .advanced_options_cutoff_quotes import QUOTE_COLUMNS as CUTOFF_QUOTE_COLUMNS
 from .advanced_options_reference_state import AdvancedOptionsReferenceState
 from .advanced_options_rolling_state import (
     AdvancedOptionsRollingState,
@@ -53,6 +56,32 @@ _QUIET_MARK_REASONS = frozenset({
     "OPTION_SPOT_SKEW_EXCEEDED",
     "UNDERLYING_SNAPSHOT_STALE_OR_NONCAUSAL",
 })
+# V3-1.5 (Nov 15): where the window's marks take their quotes (V3_1 design Step 5 note, option (b)).
+#   OFF (default, unset): today's read of rt.quote_current, aged against the receive time.
+#   RECORD: today's marks are published; the journal read is computed too and the differences are logged
+#           (MARKS_AT_CUTOFF_RECORD), with no change to anything stored.
+#   JOURNAL: the marks come from the quote set as of the barrier offset (advanced_options_cutoff_quotes), aged in
+#            market time (cutoff minus the quote's event time). A missing journal keeps today's read with
+#            MARKS_JOURNAL_UNAVAILABLE.
+MARKS_AT_CUTOFF_SETTING = "REALTIME_V3_MARKS_AT_CUTOFF"
+_CUTOFF_QUOTE_COLUMNS = frozenset(CUTOFF_QUOTE_COLUMNS)
+
+
+class MarksAtCutoffMode(str, Enum):
+    OFF = "OFF"
+    RECORD = "RECORD"
+    JOURNAL = "JOURNAL"
+
+
+def marks_at_cutoff_mode(environ=None) -> MarksAtCutoffMode:
+    raw = (os.environ if environ is None else environ).get(MARKS_AT_CUTOFF_SETTING)
+    value = (raw or "").strip().upper() or MarksAtCutoffMode.OFF.value
+    try:
+        return MarksAtCutoffMode(value)
+    except ValueError:
+        raise ValueError(
+            f"{MARKS_AT_CUTOFF_SETTING} must be OFF, RECORD or JOURNAL, not {raw!r}"
+        ) from None
 
 
 def _utc(value: datetime, name: str) -> datetime:
@@ -460,10 +489,31 @@ def _blocked(
     )
 
 
+def _with_cutoff_quote(row, quote: Mapping[str, object] | None) -> dict:
+    """The slot row with its quote columns taken from the journal's cutoff read (None: no quote at the barrier).
+    Key order is the query's, so a blocked row's evidence hash is computed the same way as today."""
+    return {
+        key: (
+            (None if quote is None else quote[key])
+            if key in _CUTOFF_QUOTE_COLUMNS
+            else value
+        )
+        for key, value in row.items()
+    }
+
+
 def assemble_advanced_options_marks_cursor(
     cursor,
     plan: AdvancedOptionsMarkProducerPlan,
+    *,
+    cutoff_quotes: Mapping[int, Mapping[str, object]] | None = None,
+    observed_quotes: dict[int, dict[str, object]] | None = None,
 ) -> AdvancedOptionsMarkPreflight:
+    """`cutoff_quotes` (V3-1.5 JOURNAL, and the RECORD comparison): the quote heads as of the barrier offset from
+    the journal, keyed by instrument id, in the `rt.quote_current` row shape; they replace the joined quote columns,
+    and the quote's age is measured in market time (cutoff minus its event time) instead of against its receive
+    time. None keeps today's read. `observed_quotes`, when given, receives each contract's quote facts used here
+    (source offset, event and receive time) for the RECORD comparison."""
     _validate_plan(plan)
     control = plan.control_plane
     cursor.execute(
@@ -517,6 +567,19 @@ def assemble_advanced_options_marks_cursor(
     )
     if actual != expected:
         raise ValueError("Advanced Options mark active slot identity changed")
+    journal_read = cutoff_quotes is not None
+    if journal_read:
+        rows = tuple(
+            _with_cutoff_quote(row, cutoff_quotes.get(int(row["instrument_id"])))
+            for row in rows
+        )
+    if observed_quotes is not None:
+        for row in rows:
+            observed_quotes[int(row["instrument_id"])] = {
+                "source_offset": row["source_offset"],
+                "event_at": row["event_at"],
+                "received_at": row["received_at"],
+            }
     tick_by_ticker = {
         row.ticker: row for row in plan.rolling_state.underlying_ticks
     }
@@ -559,7 +622,25 @@ def assemble_advanced_options_marks_cursor(
             received_at = row["event_at"]
         # A quote from at or before the cutoff can arrive just after it, so the
         # event time decides whether it belongs to this window.
-        if row["event_at"] is not None and (
+        if journal_read:
+            # V3-1.5: the journal read is bounded by the barrier offset, so the
+            # receive clock plays no part; the age is market time. A quote stamped
+            # past its receive time by any skew counts as received at its event
+            # time (the mark's observed time may not precede its market time).
+            if (
+                row["event_at"] is not None
+                and received_at is not None
+                and row["event_at"] > received_at
+            ):
+                received_at = row["event_at"]
+            if row["event_at"] is not None and (
+                row["event_at"] > plan.cutoff
+                or (
+                    plan.cutoff - row["event_at"]
+                ).total_seconds() > plan.maximum_source_age_seconds
+            ):
+                reasons.append("OPTION_NBBO_STALE_OR_NONCAUSAL")
+        elif row["event_at"] is not None and (
             row["event_at"] > received_at
             or row["event_at"] > plan.cutoff
             or (
@@ -779,6 +860,8 @@ class PostgresAdvancedOptionsMarkProducer:
         maximum_attempts: int = 3,
         retry_initial_seconds: float = 0.05,
         wait: Callable[[float], None] = time.sleep,
+        cutoff_quotes: Mapping[int, Mapping[str, object]] | None = None,
+        record_observed: bool = False,
     ) -> None:
         if not isinstance(provider, V2ConnectionProvider):
             raise TypeError("Advanced Options mark provider is invalid")
@@ -795,10 +878,24 @@ class PostgresAdvancedOptionsMarkProducer:
         self._maximum_attempts = maximum_attempts
         self._retry_initial_seconds = retry_initial_seconds
         self._wait = wait
+        # V3-1.5 JOURNAL: the same cutoff quote set for preflight and produce, so the
+        # frozen marks replay exactly whenever the window runs.
+        self._cutoff_quotes = cutoff_quotes
+        # RECORD: the quote facts each contract was judged on, for the comparison.
+        self.observed_quotes: dict[int, dict[str, object]] | None = (
+            {} if record_observed else None
+        )
 
     def _assemble(self, unit) -> AdvancedOptionsMarkPreflight:
         with unit.connection.cursor(cursor_factory=RealDictCursor) as cursor:
-            return assemble_advanced_options_marks_cursor(cursor, self._plan)
+            if self._cutoff_quotes is None and self.observed_quotes is None:
+                return assemble_advanced_options_marks_cursor(cursor, self._plan)
+            return assemble_advanced_options_marks_cursor(
+                cursor,
+                self._plan,
+                cutoff_quotes=self._cutoff_quotes,
+                observed_quotes=self.observed_quotes,
+            )
 
     def preflight(self) -> AdvancedOptionsMarkPreflight:
         with self._provider.transaction(
@@ -839,3 +936,150 @@ class PostgresAdvancedOptionsMarkProducer:
                     self._retry_initial_seconds * (2 ** (attempt - 1))
                 )
         raise AssertionError("unreachable mark producer retry state")
+
+
+# V3-1.5 RECORD: how each contract's journal-read outcome differs from today's.
+#   QUOTED_AFTER_BARRIER       today's head is past the barrier (the contract quoted between the cutoff and the
+#                              window's run): expected, the reason for V3-1.5.
+#   TODAY_HEAD_OUTSIDE_SESSION today had no head of this session (absent, older generation or session, e.g. after a
+#                              late start) and the journal holds one: expected.
+#   AGE_BASIS                  the same quote, judged fresh by one clock and stale by the other (receive time today,
+#                              market time in the journal read): expected, measured.
+#   HEAD_DIFFERS               a different quote at or before the barrier: NOT expected (fold or journal mismatch).
+#   RULE_DIFFERS               the same quote with another outcome for any other reason: NOT expected.
+MARKS_AT_CUTOFF_EXPECTED_CLASSES = frozenset({
+    "QUOTED_AFTER_BARRIER",
+    "TODAY_HEAD_OUTSIDE_SESSION",
+    "AGE_BASIS",
+})
+_TODAY_HEAD_OUTSIDE_SESSION_REASONS = frozenset({
+    "OPTION_NBBO_ABSENT",
+    "OPTION_NBBO_GENERATION_MISMATCH",
+    "OPTION_NBBO_SOURCE_SESSION_MISMATCH",
+    "OPTION_NBBO_SOURCE_DATE_MISMATCH",
+})
+_AGE_REASONS = frozenset({
+    "OPTION_NBBO_STALE_OR_NONCAUSAL",
+    OPTION_CONTRACTS_EXCLUDED_ABOVE_LIMIT,
+})
+
+
+def _stamp_or_none(value) -> str | None:
+    return None if value is None else _utc(value, "quote time").isoformat()
+
+
+def _cutoff_side(row: AdvancedOptionsMarkEvidence | None, quote: Mapping[str, object]) -> dict[str, object]:
+    return {
+        "status": None if row is None else row.status.value,
+        "reasons": [] if row is None else list(row.reason_codes),
+        "source_offset": quote.get("source_offset"),
+        "event_at": _stamp_or_none(quote.get("event_at")),
+    }
+
+
+def classify_cutoff_mark_difference(
+    today: AdvancedOptionsMarkEvidence | None,
+    journal: AdvancedOptionsMarkEvidence | None,
+    *,
+    today_offset: int | None,
+    journal_offset: int | None,
+    barrier_offset: int,
+) -> str | None:
+    """None when both reads give the same outcome on the same quote; else the difference class."""
+    if today_offset == journal_offset:
+        if (
+            today is not None
+            and journal is not None
+            and today.status is journal.status
+            and today.reason_codes == journal.reason_codes
+            and (
+                today.status is not AdvancedOptionsMarkStatus.READY
+                or today.evidence_sha256 == journal.evidence_sha256
+            )
+        ):
+            return None
+        changed = set(() if today is None else today.reason_codes) ^ set(
+            () if journal is None else journal.reason_codes
+        )
+        if changed and changed <= _AGE_REASONS and "OPTION_NBBO_STALE_OR_NONCAUSAL" in changed:
+            return "AGE_BASIS"
+        return "RULE_DIFFERS"
+    if today_offset is not None and int(today_offset) > barrier_offset:
+        return "QUOTED_AFTER_BARRIER"
+    if today_offset is None or (
+        today is not None and set(today.reason_codes) & _TODAY_HEAD_OUTSIDE_SESSION_REASONS
+    ):
+        return "TODAY_HEAD_OUTSIDE_SESSION"
+    return "HEAD_DIFFERS"
+
+
+def compare_cutoff_marks(
+    *,
+    today: AdvancedOptionsMarkPreflight,
+    journal: AdvancedOptionsMarkPreflight | None,
+    today_quotes: Mapping[int, Mapping[str, object]],
+    journal_quotes: Mapping[int, Mapping[str, object]],
+    barrier_offset: int,
+    cutoff: datetime,
+    window_id: UUID | str | None = None,
+    journal_status: str = "OK",
+    journal_read_ms: float | None = None,
+    maximum_listed: int = 250,
+) -> dict[str, object]:
+    """The RECORD document for one window (pure; the replay tool calls it too). `today_quotes` and `journal_quotes`
+    are the quote facts each read judged (assemble's `observed_quotes`; for the journal, the cutoff quote rows)."""
+    today_rows = {row.instrument_id: row for row in today.evidence}
+    journal_rows = {} if journal is None else {row.instrument_id: row for row in journal.evidence}
+    tickers = {
+        row.instrument_id: row.contract_ticker
+        for row in (*today.evidence, *(() if journal is None else journal.evidence))
+    }
+    classes: dict[str, int] = {}
+    differences = []
+    same = 0
+    for instrument_id in sorted(set(today_rows) | set(journal_rows)):
+        today_row = today_rows.get(instrument_id)
+        journal_row = journal_rows.get(instrument_id)
+        today_quote = today_quotes.get(instrument_id) or {}
+        journal_quote = journal_quotes.get(instrument_id) or {}
+        kind = classify_cutoff_mark_difference(
+            today_row,
+            journal_row,
+            today_offset=today_quote.get("source_offset"),
+            journal_offset=journal_quote.get("source_offset"),
+            barrier_offset=barrier_offset,
+        )
+        if kind is None:
+            same += 1
+            continue
+        classes[kind] = classes.get(kind, 0) + 1
+        if len(differences) < maximum_listed:
+            differences.append({
+                "instrument_id": instrument_id,
+                "contract_ticker": tickers.get(instrument_id),
+                "class": kind,
+                "today": _cutoff_side(today_row, today_quote),
+                "journal": _cutoff_side(journal_row, journal_quote),
+            })
+    return {
+        "contract": "marks-at-cutoff-record-v1",
+        "window_id": None if window_id is None else str(window_id),
+        "cutoff": _utc(cutoff, "cutoff").isoformat(),
+        "barrier_offset": barrier_offset,
+        "journal_status": journal_status,
+        "journal_read_ms": journal_read_ms,
+        "contracts": len(set(today_rows) | set(journal_rows)),
+        "same": same,
+        "differ": sum(classes.values()),
+        "unexpected": sum(
+            count for kind, count in classes.items()
+            if kind not in MARKS_AT_CUTOFF_EXPECTED_CLASSES
+        ),
+        "classes": dict(sorted(classes.items())),
+        "today": {"status": today.status.value, "marked": len(today.marks)},
+        "journal": (
+            None if journal is None
+            else {"status": journal.status.value, "marked": len(journal.marks)}
+        ),
+        "differences": differences,
+    }
