@@ -32,9 +32,17 @@ from .advanced_options_runtime import (
     build_advanced_options_v3_runtime_composition,
 )
 from .advanced_options_mark_producer import (
+    MarksAtCutoffMode,
     PostgresAdvancedOptionsMarkProducer,
     build_advanced_options_mark_producer_plan,
+    compare_cutoff_marks,
     freeze_advanced_options_mark_producer_plan,
+    marks_at_cutoff_mode,
+)
+from .advanced_options_cutoff_quotes import (
+    MARKS_JOURNAL_UNAVAILABLE,
+    CutoffQuotesUnavailable,
+    read_cutoff_quotes,
 )
 from .advanced_options_package_evidence import (
     PACKAGE_MARK_UNAVAILABLE,
@@ -657,6 +665,91 @@ def _threshold_evidence(observed, volume, completeness):
     )
 
 
+def _window_cutoff_quotes(flow_environment, binding, barrier_offset: int):
+    """V3-1.5: the selected contracts' quote heads as of the barrier offset, read from this session's journal
+    (the window's journal source: the volume the p8-window container mounts). Returns (read, status); read is None
+    when the journal cannot give them, with MARKS_JOURNAL_UNAVAILABLE:<why> as the status. Never raises."""
+    try:
+        from .advanced_options_ingress import _journal_session_ids
+
+        source = flow_environment.options_flow_source
+        registration = source.registration
+        read = read_cutoff_quotes(
+            source.path,
+            instrument_ids=tuple(
+                row.instrument_id
+                for row in binding.enrollment.activity_selection.contracts
+            ),
+            barrier_offset=barrier_offset,
+            journal_generation=registration.journal_generation,
+            registered_stream_session_id=registration.stream_session_id,
+            allowed_stream_session_ids=_journal_session_ids(
+                source.source_flow.stream_session_ids
+            ),
+            normalizer_version=registration.normalizer_version,
+        )
+    except CutoffQuotesUnavailable as error:
+        return None, str(error)[:300]
+    except Exception as error:  # noqa: BLE001 - the window keeps today's read
+        return None, f"{MARKS_JOURNAL_UNAVAILABLE}:{type(error).__name__}:{error}"[:300]
+    return read, "OK"
+
+
+def _record_cutoff_marks(
+    provider,
+    binding,
+    mark_candidate,
+    today,
+    *,
+    today_quotes,
+    cutoff_read,
+    cutoff_status: str,
+    barrier_offset: int,
+    cutoff,
+) -> dict | None:
+    """V3-1.5 RECORD: the journal read's marks next to today's, logged as one MARKS_AT_CUTOFF_RECORD line per window.
+    Nothing is stored and nothing here can fail the window."""
+    try:
+        journal = None
+        status = cutoff_status
+        if cutoff_read is not None:
+            try:
+                journal = PostgresAdvancedOptionsMarkProducer(
+                    provider,
+                    mark_candidate,
+                    cutoff_quotes=cutoff_read.quotes,
+                ).preflight()
+            except Exception as error:  # noqa: BLE001
+                status = f"JOURNAL_PREFLIGHT_FAILED:{type(error).__name__}:{error}"[:300]
+        document = compare_cutoff_marks(
+            today=today,
+            journal=journal,
+            today_quotes=today_quotes,
+            journal_quotes=({} if cutoff_read is None else cutoff_read.quotes),
+            barrier_offset=barrier_offset,
+            cutoff=cutoff,
+            window_id=binding.window_id,
+            journal_status=status,
+            journal_read_ms=(None if cutoff_read is None else cutoff_read.read_ms),
+        )
+        _LOGGER.warning(
+            "MARKS_AT_CUTOFF_RECORD %s",
+            json.dumps(document, sort_keys=True, default=str),
+        )
+        return document
+    except Exception as error:  # noqa: BLE001
+        _LOGGER.warning(
+            "MARKS_AT_CUTOFF_RECORD %s",
+            json.dumps({
+                "contract": "marks-at-cutoff-record-v1",
+                "window_id": str(binding.window_id),
+                "cutoff": cutoff.isoformat(),
+                "journal_status": f"RECORD_FAILED:{type(error).__name__}:{error}"[:300],
+            }, sort_keys=True),
+        )
+        return None
+
+
 def build_and_run_p8_serial_window(
     *,
     provider,
@@ -787,10 +880,52 @@ def build_and_run_p8_serial_window(
         valuation_policy=valuation_policy,
         market_state_committed_offset=int(market["normalized_end_offset"]),
     )
-    mark_preflight = PostgresAdvancedOptionsMarkProducer(
+    # V3-1.5 (Nov 15): REALTIME_V3_MARKS_AT_CUTOFF. OFF keeps this exactly as before.
+    marks_mode = marks_at_cutoff_mode()
+    barrier_offset = int(market["normalized_end_offset"])
+    cutoff_read = None
+    cutoff_status = "OK"
+    if marks_mode is not MarksAtCutoffMode.OFF:
+        cutoff_read, cutoff_status = _window_cutoff_quotes(
+            flow_environment,
+            binding,
+            barrier_offset,
+        )
+    published_cutoff_quotes = (
+        cutoff_read.quotes
+        if marks_mode is MarksAtCutoffMode.JOURNAL and cutoff_read is not None
+        else None
+    )
+    if marks_mode is MarksAtCutoffMode.JOURNAL and cutoff_read is None:
+        _LOGGER.warning(
+            "advanced_options_window_marks_journal window_id=%s cutoff=%s status=%s fallback=QUOTE_CURRENT",
+            binding.window_id,
+            cutoff.isoformat(),
+            cutoff_status,
+        )
+        emit_fault(kind=MARKS_JOURNAL_UNAVAILABLE, severity="DEGRADED", recoverable=True, action="QUOTE_CURRENT",
+                   service="options-window", key="marks-journal-unavailable",
+                   message=f"marks at {cutoff.isoformat()} read rt.quote_current: {cutoff_status}"[:300],
+                   context={"window_id": str(binding.window_id), "barrier_offset": barrier_offset})
+    mark_producer = PostgresAdvancedOptionsMarkProducer(
         provider,
         mark_candidate,
-    ).preflight()
+        cutoff_quotes=published_cutoff_quotes,
+        record_observed=marks_mode is MarksAtCutoffMode.RECORD,
+    )
+    mark_preflight = mark_producer.preflight()
+    if marks_mode is MarksAtCutoffMode.RECORD:
+        _record_cutoff_marks(
+            provider,
+            binding,
+            mark_candidate,
+            mark_preflight,
+            today_quotes=mark_producer.observed_quotes or {},
+            cutoff_read=cutoff_read,
+            cutoff_status=cutoff_status,
+            barrier_offset=barrier_offset,
+            cutoff=cutoff,
+        )
     # R34 (Nov 10): what the marks left out and why, per window; zero marks had no trace in the logs.
     unmarked_reasons: dict[str, int] = {}
     for row in mark_preflight.evidence:
@@ -818,6 +953,7 @@ def build_and_run_p8_serial_window(
     marks = PostgresAdvancedOptionsMarkProducer(
         provider,
         mark_plan,
+        cutoff_quotes=published_cutoff_quotes,
     ).produce()
     marked = {row.instrument_id for row in marks}
     unmarked_instrument_ids = tuple(sorted(
