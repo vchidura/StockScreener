@@ -67,6 +67,12 @@ from .reference_continuity import (
 from .stage_database_v2 import V2StageDatabase
 from .stage_orchestrator import StageCancelled, StageContext, StageOutcome, StageRunner
 from .stage_runners_advanced_equity import advanced_input_gate_identity
+from .ticker_projection import (
+    bind_pattern_watch_build_id,
+    pattern_watch_light,
+    pattern_watch_mode,
+    split_pattern_watch_build_id,
+)
 from .ticker_repository import (
     CycleRehydrationMismatch,
     TickerProjectionCancelled,
@@ -860,13 +866,14 @@ def reuse_advanced_portal_ready_runner(
         raise ValueError("Advanced portal reuse requires a PORTAL_READY receipt")
 
     def run(context: StageContext) -> StageOutcome:
+        producer_build_id, _light = split_pattern_watch_build_id(receipt.build_id)
         if (
             receipt.cutoff != context.window.cutoff
-            or receipt.build_id != environment.build_id
+            or producer_build_id != environment.build_id
         ):
             return StageOutcome.failed(
                 PORTAL_READY_PRODUCER_UNAVAILABLE
-                if receipt.build_id != environment.build_id
+                if producer_build_id != environment.build_id
                 else INPUT_READY_REUSE_MISMATCH
             )
         return StageOutcome.complete(
@@ -895,13 +902,15 @@ def equity_evidence_runner(environment: RunnerEnvironment) -> StageRunner:
             if context.is_cancelled():
                 return StageOutcome.failed(STAGE_CANCELLED)
             input_known_by = environment.known_by(window)
-            cycle = compute_realtime_ticker_cycle(
-                compute, state=environment.ticker_state, loader=environment.screening_loader,
-                cohort_id=plan.cohort_id, session=plan.session_date,
-                cutoff=window.cutoff, known_by=input_known_by,
-                source_generation=generation,
-                should_stop=context.is_cancelled,
-            )
+            light = pattern_watch_light()  # review P2-2: recorded on the receipt, used by recovery
+            with pattern_watch_mode(light):
+                cycle = compute_realtime_ticker_cycle(
+                    compute, state=environment.ticker_state, loader=environment.screening_loader,
+                    cohort_id=plan.cohort_id, session=plan.session_date,
+                    cutoff=window.cutoff, known_by=input_known_by,
+                    source_generation=generation,
+                    should_stop=context.is_cancelled,
+                )
         except (
             StageCancelled,
             TickerProjectionCancelled,
@@ -918,7 +927,8 @@ def equity_evidence_runner(environment: RunnerEnvironment) -> StageRunner:
         return StageOutcome.complete(degraded=bars.degraded_reasons(), receipt=CycleReceiptSpec(
             EQUITY_CYCLE, window.cutoff, generation,
             universe_sha256=reference_set(cycle.inputs.members)["sha256"],
-            input_sha256=inputs_sha256(cycle.inputs), build_id=environment.build_id,
+            input_sha256=inputs_sha256(cycle.inputs),
+            build_id=bind_pattern_watch_build_id(environment.build_id, light),
             known_by=input_known_by,
         ))
 
@@ -930,6 +940,7 @@ class _WindowReceipt(NamedTuple):
     reference_generation: int
     input_sha256: str
     known_by: datetime
+    build_id: str = ""
 
 
 def _window_cycle_receipt(
@@ -943,7 +954,7 @@ def _window_cycle_receipt(
         cursor.execute(
             "SELECT receipt.receipt_id, receipt.cohort_id, receipt.cutoff, receipt.universe_sha256, "
             "receipt.reference_generation, receipt.input_sha256, "
-            "window_run.provider_tier,receipt.known_by "
+            "window_run.provider_tier,receipt.known_by,receipt.build_id "
             "FROM rt.cycle_receipts AS receipt "
             "JOIN rt.window_runs AS window_run ON window_run.window_id = receipt.window_id "
             "WHERE receipt.window_id = %s AND receipt.receipt_kind = %s",
@@ -961,7 +972,7 @@ def _window_cycle_receipt(
                              row["cutoff"], row["universe_sha256"],
                              source_receipt_sha256=row["input_sha256"],
                              source_generation=int(row["reference_generation"])),
-        int(row["reference_generation"]), row["input_sha256"], row["known_by"],
+        int(row["reference_generation"]), row["input_sha256"], row["known_by"], str(row.get("build_id") or ""),
     )
 
 
@@ -986,20 +997,22 @@ def equity_projection_runner(environment: RunnerEnvironment) -> StageRunner:
         try:
             if context.is_cancelled():
                 return StageOutcome.failed(STAGE_CANCELLED)
-            cycle = compute_realtime_ticker_cycle(
-                compute,
-                state=environment.ticker_state,
-                loader=environment.screening_loader,
-                cohort_id=plan.cohort_id,
-                session=plan.session_date,
-                cutoff=window.cutoff,
-                known_by=receipt.known_by,
-                source_generation=receipt.reference_generation,
-                allow_late_identity_continuity=(
-                    environment.allow_late_identity_continuity
-                ),
-                should_stop=context.is_cancelled,
-            )
+            light = pattern_watch_light()  # review P2-2: recorded on the receipt, used by recovery
+            with pattern_watch_mode(light):
+                cycle = compute_realtime_ticker_cycle(
+                    compute,
+                    state=environment.ticker_state,
+                    loader=environment.screening_loader,
+                    cohort_id=plan.cohort_id,
+                    session=plan.session_date,
+                    cutoff=window.cutoff,
+                    known_by=receipt.known_by,
+                    source_generation=receipt.reference_generation,
+                    allow_late_identity_continuity=(
+                        environment.allow_late_identity_continuity
+                    ),
+                    should_stop=context.is_cancelled,
+                )
         except (
             StageCancelled,
             TickerProjectionCancelled,
@@ -1019,7 +1032,7 @@ def equity_projection_runner(environment: RunnerEnvironment) -> StageRunner:
             receipt.reference_generation,
             universe_sha256=reference_set(cycle.inputs.members)["sha256"],
             input_sha256=inputs_sha256(cycle.inputs),
-            build_id=environment.build_id,
+            build_id=bind_pattern_watch_build_id(environment.build_id, light),
             known_by=receipt.known_by,
         ))
 
@@ -1125,17 +1138,19 @@ def portal_publish_runner(
                 # committed: rebuild the cycle from durable rows, proven equal to the receipt.
                 logger.warning("portal publish: cycle hand-off missing for window %s, rehydrating", window.window_id)
                 try:
-                    cycle = rehydrate_realtime_ticker_cycle(
-                        publication, input_sha256=projection_receipt.input_sha256,
-                        universe_sha256=projection_receipt.release.universe_sha256, cohort_id=plan.cohort_id,
-                        session=plan.session_date, cutoff=window.cutoff,
-                        known_by=projection_receipt.known_by,
-                        source_generation=projection_receipt.reference_generation,
-                        allow_late_identity_continuity=(
-                            environment.allow_late_identity_continuity
-                        ),
-                        should_stop=context.is_cancelled,
-                    )
+                    # Review P2-2: in the Pattern Watch mode the cycle was projected in, not the current switch's.
+                    with pattern_watch_mode(split_pattern_watch_build_id(projection_receipt.build_id)[1]):
+                        cycle = rehydrate_realtime_ticker_cycle(
+                            publication, input_sha256=projection_receipt.input_sha256,
+                            universe_sha256=projection_receipt.release.universe_sha256, cohort_id=plan.cohort_id,
+                            session=plan.session_date, cutoff=window.cutoff,
+                            known_by=projection_receipt.known_by,
+                            source_generation=projection_receipt.reference_generation,
+                            allow_late_identity_continuity=(
+                                environment.allow_late_identity_continuity
+                            ),
+                            should_stop=context.is_cancelled,
+                        )
                 except CycleRehydrationMismatch:
                     logger.error("portal publish: the rehydrated cycle does not match the receipt of window %s",
                                  window.window_id)

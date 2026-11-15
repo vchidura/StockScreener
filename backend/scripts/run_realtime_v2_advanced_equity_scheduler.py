@@ -943,6 +943,7 @@ def main(
             stop.wait(args.poll_seconds)
         return 0
     finally:
+        daily_products.stop()  # review P2-5: no job or worker outlives the scheduler
         pool.closeall()
 
 

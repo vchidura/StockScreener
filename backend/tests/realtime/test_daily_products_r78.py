@@ -14,6 +14,7 @@ import realtime.daily_products as job
 import realtime.daily_products_launcher as launcher
 from realtime.dashboard_projection import produce_realtime_dashboard
 from realtime.lineage_head import inputs_sha256
+from realtime.portal_projection_repository import publish_portal_release_cursor, session_close_snapshot
 from realtime.preflight import ProviderTier
 from realtime.screening_projection import (
     ENDPOINT_CLOSE_SCALE_MAX_RELATIVE_DIFFERENCE, SOURCE_LINEAGE_LOADED, STORED_LINEAGE_ACCEPTED, _validate_bars,
@@ -397,11 +398,12 @@ def _compute_db():
     return V2WorkerDatabase(Provider(), RealtimeDatabaseRole.COMPUTE)
 
 
-def _patch_load(monkeypatch, inputs, stored):
+def _patch_load(monkeypatch, inputs, stored, current=None):
     monkeypatch.setattr(job, "next_source_generation_cursor", lambda cursor, cohort: inputs.source_generation)
     monkeypatch.setattr(job, "load_daily_products_input", lambda cursor, **scope: inputs)
     monkeypatch.setattr(job, "stored_daily_products_cursor", lambda cursor, cohort, mode, **_: stored)
     monkeypatch.setattr(job, "prepared_daily_products_cursor", lambda cursor, cohort, mode, identity, **_: {})
+    monkeypatch.setattr(job, "_current_release_cursor", lambda cursor, cohort: current)
 
 
 def _refuse(*_args, **_kwargs):
@@ -482,9 +484,9 @@ class _PublishCursor:
         return self._all
 
 
-def _current(cutoff, entries=(), tier=None):
+def _current(cutoff, entries=(), tier=None, generation=1, session=SESSION):
     tier = tier or daily_scanner_fixture().provider_tier.value
-    return dict(release_id=uuid4(), cutoff=cutoff, session_date=SESSION, provider_tier=tier,
+    return dict(release_id=uuid4(), cutoff=cutoff, session_date=session, provider_tier=tier, publication_generation=generation,
                 receipt_id=uuid4(), universe_sha256="a" * 64, desired_revision_id=uuid4(),
                 desired_snapshot_sha256="b" * 64, membership_sha256="c" * 64, manifest=dict(snapshots=list(entries)))
 
@@ -492,11 +494,15 @@ def _current(cutoff, entries=(), tier=None):
 def _patch_publication(monkeypatch, published):
     monkeypatch.setattr(job, "persist_strategy_snapshot_cursor",
                         lambda cursor, snapshot: published.append(("strategy", snapshot)))
-    monkeypatch.setattr(job, "persist_realtime_dashboard_cursor",
-                        lambda cursor, snapshot, session_close: published.append(("dashboard", snapshot, session_close)))
 
-    def release(cursor, receipt, snapshots, session_date=None):
-        published.append(("release", receipt, tuple(snapshots), session_date))
+    def dashboard(cursor, snapshot, session_close):
+        published.append(("dashboard", snapshot, session_close))
+        return (snapshot,), ((session_close_snapshot(snapshot),) if session_close else ())
+    monkeypatch.setattr(job, "persist_realtime_dashboard_cursor", dashboard)
+
+    def release(cursor, receipt, snapshots, session_date=None, release_class="INTRADAY"):
+        published.append(("release", receipt, tuple(snapshots), session_date) if release_class == "INTRADAY"
+                         else ("close-release", receipt, tuple(snapshots), session_date))
         return SimpleNamespace(pointer_swapped=True, release_id=uuid4(), cutoff=receipt.cutoff,
                                publication_disposition="CURRENT")
     monkeypatch.setattr(job, "publish_portal_release_cursor", release)
@@ -591,14 +597,36 @@ class _Process:
         return -9
 
 
-def _launcher(tmp_path, processes, mode="JOB", **options):
-    started = []
+class _Timer:
+    def __init__(self, interval, function, args=()):
+        self.interval, self.function, self.args = interval, function, args
+        self.daemon = self.started = self.cancelled = False
 
-    def popen(command, env=None, close_fds=True):
+    def start(self):
+        self.started = True
+
+    def cancel(self):
+        self.cancelled = True
+
+    def fire(self):
+        self.function(*self.args)
+
+
+def _launcher(tmp_path, processes, mode="JOB", **options):
+    started, popen_options, timers = [], [], []
+
+    def popen(command, env=None, **kwargs):
         started.append((command, env))
+        popen_options.append(kwargs)
         return processes.pop(0)
+
+    def timer(interval, function, args=()):
+        timers.append(_Timer(interval, function, args))
+        return timers[-1]
+    options.setdefault("timer_factory", timer)
     instance = launcher.DailyProductsLauncher(report_directory=tmp_path, environ={job.DAILY_PRODUCTS_SWITCH: mode},
                                               popen=popen, python="python", **options)
+    instance.test_popen_options, instance.test_timers = popen_options, timers
     return instance, started
 
 
@@ -1008,3 +1036,392 @@ def test_latest_session_strategy_release_is_selectable_and_feeds_the_dashboard(m
     assert strategy.source_manifest[job.DAILY_PRODUCTS_MARKER]["strategy_sessions"] == 1
     _validate_strategy_snapshot(strategy.source_manifest, strategy.payload)
     assert products.dashboard.payload["setup_summary"]["results"] == strategy.payload["setup_summary"]["results"]
+
+
+# --- review round (Nov 15) ---------------------------------------------------------------------------------------------
+# P1: the publication generation of prepared products, through the real publisher.
+
+WINDOW_ENTRY = dict(snapshot_id=str(UUID(int=41)), snapshot_class="EPHEMERAL_PORTAL", snapshot_type="TICKER_PAGE",
+                    snapshot_key="AAPL", source_generation=13, generated_at="2026-11-16T14:35:00+00:00")
+
+
+class _RealPublisherCursor:
+    """Answers the job's reads (current release, stored products) and the real publisher's statements (catalog,
+    pointer, release rows) from in-memory rows, so `publish_portal_release_cursor` runs unchanged: its ordering by
+    (session, cutoff, generation) and its pointer swap are what is tested, not a stub."""
+
+    def __init__(self, current):
+        self.current, self.catalog, self.releases, self.writes = current, {}, {}, []
+        self._one = self._all = None
+
+    def execute(self, sql, params=()):
+        current = self.current
+        if sql.startswith("SELECT pg_advisory_xact_lock"):
+            self._one = None
+        elif "FOR UPDATE OF pointer" in sql:
+            self._one = (str(current["release_id"]), current["session_date"], current["cutoff"],
+                         current["publication_generation"], str(current["receipt_id"]),
+                         current["desired_snapshot_sha256"], current["manifest"])
+        elif "FROM rt.portal_release_current AS pointer" in sql:
+            self._one = current
+        elif "snapshot.source_manifest->" in sql:
+            self._all = []
+        elif "FROM rt.snapshot_catalog WHERE snapshot_id=ANY" in sql:
+            self._all = [(key, *self.catalog[key]) for key in params[0] if key in self.catalog]
+        elif sql.startswith("INSERT INTO rt.portal_releases"):
+            self.releases[(params[0], params[6])] = params
+            self.writes.append(("release", params[3], params[14], params[10]))
+        elif sql.startswith("SELECT release_id, cohort_id"):
+            values = self.releases[(params[0], params[1])]
+            self._one = (*values[:8], *values[9:])
+        elif sql.startswith("INSERT INTO rt.portal_release_current"):
+            ordered = ((current["session_date"], current["cutoff"], current["publication_generation"])
+                       <= (params[4], params[3], params[5]))
+            self._one = (params[2],) if ordered else None
+            if ordered:
+                self.writes.append(("pointer", params[2]))
+        else:
+            raise AssertionError(sql)
+
+    def fetchone(self):
+        return self._one
+
+    def fetchall(self):
+        return self._all
+
+    def store(self, snapshot, snapshot_class):
+        self.catalog[str(snapshot.snapshot_id)] = (snapshot_class, snapshot.source_manifest_sha256,
+                                                   snapshot.payload_sha256, snapshot.generated_at)
+        self.writes.append(("snapshot", snapshot.snapshot_type, snapshot_class))
+
+
+def _store_in_catalog(monkeypatch):
+    """The persistence functions write the catalog rows the real publisher reads (KEPT strategies are SESSION_CLOSE
+    class; a HOT Dashboard EPHEMERAL, its kept variant SESSION_CLOSE)."""
+    monkeypatch.setattr(job, "persist_strategy_snapshot_cursor",
+                        lambda cursor, snapshot: cursor.store(snapshot, "SESSION_CLOSE"))
+
+    def dashboard(cursor, snapshot, session_close):
+        cursor.store(snapshot, "EPHEMERAL_PORTAL")
+        if not session_close:
+            return (snapshot,), ()
+        kept = session_close_snapshot(snapshot)
+        cursor.store(kept, "SESSION_CLOSE")
+        return (snapshot,), (kept,)
+    monkeypatch.setattr(job, "persist_realtime_dashboard_cursor", dashboard)
+
+
+def _at_generation(products, generation):
+    """The products as a run at `generation` would carry them (the generation is the publisher's ordering key)."""
+    from dataclasses import replace as replaced
+    strategy = replaced(products.strategy.snapshot, source_generation=generation)
+    dashboard = replaced(products.dashboard, source_generation=generation)
+    return replaced(products, strategy=replaced(products.strategy, snapshot=strategy), dashboard=dashboard)
+
+
+def _first_window_release(products, generation, cutoff=datetime(2026, 11, 16, 14, 35, tzinfo=UTC)):
+    """A new cohort's first window release: the window's entries at the window's generation (READY seed count)."""
+    current = _current(cutoff, [dict(WINDOW_ENTRY, source_generation=generation)], generation=generation,
+                       session=date(2026, 11, 16))
+    current.update(desired_revision_id=None, desired_snapshot_sha256=None, membership_sha256=None)
+    return current
+
+
+@pytest.mark.parametrize("prepared, expected", [(1, "HISTORICAL_STALE"), (5, "HISTORICAL_STALE"), (8, "CURRENT")])
+def test_the_publisher_orders_a_release_at_the_current_cutoff_by_generation(monkeypatch, job_products, prepared,
+                                                                               expected):
+    """The reviewer's reproduction: at the current release's cutoff, a release below its generation is
+    HISTORICAL_STALE and the pointer stays (the job then raised, and every retry found the same prepared products)."""
+    from realtime.portal_projection_repository import PortalReleaseReceipt
+    products = _at_generation(job_products, prepared)
+    current = _first_window_release(products, 7)
+    cursor = _RealPublisherCursor(current)
+    for snapshot, snapshot_class in ((products.strategy.snapshot, "SESSION_CLOSE"),
+                                     (products.dashboard, "EPHEMERAL_PORTAL")):
+        cursor.store(snapshot, snapshot_class)
+    receipt = PortalReleaseReceipt(current["receipt_id"], products.inputs.cohort_id, products.inputs.provider_tier,
+                                   current["cutoff"], current["universe_sha256"])
+    release = publish_portal_release_cursor(cursor, receipt, job._snapshots(products),
+                                            session_date=current["session_date"])
+    assert release.publication_disposition == expected
+    assert release.pointer_swapped is (expected == "CURRENT")
+
+
+@pytest.mark.parametrize("prepared", [1, 5, 12])
+def test_products_below_the_current_generation_are_refused_before_anything_is_written(monkeypatch, job_products,
+                                                                                      prepared):
+    _store_in_catalog(monkeypatch)
+    cursor = _RealPublisherCursor(_first_window_release(job_products, 13))
+    status, release, reason = job.publish_daily_products_cursor(cursor, _at_generation(job_products, prepared))
+    assert (status, release, reason) == (job.OUTRANKED, None, f"GENERATION_{prepared}_BELOW_CURRENT_13")
+    assert cursor.writes == []
+
+
+@pytest.mark.parametrize("generation", [13, 14])
+def test_products_at_or_above_the_current_generation_become_current_with_the_window_entries(
+        monkeypatch, job_products, generation):
+    _store_in_catalog(monkeypatch)
+    products = _at_generation(job_products, generation)
+    cursor = _RealPublisherCursor(_first_window_release(products, 13))
+    status, release, reason = job.publish_daily_products_cursor(cursor, products)
+    assert status == job.PUBLISHED and release.pointer_swapped and release.publication_disposition == "CURRENT"
+    assert release.publication_generation == generation
+    names = {(entry["snapshot_type"], entry["snapshot_key"]) for entry in release.manifest["snapshots"]}
+    assert names == {("TICKER_PAGE", "AAPL"), (HISTORY_VERSION, "COHORT"), ("DASHBOARD_V1", "COHORT")}
+    assert [write[0] for write in cursor.writes].count("release") == 1  # a new cohort's products: no close
+
+
+def test_the_job_generation_is_above_the_window_counter_the_current_release_and_the_cohort():
+    class Cursor:
+        def execute(self, sql, params=()):
+            self.sql, self.params = sql, params
+
+        def fetchone(self):
+            return {"generation": 14}
+    cursor = Cursor()
+    assert job.next_source_generation_cursor(cursor, UUID(int=5)) == 14
+    for term in ("rt.snapshot_catalog", "rt.feature_snapshots", "rt.portal_release_current",
+                 "FROM rt.seed_manifests WHERE status='READY'"):
+        assert term in cursor.sql
+    assert cursor.params == (str(UUID(int=5)),) * 3
+
+
+def test_prepared_products_outranked_by_the_current_release_are_computed_again(monkeypatch):
+    inputs = _narrow(daily_scanner_fixture())
+    low = {("DAILY_STRATEGIES_V1", "COHORT"): SimpleNamespace(source_generation=1),
+           ("DASHBOARD_V1", "COHORT"): SimpleNamespace(source_generation=1)}
+    _patch_load(monkeypatch, inputs, {}, current=dict(publication_generation=13))
+    monkeypatch.setattr(job, "prepared_daily_products_cursor", lambda cursor, cohort, mode, identity, **_: low)
+    products, stored = job.compute_daily_products(_compute_db(), cohort_id=inputs.cohort_id, session=inputs.session,
+                                                  cutoff=inputs.cutoff, mode=job.MODE_JOB, sessions=1)
+    assert stored is None and products.prepared is False
+    assert products.counts["prepared_outranked"] == dict(prepared=1, current=13)
+    assert products.strategy.snapshot.snapshot_type == "DAILY_STRATEGIES_V1" and products.dashboard is not None
+    # At or above the current release they are released as they are, without computing.
+    high = {key: SimpleNamespace(source_generation=13) for key in low}
+    monkeypatch.setattr(job, "prepared_daily_products_cursor", lambda cursor, cohort, mode, identity, **_: high)
+    monkeypatch.setattr(job, "project_realtime_daily_strategies", _refuse)
+    products, _stored = job.compute_daily_products(_compute_db(), cohort_id=inputs.cohort_id, session=inputs.session,
+                                                   cutoff=inputs.cutoff, mode=job.MODE_JOB, sessions=1)
+    assert products.prepared is True and "prepared_outranked" not in products.counts
+
+
+def test_a_prepared_release_outranked_at_publication_is_computed_again_once(monkeypatch, job_products):
+    """A window publishing above the prepared products between the run's load and its release: the run computes
+    again (force: the prepared ones are skipped) and publishes; outranked again, it fails (the launcher retries)."""
+    prepared = replace(job_products, prepared=True)
+    fresh = replace(job_products, prepared=False, counts={}, timings={})
+    calls = []
+
+    def compute(*_args, **options):
+        calls.append(("compute", options.get("force")))
+        return (fresh if options.get("force") else prepared), None
+    statuses = [(job.OUTRANKED, None, "GENERATION_1_BELOW_CURRENT_13"),
+                (job.PUBLISHED, SimpleNamespace(release_id=uuid4(), cutoff=T0), None)]
+    monkeypatch.setattr(job, "compute_daily_products", compute)
+    monkeypatch.setattr(job, "write_strategy_evidence", lambda database, projection: calls.append("evidence") or 3)
+    monkeypatch.setattr(job, "publish_daily_products_cursor",
+                        lambda cursor, products: calls.append(("publish", products.prepared)) or statuses.pop(0))
+    compute_db, publication_db, _provider = _run_databases()
+    outcome = job.run_daily_products(compute_db, publication_db, cohort_id=job_products.inputs.cohort_id,
+                                     session=job_products.inputs.session, cutoff=T0, mode=job.MODE_JOB)
+    assert outcome.status == job.PUBLISHED
+    assert outcome.counts["prepared_outranked"] == "GENERATION_1_BELOW_CURRENT_13"
+    assert calls == [("compute", False), ("publish", True), ("compute", True), "evidence", ("publish", False)]
+    statuses[:] = [(job.OUTRANKED, None, "GENERATION_14_BELOW_CURRENT_15")]
+    monkeypatch.setattr(job, "compute_daily_products", lambda *_a, **_k: (fresh, None))
+    with pytest.raises(ValueError, match="below the current release"):
+        job.run_daily_products(compute_db, publication_db, cohort_id=job_products.inputs.cohort_id,
+                               session=job_products.inputs.session, cutoff=T0, mode=job.MODE_JOB)
+
+
+# P2-3: the closed session's products are kept, with a SESSION_CLOSE release.
+
+def _closing_release(products, generation=13):
+    session = products.inputs.session
+    close = exchange_calendars.get_calendar("XNYS").session_close(str(session)).to_pydatetime()
+    current = _current(close, [dict(WINDOW_ENTRY, source_generation=generation)], generation=generation, session=session)
+    current.update(desired_revision_id=None, desired_snapshot_sha256=None, membership_sha256=None)
+    return current
+
+
+def test_the_after_close_run_keeps_the_dashboard_and_names_the_kept_products_in_a_session_close_release(
+        monkeypatch, job_products):
+    _store_in_catalog(monkeypatch)
+    products = _at_generation(job_products, 14)
+    current = _closing_release(products)
+    assert job.closes_session(current, products.inputs.session)
+    cursor = _RealPublisherCursor(current)
+    status, release, _reason = job.publish_daily_products_cursor(cursor, products)
+    assert status == job.PUBLISHED and release.pointer_swapped
+    releases = [write for write in cursor.writes if write[0] == "release"]
+    assert [(write[1], write[2]) for write in releases] == [("INTRADAY", "CURRENT"), ("SESSION_CLOSE", "SESSION_CLOSE")]
+    close_release = next(params for params in cursor.releases.values() if params[3] == "SESSION_CLOSE")
+    import json
+    named = json.loads(close_release[8])["snapshots"]
+    kept_dashboard = session_close_snapshot(products.dashboard)
+    assert {entry["snapshot_id"] for entry in named} == {str(products.strategy.snapshot.snapshot_id),
+                                                        str(kept_dashboard.snapshot_id)}
+    assert {entry["snapshot_class"] for entry in named} == {"SESSION_CLOSE"}
+    assert close_release[5] == products.inputs.session
+    # The current (INTRADAY) release names the HOT Dashboard, as a window's close did.
+    assert str(products.dashboard.snapshot_id) in {entry["snapshot_id"] for entry in release.manifest["snapshots"]}
+
+
+def test_a_new_cohorts_products_are_never_a_session_close(monkeypatch, job_products):
+    products = _at_generation(job_products, 14)
+    current = _closing_release(products)
+    for changed in (dict(session_date=products.inputs.session + timedelta(days=3)),
+                    dict(cutoff=current["cutoff"] - timedelta(minutes=5))):
+        assert not job.closes_session(dict(current, **changed), products.inputs.session)
+    published = []
+    _patch_publication(monkeypatch, published)
+    job.publish_daily_products_cursor(_PublishCursor(current=dict(current, session_date=date(2026, 11, 16))), products)
+    assert [item[0] for item in published] == ["strategy", "dashboard", "release"] and published[1][2] is False
+
+
+# P2-2: recovery projects a cycle in the Pattern Watch mode recorded on its receipt.
+
+def test_the_pattern_watch_mode_is_bound_to_the_build_identity_and_read_back():
+    from realtime.ticker_projection import bind_pattern_watch_build_id, split_pattern_watch_build_id
+    build = "advanced-equity-window-v2"
+    assert bind_pattern_watch_build_id(build, False) == build  # FULL receipts are unchanged
+    bound = bind_pattern_watch_build_id(build, True)
+    assert len(bound) <= 96 and split_pattern_watch_build_id(bound) == (build, True)
+    assert split_pattern_watch_build_id(build) == (build, False)
+    with pytest.raises(ValueError):
+        bind_pattern_watch_build_id(bound, True)
+
+
+def test_a_bound_mode_overrides_the_switch_in_the_projection(monkeypatch, pattern_projections):
+    """The rebuilt workspaces equal the original ones in both directions of a switch change."""
+    from realtime.ticker_projection import (
+        PATTERN_WATCH_SWITCH, TickerProjectionState, pattern_watch_mode, project_realtime_ticker_workspace,
+    )
+    full, _full_watch, light, _light_watch = pattern_projections
+    inputs = _two_names()
+    for switch, bound, original in (("LIGHT", False, full), ("", True, light)):
+        monkeypatch.setenv(PATTERN_WATCH_SWITCH, switch)
+        with pattern_watch_mode(bound):
+            rebuilt = project_realtime_ticker_workspace(inputs, state=TickerProjectionState())
+        assert [snapshot.snapshot_id for snapshot in rebuilt.snapshots] == [
+            snapshot.snapshot_id for snapshot in original.snapshots]
+        assert [(m.interval, m.input_sha256) for m in rebuilt.pattern_materializations] == [
+            (m.interval, m.input_sha256) for m in original.pattern_materializations]
+
+
+def test_the_projection_stage_records_its_mode_and_recovery_uses_it_whatever_the_switch(monkeypatch):
+    import realtime.stage_runners_equity as runners
+    from realtime.orchestration_repository import CycleReceiptSpec
+    from realtime.runner_environment import RunnerEnvironment
+    from realtime.ticker_projection import PATTERN_WATCH_SWITCH, pattern_watch_light
+    from tests.realtime.test_stage_runners_equity import NOW as STAGE_NOW, _Database, _context, _inputs, _receipt_row
+
+    seen = []
+    monkeypatch.setattr(runners, "compute_realtime_ticker_cycle",
+                        lambda *a, **k: seen.append(pattern_watch_light()) or SimpleNamespace(inputs=_inputs()))
+    for switch, light in (("LIGHT", True), ("", False)):
+        monkeypatch.setenv(PATTERN_WATCH_SWITCH, switch)
+        context = _context("EQUITY_PROJECTION")
+        context = replace(context, database=_Database([_receipt_row(context)]))
+        environment = RunnerEnvironment(None, build_id="advanced-equity-window-v2")
+        outcome = runners.equity_projection_runner(environment)(context)
+        assert outcome.state == "COMPLETE" and seen[-1] is light
+        assert outcome.receipt.build_id == ("advanced-equity-window-v2+pattern-watch-light" if light
+                                            else "advanced-equity-window-v2")
+
+    rebuilt = []
+    monkeypatch.setattr(runners, "rehydrate_realtime_ticker_cycle",
+                        lambda database, **options: rebuilt.append(pattern_watch_light()) or "cycle")
+    monkeypatch.setattr(runners, "publish_realtime_portal_cycle_atomic", lambda *a, **k: None)
+    for switch, build_id, light in (("", "advanced-equity-window-v2+pattern-watch-light", True),
+                                    ("LIGHT", "advanced-equity-window-v2", False)):
+        monkeypatch.setenv(PATTERN_WATCH_SWITCH, switch)
+        context = _context("PORTAL_PUBLISH")
+        context = replace(context, database=_Database([dict(_receipt_row(context), build_id=build_id)]))
+        assert runners.portal_publish_runner(RunnerEnvironment(None))(context).state == "COMPLETE"
+        assert rebuilt[-1] is light
+
+    # A retry reuses a bound PORTAL_READY receipt of the same producer build (and refuses another build's).
+    environment = RunnerEnvironment(None, build_id="advanced-equity-window-v2")
+    for build_id, state in (("advanced-equity-window-v2+pattern-watch-light", "COMPLETE"),
+                            ("advanced-equity-window-v2", "COMPLETE"),
+                            ("advanced-equity-window-v1+pattern-watch-light", "FAILED")):
+        receipt = CycleReceiptSpec(runners.PORTAL_READY, STAGE_NOW, 3, "b" * 64, "c" * 64, build_id)
+        assert runners.reuse_advanced_portal_ready_runner(environment, receipt=receipt)(
+            _context("EQUITY_PROJECTION")).state == state
+
+
+# P2-4 / P2-5: the deadline is a watchdog independent of the window loop; kills reach the whole process group.
+
+def test_the_job_starts_in_its_own_process_group_and_the_watchdog_kills_it_without_a_tick(tmp_path, monkeypatch):
+    faults = []
+    monkeypatch.setattr(launcher, "emit_fault", lambda **record: faults.append(record))
+    process = _Process([])
+    instance, _started = _launcher(tmp_path, [process], deadline=timedelta(minutes=10))
+    instance.tick(T0, lambda at: [DUE])
+    assert instance.test_popen_options == [dict(close_fds=True, start_new_session=True)]
+    timer = instance.test_timers[0]
+    assert timer.started and timer.daemon and timer.interval == 600
+    timer.fire()  # the deadline, while the main loop is inside a window: no tick needed
+    assert process.killed
+    process.codes = [-9]
+    instance.tick(T0 + timedelta(minutes=10, seconds=5), lambda at: [])
+    assert instance.running is None and timer.cancelled and "DEADLINE" in faults[-1]["message"]
+
+
+def test_a_finished_job_cancels_its_watchdog_and_shutdown_kills_a_running_one(tmp_path, monkeypatch):
+    monkeypatch.setattr(launcher, "emit_fault", lambda **record: None)
+    finished, running = _Process([0]), _Process([])
+    instance, _started = _launcher(tmp_path, [finished, running], check_seconds=0)
+    instance.tick(T0, lambda at: [DUE])
+    instance.tick(T0 + timedelta(seconds=1), lambda at: [])
+    assert instance.test_timers[0].cancelled and not finished.killed
+    instance.test_timers[0].fire()  # a late timer of a finished run kills nothing
+    assert not finished.killed
+    other = launcher.DueProducts(str(UUID(int=8)), SESSION, launcher.AFTER_CLOSE)
+    instance.tick(T0 + timedelta(seconds=2), lambda at: [other])
+    instance.stop()
+    assert running.killed and instance.running is None and instance.test_timers[1].cancelled
+
+
+@pytest.mark.skipif(not hasattr(__import__("os"), "killpg"), reason="process groups are POSIX")
+def test_a_killed_job_takes_its_workers_with_it(tmp_path, monkeypatch):
+    """A real process tree: the job (own session) starts a worker, as `--workers` > 1 does; the watchdog's kill at the
+    deadline stops both, before any retry."""
+    import os
+    import subprocess
+    import sys
+    import time
+    monkeypatch.setattr(launcher, "emit_fault", lambda **record: None)
+    pid_file = tmp_path / "worker.pid"
+    script = ("import subprocess, sys, time; "
+              "worker = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(120)']); "
+              f"open({str(pid_file)!r}, 'w').write(str(worker.pid)); time.sleep(120)")
+
+    def popen(command, env=None, **kwargs):
+        return subprocess.Popen([sys.executable, "-c", script], **kwargs)
+    instance = launcher.DailyProductsLauncher(report_directory=tmp_path, environ={job.DAILY_PRODUCTS_SWITCH: "JOB"},
+                                              popen=popen, deadline=timedelta(seconds=2))
+    instance.tick(datetime.now(UTC), lambda at: [DUE])
+    job_process = instance.running
+    for _ in range(100):
+        if pid_file.exists() and pid_file.read_text():
+            break
+        time.sleep(0.05)
+    worker = int(pid_file.read_text())
+
+    def alive(pid):
+        try:
+            with open(f"/proc/{pid}/stat", encoding="utf-8") as stat:
+                return stat.read().split(")")[-1].split()[0] != "Z"
+        except FileNotFoundError:
+            return False
+    assert alive(job_process.pid) and alive(worker) and os.getpgid(worker) == job_process.pid
+    for _ in range(100):  # the real timer thread fires at 2 s
+        if not alive(job_process.pid) and not alive(worker):
+            break
+        time.sleep(0.1)
+    assert not alive(job_process.pid) and not alive(worker)
+    instance.tick(datetime.now(UTC), lambda at: [])
+    assert instance.running is None and instance.last_outcomes[-1][2] == "DEADLINE"

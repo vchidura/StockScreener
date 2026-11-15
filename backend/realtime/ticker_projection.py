@@ -2,6 +2,7 @@
 from collections import Counter
 from collections.abc import Callable
 from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from datetime import datetime, time, timedelta, timezone
 from decimal import Decimal
@@ -62,10 +63,46 @@ SETUP_INTERVALS = ("30m", "1h", "1d", "1wk", "1mo")
 # like the retired 5m/15m frames (its rows live in the release). Unset: today's behaviour.
 PATTERN_WATCH_SWITCH = "REALTIME_V2_PATTERN_WATCH"
 LIGHT_PATTERN_INTERVALS = ("30m", "1h")
+# Review P2-2 (Nov 15): the mode is part of what a cycle's workspaces are (LIGHT frames name no pattern evidence), but
+# not of its input identity. The stage that projects a cycle records it on the cycle's receipt (`build_id` suffix, so
+# a FULL receipt is unchanged), and recovery projects in the recorded mode (`pattern_watch_mode`) instead of the
+# current switch: a switch changed between the two stages would otherwise rebuild other workspaces (FULL -> LIGHT) or
+# name evidence that was never written (LIGHT -> FULL).
+PATTERN_WATCH_LIGHT_BUILD_SUFFIX = "+pattern-watch-light"
+_PATTERN_WATCH_LIGHT: ContextVar = ContextVar("pattern_watch_light", default=None)
 
 
 def pattern_watch_light(environ=None) -> bool:
+    """The mode bound by `pattern_watch_mode` (a stage, recovery), else the switch. The projection reads it in the
+    calling thread; R75-v2 shard workers read the switch, which is the value the computing stage bound."""
+    if environ is None:
+        bound = _PATTERN_WATCH_LIGHT.get()
+        if bound is not None:
+            return bound
     return (os.environ if environ is None else environ).get(PATTERN_WATCH_SWITCH, "").strip().upper() == "LIGHT"
+
+
+@contextmanager
+def pattern_watch_mode(light: bool):
+    token = _PATTERN_WATCH_LIGHT.set(bool(light))
+    try:
+        yield
+    finally:
+        _PATTERN_WATCH_LIGHT.reset(token)
+
+
+def bind_pattern_watch_build_id(build_id: str, light: bool) -> str:
+    """The receipt's build identity with the projection's Pattern Watch mode (FULL: unchanged)."""
+    if build_id.endswith(PATTERN_WATCH_LIGHT_BUILD_SUFFIX):
+        raise ValueError("build identity already carries a Pattern Watch mode")
+    return f"{build_id}{PATTERN_WATCH_LIGHT_BUILD_SUFFIX}" if light else build_id
+
+
+def split_pattern_watch_build_id(build_id: str) -> tuple[str, bool]:
+    """(producer build identity, light) of a receipt's build identity."""
+    if build_id.endswith(PATTERN_WATCH_LIGHT_BUILD_SUFFIX):
+        return build_id[:-len(PATTERN_WATCH_LIGHT_BUILD_SUFFIX)], True
+    return build_id, False
 
 
 def light_pattern_rows(window):

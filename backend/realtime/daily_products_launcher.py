@@ -15,17 +15,30 @@ Due work, read from durable state on each check (every `check_seconds`, and righ
 
 The job itself is idempotent (ALREADY_STORED by input identity) and never replaces a newer publication, so a
 scheduler restart that re-runs a key costs one narrow load. Attempts per key are bounded (`max_attempts`, spaced by
-`retry_spacing`); a run past its deadline is killed. A failed or abandoned key raises a fault record; the previous
-publications stay served and the windows are never touched.
+`retry_spacing`). A failed or abandoned key raises a fault record and the windows are never touched. What readers
+see then: the cohort's previous products stay served, but a new cohort has none of its own (its first release
+carries no Dashboard in JOB mode), so until a run publishes, its Dashboard reads are refused.
+
+Deadline (review P2-4, Nov 15): a watchdog timer thread kills a run at its deadline, whatever the scheduler's main
+loop is doing (it calls the window synchronously, so a check between windows can come minutes late). The tick also
+checks, as a fallback.
+
+Process tree (review P2-5): the job starts in its own session (process group), and a kill (deadline, failure,
+scheduler shutdown) signals the whole group, so the setup workers of `--workers` > 1 stop with it before any retry.
+The address-space and CPU limits are per process: with N workers the job may use up to (N + 1) times the memory
+limit, so the workers stay at 1 (the default) unless that total fits.
 
 The child applies its own limits (address space, CPU seconds, nice) at start, so the launch is a plain spawn: the
-scheduler holds the bars of its warm windows, and a fork with a `preexec_fn` would copy that address space.
+scheduler holds the bars of its warm windows, and a fork with a `preexec_fn` would copy that address space
+(`start_new_session` needs no `preexec_fn`).
 """
 from __future__ import annotations
 
 import os
+import signal
 import subprocess
 import sys
+import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -79,6 +92,10 @@ class DailyProductsLauncher:
     next_attempt_at: dict = field(default_factory=dict)
     next_check_at: datetime | None = None
     last_outcomes: list = field(default_factory=list)
+    timer_factory: Callable = threading.Timer
+    _lock: object = field(default_factory=threading.Lock, repr=False)
+    _timer: object = field(default=None, repr=False)
+    _expired: bool = False
 
     def __post_init__(self):
         if self.deadline is None:
@@ -132,27 +149,54 @@ class DailyProductsLauncher:
         for name in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
             environment.setdefault(name, "1")
         self.attempts[due.key] = self.attempts.get(due.key, 0) + 1
-        self.running = self.popen(command, env=environment, close_fds=True)
-        self.running_due = due
-        self.running_deadline = now + self.deadline
+        process = self.popen(command, env=environment, close_fds=True, start_new_session=True)
+        with self._lock:
+            self.running, self.running_due, self.running_deadline = process, due, now + self.deadline
+            self._expired = False
+            self._timer = self.timer_factory(self.deadline.total_seconds(), self._expire, args=(process,))
+            self._timer.daemon = True
+            self._timer.start()
         print(f"Daily products started: {due.trigger} cohort {due.cohort_id} session {due.session} "
               f"mode {mode} attempt {self.attempts[due.key]}", file=sys.stderr, flush=True)
 
-    def _poll(self, now: datetime) -> None:
-        if self.running is None:
-            return
-        due = self.running_due
-        code = self.running.poll()
-        if code is None:
-            if now < self.running_deadline:
+    def _expire(self, process) -> None:
+        """The watchdog (timer thread): kills the run at its deadline, independently of the window loop."""
+        with self._lock:
+            if self.running is not process or process.poll() is not None:
                 return
-            self.running.kill()
-            try:
-                self.running.wait(timeout=10)
-            except Exception:  # noqa: BLE001
-                pass
-            code = "DEADLINE"
-        self.running = self.running_due = self.running_deadline = None
+            self._expired = True
+            _kill_tree(process)
+
+    def stop(self) -> None:
+        """Scheduler shutdown: kills a running job and its workers."""
+        with self._lock:
+            if self.running is not None and self.running.poll() is None:
+                _kill_tree(self.running)
+                _wait(self.running)
+            self._clear()
+
+    def _clear(self) -> None:
+        if self._timer is not None:
+            self._timer.cancel()
+        self.running = self.running_due = self.running_deadline = self._timer = None
+
+    def _poll(self, now: datetime) -> None:
+        with self._lock:
+            if self.running is None:
+                return
+            due, process = self.running_due, self.running
+            code = process.poll()
+            if code is None:
+                if now < self.running_deadline:
+                    return
+                _kill_tree(process)  # the watchdog did not fire (a stalled timer thread): the fallback
+                _wait(process)
+                code = "DEADLINE"
+            elif self._expired:
+                code = "DEADLINE"
+            if code != 0:
+                _kill_tree(process)  # a failed or killed job: no worker outlives it into the retry
+            self._clear()
         self.last_outcomes.append((due.key, due.trigger, code))
         del self.last_outcomes[:-20]
         if code == 0:
@@ -173,6 +217,29 @@ class DailyProductsLauncher:
             service=SERVICE, key=f"{due.trigger}:{code}",
             context=dict(cohort_id=due.cohort_id, session=str(due.session), attempts=self.attempts.get(due.key)),
         )
+
+
+def _kill_tree(process) -> None:
+    """SIGKILL to the job's process group (its own session, see `_start`); a process without one (a test double, a
+    platform without process groups) is killed alone."""
+    killpg, pid = getattr(os, "killpg", None), getattr(process, "pid", None)
+    if killpg is not None and isinstance(pid, int) and pid > 0:
+        try:
+            killpg(pid, signal.SIGKILL)
+            return
+        except (ProcessLookupError, PermissionError):
+            pass  # the group is gone (every member exited) or is not ours
+    try:
+        process.kill()
+    except (ProcessLookupError, OSError):
+        pass
+
+
+def _wait(process) -> None:
+    try:
+        process.wait(timeout=10)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def discover_due_daily_products(provider, *, lifecycle, calendar, now, load_scope, recovery_complete, app_role):
