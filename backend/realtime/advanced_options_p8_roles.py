@@ -36,10 +36,13 @@ from .advanced_options_consumers import (
     AdvancedOptionsBoundedDetectorRouter,
     AdvancedOptionsDetectorRoutingState,
     AdvancedOptionsMarketStateConsumer,
+    MARKET_STATE_SINGLE_PASS_IDLE,
     load_advanced_options_detector_routing_state_cursor,
     load_advanced_options_market_state_cursor,
+    market_state_single_pass_mode,
     persist_advanced_options_detector_routing_state_cursor,
     persist_advanced_options_market_state_slice_cursor,
+    plan_market_state_single_pass,
 )
 from .advanced_options_activity_momentum_c6 import (
     ACTIVITY_MOMENTUM_PROFILE_VERSION,
@@ -1670,6 +1673,9 @@ def _run_market_state(
     # mid-session (recreate this container) resumes from the same checkpoints.
     # FUTURE: remove the P8 loop (C9) after the V3 loop has run clean for a few sessions.
     v3_loop = market_state_loop_mode(environment) == "V3"
+    # V3-1.4 / R81 item 1 (Nov 15): REALTIME_V3_MARKET_STATE_SINGLE_PASS=ON computes every shard's next state in one
+    # pass over the V3 shared read (OFF, the default: each shard consumer scans every record). Invalid value: fails here.
+    single_pass = market_state_single_pass_mode(environment) == "ON"
     source = AdvancedOptionsJournalSource(
         root=_journal_root(environment),
         registration=registration,
@@ -1889,6 +1895,13 @@ def _run_market_state(
     idle_wait = V3_MARKET_STATE_IDLE_WAIT_SECONDS[0]
     current = None
     _LOGGER.warning("advanced_options_market_state_loop mode=%s", "V3" if v3_loop else "P8")
+    if single_pass:
+        _LOGGER.warning(
+            "advanced_options_market_state_single_pass mode=ON shards=%s%s",
+            len(shard_ids),
+            "" if v3_loop else " inactive=NEEDS_V3_LOOP",
+        )
+    single_pass_status = None
     try:
         while True:
             if not v3_loop or time.monotonic() >= next_registration_at:
@@ -1940,20 +1953,55 @@ def _run_market_state(
                         ))
                     except Exception:  # noqa: BLE001 - the per-consumer read reports it
                         shared = None
+            # V3-1.4: one fan-out pass for every shard, else (reason logged on change) each shard as before.
+            single = None
+            if single_pass and v3_loop and consumers:
+                single, status = plan_market_state_single_pass(
+                    consumers,
+                    layout.shard_map,
+                    shared,
+                )
+                if status != MARKET_STATE_SINGLE_PASS_IDLE and status != single_pass_status:
+                    _LOGGER.warning(
+                        "advanced_options_market_state_single_pass status=%s",
+                        status,
+                    )
+                    single_pass_status = status
             for shard_id, consumer in tuple(consumers.items()):
                 observed_at = datetime.now(UTC)
                 try:
-                    planned = (
-                        consumer.plan_slice(maximum_records=10_000)
-                        if shared is None
-                        else consumer.plan_slice(
-                            maximum_records=10_000,
-                            records=_records_after(
-                                shared,
-                                consumer.committed_offset,
-                            ),
+                    planned = None
+                    if (
+                        single is not None
+                        and shard_id in single.states
+                        and consumer.committed_offset == single.start_offset
+                    ):
+                        try:
+                            planned = consumer.plan_slice(
+                                maximum_records=10_000,
+                                records=single.records,
+                                next_states=(single.states[shard_id],),
+                            )
+                        except ValueError as error:
+                            _LOGGER.warning(
+                                "advanced_options_market_state_single_pass status=PER_SHARD_FALLBACK shard=%s reason=%s",
+                                shard_id,
+                                str(error)[:160],
+                            )
+                            single_pass_status = "PER_SHARD_FALLBACK"
+                            planned = None
+                    if planned is None:
+                        planned = (
+                            consumer.plan_slice(maximum_records=10_000)
+                            if shared is None
+                            else consumer.plan_slice(
+                                maximum_records=10_000,
+                                records=_records_after(
+                                    shared,
+                                    consumer.committed_offset,
+                                ),
+                            )
                         )
-                    )
                     last_planned[shard_id] = planned
                     if planned.record_count:
                         with provider.transaction(APP_ROLE) as unit:
