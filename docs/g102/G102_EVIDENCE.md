@@ -3061,7 +3061,7 @@ Tests run offline in the r98 image with the worktree mounted (`runner/run_tests_
     `runner/build_candidate.sh` builds the live scheduler code again.
   - The ops folder (handover, runner tools, rollout) is gitignored, as before.
 
-## Nov 15 (Sun) - Universe sizing build (R62/R63 lasting fix, R79) and V4 capacity replay
+## Nov 15 (Sun) - Universe sizing build (R62/R63 lasting fix, R82; numbered R79 in the commits, renumbered: R79 is the Stock Persistence redesign) and V4 capacity replay
 
 Design `G102_UNIVERSE_SIZING_20261114.md` (sections 1-4); worktree `universe-sizing` from `v3-live-fixes` 60da29d
 (includes R78). Built as four packages in separate worktrees, merged without conflicts (52 files), then rehearsed on a

@@ -4,8 +4,8 @@
   BUILT. Each item names what happens today, the impact, the planned handling and how to verify it.
 - **Principle (user, Nov 14-15):** one name never blocks the others; a name that cannot be served is left out or
   labelled with its reason, and the rest of the session runs.
-- **Related:** `G102_UNIVERSE_SIZING_20261114.md` (R79: exclusions, confirmed-empty minutes, Options readiness),
-  matrix rows R58, R59, R66, R76, R79, G86, G105.
+- **Related:** `G102_UNIVERSE_SIZING_20261114.md` (R82: exclusions, confirmed-empty minutes, Options readiness),
+  matrix rows R58, R59, R66, R76, R82, G86, G105.
 - **Code facts used below (checked Nov 15):** no realtime module knows about trading halts (no halt, LULD or
   circuit-breaker handling); the market calendar (`options/calendar.py`, `exchange_calendars` XNYS) knows early
   closes (Nov 27 and Dec 24 2026 close at 18:00 UTC).
@@ -30,7 +30,7 @@
 - **Impact:** high. A routine 5-minute LULD pause in one of 45 names fails windows for everyone.
 - **Handling plan:**
   1. Per-member degradation in the Equity input gate: a member without its minute after the repair confirms the
-     provider has none (`REALTIME_V2_CONFIRMED_EMPTY_MINUTES`, built behind a switch in R79, today capped at 5 minutes
+     provider has none (`REALTIME_V2_CONFIRMED_EMPTY_MINUTES`, built behind a switch in R82, today capped at 5 minutes
      per hole) is served as "no new bar" and the window proceeds for everyone. Remove the 5-minute cap for a
      provider-confirmed halt.
   2. Halt awareness: read the provider's halt/resume status (or infer: no trades + repair confirms empty) and label
@@ -40,7 +40,7 @@
   4. Stock Alerts: treat confirmed-empty or halted slots as continuous history (no warm-up restart), flagged in the
      evidence.
   5. Options: the underlying's lanes report `UNDERLYING_HALTED` for those windows; other underlyings unaffected.
-- **Verify:** replay a Nov 13 window with one member's minutes removed (gate 6 of R79), then a 30-minute and a
+- **Verify:** replay a Nov 13 window with one member's minutes removed (gate 6 of R82), then a 30-minute and a
   2-hour gap; check windows, derived bars, the close and Stock Alert continuity.
 
 ### 1.2 Market-wide circuit breaker (Level 1/2: all names halt 15 min; Level 3: closed for the day)
@@ -79,17 +79,17 @@
 ### 1.5 Late or delayed open of one name (news pending, IPO first trade mid-morning)
 
 - **What happens today:** like a halt from the open (1.1); for an IPO the name is not READY (no history) and is left
-  out (R79).
-- **Handling plan:** as 1.1; an IPO joins from the next session after its backfill (R79).
+  out (R82).
+- **Handling plan:** as 1.1; an IPO joins from the next session after its backfill (R82).
 
 ## 2. Security lifecycle events
 
 | Event | Today | Plan |
 |---|---|---|
-| Delisting (merger completed, exchange delisting) | BUILT (R79): excluded before the session from the provider's delisting date; history kept; returns if active again | Delisting effective mid-day: behaves like a halt for the rest of the day (1.1) |
+| Delisting (merger completed, exchange delisting) | BUILT (R82): excluded before the session from the provider's delisting date; history kept; returns if active again | Delisting effective mid-day: behaves like a halt for the rest of the day (1.1) |
 | Ticker change (FB -> META) | Preparation cannot finish 5-year weekly/monthly history (G86 rename part, not built) | Follow the provider's ticker events; stitch history under the old ticker by security identity |
-| Spin-off / when-issued (SNDK, Feb 2025) | Listing date = when-issued day; bars start at regular trading; the gap blocks weekly history (found Nov 15) | Accept the gap between the listing date and the provider's first bar (follow-up in R79) |
-| New listing / IPO | BUILT (R79): history from the listing date, recorded as `history_shortened`; READY with shorter history | Ticker page shows the shorter history; indicators needing more bars marked unavailable |
+| Spin-off / when-issued (SNDK, Feb 2025) | Listing date = when-issued day; bars start at regular trading; the gap blocks weekly history (found Nov 15) | Accept the gap between the listing date and the provider's first bar (follow-up in R82) |
+| New listing / IPO | BUILT (R82): history from the listing date, recorded as `history_shortened`; READY with shorter history | Ticker page shows the shorter history; indicators needing more bars marked unavailable |
 | Splits / reverse splits | Corporate actions refreshed by the rollover; adjusted history rebuilt (CRWD split drift fixed Nov 9-10) | Verify an intraday-announced split effective next open on a copy |
 | Symbol reuse (old SanDisk vs new) | Identity by security, not ticker; G86 listing date avoids the old history | Keep; check the provider's FIGI on rename/reuse |
 
@@ -97,7 +97,7 @@
 
 | Event | Today | Plan |
 |---|---|---|
-| No-trade minutes in quiet names | BUILT: accepted in preparation (R58); in session behind `REALTIME_V2_CONFIRMED_EMPTY_MINUTES` (off) | Rehearse and switch on (R79 gate 6); same rule as 1.1 |
+| No-trade minutes in quiet names | BUILT: accepted in preparation (R58); in session behind `REALTIME_V2_CONFIRMED_EMPTY_MINUTES` (off) | Rehearse and switch on (R82 gate 6); same rule as 1.1 |
 | Stream disconnect / network outage | Gap repair by REST for the hole; Nov 10 DNS outage left Options 460 s behind (R28); a host sleep restarts services (Nov 15) | Keep; host sleep disabled; repairs of derived bars after a hole (R66 follow-up) |
 | One member missing from the stream while others flow | Treated as a gap; repaired by REST if the provider has bars | As 1.1 when the provider has none |
 | REST outage or 404 | 404 for an inactive ticker handled (R59); other failures retry with backoff | A per-name deadline: left out for the day with the reason |
@@ -108,7 +108,7 @@
 | Event | Today | Plan |
 |---|---|---|
 | Underlying halted | Options on it halt; quotes stale; quiet-contract rule keeps windows running | Label the underlying's lanes `UNDERLYING_HALTED` (1.1) |
-| One underlying's preparation keeps failing (e.g. a provider error on its chain) | Session activation waits for every underlying's work: Options down for all (pre-existing) | Per-underlying cut-off a few minutes after the open: dropped for the day as UNAVAILABLE (user, Nov 15; R79 follow-up) |
+| One underlying's preparation keeps failing (e.g. a provider error on its chain) | Session activation waits for every underlying's work: Options down for all (pre-existing) | Per-underlying cut-off a few minutes after the open: dropped for the day as UNAVAILABLE (user, Nov 15; R82 follow-up) |
 | Contract adjustments after a corporate action (non-standard deliverables) | Not reviewed | Check how the catalog and marks treat adjusted contracts; exclude non-standard ones from selection if needed |
 | Expiration day (0DTE at the close; early-close expirations) | Selection by DTE; early-close expirations untested | Include in the early-close rehearsal (1.3) |
 

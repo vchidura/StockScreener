@@ -2,7 +2,7 @@
 
 - **Status:** BUILT + REHEARSED, Nov 15 2026 (worktree `universe-sizing`, branch `universe-sizing` from `v3-live-fixes`
   60da29d; uncommitted), target the Mon Nov 16 session; gate results in `G102_EVIDENCE.md` "Nov 15 (Sun) - Universe
-  sizing build" and matrix row R79. Sections 1-3 are the design, section 4 the build and its gates. Any migration,
+  sizing build" and matrix row R82. Sections 1-3 are the design, section 4 the build and its gates. Any migration,
   grant, live write or deploy needs the user's go and runs outside a session.
 - **Goal (user, Nov 14):** a fresh database starts with any universe (for example 1 Equity name and 1 Options
   underlying) and grows or shrinks by changing the desired list only. No per-size registration, no admin step, no
