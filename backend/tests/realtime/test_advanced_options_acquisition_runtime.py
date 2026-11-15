@@ -1448,3 +1448,174 @@ def test_a_dropped_socket_records_which_side_closed_it():
         "close_received_reason": "slow consumer",
     }
     assert runtime._close_detail(ConnectionError("reset")) == {}
+
+
+# R81 (Nov 15): Options journal free-space guard. The tests above run with the guard OFF (autouse fixture below) so
+# they do not depend on the test machine's disk; these give run_acquisition an explicit guard.
+
+@pytest.fixture(autouse=True)
+def _journal_headroom_guard_off(monkeypatch):
+    monkeypatch.setenv("REALTIME_V3_OPTIONS_JOURNAL_GUARD", "OFF")
+
+
+def _headroom_guard(free_bytes_for_call, **kwargs):
+    from realtime.options_journal_headroom import OptionsJournalHeadroomGuard
+
+    total = 1000 * 1024 ** 3
+    calls = []
+
+    def disk(_path):
+        calls.append(1)
+        free = free_bytes_for_call(len(calls))
+        return (total, total - free, free)
+
+    return OptionsJournalHeadroomGuard(disk_usage=disk, **kwargs)
+
+
+def test_low_journal_disk_refuses_before_any_journal_socket_or_authority(
+    tmp_path,
+    monkeypatch,
+):
+    binding = _binding()
+    _install_runtime_fakes(monkeypatch, binding)
+    persisted = []
+    monkeypatch.setattr(
+        runtime,
+        "persist_session_acquisition_authorization_cursor",
+        lambda *_: persisted.append(1),
+    )
+    connections = []
+    report = run_acquisition(
+        binding,
+        provider=_Provider(),
+        api_key="provider-free",
+        journal_root=tmp_path / "journal",
+        status_path=tmp_path / "status.json",
+        lock_path=tmp_path / "socket.lock",
+        stop_event=threading.Event(),
+        connection_factory=lambda _: connections.append(1),
+        clock=lambda: NOW,
+        monotonic_ns=lambda: 100,
+        journal_guard=_headroom_guard(lambda _call: 4 * 1024 ** 3),
+    )
+
+    assert report["state"] == "REFUSED_JOURNAL_DISK_HEADROOM_LOW"
+    assert report["failure_code"] == "JOURNAL_DISK_HEADROOM_LOW"
+    assert report["journal_headroom"]["admitted"] is False
+    assert report["provider_effects"] == 0
+    assert connections == [] and persisted == []
+    assert not (tmp_path / "status.json").exists()
+    assert not list((tmp_path / "journal").rglob("options.sqlite*"))
+
+
+def test_low_journal_disk_mid_session_pauses_and_a_later_start_continues(
+    tmp_path,
+    monkeypatch,
+):
+    binding = _binding()
+    _install_runtime_fakes(monkeypatch, binding)
+    status_path = tmp_path / "status.json"
+    low = threading.Event()
+    gib = 1024 ** 3
+
+    def run(guard, seconds=5.0):
+        stop = threading.Event()
+        timer = threading.Timer(seconds, stop.set)  # safety stop only
+        timer.start()
+        try:
+            return run_acquisition(
+                binding,
+                provider=_Provider(),
+                api_key="provider-free",
+                journal_root=tmp_path / "journal",
+                status_path=status_path,
+                lock_path=tmp_path / "socket.lock",
+                stop_event=stop,
+                connection_factory=lambda _: _QuietFixtureConnection(
+                    binding,
+                    now=NOW,
+                ),
+                clock=lambda: NOW,
+                monotonic_ns=lambda: 100,
+                journal_guard=guard,
+            )
+        finally:
+            timer.cancel()
+
+    trigger = threading.Timer(0.4, low.set)
+    trigger.start()
+    first = run(_headroom_guard(
+        lambda _call: 1 * gib if low.is_set() else 500 * gib,
+        check_interval_seconds=0.05,
+    ))
+    trigger.cancel()
+    stored = json.loads(status_path.read_text(encoding="utf-8"))
+
+    assert first["state"] == stored["state"] == "PAUSED"
+    assert stored["last_raw_offset"] > 0
+    assert stored["transport_gaps"][-1]["error_type"] == "JOURNAL_DISK_HEADROOM_LOW"
+    assert stored["transport_gaps"][-1]["status"] == "OPEN"
+    assert acquisition_health(status_path, binding, checked_at=NOW)["state"] == "PAUSED"
+
+    # still low: refused at the entry, the paused status is left as it was
+    paused_bytes = status_path.read_bytes()
+    refused = run(_headroom_guard(lambda _call: 1 * gib))
+    assert refused["state"] == "REFUSED_JOURNAL_DISK_HEADROOM_LOW"
+    assert status_path.read_bytes() == paused_bytes
+
+    # space is back: the same journal continues
+    second = run(_headroom_guard(lambda _call: 500 * gib), seconds=0.4)
+    assert second["state"] == "PAUSED"  # the safety stop before the session's end
+    assert second["journal_generation"] == first["journal_generation"]
+    assert second["connection_attempts"] == first["connection_attempts"] + 1
+    assert second["last_raw_offset"] > first["last_raw_offset"]
+    assert second["transport_gaps"][0]["error_type"] == "JOURNAL_DISK_HEADROOM_LOW"
+    assert second["transport_gaps"][-1]["error_type"] == "STOP_REQUESTED"
+
+
+def test_low_journal_disk_at_a_reconnect_pauses_without_a_new_socket(
+    tmp_path,
+    monkeypatch,
+):
+    binding = _binding()
+    _install_runtime_fakes(monkeypatch, binding)
+    connections = []
+
+    def connection_factory(_configuration):
+        connections.append(1)
+        return _DisconnectConnection()
+
+    stop = threading.Event()
+    timer = threading.Timer(5.0, stop.set)  # safety stop only
+    timer.start()
+    gib = 1024 ** 3
+    try:
+        report = run_acquisition(
+            binding,
+            provider=_Provider(),
+            api_key="provider-free",
+            journal_root=tmp_path / "journal",
+            status_path=tmp_path / "status.json",
+            lock_path=tmp_path / "socket.lock",
+            stop_event=stop,
+            connection_factory=connection_factory,
+            clock=lambda: NOW,
+            monotonic_ns=lambda: 100,
+            # call 1 = entry check, call 2 = the first in-session watch, call 3 = the reconnect check
+            journal_guard=_headroom_guard(
+                lambda call: 500 * gib if call < 3 else 1 * gib,
+                monotonic=lambda: 0.0,
+                check_interval_seconds=3600,
+            ),
+        )
+    finally:
+        timer.cancel()
+
+    assert not stop.is_set()
+    assert connections == [1]
+    assert report["state"] == "PAUSED"
+    assert report["connection_attempts"] == 1
+    assert [gap["error_type"] for gap in report["transport_gaps"]] == [
+        "ConnectionError",
+        "JOURNAL_DISK_HEADROOM_LOW",
+    ]

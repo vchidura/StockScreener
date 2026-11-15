@@ -58,6 +58,9 @@ from realtime.migrations import (  # noqa: E402
 UTC = timezone.utc
 
 
+JOURNAL_HEADROOM_RETRY_SECONDS = 60.0
+
+
 def _read(path: Path) -> dict[str, object]:
     value = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(value, dict):
@@ -485,11 +488,20 @@ def main(argv=None) -> int:
             finally:
                 physical_fence.close()
                 active_stop[0] = None
-            print(json.dumps(report, indent=2, sort_keys=True))
+            refused = str(report.get("state", "")).startswith("REFUSED_")
+            print(json.dumps(
+                report,
+                indent=None if refused else 2,
+                sort_keys=True,
+            ), flush=True)
             if args.state_source == LEGACY_DIAGNOSTIC_STATE_SOURCE:
                 break
             # A finished session returns at once until its authority ends.
-            stop.wait(2.0)
+            # R81: a journal disk below the free-space floor is checked again
+            # once a minute (no journal, no socket meanwhile).
+            stop.wait(
+                JOURNAL_HEADROOM_RETRY_SECONDS if refused else 2.0
+            )
         return 0
     finally:
         pool.closeall()
