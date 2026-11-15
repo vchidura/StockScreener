@@ -770,13 +770,20 @@ class AdvancedOptionsMarketStateConsumer:
         *,
         maximum_records: int = 1000,
         records=None,
+        next_states=None,
     ) -> AdvancedOptionsMarketStateSlice:
         """`records`: V3-1 (Nov 11) shared read: the records after this consumer's committed offset that the role
         already read once for every consumer and the detector router (same validation, same order). None reads them
-        here, as before. The materializer still requires them to start right after the committed offset."""
+        here, as before. The materializer still requires them to start right after the committed offset.
+
+        `next_states`: V3-1.4 single pass (Nov 15): this consumer's shard states already computed from exactly these
+        `records` by one `materialize_shard_fanout` over every shard (`plan_market_state_single_pass`). Everything
+        after the materialize step (dirty set, checkpoints, identity) is unchanged."""
         if type(maximum_records) is not int or not 1 <= maximum_records <= 10_000:
             raise ValueError("market-state record bound must be in [1, 10000]")
         if records is None:
+            if next_states is not None:
+                raise ValueError("precomputed market-state states need the shared records")
             records = tuple(self.source.read_normalized_after(
                 self.committed_offset,
                 limit=maximum_records,
@@ -785,22 +792,36 @@ class AdvancedOptionsMarketStateConsumer:
             records = tuple(records)[:maximum_records]
             if records and records[0].event_offset != self.committed_offset + 1:
                 raise ValueError("shared market-state records do not follow the committed offset")
-        next_states = (
-            materialize_shard_fanout(
-                self._states,
-                self.shard_map,
-                records,
-            )
-            if len(self._states) == self.shard_map.shard_count
-            else tuple(
-                materialize_shard_batch(
-                    state,
+        if next_states is not None:
+            next_states = tuple(sorted(next_states, key=lambda state: state.shard_id))
+            scanned_offset = records[-1].event_offset if records else self.committed_offset
+            if (
+                tuple(state.shard_id for state in next_states) != self.owned_shard_ids
+                or any(
+                    not isinstance(state, MaterializerShardState)
+                    or state.shard_map_sha256 != self.shard_map.sha256
+                    or state.scanned_offset != scanned_offset
+                    for state in next_states
+                )
+            ):
+                raise ValueError("precomputed market-state states do not match this consumer")
+        else:
+            next_states = (
+                materialize_shard_fanout(
+                    self._states,
                     self.shard_map,
                     records,
                 )
-                for state in self._states
+                if len(self._states) == self.shard_map.shard_count
+                else tuple(
+                    materialize_shard_batch(
+                        state,
+                        self.shard_map,
+                        records,
+                    )
+                    for state in self._states
+                )
             )
-        )
         dirty = tuple(
             dirty_materializer_instruments(previous, current)
             for previous, current in zip(self._states, next_states)
@@ -861,6 +882,82 @@ class AdvancedOptionsMarketStateConsumer:
                 allocation=self._detector_router.allocation,
                 state=planned.detector_routing.state,
             )
+
+
+MARKET_STATE_SINGLE_PASS_SWITCH = "REALTIME_V3_MARKET_STATE_SINGLE_PASS"
+MARKET_STATE_SINGLE_PASS_APPLIED = "APPLIED"
+MARKET_STATE_SINGLE_PASS_IDLE = "IDLE"
+
+
+def market_state_single_pass_mode(environment) -> str:
+    """V3-1.4 / R81 item 1 (Nov 15): OFF (unset, the default) = today's path, every shard consumer materializes the
+    shared batch for itself (N shards = N scans of every record); ON = one `materialize_shard_fanout` pass over the
+    shared batch computes every shard's next state when this process owns every shard at one committed offset. The
+    persistence (one transaction, lease and checkpoint per shard) is unchanged. Any other value fails at first use."""
+    raw = (environment or {}).get(MARKET_STATE_SINGLE_PASS_SWITCH)
+    value = "" if raw is None else str(raw).strip().upper()
+    if value in ("", "OFF"):
+        return "OFF"
+    if value == "ON":
+        return "ON"
+    raise ValueError(
+        f"{MARKET_STATE_SINGLE_PASS_SWITCH} must be OFF or ON, not {str(raw)[:40]!r}"
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class AdvancedOptionsMarketStateSinglePass:
+    """One fan-out pass for every shard: the records after `start_offset` and each shard's next state."""
+    start_offset: int
+    records: tuple[NormalizedJournalRecord, ...]
+    states: Mapping[int, MaterializerShardState]
+
+
+def plan_market_state_single_pass(
+    consumers: Mapping[int, "AdvancedOptionsMarketStateConsumer"],
+    shard_map: MaterializerShardMap,
+    shared,
+    *,
+    maximum_records: int = 10_000,
+) -> tuple[AdvancedOptionsMarketStateSinglePass | None, str]:
+    """V3-1.4: every shard's next state from one pass over the shared read, or None and the reason to use the
+    per-shard path for this pass (NO_SHARED_READ, NOT_ALL_SHARDS_OWNED, COMMITTED_OFFSETS_DIFFER, FANOUT_<error>).
+    IDLE: nothing new to materialize. The result is identical to each shard consumer materializing the same records
+    for itself (`materialize_shard_batch` keeps a shard's records in journal order, as the fan-out partition does)."""
+    if shared is None:
+        return None, "NO_SHARED_READ"
+    shard_ids = tuple(range(shard_map.shard_count))
+    if tuple(sorted(consumers)) != shard_ids or any(
+        consumers[shard_id].owned_shard_ids != (shard_id,)
+        or consumers[shard_id].shard_map.sha256 != shard_map.sha256
+        for shard_id in shard_ids
+    ):
+        return None, "NOT_ALL_SHARDS_OWNED"
+    offsets = {consumers[shard_id].committed_offset for shard_id in shard_ids}
+    if len(offsets) != 1:
+        return None, "COMMITTED_OFFSETS_DIFFER"
+    start_offset = offsets.pop()
+    records = tuple(
+        record for record in shared if record.event_offset > start_offset
+    )[:maximum_records]
+    if not records:
+        return None, MARKET_STATE_SINGLE_PASS_IDLE
+    try:
+        next_states = materialize_shard_fanout(
+            tuple(consumers[shard_id].states[0] for shard_id in shard_ids),
+            shard_map,
+            records,
+        )
+    except Exception as error:  # noqa: BLE001 - the per-shard path reports it per shard
+        return None, ("FANOUT_" + type(error).__name__.upper())[:80]
+    return (
+        AdvancedOptionsMarketStateSinglePass(
+            start_offset=start_offset,
+            records=records,
+            states=MappingProxyType({state.shard_id: state for state in next_states}),
+        ),
+        MARKET_STATE_SINGLE_PASS_APPLIED,
+    )
 
 
 MARKET_STATE_HASH_SWITCH = "REALTIME_V3_MARKET_STATE_HASH"
