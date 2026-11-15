@@ -221,7 +221,10 @@ MONDAY = date(2026, 11, 16)
     ({"active": True, "delisted_date": date(2026, 12, 1)}, None),
     ({"active": True, "delisted_date": MONDAY}, "PROVIDER_DELISTED:2026-11-16"),
     ({"active": False, "delisted_date": date(2026, 11, 9)}, "PROVIDER_INACTIVE:2026-11-09"),
-    ({"active": False, "delisted_date": None}, "PROVIDER_INACTIVE:UNKNOWN"),
+    # Review (Nov 15): active=False without the provider's delisting date keeps the member (a stored record may
+    # default the field to False); exclusion needs the date.
+    ({"active": False, "delisted_date": None}, None),
+    ({"active": False, "delisted_date": date(2026, 11, 20)}, None),
 ))
 def test_inactive_rule(reference, reason):
     assert desired_repo.provider_inactive_reason_for_session(reference, MONDAY) == reason
@@ -420,6 +423,16 @@ def test_warmup_requires_only_the_listed_periods_and_records_why():
     assert chunk.coverage_after["history_shortened"]["periods_before_listing"] == {"1wk:ADJUSTED": 168}
     with pytest.raises(EquityPreparationUnavailableError, match="1wk:ADJUSTED:PORTAL_HISTORY_INCOMPLETE"):
         _warmup({"available_intervals": counts}, {"1wk:ADJUSTED": 260})
+
+
+def test_warmup_daily_requirement_excludes_days_before_a_recent_listing():
+    """Review (Nov 15): a name listed inside the technical warm-up depth (fewer daily bars than required) becomes
+    READY with its listed days; the same name without the listing record still waits."""
+    chunk = _warmup({"available_intervals": {"1d:ADJUSTED": 100}, "listing_date": "2026-06-22",
+                     "not_listed_before_listing": {"1d:ADJUSTED": 183}}, {})
+    request_required = 2  # _warmup's required_adjusted_daily_bars
+    assert request_required and chunk.complete is True
+    assert chunk.coverage_after["history_shortened"]["periods_before_listing"] == {"1d:ADJUSTED": 183}
 
 
 def test_projection_listed_periods():

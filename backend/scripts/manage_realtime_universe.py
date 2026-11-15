@@ -20,7 +20,7 @@ import argparse
 import json
 import os
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from uuid import UUID
 
@@ -118,6 +118,27 @@ def command_diff(cursor, wanted) -> dict:
     }
 
 
+def activation_window_refusal(observed_at: datetime) -> str | None:
+    """Review (Nov 15): between a session day's activation (open - controller warm-up, 14:15 UTC) and the open, a new
+    revision would target the session that has already activated. Refuse with the times to use instead."""
+    from options.calendar import OptionExchangeCalendar
+    from realtime.advanced_ingress_runtime_profile import load_advanced_ingress_runtime_catalog
+
+    observed = observed_at.astimezone(timezone.utc)
+    exchange = OptionExchangeCalendar("XNYS")
+    if exchange.session_on_or_after(observed.date()) != observed.date():
+        return None
+    opens = exchange.session_open(observed.date())
+    catalog = load_advanced_ingress_runtime_catalog(BACKEND_DIR / "realtime" / "policies" / "advanced_equity_ingress_v1.json")
+    activation = opens - timedelta(seconds=catalog.profile.settings.controller_warmup_seconds)
+    if activation <= observed < opens:
+        return (
+            f"today's session activated at {activation:%H:%M} UTC and opens at {opens:%H:%M} UTC: apply before the "
+            f"activation (it then applies today) or after the open (it then applies to the next session)"
+        )
+    return None
+
+
 def command_apply(connection, wanted, *, commit: bool, source_cohort_id: UUID | None, observed_at: datetime) -> dict:
     from realtime.advanced_realtime_desired_state_repository import (
         reconcile_desired_state_revision_cursor,
@@ -132,6 +153,14 @@ def command_apply(connection, wanted, *, commit: bool, source_cohort_id: UUID | 
                     raise SystemExit("no current desired revision: pass --source-cohort-id (the bootstrap cohort)")
                 source_cohort_id = UUID(current[2])
             diff = diff_universe(universe_from_members(() if current is None else current[4]), wanted)
+            if current is not None and not diff["changed"]:
+                connection.rollback()
+                return {"committed": False, "changed": False, "current_revision": current[0],
+                        "note": "the file equals the current desired revision; nothing to apply"}
+            refusal = activation_window_refusal(observed_at)
+            if refusal is not None:
+                connection.rollback()
+                return {"committed": False, "refused": refusal, "diff": diff}
             change = wanted.to_change(
                 source_cohort_id=source_cohort_id,
                 source_slot_version=None if current is None else current[3],

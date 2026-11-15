@@ -7,33 +7,30 @@ import json
 import sys
 from pathlib import Path
 
-from dotenv import set_key
+from dotenv import set_key, unset_key
 
 
 BACKEND_DIR = Path(__file__).resolve().parent.parent
 if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
-from realtime.universe_limits import (  # noqa: E402
-    DEFAULT_OPTIONS_MAX_CONTRACTS,
-    DEFAULT_OPTIONS_MAX_UNDERLYINGS,
-    DEFAULT_UNIVERSE_MAX_NAMES,
-    SCHEMA_MAX_UNIVERSE_NAMES,
-)
+# The universe limits (realtime/universe_limits.py) are operator settings: this writer never sets them, so a raised
+# limit in the env file is kept (they are listed in backend/.env.realtime.example).
 SAFE_SETTINGS = {
     "REALTIME_V2_EQUITY_PIPELINE": "MASSIVE_ADVANCED",
     "REALTIME_V2_OPTIONS_PIPELINE": "DISABLED",
-    # Universe limits (realtime/universe_limits.py): the env file is where they are changed.
-    "REALTIME_UNIVERSE_MAX_NAMES": str(DEFAULT_UNIVERSE_MAX_NAMES),
-    "REALTIME_OPTIONS_MAX_UNDERLYINGS": str(DEFAULT_OPTIONS_MAX_UNDERLYINGS),
-    "REALTIME_OPTIONS_MAX_CONTRACTS_PER_CONNECTION": str(DEFAULT_OPTIONS_MAX_CONTRACTS),
-    "REALTIME_V2_ADVANCED_STOCK_CHANNELS": "AM",
-    "REALTIME_V2_ADVANCED_CONNECTION_CEILING": "1",
-    "REALTIME_V2_ADVANCED_SCALE_CONTROL": "MANUAL_GATED",
-    "REALTIME_V2_ADVANCED_UNIVERSE_LADDER": "1,9,25,50,100,200,400",
-    "REALTIME_V2_ADVANCED_UNIVERSE_TARGET": "9",
-    "REALTIME_V2_ADVANCED_STABLE_SESSIONS_BEFORE_UP": "5",
 }
+# Universe sizing (Nov 15): settings of the October canary's scale ladder that no code reads (the size comes from the
+# universe file, the cap from REALTIME_UNIVERSE_MAX_NAMES, the stream settings from the runtime policy file). --execute
+# removes them from the env file so they cannot be mistaken for live configuration.
+RETIRED_SETTINGS = (
+    "REALTIME_V2_ADVANCED_STOCK_CHANNELS",
+    "REALTIME_V2_ADVANCED_CONNECTION_CEILING",
+    "REALTIME_V2_ADVANCED_SCALE_CONTROL",
+    "REALTIME_V2_ADVANCED_UNIVERSE_LADDER",
+    "REALTIME_V2_ADVANCED_UNIVERSE_TARGET",
+    "REALTIME_V2_ADVANCED_STABLE_SESSIONS_BEFORE_UP",
+)
 SECRET_NAMES = {
     "POLYGON_API_KEY",
     "REALTIME_V2_APP_DSN",
@@ -71,25 +68,6 @@ def parse_args(argv=None):
     )
     parser.add_argument("--execute", action="store_true")
     parser.add_argument(
-        "--scale-control",
-        choices=(
-            "MANUAL_GATED",
-            "AUTOMATIC_DOWN_MANUAL_UP",
-            "AUTOMATIC_BOTH",
-        ),
-        default="MANUAL_GATED",
-    )
-    parser.add_argument(
-        "--universe-ladder",
-        default="1,9,25,50,100,200,400",
-    )
-    parser.add_argument("--universe-target", type=int, default=9)
-    parser.add_argument(
-        "--stable-sessions-before-up",
-        type=int,
-        default=5,
-    )
-    parser.add_argument(
         "--remove-placeholder-secret-lines",
         action="store_true",
     )
@@ -106,35 +84,8 @@ def parse_args(argv=None):
         or not args.ingress_policy_version.strip()
     ):
         parser.error("Advanced ingress policy identity is invalid")
-    try:
-        ladder = tuple(
-            int(value.strip())
-            for value in args.universe_ladder.split(",")
-            if value.strip()
-        )
-    except ValueError:
-        parser.error("--universe-ladder must contain integers")
-    if (
-        not ladder
-        or ladder[0] != 1
-        or ladder != tuple(sorted(set(ladder)))
-        or ladder[-1] > SCHEMA_MAX_UNIVERSE_NAMES
-        or args.universe_target not in ladder
-        or args.stable_sessions_before_up <= 0
-    ):
-        parser.error("universe scaling settings are invalid")
     args.safe_settings = {
         **SAFE_SETTINGS,
-        "REALTIME_V2_ADVANCED_SCALE_CONTROL": args.scale_control,
-        "REALTIME_V2_ADVANCED_UNIVERSE_LADDER": ",".join(
-            str(value) for value in ladder
-        ),
-        "REALTIME_V2_ADVANCED_UNIVERSE_TARGET": str(
-            args.universe_target
-        ),
-        "REALTIME_V2_ADVANCED_STABLE_SESSIONS_BEFORE_UP": str(
-            args.stable_sessions_before_up
-        ),
         "REALTIME_V2_ADVANCED_INGRESS_POLICY_PATH": str(
             args.ingress_policy_path
         ),
@@ -172,6 +123,11 @@ def main(argv=None):
                 "".join(retained),
                 encoding="utf-8",
             )
+        retired_removed = []
+        for name in RETIRED_SETTINGS:
+            removed, _key = unset_key(str(args.env_file), name, quote_mode="never")
+            if removed:
+                retired_removed.append(name)
         for name, value in args.safe_settings.items():
             set_key(
                 str(args.env_file),
@@ -195,6 +151,9 @@ def main(argv=None):
                     tuple(removed_placeholders)
                     if args.execute
                     else ()
+                ),
+                "retired_settings_removed": (
+                    tuple(retired_removed) if args.execute else ()
                 ),
                 "values_exposed": False,
             },

@@ -20,6 +20,7 @@ from .advanced_realtime_desired_state_repository import (
     load_current_desired_state_revision_cursor,
     load_desired_member_preparations_cursor,
     load_effective_desired_state_reconciliation_cursor,
+    provider_excluded_members_cursor,
     reconcile_desired_state_revision_cursor,
     set_desired_member_preparation_cursor,
 )
@@ -492,7 +493,10 @@ def claim_advanced_options_preparation_cursor(
         "WHERE prior.revision_id=work.revision_id "
         "AND ("
         "(work.stage='SESSION_ACTIVATION' "
-        "AND prior.stage_order<work.stage_order) "
+        "AND prior.stage_order<work.stage_order "
+        # Review (Nov 15): only the session's own underlyings gate the activation; work left behind by an
+        # underlying that left the session's list (UNAVAILABLE for the day) cannot block the others.
+        "AND prior.ticker=ANY(session.option_underlyings)) "
         "OR (work.stage<>'SESSION_ACTIVATION' "
         "AND prior.intent_id=work.intent_id "
         "AND prior.stage_order<work.stage_order)"
@@ -1706,6 +1710,11 @@ def reconcile_advanced_options_lifecycle_cursor(
         cursor,
         revision.revision_id,
     )
+    # Review (Nov 15): a member the provider reports inactive or delisted is left out of the session before it
+    # starts, so its underlying never gets preparation work (activation applies the same exclusion).
+    provider_excluded = provider_excluded_members_cursor(
+        cursor, preparations, session_date=target_session_date,
+    )
     base_ready = {
         row.ticker
         for row in preparations
@@ -1715,6 +1724,7 @@ def reconcile_advanced_options_lifecycle_cursor(
             DesiredMemberKind.SECTOR_ETF,
         }
         and row.status is MemberPreparationStatus.READY
+        and row.security_id not in provider_excluded
     }
     reconciliation = load_effective_desired_state_reconciliation_cursor(
         cursor,
@@ -1743,11 +1753,11 @@ def reconcile_advanced_options_lifecycle_cursor(
     work_rows = tuple(cursor.fetchall())
     work_tickers = {str(row[0]) for row in work_rows}
     frozen = any(bool(row[1]) for row in work_rows)
-    effective = (
-        tuple(sorted(work_tickers))
-        if frozen
-        else tuple(sorted(work_tickers | (set(configured) & eligible)))
-    )
+    # Review (Nov 15): an underlying whose work exists but whose Equity member is not eligible (left out at the 14:15
+    # activation, or excluded since) leaves the session's list; the session's activation waits only on the work of
+    # the underlyings in that list (`claim_advanced_options_preparation_cursor`), so it cannot block the others.
+    candidates = work_tickers if frozen else (work_tickers | set(configured))
+    effective = tuple(sorted(candidates & eligible))
     unavailable = tuple(sorted(set(configured) - set(effective)))
     missing_equity = () if effective else configured
     if effective:

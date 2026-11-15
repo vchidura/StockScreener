@@ -2,9 +2,10 @@
 """Check (and if needed register) the size-independent Advanced runtime profile, as the admin role.
 
 G102 R62 (Nov 15 2026): migration 053 registers the size-independent STOCKS AM runtime profile ACTIVE, so a database
-with 053 applied needs nothing from this tool. It exists for the deploy check and for a database where 053 is not yet
-applied: it reports every STOCKS runtime profile row, verifies the size-independent one against the source catalog,
-and registers plus activates it with exactly the evidence migration 053 uses when it is missing.
+with 053 applied needs nothing from this tool. It is the deploy check: it reports every STOCKS runtime profile row,
+verifies the size-independent one against the source catalog, and re-registers plus activates it with exactly the
+evidence migration 053 uses if it is missing. It refuses a database without 053: before 053 the schema bounds profile
+sizes at 400, below the profile's coverage (the universe-limits ceiling).
 
 DRY RUN BY DEFAULT: the transaction is rolled back unless --commit is given. Credentials come from --env-file and are
 never printed.
@@ -117,6 +118,10 @@ def run(args) -> dict:
             )
             cursor.execute("SELECT EXISTS (SELECT 1 FROM rt.schema_migrations WHERE version=%s)", (MIGRATION_VERSION,))
             report["migration_053_applied"] = bool(cursor.fetchone()[0])
+            if not report["migration_053_applied"]:
+                raise RuntimeError(
+                    "migration 053 is not applied: apply it (it registers the profile) instead of this tool"
+                )
             report["before"] = _profile_rows(cursor)
             cursor.execute(
                 "SELECT status,profile_document FROM rt.advanced_ingress_runtime_profiles "

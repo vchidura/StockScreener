@@ -116,3 +116,28 @@ def test_the_shipped_file_is_valid_and_matches_the_live_list_of_nov_16():
     assert (len(universe.equity), len(universe.sector_etfs), len(universe.option_underlyings)) == (38, 7, 9)
     assert set(universe.option_underlyings) <= set(universe.equity)
     assert all(member.kind in DesiredMemberKind for member in universe.members())
+
+
+def test_priority_keys_with_a_dot_round_trip(tmp_path):
+    """Review (Nov 15): tickers may contain '.', which TOML reads as a dotted key unless quoted."""
+    universe = parse_universe(_doc(equity=("BRK.B", "AAPL"), options=("AAPL",), priority={"BRK.B": 2}))
+    path = tmp_path / "u.toml"
+    path.write_text(render_universe(universe), encoding="utf-8")
+    assert load_universe_file(path) == universe
+
+
+@pytest.mark.parametrize("moment,refused", [
+    ("2026-11-16T14:14:59+00:00", False),
+    ("2026-11-16T14:15:00+00:00", True),
+    ("2026-11-16T14:29:59+00:00", True),
+    ("2026-11-16T14:30:00+00:00", False),
+    ("2026-11-15T14:20:00+00:00", False),  # Sunday: no session
+])
+def test_apply_is_refused_between_activation_and_open(moment, refused):
+    import importlib.util
+    from datetime import datetime
+
+    spec = importlib.util.spec_from_file_location("manage_realtime_universe", BACKEND / "scripts" / "manage_realtime_universe.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    assert (module.activation_window_refusal(datetime.fromisoformat(moment)) is not None) is refused

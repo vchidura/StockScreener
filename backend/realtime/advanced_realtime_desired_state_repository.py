@@ -64,6 +64,7 @@ from .tier_cohort import (
     product_capabilities,
     product_disabled_detectors,
 )
+from .universe_limits import max_option_contracts_per_connection
 
 DESIRED_STATE_SCOPE = "ADVANCED_REALTIME"
 _DESIRED_MEMBER_BATCH_SIZE = 1_000
@@ -170,9 +171,12 @@ def provider_inactive_reason_for_session(reference, session_date: date) -> str |
     if reference is None:
         return None
     delisted = reference.get("delisted_date")
-    if reference.get("active") is False:
-        return f"PROVIDER_INACTIVE:{delisted.isoformat() if delisted else 'UNKNOWN'}"
+    # Review (Nov 15): exclusion needs the provider's delisting date. A stored record may carry active=False without
+    # the provider having said so (the field defaults to False when a payload lacks it), so active=False alone keeps
+    # the member; the status query still shows it.
     if delisted is not None and delisted <= session_date:
+        if reference.get("active") is False:
+            return f"PROVIDER_INACTIVE:{delisted.isoformat()}"
         return f"PROVIDER_DELISTED:{delisted.isoformat()}"
     return None
 CAPABILITY_REFRESH_OWNER = "REFERENCE"
@@ -2338,7 +2342,7 @@ def reconcile_desired_state_revision_cursor(
         allocation_policy_sha256=allocation_policy_sha256,
         members=equity_members + option_members,
         maximum_option_quote_contracts=(
-            1000 if snapshot_option_tickers else 0
+            max_option_contracts_per_connection() if snapshot_option_tickers else 0
         ),
     )
     instrument_ids = _equity_instrument_ids_cursor(

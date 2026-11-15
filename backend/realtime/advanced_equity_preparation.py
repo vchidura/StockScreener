@@ -1306,6 +1306,7 @@ def _inactive_reference_chunk(
     request: EquityPreparationFetchRequest,
     record: Mapping[str, object],
     seed_request: ReferenceSeedRequest,
+    provider_requests: int = 2,
 ) -> EquityPreparationChunk:
     """R59 / universe sizing 3.2 (Nov 15): the provider reports the ticker inactive (delisted).
 
@@ -1341,7 +1342,7 @@ def _inactive_reference_chunk(
             "reason": reason,
         },
         complete=True,
-        provider_requests=2,
+        provider_requests=provider_requests,
         response_bytes=len(body),
         reference_facts=(fact,),
     )
@@ -1456,15 +1457,20 @@ class MassiveEquityPreparationSource:
         lookback_days = (
             session_date - date.fromisoformat(str(claim.target["window_start"]))
         ).days + 1
+        security_requests = [0]
+
         def fetch_security(ticker, as_of):
             # R59 (Nov 15): the overview endpoint answers 404 for an inactive ticker (ROKU, delisted 2026-11-09 per
             # the provider); its record, with active=false and the delisting date, comes from the list endpoint.
+            security_requests[0] += 1
             try:
                 record = self.client.fetch_ticker_overview(ticker, as_of_date=as_of)
             except requests.HTTPError as error:
                 if getattr(getattr(error, "response", None), "status_code", None) != 404:
                     raise
                 lookup = getattr(self.client, "fetch_inactive_ticker_record", None)
+                if lookup is not None:
+                    security_requests[0] += 1
                 record = lookup(ticker) if lookup is not None else None
                 if record is None:
                     raise
@@ -1507,7 +1513,9 @@ class MassiveEquityPreparationSource:
         try:
             generation = adapter.collect(seed_request)
         except _ProviderInactiveTicker as inactive:
-            return _inactive_reference_chunk(request, inactive.record, seed_request)
+            return _inactive_reference_chunk(
+                request, inactive.record, seed_request, provider_requests=security_requests[0],
+            )
         security = next(
             (
                 fact
@@ -2379,15 +2387,16 @@ class AdvancedEquityPreparationResident:
         )
         if not reference.get("corporate_actions_ready"):
             reasons.append("CORPORATE_ACTION_COVERAGE_UNAVAILABLE")
-        if daily.get("1d:ADJUSTED", 0) < required_daily:
-            reasons.append("DAILY_TECHNICAL_WARMUP_INCOMPLETE")
-        # G86 (Nov 15): periods before the listing do not exist; only the listed ones are required.
+        # G86 (Nov 15): periods before the listing do not exist; only the listed ones are required (the technical
+        # warm-up too: a name listed inside the warm-up depth runs with shorter history, recorded below).
         not_listed = {
             str(name): int(count)
             for name, count in dict(
                 stages["ADJUSTED_DAILY"][1].get("not_listed_before_listing") or {}
             ).items()
         }
+        if daily.get("1d:ADJUSTED", 0) < max(1, required_daily - not_listed.get("1d:ADJUSTED", 0)):
+            reasons.append("DAILY_TECHNICAL_WARMUP_INCOMPLETE")
         for interval, required in required_adjusted.items():
             if daily.get(interval, 0) < int(required) - not_listed.get(interval, 0):
                 reasons.append(

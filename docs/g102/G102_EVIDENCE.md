@@ -3133,3 +3133,29 @@ copy of live. Nothing deployed, nothing written to live, nothing committed.
   PASS; Monday's path (revision 7fabaec0, 45 names, capability refresh, controller at a Monday 14:20 clock): 45-member
   session, one approval without a parent, plan 45 READY on the existing exact-45 configuration (same size keeps the
   source cohort's configuration). No admin step.
+- **Holistic review of 0d14d42 (user asked before building r120, Nov 15 ~04:50 UTC; code-review "high" over the whole
+  branch):** 10 findings, each verified against the code; 9 fixed, 1 kept as designed:
+  1. Options: work created for an underlying before the 14:15 activation kept it in the session's list after the
+     activated Equity list dropped it, and the session activation waited on every work row: one dropped underlying
+     blocked Options for all. Fixed: known-delisted members get no work; the list is intersected with the eligible
+     (READY, not excluded, activated) members; the activation waits only on the session's own underlyings
+     (`claim_advanced_options_preparation_cursor`). Tests: delisted underlying gets no work; work created before
+     activation leaves the session when activation drops its Equity.
+  2. G86: the technical warm-up kept requiring 210 daily bars, so a name listed inside that depth could never be
+     READY. Fixed (daily periods before the listing are not required; recorded as history_shortened).
+  3. The env-file writer would reset a raised universe limit to its default. Fixed (it no longer writes the limits).
+  4. The profile registration tool claimed to work before 053, whose schema bounds reject the profile's coverage.
+     Fixed (refuses without 053; it is the deploy check).
+  5. `manage_realtime_universe.py apply` between 14:15 and 14:30 UTC would target the already activated session, and a
+     no-change apply wrote a revision. Fixed (refused in that window with the times to use; no-change apply writes
+     nothing).
+  6. Exclusion treated active=False alone as inactive, while a stored record may default the field to False. Fixed
+     (exclusion needs the provider's delisting date).
+  7. The universe export wrote dotted tickers (BRK.B) as unquoted TOML keys. Fixed (keys quoted).
+  8. The inactive lookup always counted two provider requests. Fixed (counts the requests made).
+  9. Kept as designed: preparation accepts provider-confirmed no-trade minutes (decision 3.1) while the in-session rule
+     stays behind its switch until rehearsed (gate 6).
+  10. The session manifest still hardcoded 1,000 contracts. Fixed (`max_option_contracts_per_connection()`).
+  Follow-up (user, Nov 15, future iteration): a per-underlying cut-off for Options preparation (an underlying not
+  prepared a few minutes after the open is dropped for the day), so one failing option chain cannot block the
+  session activation for the others.

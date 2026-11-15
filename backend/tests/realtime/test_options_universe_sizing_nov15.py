@@ -278,7 +278,7 @@ class _ReconcileCursor:
         return value
 
 
-def _reconcile(monkeypatch, *, ready, work_rows=(), snapshot_members=None):
+def _reconcile(monkeypatch, *, ready, work_rows=(), snapshot_members=None, excluded=()):
     from realtime.advanced_realtime_desired_state import DesiredMemberKind, MemberPreparationStatus
 
     configured = ("GOOGL", "QQQ", "SPY")
@@ -303,6 +303,10 @@ def _reconcile(monkeypatch, *, ready, work_rows=(), snapshot_members=None):
     monkeypatch.setattr(lifecycle, "load_current_desired_state_revision_cursor", lambda cursor: revision)
     monkeypatch.setattr(lifecycle, "_supersede_date_preparation_cursor", lambda *a, **k: None)
     monkeypatch.setattr(lifecycle, "load_desired_member_preparations_cursor", lambda *a: preparations)
+    monkeypatch.setattr(
+        lifecycle, "provider_excluded_members_cursor",
+        lambda *a, **k: {securities[ticker]: "PROVIDER_INACTIVE:2026-11-09" for ticker in excluded},
+    )
     monkeypatch.setattr(
         lifecycle, "load_effective_desired_state_reconciliation_cursor", lambda *a, **k: reconciliation,
     )
@@ -410,3 +414,24 @@ def test_for_the_october_nine_the_new_forms_equal_what_the_old_code_accepts():
     assert advanced_options_market_universe(nine).sha256 == old_narrowed.sha256
     contracts = ("O:SPY261218C00600000", "O:QQQ261218P00500000")
     assert acquisition_binding_payload(_binding(contracts, nine))["membership"]["equity_tickers"] == sorted(nine)
+
+
+def test_a_delisted_underlying_gets_no_work_and_the_rest_prepare(monkeypatch):
+    """Review (Nov 15): an underlying whose Equity member the provider reports delisted is left out before any work
+    is created for it; the others prepare."""
+    status, cursor = _reconcile(monkeypatch, ready={"GOOGL", "QQQ", "SPY", "AAPL"}, excluded={"GOOGL"})
+    assert status.option_underlyings == ("QQQ", "SPY")
+    assert "UNDERLYING_UNAVAILABLE:GOOGL" in status.reason_codes
+    assert {ticker for ticker, _stage in cursor.work_inserts} == {"QQQ", "SPY"}
+
+
+def test_work_created_before_activation_leaves_the_session_when_activation_drops_its_equity(monkeypatch):
+    """Review (Nov 15): GOOGL got work before the 14:15 activation; the activated Equity list does not include it, so
+    it leaves the session's list (activation waits only on the session's underlyings) and the others run."""
+    status, _cursor = _reconcile(
+        monkeypatch, ready={"GOOGL", "QQQ", "SPY", "AAPL"},
+        work_rows=[("GOOGL", False), ("QQQ", False), ("SPY", False)],
+        snapshot_members=("QQQ", "SPY", "AAPL"),
+    )
+    assert status.option_underlyings == ("QQQ", "SPY")
+    assert "UNDERLYING_UNAVAILABLE:GOOGL" in status.reason_codes

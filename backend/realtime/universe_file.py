@@ -243,5 +243,5 @@ def render_universe(universe: UniverseFile, *, header: str = "") -> str:
     lines.append("underlyings = " + _toml_list(universe.option_underlyings))
     lines.append("")
     lines.append("[priority]")
-    lines.extend(f"{ticker} = {value}" for ticker, value in universe.priorities)
+    lines.extend(f'"{ticker}" = {value}' for ticker, value in universe.priorities)
     return "\n".join(lines) + "\n"
