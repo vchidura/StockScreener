@@ -49,6 +49,11 @@ from .provider_socket_lease import (
     HostProviderSocketLease,
 )
 from .advanced_options_selection_c6 import C6SelectionPlan
+from .options_journal_headroom import (
+    HEADROOM_LOW,
+    OptionsJournalHeadroomGuard,
+    options_journal_headroom_guard,
+)
 
 
 UTC = timezone.utc
@@ -765,9 +770,15 @@ def run_acquisition(
     selection_plan: C6SelectionPlan | None = None,
     monotonic_ns: Callable[[], int] = time.monotonic_ns,
     diagnostic: bool = False,
+    journal_guard: OptionsJournalHeadroomGuard | None = None,
 ) -> dict[str, object]:
     if not api_key.strip():
         raise ValueError("Options acquisition provider key is required")
+    guard = (
+        options_journal_headroom_guard(os.environ)
+        if journal_guard is None
+        else journal_guard
+    )
     # The journal thread would otherwise hold the GIL for up to 5 ms after every
     # socket call, capping the feed below its live rate until pings time out.
     sys.setswitchinterval(ACQUISITION_GIL_SWITCH_SECONDS)
@@ -800,6 +811,22 @@ def run_acquisition(
         / "options.sqlite"
     )
     journal_path.parent.mkdir(parents=True, exist_ok=True)
+    # R81 (Nov 15): the Equity ingress floor (5 GiB and 20% free) for Options too. Below it the journal is not
+    # opened and no socket is made; the caller waits and checks again, and a PAUSED session resumes later.
+    headroom = guard.check(journal_root)
+    if not headroom.admitted:
+        return {
+            "schema": ACQUISITION_STATUS_SCHEMA,
+            "state": "REFUSED_" + str(headroom.reason),
+            "failure_code": headroom.reason,
+            "binding_sha256": binding.binding_sha256,
+            "owner_id": str(binding.owner_id),
+            "journal_generation": str(
+                binding.authority.journal_generation
+            ),
+            "journal_headroom": headroom.document(),
+            "provider_effects": 0,
+        }
     effect_sha256 = canonical_sha256({
         "schema": ACQUISITION_BINDING_SCHEMA,
         "binding_sha256": binding.binding_sha256,
@@ -905,11 +932,19 @@ def run_acquisition(
     publisher_holder[0] = publisher
     publisher.start()
 
+    headroom_paused = [False]
+
+    def headroom_low() -> bool:
+        if guard.watch(journal_root):
+            headroom_paused[0] = True
+        return headroom_paused[0]
+
     def stop_pauses_session() -> bool:
         """Only the authority's end or a spent ceiling ends a session. A stop
-        before that leaves the journal open for a restart to continue."""
+        before that leaves the journal open for a restart to continue. So does
+        a journal disk below the free-space floor (R81)."""
         return (
-            stop_event.is_set()
+            (stop_event.is_set() or headroom_paused[0])
             and not diagnostic
             and _utc(clock(), "clock")
             < binding.authority.acquisition_stop
@@ -939,6 +974,13 @@ def run_acquisition(
                 binding.decoded_byte_ceiling - decoded_bytes
             )
             if remaining_messages <= 0 or remaining_bytes <= 0:
+                break
+            if headroom_paused[0] or (
+                attempts > 1 and not guard.check(journal_root).admitted
+            ):
+                # A reconnect checks the floor like a new Equity attempt.
+                headroom_paused[0] = True
+                attempts -= 1
                 break
             with provider.transaction(APP_ROLE) as unit:
                 consume_session_acquisition_authority_cursor(
@@ -1077,7 +1119,9 @@ def run_acquisition(
                     ),
                     maximum_received_bytes=remaining_bytes,
                     stop_requested=lambda: (
-                        stop_event.is_set() or publisher.failed()
+                        stop_event.is_set()
+                        or publisher.failed()
+                        or headroom_low()
                     ),
                     stop_at=binding.authority.acquisition_stop,
                 ))
@@ -1152,7 +1196,7 @@ def run_acquisition(
                 reserved_decoded_messages=decoded_messages,
                 reserved_decoded_bytes=decoded_bytes,
             )
-            if result.stop_reason is not None:
+            if result.stop_reason is not None or headroom_paused[0]:
                 break
             if diagnostic:
                 while not stop_event.wait(0.1):
@@ -1199,7 +1243,11 @@ def run_acquisition(
             "attempt": attempts,
             "status": "OPEN",
             "disconnected_at_utc": _utc(clock(), "clock").isoformat(),
-            "error_type": "STOP_REQUESTED",
+            "error_type": (
+                HEADROOM_LOW
+                if headroom_paused[0] and not stop_event.is_set()
+                else "STOP_REQUESTED"
+            ),
         })
         publisher.update(
             persist=True,
