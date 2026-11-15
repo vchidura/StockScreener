@@ -3188,3 +3188,121 @@ copy of live. Nothing deployed, nothing written to live, nothing committed.
     for P2-5). The 27 touched suites (the 25 of the build plus the two scheduler suites): 978 passed, 11 failed. Ten are the baseline failures of ea76dd5. The eleventh, test_equity_full_session_services_are_long_lived_until_stopped, fails the same way on the committed 60da29d: it reads docker-compose.realtime-v2.yml from the repository root, which the test container does not mount. No new failures.
   - Live r119 still has P1: without a fixed image, Monday's new cohort has no Dashboard or strategies in the
     session. Handover section 11 has the finding and the switch fallback.
+
+## Nov 15 (Sun) - Monday package r120: build, tests and gates (build session from `BUILD_PROMPT_MONDAY_PACKAGE_20261115.md`)
+
+Worktree `universe-sizing`, branch `universe-sizing` (local commits, not pushed): `8745885` (universe sizing R82, review
+fixes, WARMING fix) + the R78 review round `a369bdb` merged (`36b9e0c`: without it Monday's new cohort would have no
+Dashboard or strategies all session on r119, R78 P1) + the four package items. Items 2-4 were built in parallel worktrees
+(`pkg-v315`, `pkg-retention`, `pkg-singlepass`, all from `36b9e0c`) and merged without conflicts. Nothing written to live
+by the build; one live incident (below). Ops outputs: `$R/data-audit/monday-package-20261115/`.
+
+- **R71 Stock Alerts (b80fc4e).** The r102 batch claimed, read and wrote in one SERIALIZABLE transaction (8 receipts,
+  50-130 s at 38 members). Now, per receipt: a claimability probe (`FOR UPDATE SKIP LOCKED`, READ COMMITTED), the build in
+  a REPEATABLE READ READ ONLY snapshot (`list_due_...`, `build_canonical_stock_alert_batch_cursor` unchanged), then a short
+  SERIALIZABLE transaction: claim the receipt, compare the detector-state fingerprint with the snapshot's
+  (`canonical_stock_alert_state_fingerprint_cursor`; a change raises a retryable conflict and the batch is rebuilt), write.
+  A receipt held by another claimer stops the pass (cutoff order kept). `REALTIME_V2_STOCK_ALERT_BATCH_READS=SERIALIZABLE`
+  is the r102 path. The rule module and the version-hashed files are untouched in content, but r120's RESEARCH detector
+  version is `7bec7112...` vs r102's `e88bf450...`: four hashed files have CRLF line endings in r120 (fresh Windows
+  checkout) and LF in r102 (`_CODE_PATHS` hashes raw bytes). Saved state is keyed by version and cohort and Monday's
+  activation creates a new cohort, so Monday starts without state either way (follow-up: hash with line endings
+  normalized). **Mechanism (found in the rehearsal):** Postgres keeps a committed serializable
+  transaction's SIReadLocks until every serializable transaction that overlapped it has ended; the long batch pinned
+  every short serializable transaction the Options roles committed meanwhile (Nov 13: 38,598 locks, 110 once the service
+  stopped). **Gate 7** on an isolated `sim-postgres:17` (live's settings: max_pred_locks_per_transaction 64,
+  max_connections 100; never the live server, whose lock table is shared with live) restored from the 07:18 backup,
+  Nov 13 cohort `e2ad1a24`, the 37 receipts left due when the service stopped (18:25-21:00), 38 stock members, every
+  rule evaluated (1,406 evaluations, 5 MATCH, 0 UNAVAILABLE): per round the r102 path ran and was rolled back, then the
+  snapshot path committed. Quiet server: r102 peak 125-148 SIReadLocks, snapshot 29-62. With 20 short serializable
+  transactions/s beside it (as the Options roles): r102 **13,430-14,356**, snapshot **75-89** (5,484 background
+  transactions, 0 failures). Batches identical in all 61 comparisons (37 + 24: `batch_sha256` and the whole document).
+  Time per 8 receipts: 50-114 s on both paths (the SERIALIZABLE part is now the write only). The 52-name batch was not
+  measurable (no such cohort exists); the snapshot path's locks scale with the rows written (about 2 per member), the
+  reads take none. Tests: `test_stock_alert_snapshot_reads_r71.py` (6) + DB `test_stock_alert_snapshot_reads_r71_v2_db.py`
+  (list, SKIP LOCKED claim, fingerprint on the real schema) pass. Tool `runner/r71_stock_alert_locks_rehearsal.py`.
+- **V3-1.5 marks at the cutoff (2a44f44).** Matrix V3-1.5; Nov 12 77 windows and Nov 13 8 run windows replayed from
+  the journal copies against what live stored: 0 unexpected differences (AGE_BASIS only: 218 / 14). Monday: `RECORD`.
+- **V3-1.4 single pass (da582a8).** Matrix V3-1.4: 0 of 4,252 shard checkpoints differ (1 and 3 shards, 10.6M Nov 13
+  events); no gain at 1-3 shards; OFF.
+- **Journal retention + free-space guard (4e142e5).** Matrix R54 / G106 H3; gate 8 below.
+- **WARMING test (6b08b88).** `test_a_warming_contract_still_stops_the_window` asserted the rule 52845b0 removed and
+  failed since 52845b0 (the last full suite ran before it); replaced by the new rule and a window-side test.
+- **Gate 2 (copy `test_realtime_v2_recovery_20261104r120` on the live server, restored from the 07:18 read-only
+  backup `stocks_db_backup_v3-pre-r120-rehearsal-20261115T071829Z.dump`, 5.05 GB, sha256 E033F474...):** 053 + 054
+  applied, hardening and security audit PASS, no roles created; v6 `advanced-equity-ingress-v6` ACTIVE at 5,000;
+  plan, profile and approval bounds 1-5,000; `rt.stream_gaps.provider_confirmed_empty_starts` present.
+- **Gate 4 (same copy, libfaketime):** capability refresh at Monday 14:16 READY (1 provider probe); controller at 14:20
+  (live's settings, app role, no admin step): Monday session snapshot, manifest 45/45, one approval `{45}` with no
+  parent, ingress plan 45 READY on the exact-45 configuration (same size as the source cohort). Options lifecycle at
+  14:21: the Monday session on the activated cohort, revision 7fabaec0, the 9 underlyings, Treasury curve VERIFIED,
+  waiting at CATALOG_QUOTE ("provider window is not open; history ready", as every morning); at 14:32: CATALOG_QUOTE,
+  REFERENCE_OI and HISTORY COMPLETE, CAPACITY_SHARDS reached, then CATALOG_QUOTE_CAPTURE_STALE for all 9 (Friday quotes
+  under a Monday clock): contract selection and activation are not reachable on a weekend clock. No errors.
+- **Gate 8:** retention dry run on the live registry (read-only) and a copy volume: hot=10 nothing; hot=3 exactly
+  Nov 3, 4, 5, 6, 9, 10 (Nov 11-12 HOT, Nov 13 PROTECTED); on the copy Nov 4 archived (xz), verified, originals
+  deleted, restore byte-identical; Nov 3 (DRAINING) archived but the delete refused. Live journal volume 848.9 GB free
+  of 1,081 GB (78.5%): the guard admits.
+- **Incident 08:53:54 UTC (Sunday, no session): the live Postgres server went through crash recovery.** The backend
+  serving gate 5's first cold read (a copy on the live server; the process started 08:53:41) died with 0xC0000005 in
+  postgres.exe (WER APPCRASH); crash recovery finished 08:54:18, every service reconnected by 08:56 (about 8 restarts
+  each), healthy. Signs of host memory corruption around it: 08:47:20 a live preparation query failed `unrecognized
+  node type: 1080352645`; 08:44 a rehearsal client segfaulted in psycopg2 on its second full load (six identical loads
+  passed); the host rebooted from bugcheck 0x12B FAULTY_HARDWARE_CORRUPTED_PAGE on Nov 14 18:33 UTC (the third bugcheck after
+  Sep 8 and Oct 11; R57). The same read ran six times on the r119 code minutes earlier. Response: gate 5's runs stopped,
+  the copy dropped from the live server, and every later rehearsal database runs on the isolated test server.
+- **Gate 1, tests (84298b5):** full offline suite 265 failed / 7,542 passed / 29 errors vs baseline 60da29d 265 / 7,335 /
+  29: the same 296 failure ids, 0 new, 0 fixed (`data-audit/monday-package-20261115/full-r120.txt`). DB suites on a
+  throwaway Postgres 17: 8 failed / 81 passed, the same 8 as the baseline; R71 + Stock Alert source DB tests pass; the 2
+  `test_advanced_options_rolling_producer_v2_db` failures also fail on the r119 code (old fixture clocks).
+- **Image r120** `alpha-research-realtime-v3:stable-nov5-r120-652b2234885f6ff2`
+  `sha256:a5372c78d8ee9c0c91672c01c708cf51f78465e5ed06a97f81b7d23412f39723` (`build_candidate_from.sh`: image code ==
+  worktree, 980 files; imports and Stock Alert policy checked; `candidates.txt` last line).
+- **Gate 3, service start run** (isolated `g102-test-pg` on `g102-test-net`, no route to live, the host or the provider;
+  copy `test_realtime_v2_recovery_20261104r120svc` from the same backup, 053/054 + hardening + audit PASS with the image;
+  kit `rehearsal-r120/`): every backend service (19) on r120 with live's compose switches plus
+  `REALTIME_V3_MARKS_AT_CUTOFF=RECORD`: after 4 minutes 19 running, 0 restarts, 0 error lines, 18 healthy (preparation
+  has no healthcheck, as live); Options roles READY_WAITING_FOR_SESSION. API smoke: 153 routes, 132 OK on the copy and
+  on live, 0 status and 0 size differences. Stop: all exit 0, no OOM, 4 s. (First start: 10 services exited because the
+  old test-secrets folder held only the app DSN; Docker created empty folders for the other four. Fresh test-only
+  secrets in the session scratchpad fixed it.)
+- **Gate 5, Equity windows** (Nov 13 cohort `e2ad1a24`, cutoffs 14:40, 14:45, 14:50, 16:15, 16:20, 16:25, 21:00;
+  `REALTIME_V2_PATTERN_WATCH=LIGHT`, the window builds no Dashboard as with `JOB`; writes rolled back;
+  `runner/r120_equity_window_parity.py`): r119 code (v3-stable-nov5) on the live-server copy before the incident,
+  r120 code on the test server after it. Every published snapshot (45 workspaces + PLATFORM per cutoff) equal after
+  removing hash and id fields; 45 of 46 byte-identical, PLATFORM differs only in its code identity fields. Seconds
+  (inputs + projection + writes): r119 cold 109 / 135 / 148, warm 18-23; r120 cold 87-90 / 130 / 123, warm 20-22
+  (different servers). **Four of the ten loader processes crashed** (SIGSEGV / general protection fault in
+  libpython or psycopg2, VM `dmesg`), two on each code version, always on a second or later full load in one process and
+  at different places (psycopg2 `fetchall`, a pure-Python generator in `_validate_bars`): memory corruption in the
+  environment (R57), not the package; runs were split into one process per cold segment to finish.
+- **Gate 6, Options:** V3-1.5 RECORD comparison PASS (0 unexpected over Nov 12 and Nov 13) and single-pass parity PASS
+  (above). The WARMING fix is covered by tests (rolling producer `_volumes`, window `_baseline_incomplete_instruments`),
+  not by an end-to-end Options window replay (a window cannot run on a weekend clock; the Nov 13 rows were rewritten to
+  INCOMPLETE by the user's 18:13 write).
+- **Gate 9** (read-only pre-open dry run on live with the new images) runs after the deploy.
+
+## Nov 15 (Sun) - Monday readiness (Mon Nov 16 with r120): Nov 13's failures against Monday's timeline
+
+Monday, if r120 is deployed (otherwise section 2 of `HANDOVER-20261116-LIVE.md`): 45 names (38 EQUITY + 7 SECTOR_ETF,
+revision 7fabaec0), 9 Options underlyings, V4 (216 contracts), every backend service on r120, frontend f38. Times UTC.
+
+| Time | Step | Nov 13 failure | Protection on Monday (evidence) | Still open / in-session mitigation |
+|---|---|---|---|---|
+| before | host | R57 host memory corruption (bugcheck 0x12B Nov 14 18:33; Postgres backend 0xC0000005 Nov 15 08:53, crash recovery ~25 s) | none in code | **Highest residual risk.** Memory test / BIOS memory profile = the user's decision before the session. In session: a Postgres crash recovery takes every service down for ~1-2 min; they reconnect by themselves (Nov 15: all healthy within ~2 min); the Equity windows in that interval fail and run after the close (R72); Options consumers late-start (R67). No heavy jobs on the host (R76). |
+| before | host | sleep (Nov 15 01:15 Modern Standby) and clock (Nov 10 R34) | AC standby = never (checked Nov 15 08:2x; on battery 30 min); W32Time running | Keep the laptop on AC. Clock +0.34 s at 08:2x (WARN > 0.25 s, tolerance 2 s): `w32tm /resync /force` (admin) before 13:01; the 13:01 audit measures it. |
+| ~07:27 | Options preparation | R63 prepared against the previous session's Equity list | underlyings-only fingerprint; r104's stored-universe acceptance kept; gate 4: the lifecycle took the Monday session on the activated cohort and ran CATALOG_QUOTE, REFERENCE_OI, HISTORY to CAPACITY_SHARDS on r120 | Contract selection and activation are not reachable on a weekend clock: the 14:41 one-shot checks the Options session binding and 216 admitted. |
+| 14:15 | Equity activation | R62 controller needed an exact-size profile row it cannot write (lost 14:15-14:35) | 053 relaxes the plan and approval rules, v6 covers 1-5,000; the controller writes no profile rows; exact-45 is ACTIVE anyway; gate 4: app role, one approval {45} without parent, plan 45 READY, manifest 45/45 | none for 45 names. |
+| 14:15-14:30 | R78 PRE_OPEN products | (first live day of R78) | r120 has the P1 fix (generation ranks above the READY seeds), so the publish-only run after E:14:35 is no longer HISTORICAL_STALE | Watch `Daily products started: PRE_OPEN` and `DAILY_PRODUCTS ... PREPARED`; fallback `REALTIME_V2_DAILY_PRODUCTS=STRATEGIES` + scheduler hotfix on the same image. |
+| 14:30-14:36 | stream start, opening slot | R66 late start left 5m/15m/30m/1h 14:30 bars missing; Stock Alerts warm-up restarted | on-time start (R62 fixed) | R66 follow-up (gap repair queues the finalizer) is NOT built: if the stream starts late, the opening derived bars need `runner/repair_opening_bars_nov13.py` (user's yes). 14:41 check: 5m 14:30 bar for all 45. |
+| E:14:35+ | Equity windows | R64/R73 cold windows over 300 s at 45 names; R72 retries rebuilt older cutoffs into the live slot; R70/R74 scheduler exits | R72/R74/R70/R77 fixes live since r110-r116 (in r120); R78: no Dashboard in the window (cold PORTAL_PUBLISH 1-2 s instead of 87-119 s); gate 5 (r119 code, copy, Nov 13): cold inputs+projection 109-148 s, warm 18-23 s at 45 | R73's 300 s bound unchanged: avoid scheduler restarts in the afternoon; no heavy jobs on the host. |
+| 14:31:30+ | Options capture, binding, windows | R65 consumers below the arrival rate; R67 replay from offset 0; R68 checkpoint > 1 MiB; R69 reconciler; stale WARMING rows blocked windows | R65 (persistent reader + throttle), R67 (late start ON), R68 (compressed), R69 live since r105-r109; WARMING no longer blocks (52845b0, tests 6b08b88); V4 replay 6.7x (market-state) / 28x (flow) on one core | After the deploy market-state runs at 2 CPUs and flow at 3 (compose; live has 8 since Nov 13's `docker update`). Never the 0.3 cap with V4. |
+| windows | Options marks | R34/R35 marks depend on when the window runs | V3-1.5 in RECORD: today's marks published, the journal read logged per window (`MARKS_AT_CUTOFF_RECORD`) | Record-only; a typo in the switch fails every Options window (check the compose value). |
+| in session | Stock Alerts | R71 predicate-lock exhaustion (38,598) crash-looped Stock Alerts and slowed Equity into cold windows | r120 snapshot reads: 75-89 locks under 20 tps serializable load vs 13,430-14,356 on r102 (gate 7) | Start the service on the user's go (it is stopped since Nov 13). Watch `pg_locks` SIReadLock count (new check): under ~1,000 normal; if it climbs, stop the service first (handover section 7). |
+| in session | host load | R76 heavy replay stalled the VM | rule in the handover | unchanged. |
+| 21:00+ | close, after-close products | R77 close never retried; R78 after-close job | R77 fix (r116, in r120); R78 AFTER_CLOSE run with the session-close Dashboard kept (P2-3) | close check as before (78 5m slots, RAW/ADJ daily). |
+| any | journals | Options journal disk had no cleanup or guard | retention tool (dry run; first apply = user's yes); acquisition guard 5 GiB / 20% (78.5% free) | none for Monday. |
+
+Not in the package (unchanged on Monday): 25 Options underlyings (G106 U1), R80 halt and early-close handling (a halted
+member's missing minute still fails the Equity window until the repair gives up; the confirmed-empty switch stays OFF),
+R73/R75-v2, the per-underlying Options preparation cut-off.

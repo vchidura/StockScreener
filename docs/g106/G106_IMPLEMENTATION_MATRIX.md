@@ -37,7 +37,7 @@ Last updated: 2026-11-12 18:10 UTC (opened).
 | A4 | Observations product: Alerts page section (and Screener), up to 3 per name and 20 per window | 6 | P1 | DESIGNED (was G102 O1D.2) | API read + frontend, portal batch |
 | H1 | Daily close chain snapshot per contract (`option_breadth_daily`) | 7, 10.1 | P0 | DESIGNED | **Nov 12: interim copies to files started 18:57 (research/chains/2026-11-12); the table still needs the migration.** First build: history only has value once accumulated |
 | H2 | Research datasets, nightly Parquet: every trade with NBBO at trade time and side; 1-minute NBBO bars per contract; every 5-minute chain snapshot; daily close | 10.1 | P1 | DESIGNED | Builder after the close; Model Lab reads it |
-| H3 | Raw journal retention: hot 10 sessions, archive zstd 12 months | 10.1 | P1 | DESIGNED | Archive disk (Q2.7) |
+| H3 | Raw journal retention: hot 10 sessions, archive zstd 12 months | 10.1 | P1 | IMPLEMENTED (Nov 15, r120 package 4e142e5: `scripts/retain_advanced_options_journals.py`, dry run default, hot 10, current + previous session protected, archive xz until zstd is in the image, verify then delete; acquisition free-space guard 5 GiB / 20%; copy rehearsal in G102 evidence 'Monday package r120'; first live apply needs the user's yes) | Archive disk (Q2.7); archives sit on the same volume today |
 | H4 | Promotion ledger (contract, window promoted/evicted, reason, slot) | 7 | P1 | DESIGNED | With B3 |
 
 ## 3. Streamed contracts

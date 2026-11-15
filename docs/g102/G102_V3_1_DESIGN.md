@@ -125,6 +125,12 @@ before turning it on: replay the Nov 12 windows on the copy with both reads and 
 comparison logged (record-only: the window computes both, publishes today's). (a) only if the platform moves to more than
 one host. The R33 trigger-time facts follow the same switch.
 
+**Status Nov 15 (r120 package, not deployed when written):** Step 5 built as option (b) behind
+`REALTIME_V3_MARKS_AT_CUTOFF` (OFF / RECORD / JOURNAL; Monday RECORD; replay of Nov 12 and Nov 13 windows: 0 unexpected
+differences, only AGE_BASIS); the Step 4 single pass (one fan-out over the shared read for every shard a process holds)
+built behind `REALTIME_V3_MARKET_STATE_SINGLE_PASS` (OFF; byte-identical on the Nov 13 journal at 1 and 3 shards, no
+gain at 1-3 shards). Evidence: `G102_EVIDENCE.md` "Nov 15 (Sun) - Monday package r120"; matrix V3-1.4, V3-1.5.
+
 ### Folded into V3-1 (no P8 patch)
 - R32: past-deadline windows closed as MISSED (self-heal MARK_MISSED, R38) once the barrier is checkpoint-based.
 - R37: a role stop finishes its current pass and records the stop instead of raising after a fixed bound.
