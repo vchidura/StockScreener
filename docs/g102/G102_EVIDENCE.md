@@ -3393,3 +3393,46 @@ Copy (isolated `g102-test-pg`, Nov 15 backup; hot pages there: Nov 12 and 13 onl
 Images: r122 / r123 / r124 were intermediate builds (superseded, never used); **r125
 `sha256:6b5b1e7aa7f816ae5431d514c04c7f609a3a456a6b7ac1727cce1faddcc37799`** (source 7c10cc6673226e76) = r121 + OA3. Deploy
 note: HANDOVER-20261116-LIVE.md section 14 (API hotfix; any time, the API is stateless).
+
+## Nov 16 (Mon) - live session 79128b47: run, in-session changes and close (times UTC)
+
+**Pre-open.** 13:01 audit and 13:31 dry run PASS (accepted items only: CRWD Nov 9 and GS Nov 13 1m holes, 9 ETFs without
+sector/industry). Dry-run allocation gave NFLX 1 contract pre-open (307/310 rejected ROLE_SPREAD_LIMIT on pre-open
+spreads); the live allocation after the open admitted 216 (24 per underlying). Activation: plan 45 READY 14:15:09, stream
+LIVE 14:30:01-04 (first attempt), R78 PRE_OPEN PREPARED 14:16:23, SESSION_COHORT PUBLISHED ~14:38.
+
+**Changes during the day (one at a time):**
+- 10:18 API -> r125 `6b5b1e7aa7f8` (OA3 Options Alerts past sessions): sessions Nov 10-13 (+ Nov 16 after the open); Day History
+  Nov 10 9 / Nov 11 14 / Nov 12 11 rows with each session's own cohort.
+- 14:51 Options window -> r121 `601cc71f9352` with `REALTIME_V3_O1_DEBIT_VERTICAL=RECORD`; the stop at 3:00 of the cycle lost
+  E:14:45 (R90). RECORD 22 windows, 0 failures, built for 7 detected events.
+- 15:08 market-state `REALTIME_V3_MARKET_STATE_PERSIST_CHECK=SAMPLED` (r120): stopped in 5 s; next windows 102 s / 70 s.
+- 15:23 Equity scheduler -> r127 `f86347b6a7a7` (R85, from the user's 'STALE DATA ... 30m' banner): ticker workspaces had been
+  frozen at 14:35 since 14:40 (window releases HISTORICAL_STALE behind the R78 job's generation 14). Cold window E:15:25 256 s;
+  release CURRENT 15:29:32; every cutoff after: 2 CURRENT releases.
+- 16:09 API (r125) `REALTIME_V2_BREADTH_LATEST_CAPTURE_ONLY=ON` (R55: Flow contract counts drop by stale rows only, e.g. TSLA
+  1158 -> 1074) + `REALTIME_V2_OPTIONS_GAMMA_READ=ON` (SPY 0.18 s, NEGATIVE_GAMMA at 746.03, flip 756.67).
+- 16:49 Options window `REALTIME_V3_O1_DEBIT_VERTICAL=ON` (r121), started at 4:05 of the cycle: E:16:45 finished COMPLETE before
+  the stop. ON to 21:00: 50 windows, 604 detected events, 53 verticals built and used (53 two-leg packages, 167 single).
+
+**Faults found (matrix rows):** R85 (fixed live), R86 trade-plan stops vs pullback entry, R87 O1 without a liquidity floor
+(AAPL 362.5P OI 27 / vol 109), R88 ticker context 503 all session (since Nov 3), R89 ticker page latency (no gzip, 636 KB 5m
+chart, staleTime 0), R90 window stop while idle, R91 API 503 burst 14:40:09, R92 provider REST chain failures, R93 Options
+window predicate-lock spikes (7,149 peak), R94 one resident-role lag (E:17:40 253 s).
+
+**Host memory.** Equity scheduler 5.5-5.6 GB all day (R83); host available 0.5-3.5 GB, heavy paging before Edge was closed
+(14:42) and during the 15:23 cold window; Options acquisition growth was file cache (anon 0.18 GB); Postgres private 0.8 GB
+(the summed working set counts the 4 GB shared buffers per process). Docker VM swap 0 -> ~0.5 GB by the close.
+
+**Session totals.** Equity 77/77 windows COMPLETE 14:35-20:55 (warm 38-66 s); E:21:00 FAILED in session with
+CLOSING_DAILY_INPUTS_PENDING (adjusted 1d arrive one per ~1m44s after the close) -> R77 recovery. 1m 390 and 5m 78 for all 45;
+RAW 1d 45. Options 76 windows COMPLETE (avg 75 s, p90 92 s, max 253 s), E:14:45 lost. Open alerts: STOCK 24, OPTION 27.
+Journals verified (0 bad records). Options profile 20:47: market-state 32% avg / 70% max of one core (cap 2), flow 24% / 75%
+(cap 3).
+**Close.** Adjusted 1d 45/45 by 22:27 (one per ~1m44s from ~21:00); E:21:00 COMPLETE via R77 retry4 22:29:51; R78 AFTER_CLOSE
+PUBLISHED 22:30:11 (generation 15, 18.7 s; the scheduler process peaked at maxrss 6,230 MB). Earnings calendar and
+fundamentals REFRESHED 21:09. **R84 deployed after the close:** API r128 `09b2e63345ec` 22:30:36-22:31:15 (portal reads 200,
+Options Alerts Nov 10-16, strategies without drift; `/strategies/daily?interval=1h` 503 "no retained release" = 1h not
+produced by the JOB mode, not R84), scheduler r128 22:31:41-22:32:21 (re-ran AFTER_CLOSE once with the new content identity:
+PUBLISHED generation 16). A second scheduler restart (22:33) to test restart stability hit R95 (prepared lookup vs the kept
+Dashboard); products stay served.
