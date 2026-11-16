@@ -3306,3 +3306,28 @@ revision 7fabaec0), 9 Options underlyings, V4 (216 contracts), every backend ser
 Not in the package (unchanged on Monday): 25 Options underlyings (G106 U1), R80 halt and early-close handling (a halted
 member's missing minute still fails the Equity window until the repair gives up; the confirmed-empty switch stays OFF),
 R73/R75-v2, the per-underlying Options preparation cut-off.
+
+## Nov 16 (Mon) 05:05-06:38 UTC - r120 deploy before the session (user's go) and host memory change
+
+- **Host (R57):** the memory test failed on the 32 GB SK Hynix SO-DIMM (moving inversions, also after reseating); the
+  soldered 16 GB passed alone. Replaced by an 8 GB Samsung (host 24 GB, tests pass). Postgres `ALTER SYSTEM`
+  `shared_buffers` 10 GB -> 4 GB and `effective_cache_size` 40 GB -> 10 GB; `%USERPROFILE%\.wslconfig` Docker VM 15 GB +
+  8 GB swap; reboot 04:58 UTC, all services back, Postgres up 04:58:58 with the new values. The 45-name Equity window path
+  measured on r120 before the reboot: peak 5.5 GB cold, 4.3 GB warm (same run crashed twice on the faulty stick; clean now).
+- **Pre-checks:** pre-open audit 05:09 (45 members, G94 PASS, read flags 358/360 charts OK, the accepted readiness issues plus
+  the morning dividend refresh in progress: 21/45 at 05:09, 45/45 at 07:10); r120's relation registry and security code identical to live (the Nov 12 API grant stays `api=True`); the
+  Nov 13 exact-45 row ACTIVE (no longer needed with v6); preflight 05:11: pending exactly 053/054, live audit PASS.
+- **Deploy:** O3 `REALTIME_V3_O3_INPUTS=ON` (user) and `REALTIME_V3_MARKS_AT_CUTOFF=RECORD` set on p8-window (compose
+  backups 05:11:51); rollback list `rollout/pre-r120-images-20261116.txt`; stop-writers/stop-options 05:13-05:14; snapshot
+  05:14-06:14 (dump 4.97 GB sha256 57D9C32C...; journals tar 39.5 GB at ~12 MB/s); g102-migrate 06:14 (053 + 054 applied,
+  harden PASS, bar-head backfill 0 inserted) stopped at its bar-head check: the A4-era rule compared `rt.bar_head`
+  (787,891 rows, current through Nov 13 21:00) with the key count of `rt.bar_current`, frozen since Nov 7 01:49 (432,684);
+  the tool now checks head-key uniqueness and that every frozen key is present (both 0), then bar-head check + verify-live
+  PASS 06:37; g102-services 06:16-06:28, every move `others_changed []`.
+- **After:** 21 services running, 0 restarts, 0 error lines; switches as planned (CPU limits back to compose 2/3/3/2); API
+  smoke 153 routes, 131 OK, 0 status/size differences vs the 05:12 baseline (the one 503, `/strategies/daily` "Strategy
+  action evidence changed", is the same before and after: the morning dividend-coverage refresh postdates the Nov 13
+  release - the reader's action-drift rule); universe file == live revision 7fabaec0 (38 + 7 READY, 9 underlyings WARMING);
+  **gate 9 pre-open dry run PASS 06:36** (Options capture 9/9 with 65 provider requests, 14,048 candidates, 0 invalid,
+  allocation STALE_BEFORE_OPEN as expected before 14:30; Stock Alerts RESEARCH 38 evaluations in 67 s; workspaces 45/45,
+  0 unavailable, 128 s cold, largest 109 KB of 128 KB).
