@@ -152,3 +152,47 @@ and quote capture, so a copy with a provider route: the user's call) or the firs
 ### Nov 13 (03:18 UTC): B1 V4.1 merged into the G102 worktree (v3-stable-nov5) for the next package
 
 The five C6 files (activity momentum, automatic preparation, P8 roles router, selection, pre-session script) were unchanged in v3-stable-nov5 since `b23fc1c`, so the v4-profile versions were taken as they are, with the v4 policy JSON and `test_c6_v4_profile_nov13.py`. C6, selection, pre-session and lifecycle suites: 112 passed, 1 failed (the baseline's lifecycle budget test). Default profile stays v2; V4.3 (`REALTIME_V3_OPTIONS_ADMISSION_PROFILE`) is the user's yes. The v4-profile worktree is kept as it was.
+
+### Nov 16 (08:40-09:36 UTC): AL2 - O1 debit verticals built, rehearsed, image r121 (build session, not deployed)
+
+Goal (user, Nov 16): build O1 debit verticals now, rehearse on previous sessions' data, and keep them ready for a
+deployment after mid-session today. Design and rule: `G106_AL2_O1_DEBIT_VERTICALS.md`. Branch `al2-o1-debit` (from
+d3ade41 = r120 code + docs), image **r121 `sha256:601cc71f9352ebcc38c2a30d6d0429b9dca792d3843457690c34fe41957ce993`**
+(source e56ad7182d4fb950; image code vs r120 = the AL2 files + 3 known line-ending-only files; Stock Alert code hashes
+unchanged). Deploy note for the live session: `HANDOVER-20261116-LIVE.md` section 13 (RECORD 2-3 windows, then ON, each a
+hotfix of `realtime-v3-options-p8-window`; the API stays r120).
+
+- Switch `REALTIME_V3_O1_DEBIT_VERTICAL` (OFF = r120 byte for byte; RECORD = log one `O1_DEBIT_VERTICAL_RECORD` line per
+  window and publish today's single contract; ON = the vertical when it qualifies, else today's single contract; any
+  other value stops the window service at start).
+- Rule `o1-debit-vertical-v1`: long = the event's contract, short = same expiry/type further OTM among the watched
+  contracts marked at the cutoff, nearest first; legacy debit-spread limits (width 0.5-10% of spot, reward/risk >= 1,
+  leg OI >= 250 and day volume >= 100, DTE <= 60); DTE floor 0 instead of the legacy 1 (O1 exits at the session close;
+  replay below). Found on the way: the live window's underlying ticks are `UnderlyingSnapshotTick` (price under
+  `evidence`): a reader of trade/quote only would have rejected every vertical as SPOT_UNAVAILABLE (fixed and tested).
+- Tests: `test_o1_debit_vertical.py` 21 passed; targeted suites (15 files) 245 passed, 1 failed = the same failure on
+  84e04b2; full `tests/realtime` (09:13-09:35, both trees in parallel): 158 failed / 5,278 passed on al2-o1-debit vs 158 failed / 5,257 passed on 84e04b2, the identical failure set (0 new, 0 fixed; +21 = the new tests).
+- Replay (`runner/o1dv_replay.py`, isolated test server, stored rows; outputs `evidence/o1dv-20261116/`):
+  Nov 12 (V2, 77 windows, 72 contracts): 591 detected events (397 alerts), 0 verticals: no further-OTM watched strike
+  431, long leg unmarked 115, reward/risk < 1 44 (in-the-money NVDA calls, 0.55-0.64), short unmarked 1; windows marked
+  18-64 of 72. Nov 13 (V4, 216 contracts; the copy has 8 windows, 18:15-19:58):
+
+| Cutoff | Marked/216 | O1 evaluations | Detected | New detected | New alerts | Built | Built alerts | Fallbacks | Debit | Width | R/R |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| 18:15:00 | 47 | 69 | 13 | 13 | 3 | 1 | 1 | long unmarked 10, short unmarked 2 | 0.04 | 2.5 | 61.5 |
+| 18:19:00 | 113 | 68 | 11 | 1 | 1 | 0 | 0 | short unmarked 1 | - | - | - |
+| 18:54:22 | 77 | 135 | 8 | 8 | 6 | 5 | 5 | long unmarked 2, no further OTM 1 | 0.15 | 5 | 32.3 |
+| 19:00:00 | 64 | 106 | 12 | 8 | 4 | 0 | 0 | short unmarked 4, long unmarked 4 | - | - | - |
+| 19:02:51 | 60 | 111 | 10 | 2 | 0 | 0 | 0 | long unmarked 2 | - | - | - |
+| 19:45:00 | 38 | 69 | 16 | 16 | 2 | 0 | 0 | long unmarked 14, short unmarked 2 | - | - | - |
+| 19:50:00 | 116 | 87 | 20 | 13 | 5 | 1 | 1 | long unmarked 7, short unmarked 2, no further OTM 2, no short in width 1 | 0.34 | 2.5 | 6.35 |
+| 19:58:40 | 60 | 156 | 47 | 42 | 10 | 11 | 10 | long unmarked 31 | 0.10-0.86 | 2.5-5 | 1.9-49 |
+
+  Built (18, 17 of them alerts): NVDA 16, TSLA 2, all 0DTE calls (Friday); debit median 0.15, reward/risk median 32,
+  capital at risk $4-$86. With the legacy DTE floor of 1 Nov 13 builds 0 (57 of 103 detected events 0DTE).
+- End-to-end on the copy (`runner/o1dv_e2e.py`, switch ON, app role): real `_load_o1` at 19:58:40 -> 156 invocations, 2
+  verticals; real O1 executor -> lane COMPLETE, 15 selected, 1 vertical (NVDA 165C/170C, debit 0.10, max profit $490);
+  package stored with leg_count 2; session alert written (CALL_DEBIT_VERTICAL, direction +1, 2 legs); API read on r120
+  and on r121: 200, the row with both legs and OA1 IV/delta per leg (no API change needed). RECORD from the r121 image at
+  18:54:22: 0 used, 94 single contracts unchanged, 50 built and logged. Test rows removed afterwards; copy restored.
+- Not exercised: a full Options window cycle with the switch (evidence batch + Alerts publication of a 2-leg O1 package).

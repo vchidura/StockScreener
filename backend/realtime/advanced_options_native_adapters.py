@@ -109,6 +109,9 @@ class AdvancedO1Invocation:
     event_id: UUID
     source: ActivitySource
     package: RealtimeOptionPackage | None = None
+    # G106 AL2 (REALTIME_V3_O1_DEBIT_VERTICAL RECORD/ON): what the debit-vertical rule decided for this event, logged
+    # once per window (O1_DEBIT_VERTICAL_RECORD). Not part of any input identity; None when the switch is OFF.
+    debit_vertical: object | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -413,6 +416,28 @@ O1_PACKAGE_SELECTION_ENABLED = (
 )
 
 
+def _log_o1_debit_vertical_record(context, entries) -> None:
+    """G106 AL2: one O1_DEBIT_VERTICAL_RECORD line per window when the switch is RECORD or ON. Logging never fails
+    the window."""
+    from .advanced_options_o1_debit_vertical import (
+        O1DebitVerticalMode,
+        log_o1_debit_vertical_record,
+        o1_debit_vertical_mode,
+        o1_debit_vertical_record,
+    )
+
+    mode = o1_debit_vertical_mode()
+    if mode is O1DebitVerticalMode.OFF:
+        return
+    try:
+        log_o1_debit_vertical_record(o1_debit_vertical_record(mode=mode, cutoff=context.cutoff, entries=entries))
+    except Exception as error:  # noqa: BLE001
+        log_o1_debit_vertical_record({
+            "contract": "o1-debit-vertical-record-v1", "mode": mode.value, "status": "RECORD_FAILED",
+            "reason": f"{type(error).__name__}: {error}"[:200],
+        })
+
+
 def build_advanced_o1_executor(
     inputs: AdvancedOptionsLaneInputs,
 ) -> NativeDetectorExecutor:
@@ -427,6 +452,7 @@ def build_advanced_o1_executor(
             return blocked
         evaluations = []
         unavailable_reasons = None
+        vertical_entries = []
         for invocation in inputs.invocations:
             result = run_o1_adapter(
                 invocation.source,
@@ -437,6 +463,7 @@ def build_advanced_o1_executor(
                 decision_at=invocation.source.received_at,
             )
             finding = result.output
+            vertical_entries.append((invocation.event_id, finding.disposition, invocation.debit_vertical))
             if finding.disposition == "UNAVAILABLE":
                 # Per-contract outcome, Nov 9: one contract without positive prior-day open interest made
                 # the lane UNAVAILABLE for every contract. The lane is unavailable only if none can be assessed.
@@ -461,6 +488,7 @@ def build_advanced_o1_executor(
                 _plain(finding),
                 invocation.package if selected else None,
             ))
+        _log_o1_debit_vertical_record(context, vertical_entries)
         if unavailable_reasons is not None and not evaluations:
             return AdvancedOptionsNativeLaneResult(
                 NativeLaneState.UNAVAILABLE,

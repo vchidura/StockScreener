@@ -1319,6 +1319,43 @@ def _session_alert_contract(evaluation):
     return None
 
 
+def _session_alert_key(evaluation):
+    """(contract id, variant) of a session alert: v1 single contract -> (contract, "") as before; G106 AL2 O1 debit
+    vertical -> (long leg contract, "O1_DEBIT_VERTICAL:<short contract>"), a session alert of its own so a single
+    contract and a vertical on one contract never share a row (their marks differ). None: one row per evaluation."""
+    contract_id = _session_alert_contract(evaluation)
+    if contract_id is not None:
+        return contract_id, ""
+    package = evaluation.package
+    if package is not None and _o1_debit_vertical_fields(package):
+        return package.legs[0].contract_id, f"O1_DEBIT_VERTICAL:{package.legs[1].contract_id}"
+    return None
+
+
+def _o1_debit_vertical_fields(package) -> dict | None:
+    """Structure, direction and payoff of an O1 debit vertical (leg 0 BUY long, leg 1 SELL short); None otherwise.
+    Money is per package (x multiplier), as the package's premium and capital at risk."""
+    from .advanced_options_o1_debit_vertical import debit_vertical_structure
+
+    structure = debit_vertical_structure(package)
+    if structure is None:
+        return None
+    long, short = package.legs[0], package.legs[1]
+    width = abs(short.strike - long.strike)
+    debit = long.entry_mark - short.entry_mark
+    if debit <= 0:
+        return None
+    multiplier = Decimal(long.multiplier)
+    call = long.contract_type.value == "CALL"
+    return {
+        "structure_type": structure[0],
+        "direction": structure[1],
+        "maximum_profit": str((width - debit) * multiplier),
+        "return_on_risk": float((width - debit) / debit),
+        "breakevens": [str(long.strike + debit if call else long.strike - debit)],
+    }
+
+
 def _one_alert_per_contract(pairs):
     """Options alerts v1 grouping (user, Nov 6): one alert per contract and detector in a window.
 
@@ -1328,9 +1365,10 @@ def _one_alert_per_contract(pairs):
     one row per evaluation, as before."""
     groups: dict[tuple[str, str], list] = {}
     for evaluation, row in pairs:
-        contract_id = _session_alert_contract(evaluation)
-        if contract_id is not None:
-            key = (str(row["detector_id"]), f"contract:{contract_id}")
+        alert_key = _session_alert_key(evaluation)
+        if alert_key is not None:
+            contract_id, variant = alert_key
+            key = (str(row["detector_id"]), f"contract:{contract_id}" + (f":{variant}" if variant else ""))
         else:
             key = (str(row["detector_id"]), f"evaluation:{row['evaluation_id']}")
         groups.setdefault(key, []).append((evaluation, row))
@@ -1454,8 +1492,10 @@ def _alert_run_row(
     if package is None:
         return None
     direction = row["direction"]
+    vertical = _o1_debit_vertical_fields(package)
     if direction not in (-1, 1):
-        direction = _legs_direction(package.legs) or 1
+        # G106 AL2: a debit vertical's legs cancel by count (BUY + SELL of one type); its direction is its BUY leg's.
+        direction = vertical["direction"] if vertical else (_legs_direction(package.legs) or 1)
     return {
         "evaluation_id": row["evaluation_id"],
         "candidate_id": row["candidate_id"],
@@ -1494,7 +1534,7 @@ def _alert_run_row(
         "original_package": {
             "status": "AVAILABLE",
             "basis": "ORIGINAL_CANDIDATE_SNAPSHOTS",
-            "structure_type": None,
+            "structure_type": vertical["structure_type"] if vertical else None,
             "expiration_date": (
                 max(leg.expiration_date for leg in package.legs).isoformat()
             ),
@@ -1502,8 +1542,8 @@ def _alert_run_row(
             "net_premium": str(package.entry_net_premium),
             "capital_at_risk": str(package.capital_at_risk),
             "maximum_loss": str(package.capital_at_risk),
-            "maximum_profit": None,
-            "breakevens": [],
+            "maximum_profit": vertical["maximum_profit"] if vertical else None,
+            "breakevens": vertical["breakevens"] if vertical else [],
             "market_data_time": package.entry_market_time.isoformat(),
             "observed_time": evaluation.observed_at.isoformat(),
             "legs": [
@@ -1585,6 +1625,11 @@ def _candidate_detail(evaluation, policy_sha256: str):
         else "MULTI_LEG"
     )
     candidate_id = str(package.candidate_id)
+    # G106 AL2: an O1 debit vertical names its structure and payoff; every other package reads as before.
+    vertical = _o1_debit_vertical_fields(package)
+    # The source contract stays leg 0 for every package (O3's is its short anchor); a debit vertical's leg 0 is its
+    # BUY leg, the O1 event's contract.
+    bought = package.legs[0]
     return {
         "candidate": {
             "candidate_id": candidate_id,
@@ -1602,8 +1647,8 @@ def _candidate_detail(evaluation, policy_sha256: str):
             "candidate_kind": candidate_kind,
             "strategy_archetype": evaluation.detector.value,
             "persona_tags": [],
-            "structure_type": "ADVANCED_CANONICAL_PACKAGE",
-            "structure_risk_class": "DEFINED_RISK",
+            "structure_type": vertical["structure_type"] if vertical else "ADVANCED_CANONICAL_PACKAGE",
+            "structure_risk_class": "PREMIUM_AT_RISK_DEBIT" if vertical else "DEFINED_RISK",
             "expiration_date": expiration.isoformat(),
             "candidate_rank": 1,
             "status": "SELECTED",
@@ -1614,11 +1659,11 @@ def _candidate_detail(evaluation, policy_sha256: str):
             "net_premium": str(package.entry_net_premium),
             "collateral_required": str(package.capital_at_risk),
             "capital_at_risk": str(package.capital_at_risk),
-            "maximum_profit": None,
+            "maximum_profit": vertical["maximum_profit"] if vertical else None,
             "maximum_loss": str(package.capital_at_risk),
             "return_on_collateral": None,
-            "return_on_risk": None,
-            "breakevens": [],
+            "return_on_risk": vertical["return_on_risk"] if vertical else None,
+            "breakevens": vertical["breakevens"] if vertical else [],
             "execution_eligibility": None,
             "reason_codes": [],
             "management_policy_version": None,
@@ -1633,9 +1678,9 @@ def _candidate_detail(evaluation, policy_sha256: str):
                 else None
             ),
             "presentation_metadata": {},
-            "source_contract_id": package.legs[0].contract_id,
+            "source_contract_id": bought.contract_id,
             "source_contract_ticker": (
-                package.legs[0].contract_ticker
+                bought.contract_ticker
             ),
             "context_status": "PERSISTED_EVIDENCE_ONLY",
             "trend_state": None,
@@ -3280,8 +3325,11 @@ OPTIONS_SESSION_ALERT_NAMESPACE = uuid5(NAMESPACE_URL, "stockscreener:options-se
 OPTIONS_SESSION_ALERT_SCHEMA = "options-alert-session-v1"
 
 
-def options_session_alert_id(session_date, detector_id: str, contract_id: int) -> UUID:
-    """One alert per session, detector and contract; a rerun writes the same row."""
+def options_session_alert_id(session_date, detector_id: str, contract_id: int, variant: str = "") -> UUID:
+    """One alert per session, detector and contract (and package variant: G106 AL2 debit vertical); a rerun writes the
+    same row. The v1 single contract has no variant, so its ids are unchanged."""
+    if variant:
+        return uuid5(OPTIONS_SESSION_ALERT_NAMESPACE, f"{session_date}|{detector_id}|{contract_id}|{variant}")
     return uuid5(OPTIONS_SESSION_ALERT_NAMESPACE, f"{session_date}|{detector_id}|{contract_id}")
 
 
@@ -3300,17 +3348,17 @@ def persist_options_session_alerts_cursor(cursor, *, cohort_id, session_date, al
     holds (two detectors can fire on one trade). Stored multi-leg packages keep their per-window rows. Returns the
     number of rows inserted or updated."""
     evaluations_by_id = {str(row.evaluation_id): row for row in evaluations}
-    groups: dict[tuple[str, int], list] = {}
+    groups: dict[tuple[str, int, str], list] = {}
     for evaluation in evaluations:
-        contract_id = _session_alert_contract(evaluation)
-        if contract_id is not None:
-            groups.setdefault((evaluation.detector.value, contract_id), []).append(evaluation)
+        alert_key = _session_alert_key(evaluation)
+        if alert_key is not None:
+            groups.setdefault((evaluation.detector.value, *alert_key), []).append(evaluation)
     rows = {}
     for row in alert_rows:
         evaluation = evaluations_by_id.get(str(row["evaluation_id"]))
-        contract_id = None if evaluation is None else _session_alert_contract(evaluation)
-        if contract_id is not None:
-            rows[(str(row["detector_id"]), contract_id)] = row
+        alert_key = None if evaluation is None else _session_alert_key(evaluation)
+        if alert_key is not None:
+            rows[(str(row["detector_id"]), *alert_key)] = row
     if not rows:
         return 0
     alert_ids = {key: str(options_session_alert_id(session_date, *key)) for key in rows}
@@ -3343,7 +3391,8 @@ def persist_options_session_alerts_cursor(cursor, *, cohort_id, session_date, al
             anchor = next((item for item in members if held.get(str(item.event_id), alert_id) == alert_id), None)
             if anchor is None:
                 logging.getLogger(__name__).warning(
-                    "Options session alert %s %s not stored: each of its trades anchors another alert", *key,
+                    "Options session alert %s %s not stored: each of its trades anchors another alert",
+                    key[0], f"{key[1]} {key[2]}" if key[2] else key[1],
                 )
                 continue
             projection = deepcopy(dict(row))

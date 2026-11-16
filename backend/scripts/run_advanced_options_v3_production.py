@@ -410,6 +410,11 @@ def _docker_service_main(argv) -> int | None:
     kind = AdvancedOptionsProcessKind(
         args.docker_service_kind or args.docker_health_kind
     )
+    if kind is AdvancedOptionsProcessKind.WINDOW:
+        # G106 AL2: an invalid REALTIME_V3_O1_DEBIT_VERTICAL stops the window service at start (never silently OFF).
+        from realtime.advanced_options_o1_debit_vertical import o1_debit_vertical_mode
+
+        o1_debit_vertical_mode()
     provider = None
     pool = None
     if args.state_source == POSTGRES_STATE_SOURCE:

@@ -15,7 +15,7 @@ evidence named), LIVE (running, verification pending), DEFERRED (reason and trig
 P0 this week, P1 next week (9 names), P2 25 names, P3 50 names, P4 continuous research. Objective order (user):
 directional intraday, directional swing, income, volatility/event.
 
-Last updated: 2026-11-12 18:10 UTC (opened).
+Last updated: 2026-11-16 09:16 UTC (AL2 O1 debit verticals, r121).
 
 ## 1. Decisions and checks
 
@@ -59,7 +59,7 @@ Last updated: 2026-11-12 18:10 UTC (opened).
 | D4 | F-BLOCK: large single prints through the ask/bid | D intraday | B | P2 | DESIGNED (profile B exists) | |
 | D5 | F-0DTE: index 0DTE gamma activity (with GEX pin risk) | D intraday | B+A3+C | P2 | DESIGNED | Needs B1 0DTE buckets |
 | D6 | F-ACCUM: same-side buying in one contract across windows | D swing | B+H | P2 | DESIGNED (profile A exists) | |
-| D7 | OS1/OS2 debit-spread variant | D swing | C+B | P2 | DESIGNED | Package builder D-structures (AL2) |
+| D7 | OS1/OS2 debit-spread variant | D swing | C+B | P2 | DESIGNED | Package builder D-structures (AL2); Nov 16: the O1 rule (`advanced_options_o1_debit_vertical.select_debit_vertical`) is reusable for OS1/OS2 packages |
 | D8 | P-OICHG: day-over-day OI change confirming opening flow (reuse `open_interest_change`) | D swing / P | H1 | P1 store, P2 use | DESIGNED | Needs H1 history |
 | D9 | V-RICH: IV well above realized vol -> credit vertical / iron condor (with O3 locator, G102 R44) | I | A3+C | P2 | DESIGNED | |
 | D10 | I-WHEEL: cash-secured put at support with rich IV | I | A+C | P3 | DESIGNED | Q2.4 (income structures) |
@@ -78,7 +78,7 @@ Last updated: 2026-11-12 18:10 UTC (opened).
 | ID | Item | Phase | Status | Next |
 |---|---|---|---|---|
 | AL1 | Fairness across names (user: no count limits, cover the universe): 3 new per name per run, round-robin by rank, coverage metric per session in the watcher | P0-P1 | DESIGNED | **Nov 12: coverage line in the watcher from 19:10.** With D1; watcher line |
-| AL2 | Package builder structures via `options/strategies` (debit/credit verticals, iron condor, cash-secured put; calendars later) | P2 | DESIGNED (engine exists) | After O3 (G102 R44) |
+| AL2 | Package builder structures via `options/strategies` (debit/credit verticals, iron condor, cash-secured put; calendars later) | P2 | IMPLEMENTED for O1 debit verticals (Nov 16: image r121 `601cc71f9352`, branch `al2-o1-debit`; switch `REALTIME_V3_O1_DEBIT_VERTICAL` OFF/RECORD/ON on the Options window, OFF = r120; rule `o1_debit_vertical_v1.json` from the legacy debit-spread limits; tests 21 + targeted suites 0 new failures; replay Nov 12 (V2) 0 / Nov 13 (V4) 18 verticals; copy end-to-end package + session alert + API read on r120 and r121 (no API change); design `G106_AL2_O1_DEBIT_VERTICALS.md`, evidence Nov 16) | **Nov 16: live session deploys per HANDOVER-20261116-LIVE section 13: RECORD 2-3 windows, then ON; VERIFIED when a live O1 alert is a 2-leg vertical.** Next structures (credit verticals for V-RICH, condors) after O3 is judged live |
 | AL3 | Model Lab grading per detector from H2 (hit rate, move after alert by structure, calibration); no live paper P/L (user) | P4 | DESIGNED | After H2 |
 
 ## 6. Universe

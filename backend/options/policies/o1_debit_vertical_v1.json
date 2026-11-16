@@ -1,0 +1,21 @@
+{
+  "version": "o1-debit-vertical-v1",
+  "description": "G106 AL2: the O1 debit vertical. Long leg = the O1 event's contract; short leg = same underlying, expiry and type, further out of the money, among the window's watched contracts marked at the cutoff. Limits from the legacy DIRECTIONAL_DEBIT_SPREAD block (strategy_o3_credit_v2.json debit_spread, the block the V4 profile's debit-spread groups use).",
+  "legacy_source": "backend/options/policies/strategy_o3_credit_v2.json#debit_spread",
+  "minimum_dte": 0,
+  "maximum_dte": 60,
+  "minimum_width_fraction": "0.005",
+  "maximum_width_fraction": "0.10",
+  "minimum_return_on_risk": "1.0",
+  "minimum_leg_open_interest": 250,
+  "minimum_leg_day_volume": 100,
+  "short_leg_order": "NEAREST_FURTHER_OTM_STRIKE_FIRST",
+  "pricing": "BOTH_LEGS_AT_WINDOW_CUTOFF_ADVANCED_NBBO_MIDPOINT",
+  "exit": "SESSION_CLOSE",
+  "not_applied_from_legacy": [
+    "minimum_dte 1 -> 0: O1 packages exit at the session close (a 0DTE vertical at its expiry), like today's single contract; the legacy floor is for multi-day holds (replay Nov 13: 57 of 103 detected events were 0DTE)",
+    "minimum_long_absolute_delta / maximum_long_absolute_delta: the long leg is the O1 event's contract, not chosen",
+    "maximum_breakeven_expected_move_ratio / maximum_target_expected_move_ratio: need an IV solve at the cutoff (v2)",
+    "near/short DTE lanes and maximum_candidates_per_lane_side: one vertical per O1 event"
+  ]
+}

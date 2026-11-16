@@ -43,6 +43,16 @@ from .advanced_options_native_adapters import (
     advanced_o3_invocation_document,
     decode_advanced_o3_invocation_document,
 )
+from .advanced_options_o1_debit_vertical import (
+    O1DebitVerticalMode,
+    O1DebitVerticalOutcome,
+    debit_vertical_for_event,
+    is_o1_debit_vertical_package,
+    load_o1_vertical_inputs_guarded,
+    o1_debit_vertical_mode,
+    o1_debit_vertical_package,
+    o1_debit_vertical_policy,
+)
 from .advanced_options_o3_inputs import o3_inputs_enabled
 from .advanced_options_producers import AdvancedOptionsProducerPlan
 from .advanced_options_reference_state import AdvancedOptionsReferenceState
@@ -676,7 +686,11 @@ def _packages_for_events(
     cohort_id: UUID,
     event_ids: tuple[UUID, ...],
     unmarked_instrument_ids: tuple[int, ...] = (),
+    filtered_out: dict[UUID, RealtimeOptionPackage] | None = None,
 ) -> dict[UUID, RealtimeOptionPackage]:
+    """The stored package of each event, without those that have a leg unmarked at this window. `filtered_out`, when
+    given, receives the stored packages left out for an unmarked leg (G106 AL2: such an event must not get a second
+    package)."""
     if not event_ids:
         return {}
     cursor.execute(
@@ -702,6 +716,12 @@ def _packages_for_events(
         cohort_id=cohort_id,
     )
     by_candidate = {row.candidate_id: row for row in packages}
+    if filtered_out is not None:
+        filtered_out.update({
+            event_id: by_candidate[candidates[0]]
+            for event_id, candidates in grouped.items()
+            if _has_unmarked_leg(by_candidate[candidates[0]], unmarked_instrument_ids)
+        })
     return {
         event_id: by_candidate[candidates[0]]
         for event_id, candidates in grouped.items()
@@ -823,6 +843,29 @@ def options_alert_v1_event_package(row, *, cohort_id, matrix_id, session_date, u
     )
 
 
+def _o1_debit_vertical_outcome(row, event_id, plan, inputs, inputs_reason, policy, *, use: bool):
+    """G106 AL2: the event's debit vertical (RECORD: built and checked, not used; ON: the package when it qualifies).
+    Returns (outcome, package to use or None). Never raises on market data: a failure is a recorded reason."""
+    ticker = str(row["contract_ticker"]).strip().upper()
+    result = debit_vertical_for_event(row, inputs, plan, policy=policy, inputs_reason=inputs_reason)
+    if isinstance(result, str):
+        return O1DebitVerticalOutcome(ticker, reason=result), None
+    try:
+        package = o1_debit_vertical_package(
+            result,
+            event_id=event_id,
+            cohort_id=plan.control_plane.cohort_id,
+            matrix_id=plan.rolling_state.state_id,
+            session_date=plan.control_plane.session_date,
+            cutoff=plan.cutoff,
+            policy=policy,
+            valuation_policy_sha256=session_valuation_policy_sha256(),
+        )
+    except (ValueError, TypeError, ArithmeticError) as error:
+        return O1DebitVerticalOutcome(ticker, reason=f"O1DV_PACKAGE_INVALID:{type(error).__name__}"), None
+    return O1DebitVerticalOutcome(ticker, vertical=result, used=use), (package if use else None)
+
+
 def _load_o1(
     cursor,
     plan: AdvancedOptionsNativeInputPlan,
@@ -884,12 +927,20 @@ def _load_o1(
         ),
     )
     rows = tuple(cursor.fetchall())
+    # G106 AL2: REALTIME_V3_O1_DEBIT_VERTICAL (OFF = today). An invalid value raises here, so the window fails loudly.
+    vertical_mode = o1_debit_vertical_mode()
+    filtered_out: dict[UUID, RealtimeOptionPackage] = {}
     packages = _packages_for_events(
         cursor,
         cohort_id=plan.control_plane.cohort_id,
         event_ids=tuple(UUID(str(row["event_id"])) for row in rows),
         unmarked_instrument_ids=plan.unmarked_instrument_ids,
+        filtered_out=filtered_out,
     )
+    vertical_policy = vertical_inputs = vertical_inputs_reason = None
+    if vertical_mode is not O1DebitVerticalMode.OFF and rows:
+        vertical_policy = o1_debit_vertical_policy()
+        vertical_inputs, vertical_inputs_reason = load_o1_vertical_inputs_guarded(cursor, plan)
     calendar = OptionExchangeCalendar()
     invocations = []
     rejected: dict[str, int] = {}
@@ -938,7 +989,13 @@ def _load_o1(
             rejected[reason] = rejected.get(reason, 0) + 1
             continue
         package = packages.get(event_id)
-        if package is None:
+        vertical_outcome = None
+        stored = filtered_out.get(event_id)
+        if package is None and stored is not None and is_o1_debit_vertical_package(stored):
+            # G106 AL2: a stored debit vertical with a leg unmarked at this window stays the event's only package
+            # (a second package for one event makes the next read of it ambiguous); the detection is an observation.
+            pass
+        elif package is None:
             try:
                 package = options_alert_v1_event_package(
                     row,
@@ -952,10 +1009,23 @@ def _load_o1(
                 reason = f"OPTIONS_ALERT_V1_PACKAGE:{type(error).__name__}"
                 rejected[reason] = rejected.get(reason, 0) + 1
                 package = None
+            if vertical_policy is not None and stored is None:
+                vertical_outcome, vertical_package = _o1_debit_vertical_outcome(
+                    row,
+                    event_id,
+                    plan,
+                    vertical_inputs,
+                    vertical_inputs_reason,
+                    vertical_policy,
+                    use=vertical_mode is O1DebitVerticalMode.ON,
+                )
+                if vertical_package is not None:
+                    package = vertical_package
         invocations.append(AdvancedO1Invocation(
             event_id,
             source,
             package,
+            vertical_outcome,
         ))
     if rejected:
         print(
