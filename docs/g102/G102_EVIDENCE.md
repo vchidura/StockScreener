@@ -3338,3 +3338,58 @@ R73/R75-v2, the per-underlying Options preparation cut-off.
   window) in compose (backup `compose.stable.before-stop-grace-20261116T072634Z.json`) and recreated both on r120
   (hotfix, `others_changed []`). Idle loops wait on the stop flag, so idle stops stay immediate. Per-service restart
   costs and rules: handover section 00b.
+
+## Nov 16 (Mon) 09:50-10:33 UTC - OA3: Options Alerts past sessions (build session; image r125, not deployed)
+
+User (~09:50): the Options Alerts date picker shows only the last run date; Stock Alerts show previous dates.
+
+Cause (read-only on live, API reads + `runner/audit_live.ps1`):
+1. The index (`/api/options/alerts/datasets`) is the latest Options page release's own index,
+   `AdvancedOptionsAlertsPagePublication.datasets()`, which lists exactly one session and dataset (live: 2026-11-13 only).
+   This is matrix OA3 (found Nov 13, not built); the realtime page has worked this way since the V3 page (`355b3ab`).
+2. A past day could not be read even with its own cohort (the portal identity maps every session to its Options cohort,
+   Nov 5-13, and every cohort has a read pin to its last release): the page payloads live in `rt.portal_snapshot_hot`,
+   kept 3 calendar days (`009_realtime_partition_maintenance.sql` HOT_TTL), so live held only Nov 13's
+   OPTIONS_ALERTS_PAGE_V2; Nov 12 with its cohort answered DETECTOR_DATASET_INDEX_UNAVAILABLE /
+   DETECTOR_ALERTS_UNAVAILABLE. OA3's planned fix (serve a past day from its retained publication) would therefore fail
+   for every day older than 3 days.
+3. Durable on live: `rt.detector_datasets` (lanes), `rt.detector_evaluations`, `rt.option_packages` + legs,
+   `rt.advanced_options_flow_package_evidence` (sealed marks) and the session alert lists in `rt.alert_current`
+   (options-alert-session-v1, from Nov 10: 9 / 20 / 12 / 11 rows Nov 10-13).
+
+Fix (API only; branch `oa3-options-history` on top of `al2-o1-debit`; `realtime/options_alert_history.py` +
+`portal_compatibility_repository.py`):
+- The index adds every session with durable history (an Options window on or after the first session alert list), oldest
+  first, each with its last window's dataset; the current session and its fields are unchanged. Additive under a
+  savepoint (a failed lookup serves today's index and says so in `optional_reads`).
+- When the cohort's pinned release resolved but its page left the hot table, the page of that release's session is
+  rebuilt from durable rows with the page builder's own row functions (`_alert_evaluation_row`, `_alert_run_row`,
+  `_one_alert_per_contract`, `_candidate_detail`, `_run_summary`, sealed marks via `_current_mark_row` where the reader may
+  read the evidence) and served by the publication's own methods with the session list, read-time marks, source facts
+  and valuation: Day History, Latest Run, Daily model results, candidate detail. The read-pin rule holds (no pin, another
+  session, Equity-only cohort: answered as before; nothing is read without a pin); everything runs under a savepoint and a
+  failure answers as before. Frontend unchanged (it already picks a past day's cohort and dataset from the index).
+- Found by the copy test: the API role has no SELECT on `rt.advanced_options_flow_package_evidence`; the rebuild checks
+  the grant and serves the rows without the window's sealed marks (the API's read-time marks fill them). No grant change.
+- Not covered: sessions before Nov 10 (Nov 5-9) have no durable alert list, so they are not listed; a candidate detail
+  exists only for the session's last window (as on a stored page); the rebuilt page's provenance policy hash is the
+  history contract's (`options-alert-session-history-v1`), not the window's manifest policy.
+
+Tests: `test_options_alert_history.py` 12 passed; API-side suites (10 files) 150 passed, 0 failed (r121 tree: 138, the
+same files without the new one); full `tests/realtime` (10:13-10:32): 158 failed / 5,290 passed, the identical failure set to r121's (0 new; +12 = the new tests).
+
+Copy (isolated `g102-test-pg`, Nov 15 backup; hot pages there: Nov 12 and 13 only):
+- Fidelity (`runner/oa3_fidelity.py`, read-only, postgres): the rebuilt Nov 12 and Nov 13 pages vs the stored ones:
+  evaluation rows 114/114 and 156/156, alert rows 5/5 and 4/4 (sealed marks included), candidate details 28/28 and 14/14,
+  run and lanes equal; only `candidate_details.*.policy_sha256` differs (provenance).
+- API containers on the copy (`runner`-style, api login): r121 (today's API code) lists `[2026-11-13]`; **r125 lists
+  `[2026-11-10, 2026-11-11, 2026-11-12, 2026-11-13]`**; Nov 10 / Nov 11 (pages pruned) served from durable rows: Day History
+  9 / 14 rows (Nov 11's 20 session alerts grouped one per contract and side, R46), Latest Run 8 / 2, Daily model results
+  235 / 70; Nov 12 / 13 from their stored pages as before (11 / 11, 5 / 4, 114 / 156). A wrong dataset id answers
+  DETECTOR_DATASET_UNAVAILABLE as before. Day History of a rebuilt day 29-53 ms (stored 39-63 ms). No API errors.
+  Outputs: `evidence/oa3-20261116/` (fidelity.json, api_r121.json, api_r125.json). Copy renamed back, test logins NOLOGIN,
+  test server stopped as found.
+
+Images: r122 / r123 / r124 were intermediate builds (superseded, never used); **r125
+`sha256:6b5b1e7aa7f816ae5431d514c04c7f609a3a456a6b7ac1727cce1faddcc37799`** (source 7c10cc6673226e76) = r121 + OA3. Deploy
+note: HANDOVER-20261116-LIVE.md section 14 (API hotfix; any time, the API is stateless).

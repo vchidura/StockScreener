@@ -968,6 +968,146 @@ class RealtimeOptionsAlertsPageRepository(_RealtimeCompatibilityRepository):
             _log_optional_read_failure("Options session alerts unavailable; serving the release's rows")
             return None
 
+    @staticmethod
+    def _with_past_options_sessions(cursor, result, *, cutoff):
+        """OA3 (Nov 16): the page index plus the past sessions with durable Options Alerts history
+        (`options_alert_history`). Additive: a failed lookup serves today's single-session index and says so."""
+        from .options_alert_history import load_options_alert_sessions_cursor, with_past_sessions
+
+        if not isinstance(result, Mapping) or not result.get("available") or not isinstance(result.get("data"), Mapping):
+            return result
+        saved = False
+        try:
+            cursor.execute("SAVEPOINT options_alert_sessions")
+            saved = True
+            sessions = load_options_alert_sessions_cursor(cursor, cutoff=cutoff)
+            cursor.execute("RELEASE SAVEPOINT options_alert_sessions")
+        except Exception:  # noqa: BLE001 - the past sessions are additive; never fail the index for them
+            if saved:
+                try:
+                    cursor.execute("ROLLBACK TO SAVEPOINT options_alert_sessions")
+                except Exception:  # noqa: BLE001
+                    _log_optional_read_failure("Options alert sessions savepoint rollback failed")
+            _log_optional_read_failure("Options past alert sessions unavailable; serving the current session only")
+            return _with_optional_reads(result, _optional_read(
+                "past_sessions", served=False, source="DURABLE_SESSION_ROWS",
+                fallback_source="CURRENT_SESSION_ONLY", reason_code="OPTIONS_PAST_SESSIONS_UNAVAILABLE",
+            ))
+        return _with_optional_reads(
+            {**result, "data": with_past_sessions(result["data"], sessions)},
+            _optional_read("past_sessions", served=True, source="DURABLE_SESSION_ROWS",
+                           fallback_source="CURRENT_SESSION_ONLY", reason_code="OPTIONS_PAST_SESSIONS_UNAVAILABLE"),
+        )
+
+    def _advanced_options_history(self, cursor, contract, *, cohort_id, cutoff, active, reason, resolved_release,
+                                  requested_session, query, candidate_id):
+        """OA3 (Nov 16): a session whose Options page release is no longer stored (the hot page table keeps 3 calendar
+        days) read from durable rows: its last window's Alerts page rebuilt (`options_alert_history`) and served by
+        the page publication's own methods, with the session list, read-time marks, source facts and valuation as for
+        a stored release. Served only when the cohort's release resolved (its read pin)
+        and only that release's own session, up to the release cutoff: the read-pin rule holds (no read without a
+        pin) and nothing newer than a release is shown. None: answer as before (unavailable)."""
+        from zoneinfo import ZoneInfo
+
+        from .options_alert_history import (
+            HISTORY_CONTRACTS,
+            history_index,
+            history_release,
+            load_options_alert_history_page_cursor,
+            load_options_alert_sessions_cursor,
+        )
+
+        if (
+            not self._reads_enabled
+            or contract not in HISTORY_CONTRACTS
+            or resolved_release is None
+            # The release resolved and only its stored page is missing (the read's own unavailable reason); any
+            # other reason (no pin, another session, Equity-only cohort, reads off) answers as before.
+            or reason not in set(self._REASONS.values())
+            or getattr(resolved_release, "provider_tier", "MASSIVE_ADVANCED") != "MASSIVE_ADVANCED"
+            or (requested_session is not None and str(requested_session) != str(resolved_release.session_date))
+        ):
+            return None
+        today = cutoff.astimezone(ZoneInfo("America/New_York")).date().isoformat()
+        release_session = str(resolved_release.session_date)
+        read_cutoff = min(cutoff, resolved_release.cutoff)
+        run_request = evaluation_request = None
+        if contract == "detector_runs":
+            from .option_alert_projection import DetectorRunQuery
+
+            run_request = DetectorRunQuery(**(query or {}))
+        elif contract == "evaluations":
+            from .option_alert_projection import DetectorEvaluationQuery
+
+            evaluation_request = DetectorEvaluationQuery(**(query or {}))
+        elif contract == "candidate" and candidate_id is None:
+            raise ValueError("Candidate identity is required")
+        saved = False
+        try:
+            cursor.execute("SAVEPOINT options_alert_history")
+            saved = True
+            if contract == "datasets":
+                sessions = [row for row in load_options_alert_sessions_cursor(cursor, cutoff=read_cutoff)
+                            if row["session_date"] <= release_session]
+                data = history_index(sessions)
+                cursor.execute("RELEASE SAVEPOINT options_alert_history")
+                if data is None:
+                    return None
+                latest = sessions[-1]
+                return {
+                    "available": True, "reason": None, "data_tier": "REAL-TIME ADVANCED RESEARCH DATA",
+                    "generated_at": cutoff, "as_of": latest["cutoff"], "observed_at": latest["cutoff"],
+                    "policy_sha256": None, "model_version": "advanced-options-v2",
+                    "data": {**data, "optional_reads": [_optional_read(
+                        "page_history", served=True, source="DURABLE_SESSION_ROWS", fallback_source="NONE",
+                        reason_code="OPTIONS_PAGE_HISTORY_UNAVAILABLE")]},
+                    "release_id": str(resolved_release.release_id), "release_cutoff": latest["cutoff"].isoformat(),
+                    "retained_session_date": latest["session_date"], "valid_until": None,
+                    "checked_at": cutoff.isoformat(), "stale": False, "staleness_seconds": 0,
+                    "serving_latest_available": False,
+                }
+            publication = load_options_alert_history_page_cursor(
+                cursor, cohort_id=cohort_id, session_date=release_session, cutoff=read_cutoff,
+            )
+            if publication is None:
+                cursor.execute("RELEASE SAVEPOINT options_alert_history")
+                return None
+            page_read = _optional_read(
+                "page_history", served=True, source="DURABLE_SESSION_ROWS", fallback_source="NONE",
+                reason_code="OPTIONS_PAGE_HISTORY_UNAVAILABLE",
+            )
+            if contract == "detector_runs":
+                session_rows = self._advanced_session_alerts(cursor, publication, cohort_id=cohort_id, cutoff=read_cutoff)
+                envelope = _with_optional_reads(
+                    publication.detector_runs(run_request, session_rows=session_rows, current_session_date=today),
+                    _optional_read(
+                        "session_alerts", served=session_rows is not None, source="SESSION_LIST",
+                        fallback_source="RELEASE_ROWS", reason_code="SESSION_ALERTS_UNAVAILABLE",
+                    ),
+                    page_read,
+                )
+                # Read-time marks as for a stored release page (newest stored quotes, aged at the read), so a past
+                # session reads the same whether its page is still stored or rebuilt.
+                envelope = self._advanced_current_marks_reported(cursor, envelope, cutoff=cutoff)
+                envelope = self._advanced_source_facts_reported(cursor, envelope, cutoff=cutoff)
+                envelope = self._advanced_alert_valuation_switched(cursor, envelope)
+            elif contract == "evaluations":
+                envelope = _with_optional_reads(publication.evaluations(evaluation_request), page_read)
+            else:
+                envelope = publication.candidate(candidate_id)
+            cursor.execute("RELEASE SAVEPOINT options_alert_history")
+        except Exception:  # noqa: BLE001 - history is additive; a failure answers as before (unavailable)
+            if saved:
+                try:
+                    cursor.execute("ROLLBACK TO SAVEPOINT options_alert_history")
+                except Exception:  # noqa: BLE001
+                    _log_optional_read_failure("Options alert history savepoint rollback failed")
+            _log_optional_read_failure("Options alert history unavailable")
+            return None
+        return _retained_options_envelope(envelope, history_release(
+            publication, checked_at=cutoff, release_id=resolved_release.release_id,
+        ))
+
     def _advanced_current_marks_reported(self, cursor, envelope, *, cutoff):
         """`_advanced_current_marks` under a savepoint, reporting what was served (INV-9): read-time marks from the
         stored quotes, or the release's marks when the quote read fails."""
@@ -1408,6 +1548,9 @@ class RealtimeOptionsAlertsPageRepository(_RealtimeCompatibilityRepository):
                         identity = dict(cohort_id=cohort_id, provider_tier=publication.provider_tier, scope_sha256=release["scope_sha256"])
                         if contract == "datasets":
                             result = publication.datasets(**identity)
+                            if advanced:
+                                # OA3 (Nov 16): the index also lists past sessions (durable rows, read below).
+                                result = self._with_past_options_sessions(cursor, result, cutoff=cutoff)
                             return (
                                 _retained_options_envelope(result, release)
                                 if advanced
@@ -1511,6 +1654,13 @@ class RealtimeOptionsAlertsPageRepository(_RealtimeCompatibilityRepository):
                             if advanced
                             else result
                         )
+            history = self._advanced_options_history(
+                cursor, contract, cohort_id=cohort_id, cutoff=cutoff, active=active, reason=reason,
+                resolved_release=resolved_release, requested_session=requested_session, query=query,
+                candidate_id=candidate_id,
+            )
+            if history is not None:
+                return history
         if contract == "datasets":
             data = {
                 "storage_ready": False, "datasets": [], "dataset_sessions": {},
