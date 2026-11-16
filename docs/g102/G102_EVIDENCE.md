@@ -3331,3 +3331,10 @@ R73/R75-v2, the per-underlying Options preparation cut-off.
   **gate 9 pre-open dry run PASS 06:36** (Options capture 9/9 with 65 provider requests, 14,048 candidates, 0 invalid,
   allocation STALE_BEFORE_OPEN as expected before 14:30; Stock Alerts RESEARCH 38 evaluations in 67 s; workspaces 45/45,
   0 unavailable, 128 s cold, largest 109 KB of 128 KB).
+- **07:24-07:28, restart safety (user: "restart is safer during the live run"):** all 20 containers match compose exactly
+  (image r120, command, environment, restart policy). Stop grace was 60 s everywhere; the Equity scheduler runs windows
+  in-line and checks its stop flag between windows, so a stop during a long window (cold up to ~200 s, budget 300 s)
+  killed it mid-window and left its lease to expire. Set `stop_grace_period` 330 s (scheduler) and 180 s (Options
+  window) in compose (backup `compose.stable.before-stop-grace-20261116T072634Z.json`) and recreated both on r120
+  (hotfix, `others_changed []`). Idle loops wait on the stop flag, so idle stops stay immediate. Per-service restart
+  costs and rules: handover section 00b.
