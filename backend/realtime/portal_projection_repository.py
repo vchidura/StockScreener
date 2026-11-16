@@ -1098,6 +1098,29 @@ def _entry_rank(entry: Mapping[str, object]) -> tuple[int, datetime]:
     )
 
 
+# G102 R85 (Nov 16, live): the R78 daily-products job publishes the cohort's strategies and Dashboard one generation
+# above every window (`daily_products.next_source_generation_cursor`) only so that its release is not outranked at the
+# current cutoff. Every later release carries those two entries forward, so its generation became the job's: from
+# the job's publish on, a window release at a cutoff another publisher (Stock Alerts) had already released ranked
+# below it and was recorded HISTORICAL_STALE, and the ticker workspaces, Pattern Watch and the workspace summary stayed
+# at the first window. A release that carries none of the job's products is ordered against the generation of the
+# products it competes with (the current release without the job's entries); every carried entry still keeps the
+# newer of the two versions (per-entry rank in the merge), so an older-generation snapshot never replaces a newer one.
+JOB_ORDERING_SNAPSHOT_TYPES = frozenset({"DAILY_STRATEGIES_V1", "DASHBOARD_V1"})
+
+
+def _competing_generation(previous_manifest, previous_generation: int, incoming_types) -> int:
+    """The current release's generation as a release carrying none of the job's products competes with it."""
+    if previous_manifest is None or any(kind in JOB_ORDERING_SNAPSHOT_TYPES for kind in incoming_types):
+        return previous_generation
+    competing = [
+        int(entry["source_generation"])
+        for entry in previous_manifest.get("snapshots", ())
+        if entry["snapshot_type"] not in JOB_ORDERING_SNAPSHOT_TYPES
+    ]
+    return min(previous_generation, max(competing)) if competing else previous_generation
+
+
 def _publish_portal_release(
     cursor,
     receipt: PortalReleaseReceipt,
@@ -1218,7 +1241,11 @@ def _publish_portal_release(
             previous_order = (
                 previous_session,
                 previous_cutoff,
-                int(previous_generation),
+                _competing_generation(
+                    previous_manifest,
+                    int(previous_generation),
+                    {identity[0] for identity in entries},
+                ),
             )
             if (
                 previous_session == release_session

@@ -1425,3 +1425,69 @@ def test_a_killed_job_takes_its_workers_with_it(tmp_path, monkeypatch):
     assert not alive(job_process.pid) and not alive(worker)
     instance.tick(datetime.now(UTC), lambda at: [])
     assert instance.running is None and instance.last_outcomes[-1][2] == "DEADLINE"
+
+
+# --- G102 R85 (Nov 16 live): a window release after the job's publish ------------------------------------------------
+def _entry(kind, key, generation, at, snapshot_int):
+    return dict(snapshot_id=str(UUID(int=snapshot_int)), snapshot_class="EPHEMERAL_PORTAL", snapshot_type=kind,
+                snapshot_key=key, source_generation=generation, generated_at=at)
+
+
+def _window_snapshot(cohort_id, tier, generation, generated_at, snapshot_int=900):
+    from realtime.portal_projection import RealtimePortalSnapshot
+    return RealtimePortalSnapshot(
+        snapshot_id=UUID(int=snapshot_int), cohort_id=cohort_id, provider_tier=tier, snapshot_type="TICKER_WORKSPACE_V1",
+        snapshot_key="AAPL", source_generation=generation, source_manifest_sha256="d" * 64, source_manifest={},
+        payload_sha256="e" * 64, payload={}, generated_at=generated_at, valid_until=None)
+
+
+def _after_job_publish(cutoff, tier):
+    """Live Nov 16 15:10: Stock Alerts released this cutoff first and carried the job's products (generation 14)
+    forward; the window's own products are at generation 13."""
+    current = _current(cutoff, [
+        _entry("TICKER_WORKSPACE_V1", "AAPL", 13, "2026-11-16T14:35:00+00:00", 801),
+        _entry("DAILY_STRATEGIES_V1", "COHORT", 14, "2026-11-16T14:30:00+00:00", 802),
+        _entry("DASHBOARD_V1", "COHORT", 14, "2026-11-16T14:30:00+00:00", 803),
+        _entry("STOCK_ALERTS_V1", "PLATFORM", 13, "2026-11-16T15:10:00+00:00", 804),
+    ], tier=tier.value, generation=14, session=date(2026, 11, 16))
+    current.update(desired_revision_id=None, desired_snapshot_sha256=None, membership_sha256=None)
+    return current
+
+
+@pytest.mark.parametrize("window_generation, expected", [(13, "CURRENT"), (12, "HISTORICAL_STALE")])
+def test_a_window_release_at_a_cutoff_already_released_is_not_outranked_by_the_jobs_products(window_generation,
+                                                                                              expected):
+    from realtime.portal_projection_repository import PortalReleaseReceipt
+    tier = daily_scanner_fixture().provider_tier
+    cohort_id = uuid4()
+    cutoff = datetime(2026, 11, 16, 15, 10, tzinfo=UTC)
+    current = _after_job_publish(cutoff, tier)
+    cursor = _RealPublisherCursor(current)
+    snapshot = _window_snapshot(cohort_id, tier, window_generation, cutoff)
+    cursor.store(snapshot, "EPHEMERAL_PORTAL")
+    receipt = PortalReleaseReceipt(uuid4(), cohort_id, tier, cutoff, current["universe_sha256"])
+    release = publish_portal_release_cursor(cursor, receipt, (snapshot,), session_date=current["session_date"])
+    assert release.publication_disposition == expected
+    assert release.pointer_swapped is (expected == "CURRENT")
+    if expected == "CURRENT":
+        entries = {(entry["snapshot_type"], entry["snapshot_key"]): entry for entry in release.manifest["snapshots"]}
+        assert entries[("TICKER_WORKSPACE_V1", "AAPL")]["snapshot_id"] == str(snapshot.snapshot_id)
+        assert {("DAILY_STRATEGIES_V1", "COHORT"), ("DASHBOARD_V1", "COHORT"), ("STOCK_ALERTS_V1", "PLATFORM")} <= set(entries)
+        assert release.publication_generation == 14
+
+
+def test_a_carried_newer_generation_entry_is_kept_over_an_older_incoming_one():
+    from realtime.portal_projection_repository import PortalReleaseReceipt
+    tier = daily_scanner_fixture().provider_tier
+    cohort_id = uuid4()
+    cutoff = datetime(2026, 11, 16, 15, 10, tzinfo=UTC)
+    current = _after_job_publish(cutoff, tier)
+    current["manifest"]["snapshots"][0] = _entry("TICKER_WORKSPACE_V1", "AAPL", 13, "2026-11-16T15:10:00+00:00", 801)
+    current["manifest"]["snapshots"].append(_entry("PATTERN_WATCH_V1", "PLATFORM", 13, "2026-11-16T15:05:00+00:00", 805))
+    cursor = _RealPublisherCursor(current)
+    older = _window_snapshot(cohort_id, tier, 13, cutoff - timedelta(minutes=5), snapshot_int=901)
+    cursor.store(older, "EPHEMERAL_PORTAL")
+    receipt = PortalReleaseReceipt(uuid4(), cohort_id, tier, cutoff, current["universe_sha256"])
+    release = publish_portal_release_cursor(cursor, receipt, (older,), session_date=current["session_date"])
+    entries = {(entry["snapshot_type"], entry["snapshot_key"]): entry for entry in release.manifest["snapshots"]}
+    assert entries[("TICKER_WORKSPACE_V1", "AAPL")]["snapshot_id"] == str(UUID(int=801))
