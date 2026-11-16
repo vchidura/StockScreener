@@ -58,6 +58,7 @@ from uuid import UUID
 
 import exchange_calendars
 
+from .corporate_action_drift import corporate_action_content, corporate_action_coverage_content
 from .contracts import canonical_sha256
 from .dashboard_projection import DASHBOARD_KEY, DASHBOARD_VERSION, produce_realtime_dashboard
 from .dashboard_repository import persist_realtime_dashboard_cursor
@@ -154,12 +155,19 @@ class DailyProductsOutcome:
 
 def daily_products_input_sha256(inputs, mode: str, sessions: int = 5) -> str:
     """What the products depend on, without the clock: two runs over the same members, actions, coverage and bars
-    produce the same products (up to their generated_at), so the second one is ALREADY_STORED."""
+    produce the same products (up to their generated_at), so the second one is ALREADY_STORED.
+
+    Nov 16: actions and coverage enter by content (`corporate_action_content`, `corporate_action_coverage_content`),
+    not by row ids and arrival times. The nightly coverage refresh re-inserts identical revisions and re-checks coverage
+    with an unchanged provider response; by row identity every refresh was a new input, so each scheduler restart
+    recomputed the previous session's products (Nov 16: source generation 20 -> 21 -> 22 with nothing changed). The
+    identity format changes once with this: the first run after the deploy computes again, then refreshes keep it."""
     return canonical_sha256(dict(
         version=DAILY_PRODUCTS_VERSION, mode=mode, products=[list(item) for item in products_for(mode, sessions)],
         cohort_id=inputs.cohort_id, provider_tier=inputs.provider_tier, session=inputs.session,
-        source_manifest_sha256=inputs.source_manifest_sha256, members=inputs.members, actions=inputs.actions,
-        coverage=inputs.coverage, bar_lineage=inputs_bar_lineage_sha256(inputs),
+        source_manifest_sha256=inputs.source_manifest_sha256, members=inputs.members,
+        actions=corporate_action_content(inputs.actions), coverage=corporate_action_coverage_content(inputs.coverage),
+        bar_lineage=inputs_bar_lineage_sha256(inputs),
         source_lineage=getattr(inputs, "source_lineage", "LOADED"),
     ))
 

@@ -13,6 +13,7 @@ from equity.domain import EvidenceType
 from equity.portal_scanners import DAILY_SCANNER_MINIMUM_BARS, HOURLY_SCANNER_MINIMUM_BARS, HOURLY_SCANNER_CONTRACTS
 from equity.ticker_contracts import setup_summary_row
 
+from .corporate_action_drift import corporate_action_drift_params, corporate_action_drift_sql
 from .contracts import canonical_json, canonical_sha256
 from .dashboard_projection import DAILY_SCANNER_CONTRACTS, SCANNER_BASIS
 from .database_access import RealtimeDatabaseRole
@@ -812,10 +813,9 @@ class RealtimeDailyStrategyRepository(_RealtimeCompatibilityRepository):
                         (str(reference["security_id"]), reference["ticker"], cutoff, cutoff, cutoff))
                     reference_current = _reference_matches(reference, cursor.fetchall()) and reference_current
             ids = [str(row["security_id"]) for row in manifest["references"]]
-            cursor.execute("SELECT EXISTS (SELECT 1 FROM ref.corporate_action_revisions WHERE security_id=ANY(%s::uuid[]) "
-                "AND received_at>%s AND received_at<=%s) OR EXISTS (SELECT 1 FROM ref.corporate_action_coverage "
-                "WHERE security_id=ANY(%s::uuid[]) AND received_at>%s AND received_at<=%s) AS action_drift",
-                (ids, stored["generated_at"], cutoff, ids, stored["generated_at"], cutoff))
+            # Nov 16: drift is new or changed action content, not re-checks that re-insert identical rows.
+            cursor.execute("SELECT " + corporate_action_drift_sql() + " AS action_drift",
+                corporate_action_drift_params(ids, stored["generated_at"], cutoff))
             action_drift = cursor.fetchone()["action_drift"]
             if action_drift and read_mode != "retained":
                 raise StrategyPublicationUnavailable("Strategy action evidence changed; new reviewed release required")

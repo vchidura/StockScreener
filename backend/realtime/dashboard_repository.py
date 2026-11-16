@@ -7,6 +7,7 @@ import exchange_calendars
 from equity.calendar import latest_expected_market_time, staleness_state
 from equity.ticker_contracts import setup_summary_row
 
+from .corporate_action_drift import corporate_action_drift_params, corporate_action_drift_sql
 from .contracts import canonical_sha256
 from .dashboard_projection import (
     DASHBOARD_KEY, DASHBOARD_VERSION, DAILY_SCANNER_CONTRACTS, MEMBER_LISTS, SCANNER_BASIS,
@@ -289,11 +290,8 @@ class RealtimeDashboardRepository(_RealtimeCompatibilityRepository):
                 ids = [str(reference["security_id"]) for reference in references]
                 until = action_evidence_until(stored["generated_at"], cutoff)
                 cursor.execute(
-                    "SELECT EXISTS (SELECT 1 FROM ref.corporate_action_revisions "
-                    "WHERE security_id=ANY(%s::uuid[]) AND received_at>%s AND received_at<=%s) "
-                    "OR EXISTS (SELECT 1 FROM ref.corporate_action_coverage "
-                    "WHERE security_id=ANY(%s::uuid[]) AND received_at>%s AND received_at<=%s) AS action_drift",
-                    (ids, stored["generated_at"], until, ids, stored["generated_at"], until),
+                    "SELECT " + corporate_action_drift_sql() + " AS action_drift",
+                    corporate_action_drift_params(ids, stored["generated_at"], until),
                 )
                 action_drift = bool(cursor.fetchone()["action_drift"])
         delay = 15 if stored["provider_tier"] == "MASSIVE_DEVELOPER" else 0
