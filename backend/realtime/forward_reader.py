@@ -5,6 +5,7 @@ from uuid import UUID
 
 from options.calendar import OptionExchangeCalendar
 
+from .corporate_action_drift import corporate_action_drift_params, corporate_action_drift_sql
 from .contracts import canonical_sha256
 from .forward_storage import decode_forward_artifact
 
@@ -51,11 +52,9 @@ def load_forward_release_cursor(cursor, *, cohort_id, available_by, artifact_kin
         if len(versions) != 1 or versions[0]["payload_sha256"] != contract["payload_sha256"]:
             raise ForwardPublicationUnavailable("forward option reference drift; explicit republish required")
     ids = manifest.get("security_ids", ())
-    cursor.execute("SELECT EXISTS (SELECT 1 FROM ref.corporate_action_revisions WHERE security_id=ANY(%s::uuid[]) "
-        "AND received_at>%s AND received_at<=%s) OR EXISTS (SELECT 1 FROM ref.corporate_action_coverage "
-        "WHERE security_id=ANY(%s::uuid[]) AND received_at>%s AND received_at<=%s) OR EXISTS ("
+    cursor.execute("SELECT " + corporate_action_drift_sql() + " OR EXISTS ("
         "SELECT 1 FROM ref.security_revisions WHERE security_id=ANY(%s::uuid[]) AND observed_at>%s AND observed_at<=%s) AS drift",
-        (list(ids), row["published_at"], available_by, list(ids), row["published_at"], available_by,
+        (*corporate_action_drift_params(list(ids), row["published_at"], available_by),
          list(ids), row["published_at"], available_by))
     if cursor.fetchone()["drift"]:
         raise ForwardPublicationUnavailable("forward security/action revision drift")

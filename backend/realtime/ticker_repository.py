@@ -15,6 +15,7 @@ from equity.domain import EvidenceType
 from equity.materialization import CHANNEL_VERSION, FEATURE_VERSION, PATTERN_VERSION, SETUP_VERSION
 from equity.ticker_contracts import PATTERN_WATCH_INTERVALS, PATTERN_WATCH_POLICY, RETIRED_PATTERN_WATCH_INTERVALS
 
+from .corporate_action_drift import corporate_action_drift_params, corporate_action_drift_sql
 from .contracts import canonical_sha256
 from .database_access import RealtimeDatabaseRole
 from .equity_bar_repository import load_bar_groups_cursor
@@ -1204,11 +1205,8 @@ class RealtimeTickerWorkspaceRepository(_RealtimeCompatibilityRepository):
             reference_current = _reference_set_matches(expected_references, cursor.fetchall())
         until = action_evidence_until(source_cutoff, cutoff, read_mode)
         cursor.execute(
-            "SELECT EXISTS (SELECT 1 FROM ref.corporate_action_revisions "
-            "WHERE security_id=ANY(%s::uuid[]) AND received_at>%s AND received_at<=%s) "
-            "OR EXISTS (SELECT 1 FROM ref.corporate_action_coverage "
-            "WHERE security_id=ANY(%s::uuid[]) AND received_at>%s AND received_at<=%s) AS action_drift",
-            (ids, source_cutoff, until, ids, source_cutoff, until),
+            "SELECT " + corporate_action_drift_sql() + " AS action_drift",
+            corporate_action_drift_params(ids, source_cutoff, until),
         )
         action_drift = cursor.fetchone()["action_drift"]
         if action_drift and read_mode != "retained" and not self_contained:
@@ -1524,12 +1522,8 @@ class RealtimeTickerWorkspaceRepository(_RealtimeCompatibilityRepository):
                 reference_current = _reference_matches(reference, cursor.fetchall())
             until = action_evidence_until(source_cutoff, cutoff, read_mode)
             cursor.execute(
-                "SELECT EXISTS (SELECT 1 FROM ref.corporate_action_revisions "
-                "WHERE security_id=%s AND received_at>%s AND received_at<=%s) "
-                "OR EXISTS (SELECT 1 FROM ref.corporate_action_coverage "
-                "WHERE security_id=%s AND received_at>%s AND received_at<=%s) AS action_drift",
-                (str(reference["security_id"]), source_cutoff, until,
-                 str(reference["security_id"]), source_cutoff, until),
+                "SELECT " + corporate_action_drift_sql(single=True) + " AS action_drift",
+                corporate_action_drift_params(str(reference["security_id"]), source_cutoff, until),
             )
             action_drift = cursor.fetchone()["action_drift"]
             if action_drift and read_mode != "retained":
@@ -1677,12 +1671,8 @@ class RealtimeTickerWorkspaceRepository(_RealtimeCompatibilityRepository):
                 raise TickerPublicationUnavailable("Ticker reference identity changed; republish required")
             until = action_evidence_until(source_cutoff, cutoff, read_mode)
             cursor.execute(
-                "SELECT EXISTS (SELECT 1 FROM ref.corporate_action_revisions "
-                "WHERE security_id=%s AND received_at>%s AND received_at<=%s) "
-                "OR EXISTS (SELECT 1 FROM ref.corporate_action_coverage "
-                "WHERE security_id=%s AND received_at>%s AND received_at<=%s) AS action_drift",
-                (str(reference["security_id"]), source_cutoff, until,
-                 str(reference["security_id"]), source_cutoff, until),
+                "SELECT " + corporate_action_drift_sql(single=True) + " AS action_drift",
+                corporate_action_drift_params(str(reference["security_id"]), source_cutoff, until),
             )
             if cursor.fetchone()["action_drift"] and read_mode != "retained":
                 raise TickerPublicationUnavailable("Ticker action evidence changed; republish required")

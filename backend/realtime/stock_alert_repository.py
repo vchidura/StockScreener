@@ -11,6 +11,7 @@ import exchange_calendars
 from research.stock_alert_review import build_stock_eod_review
 from research.stock_alerts import alert_page, session_dates
 
+from .corporate_action_drift import corporate_action_drift_params, corporate_action_drift_sql
 from .contracts import canonical_sha256
 from .database_access import RealtimeDatabaseRole
 from .lineage_head import reference_set, require_member_set
@@ -326,11 +327,8 @@ class RealtimeStockAlertViewRepository(_RealtimeCompatibilityRepository):
             ids = reference_ids
             until = action_evidence_until(row["generated_at"], cutoff)
             cursor.execute(
-                "SELECT EXISTS (SELECT 1 FROM ref.corporate_action_revisions "
-                "WHERE security_id=ANY(%s::uuid[]) AND received_at>%s AND received_at<=%s) "
-                "OR EXISTS (SELECT 1 FROM ref.corporate_action_coverage "
-                "WHERE security_id=ANY(%s::uuid[]) AND received_at>%s AND received_at<=%s) AS action_drift",
-                (ids, row["generated_at"], until, ids, row["generated_at"], until),
+                "SELECT " + corporate_action_drift_sql() + " AS action_drift",
+                corporate_action_drift_params(ids, row["generated_at"], until),
             )
             action_drift = bool(cursor.fetchone()["action_drift"])
             cursor.execute(
