@@ -876,3 +876,168 @@ it rides on `REALTIME_V3_OS_PARTICIPATION=RECORD`), then the window hotfix on th
 "O1_ZERO_DTE_RECORD|O1_AGGRESSOR_WINDOW" | tail -4` - one of each per window, `mode` RECORD, `applied` false,
 aggressor `status` OK (never INPUTS_UNAVAILABLE:* or RECORD_FAILED); O1 lane states, alert counts and window times as
 before. Undo: `--remove` the keys + hotfix (absent = OFF).
+
+### Nov 17 (08:45-10:00 UTC): AL8 call/put-balanced V4 watched set built RECORD-first (build session, not committed, not deployed)
+
+Worktree `g102-batch-nov17` (HEAD 05ae39c = image r132, uncommitted, additive). User's yes ~08:30 UTC. Research basis:
+`G106_DETECTOR_RESEARCH.md` 2.3 and P1-3. No live change; light read-only exports only (below); no `g102-test-pg`.
+
+**Cause (verified in code, `realtime/advanced_options_activity_momentum_c6.py`).**
+- The v4 SHORT_DATED_ACTIVITY basket (0-5 DTE) carries `call_priority: True` (hard-coded basket table for v2-v4).
+- `_group_rank` sorts by (basket priority, role priority, **side priority** (call 0 / put 1 when the basket has call
+  priority), candidate ranks, ...): every 0-5 DTE call ranks before every 0-5 DTE put of the name. The role priority is
+  the same for both sides (PARTICIPATION_CONTEXT is in both groups' roles), so the side priority decides.
+- `_v4_fill_product_buckets` fills each bucket first-match from that queue ("no side quota"); the basket rounds
+  (12 short / 12 core), the share round and the budget round are first-match too. The per-side safeguards of the older
+  profiles do not run for v4: v2 bootstraps one call and one put in each of the short and core baskets, v3 the core
+  basket plus the missing-side rule of its near / end-of-week expiry targets, v4 none (`basket_bootstrap = ()`, the
+  product buckets replace the expiry targets). Re-checked: the JSON flags `short_basket_put_coverage_when_eligible`,
+  `core_basket_put_coverage_when_eligible` and `short_basket_call_preference` are not read by the code at all (they
+  only enter the profile hash); the v2-v4 basket table is hard-coded, and its `put_coverage_required_when_available`
+  only matters in the legacy profile's bootstrap.
+- Effect at 24 per name: puts enter the short-dated buckets only when the calls of that bucket run out. Nov 16 (a
+  Monday): 131 C / 85 P; 0-5 DTE 73 / 16; DTE 1-2 37 / 0 (the index ETFs' NEAR bucket 18 / 0; the stocks' 0-2 DTE
+  weeklies 30 / 0). `SHORT_DATED_SWEEP_LIKE` (call-only role) only routes the P8 router's `short-dated-sweep-like-v2`
+  consumer; it does not change the rank.
+
+**Where the allocation runs.** Only in the Options lifecycle service (`realtime-v3-options-lifecycle`,
+`scripts/run_advanced_options_v3_lifecycle.py`): `PostgresAutomaticOptionsPreparationExecutor._capacity` ->
+`_allocate_capture` -> `allocate_activity_momentum`, in the CAPACITY_SHARDS stage, once per session (the first
+underlying's claim computes it; the others reference its hash). The stage follows CATALOG_QUOTE, which waits for the
+capture after the open: Nov 16 CATALOG_QUOTE 14:31:44-14:33:54, CAPACITY_SHARDS 14:35:10 UTC; Nov 13 14:35:26. The
+market-state, flow, window, scheduler and API services only read the stored allocation document
+(`activity_momentum_allocation_from_payload`). The manual `prepare_advanced_options_v3_pre_session.py` also allocates
+(not a service; unchanged, always OFF). At 08:5x UTC today the Nov 17 revision `e9ec92b3...` (16 names) was in
+CATALOG_QUOTE RETRY (waiting for the open), so its CAPACITY_SHARDS stage has not run.
+
+**Code.**
+- `realtime/advanced_options_slot_side_balance.py` (new): the switch `REALTIME_V3_OPTIONS_SLOT_SIDE_BALANCE`
+  (OFF / RECORD / ON, any case, unset / blank = OFF, anything else raises naming the key), the record documents, and
+  `allocate_with_side_balance` (the lifecycle's allocation under the switch; recording never raises).
+- `advanced_options_activity_momentum_c6.py` (additive): `allocate_activity_momentum(..., side_balance=False)` (v4
+  only; True with another profile raises); `_group_rank(neutral_side=False)`; `_v4_fill_product_buckets_side_balanced`;
+  `_side_balanced_next` / `_side_counts` / `_group_side`; `_v4_bucket_context` and `v4_contract_bucket` (the record's
+  bucket label). The three first-match `next(...)` rounds are the same generator either way; OFF takes `next(rows,
+  None)` exactly as before.
+- `advanced_options_automatic_preparation.py`: the executor takes `slot_side_balance` (default OFF; not OFF with a
+  non-v4 admission profile = configuration invalid); `_allocate_capture` builds the same arguments once (the priority
+  read is still one query) and calls `allocate_with_side_balance` (`getattr` default OFF for executors built with
+  `__new__`).
+- `scripts/run_advanced_options_v3_lifecycle.py`: reads the switch at start (invalid -> ValueError, the service does not
+  start), passes it to the executor and prints `OPTIONS_SLOT_SIDE_BALANCE_SETTING {"mode": ...}` to stderr once.
+
+**Balanced allocation (ON, `side_balance=True`).**
+- Sort: side priority neutral (the allocation sort only); calls and puts keep one quality ranking (target |delta| band,
+  activity, notional, spread, distance, expiry distance).
+- Each product bucket in order: the best admissible group leads (either side), followed by the best admissible group of
+  the other side at the same expiry (same ranking, so about the same |delta| distance from the target), else of the
+  other side at any expiry of the bucket; each side capped at half the bucket (rounded up); the ladder's two expiries
+  stay interleaved primary first. A side without supply leaves its slots to the later rounds. (A first version
+  interleaved all (expiry, side) lanes round robin; on Nov 16 it spread CORE across every listed expiry and took a deep
+  ITM AAPL 11/30 put with OI 0, so it was replaced by the pairs.)
+- The basket rounds take the next group of the side with fewer contracts in that basket; the share and budget rounds the
+  side with fewer contracts of the name; a mixed group counts for either side; when the wanted side has none, the first
+  row as before.
+- No put-side sweep role: the role is in the group identity (`group_id`) and in the profile's role contract, so adding it
+  would change OFF; balanced puts keep PARTICIPATION_CONTEXT / DIRECTIONAL_MOMENTUM routes, and O1 / OS / flow read
+  every watched contract whatever its roles.
+- ON is not stamped into the allocation document (its schema is read by market-state, flow, window and the API; a new
+  field would need all readers). The stored `short_expiry_evidence.selected_counts` (per expiry and side) and the
+  allocation hash show it; the ON log lines say `applied: true`.
+
+**Record lines** (stderr of the lifecycle, RECORD and ON, one allocation per session): one summary
+`OPTIONS_SLOT_SIDE_BALANCE_RECORD {part: summary, mode, applied, session_date, profile_version, off / balanced
+allocation sha256, contracts {off, balanced} calls / puts, dte_calls_puts (0-5, 1-2, 6-21, 22+), bucket_calls_puts
+(product:bucket), added / removed by side, thin_added (+ by OI and by prior volume), thin_policy}` and one line per
+underlying `{part: underlying, product, off / balanced calls / puts, buckets {bucket: off / balanced [calls, puts]},
+added / removed (contract, side, bucket, DTE, |delta|, prior OI, day volume and its session, thin flags)}`. Largest
+replayed line 5.2 KB (Docker splits at 16 KiB). A failure logs `OPTIONS_SLOT_SIDE_BALANCE_RECORD_FAILED {mode,
+session_date, error}`; the stage goes on with the OFF allocation (RECORD) or the balanced one (ON, computed first).
+Bucket label = the first product bucket (in order) the contract matches, else UNBUCKETED (picked by the basket rounds,
+e.g. the stocks' 0-2 DTE weeklies on a Monday).
+
+**Thin picks (record only, not applied).** `thin_oi` = prior OI missing or < 100; `thin_prior_volume` = day volume <
+500 only when the provider's day row predates the session. The capture runs after the open, so a contract that traded in
+the first minutes carries today's volume (Nov 16: 1,242 of SPY's 4,102 captured snapshots had a day row from the
+session): that volume is not judged (`day_volume_session` SESSION).
+
+**Parity (OFF and RECORD = today).** `evidence/al8-slot-balance-20261117/replay.py`: the stored CATALOG_QUOTE captures
+of the Nov 13 (`2d1e2667...`) and Nov 16 (`7fabaec0...`) revisions (read-only export, 4.7 MB) through the real
+`_combined_capture` and `_allocate_capture` with the stored admission configuration: allocation `a6d0069a...` (Nov 13)
+and `2ec07d6e...` (Nov 16) = the stored CAPACITY_SHARDS `allocation_sha256`, and the filtered capture the stage stores
+(`semantic_sha256` `78eeddd8...` / `27cffbd5...`, 216 contracts each) = the stored evidence, at HEAD 05ae39c and on
+the branch with the switch unset, OFF and RECORD (RECORD prints 20 lines, unset / OFF none). Golden in the tests: the
+fixture's OFF allocation `9356dad4...` pinned at HEAD before the change, equal with the flag False and through the
+service helper (one allocation call, no `side_balance` argument, no line).
+
+**Tests.** `tests/realtime/test_options_slot_side_balance_al8.py` 37 (golden OFF, flag False and helper parity, the
+call-heavy shape, v4-only and boolean flag, `_group_rank` unchanged unless neutral, ON balance per name and count kept,
+bucket pass caps per side and the share bound, expiry pairs, pairs from the same ranking, other-side fill without
+supply, side-balanced next, the six accepted values and six invalid ones, executor refusal (invalid, non-v4), lifecycle
+main passes the switch / refuses an invalid value before building the executor, RECORD = OFF allocation and payload +
+three lines with consistent added / removed and thin flags, lines are JSON under 16 KiB, record failure and emit
+failure never fail the stage, ON through the helper, ON keeps the balanced allocation when the record fails, helper
+refuses non-v4, `_allocate_capture` routes through the helper). Neighbours (16 files: c6, v4 profile, lifecycle,
+option slot set + repository, universe sizing x3, lifecycle isolation, v4 conventions, advanced services, treasury
+refresh, c8 tier binding, selection c6 / session state DB, write grants): 2 failed / 272 passed / 30 skipped at HEAD
+and after (+37 new passed), the same 2 (`test_options_preparation_budget_has_local_and_shared_ceilings`,
+`test_adjusted_expired_or_ineligible_catalog_members_are_rejected[7-value5]`). Wider sweep (the 105 non-DB files `tests/realtime/test_(advanced_options|c6|c8|option|options)_*.py`): branch 23 failed / 1,835 passed / 2 skipped (with the 37 new); HEAD 05ae39c (backend exported with `git archive` into a scratch copy) 29 failed / 1,792 passed: all 23 are in HEAD's set (0 new); HEAD's other 6 (acquisition runtime compose, P8 canary authorization x2, v3 deployment x3) read repository-root files the backend-only copy lacks and pass on the branch.
+
+**Replay: OFF vs balanced** (`analyze.py`; 9 names, 24 per name; the Nov 17 names AMD AVGO COIN GOOGL MSTR MU PLTR have
+no stored capture before today, so 16 names cannot be replayed; per name the allocation is independent of the name
+count at 24 each (budget 384 <= 900)):
+
+| | Nov 16 OFF | Nov 16 balanced | Nov 13 OFF | Nov 13 balanced |
+|---|---|---|---|---|
+| Watched C / P | 131 / 85 | 107 / 109 | 129 / 87 | 107 / 109 |
+| 0-5 DTE C / P | 73 / 16 | 44 / 45 | 46 / 14 | 28 / 30 |
+| DTE 1-2 C / P | 37 / 0 | 17 / 17 | 0 / 0 | 0 / 0 |
+| 6-21 DTE C / P | 46 / 57 | 51 / 52 | 71 / 61 | 67 / 67 |
+| ETFs: SAME_DAY / NEAR / WEEKLY / CORE (C / P) | 10/7, 18/0, 3/3, 8/23 | 8/9, 9/9, 3/3, 15/16 | 10/8, 3/3, 9/10, 8/9 (+9/3 unbucketed) | 9/10, 3/3, 9/10, 9/8 (+5/6) |
+| Stocks: WEEKLY / CORE / EXTENSION / 0-2 DTE (C / P) | 12/6, 38/34, 12/12, 30/0 | 9/9, 36/36, 12/12, 15/15 | 42/14, 36/28, 12/12, - | 27/27, 33/33, 12/12, - |
+| Per name | 12/12 (QQQ) to 18/6 (MSFT) | 12/12 (IWM 11/13) | 11/13 (SPY) to 18/6 (TSLA) | 12/12 (SPY 11/13) |
+| Added / removed (C, P) | | +16 C +40 P / -40 C -16 P | | +12 C +37 P / -34 C -15 P |
+
+Example (Nov 16 SPY, the NEAR bucket): OFF took 6 calls (11/17 749C, 11/18 748C / 751C, ...); balanced 3 + 3
+(11/17 747P OI 1,019, 748P OI 1,309, 11/18 750P OI 2,066; |delta| 0.46-0.55), and CORE 5 / 5 instead of 3 / 7.
+
+**Close-chain passes the watched set would cover** (`research/chains/<session>/close-retained.csv.gz`, the 9 names,
+ratio >= 3 with the AL4 floor (OI >= 100, day volume >= 500) at the close; the brief's definition is "within 3% of spot,
+DTE 0-7", which reproduces today's 53 of 257 / 6 of 254 exactly):
+
+| Nov 16 | Passes C / P | OFF watched C / P | Balanced watched C / P |
+|---|---|---|---|
+| Within 3%, DTE 0-7 | 257 / 254 | 53 / 6 | **31 / 22** |
+| Within 3%, DTE 1-7 | 164 / 161 | 32 / 0 | 16 / 7 |
+| Within 2%, DTE 0-45 (research 2.1) | 209 / 227 | 51 / 6 | 29 / 21 |
+| All strikes and DTE (research 2.3: 57 / 6) | 429 / 399 | 57 / 6 | 33 / 22 |
+
+Nov 13 (within 3%, DTE 0-7): passes 244 / 215; OFF 34 / 4; balanced 25 / 10. The balanced set multiplies the watched
+put passes by 2.5-3.7 and cuts the call passes by a quarter to 40%; the total watched passes fall slightly (Nov 16 59 -> 53 within 3% DTE
+0-7; Nov 13 38 -> 35). It does not reach DTE 1-7 put passes much (0 -> 7) because the put lanes' best-ranked contracts
+are not the high-ratio ones (formerly-OTM high-OI puts on a down day, research 2.2).
+
+**Thin added contracts** (record flags; Nov 16 / Nov 13): added puts 40 / 37: `thin_oi` 3 / 9, `thin_prior_volume` 7 /
+12, either 7 / 14 (32 / 24 of the added puts carried session volume and were not judged on volume). Added calls 16 /
+12: either 13 / 10. For scale, OFF's own set: calls 42 of 131 / 49 of 129 and puts 44 of 85 / 39 of 87 thin by the
+same flags. A filter on balanced puts only (OI >= 100 and judged prior volume >= 500) would drop 7 of 40 (Nov 16) and
+14 of 37 (Nov 13) added puts at 9 names, about 0.8-1.6 per name, i.e. roughly 12-25 at 16 names (estimate; the 7 new
+names are not replayed). The OI rule alone drops 3 / 9.
+
+**Operator steps** (RECORD only; the lifecycle, not the window):
+1. `python -I runner/compose_env.py realtime-v3-options-lifecycle REALTIME_V3_OPTIONS_SLOT_SIDE_BALANCE RECORD`, then the
+   lifecycle hotfix on the batch image. The service reads the switch at start; the allocation runs in the next
+   CAPACITY_SHARDS stage. Before ~14:30 UTC (Nov 17's CATALOG_QUOTE waits for the post-open capture, then
+   CAPACITY_SHARDS ~14:35) it applies to Nov 17; after that stage has completed it applies to Nov 18.
+2. Check right after the restart: `docker logs --since 5m stock-screener-realtime-v3-options-lifecycle 2>&1 | grep
+   OPTIONS_SLOT_SIDE_BALANCE_SETTING` = `"mode":"RECORD"`; after the stage: `... | grep -c
+   OPTIONS_SLOT_SIDE_BALANCE_RECORD` = 1 + the number of names (17 at 16 names), `applied` false, no
+   `OPTIONS_SLOT_SIDE_BALANCE_RECORD_FAILED`; the session's slot set / contract count / CAPACITY_SHARDS evidence as with
+   OFF (RECORD stores nothing new).
+3. Undo: `--remove` the key + lifecycle hotfix (absent = OFF). ON: not before 1-2 RECORD sessions and a liquidity rule
+   decision.
+
+**Not verified.** The 16-name RECORD lines (only in the live stage); ON end-to-end through SESSION_ACTIVATION, the slot
+set and the market-state / provider subscription (the allocation document's schema is unchanged and its contract count
+the same, but no live or DB-backed run); O1 / OS outcomes on the balanced set (passes counted at the close only, not
+alerts); whether the lifecycle restart near the open interrupts a stage lease (the stages were idle / RETRY at 08:5x).

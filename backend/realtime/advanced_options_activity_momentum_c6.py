@@ -4981,7 +4981,10 @@ def _group_rank(
     profile: ActivityMomentumProfile,
     *,
     session_date: date,
+    neutral_side: bool = False,
 ) -> tuple[object, ...]:
+    """`neutral_side` (G106 AL8 side balance, Nov 17): the basket's call priority is ignored (side_priority 0) so calls
+    and puts keep one quality ranking; False (default) is the rank as it was."""
     _minimum_dte, maximum_dte = group.dte_bounds(session_date)
     basket = profile.basket_for(
         dte=maximum_dte,
@@ -5010,7 +5013,7 @@ def _group_rank(
             )
             for row in group.candidates
         )
-        if basket is not None and basket.call_priority
+        if basket is not None and basket.call_priority and not neutral_side
         else 0
     )
     return (
@@ -5169,6 +5172,185 @@ def _v4_fill_product_buckets(
     return used
 
 
+def _group_side(group: ActivityMomentumGroup) -> OptionSide | None:
+    """The group's side when every leg has it; None for a mixed group (it counts for neither side)."""
+    sides = {row.option_side for row in group.candidates}
+    return next(iter(sides)) if len(sides) == 1 else None
+
+
+def _side_counts(groups: Iterable[ActivityMomentumGroup]) -> Counter:
+    """Unique contracts by side over the given groups."""
+    return Counter(
+        side
+        for side in {
+            row.contract_ticker: row.option_side
+            for group in groups
+            for row in group.candidates
+        }.values()
+    )
+
+
+def _side_balanced_next(
+    rows: Iterable[ActivityMomentumGroup],
+    counts: Counter,
+) -> ActivityMomentumGroup | None:
+    """G106 AL8: the first row (queue order) of the side with fewer contracts, a mixed group counting for either;
+    when that side has none left, or the sides are even, the first row."""
+    values = list(rows)
+    if not values:
+        return None
+    calls, puts = counts[OptionSide.CALL], counts[OptionSide.PUT]
+    if calls == puts:
+        return values[0]
+    wanted = OptionSide.PUT if calls > puts else OptionSide.CALL
+    return next(
+        (row for row in values if _group_side(row) in (wanted, None)),
+        values[0],
+    )
+
+
+def _v4_bucket_context(
+    profile: "ActivityMomentumProfile",
+    *,
+    groups: Iterable[ActivityMomentumGroup],
+    session_date: date,
+    expiry_evidence,
+) -> tuple[str, tuple[date, ...], dict[date, int], tuple[ActivityMomentumProductBucket, ...]]:
+    """The product, weekly ladder, listed-expiry ordinals and ordered buckets `_v4_fill_product_buckets` uses."""
+    product = v4_product_kind(expiry_evidence, session_date)
+    expiries = set(() if expiry_evidence is None else expiry_evidence.candidate_expiries)
+    expiries.update(candidate.expiration for group in groups for candidate in group.candidates)
+    ladder = v4_weekly_ladder(session_date, expiries, product)
+    ordinals = {
+        value: index
+        for index, value in enumerate(sorted(value for value in expiries if value > session_date), start=1)
+    }
+    buckets = tuple(sorted(
+        (row for row in profile.product_buckets if row.product == product),
+        key=lambda row: row.order,
+    ))
+    return product, ladder, ordinals, buckets
+
+
+def v4_contract_bucket(
+    candidate: "ActivityMomentumCandidate",
+    *,
+    session_date: date,
+    ladder: tuple[date, ...],
+    ordinals: Mapping[date, int],
+    buckets: Iterable[ActivityMomentumProductBucket],
+) -> str:
+    """G106 AL8 record: the first product bucket (in order) a contract matches, else UNBUCKETED."""
+    for bucket in buckets:
+        if bucket.matches(
+            expiration=candidate.expiration,
+            dte=candidate.dte_for(session_date),
+            ladder=ladder,
+            ordinal=ordinals.get(candidate.expiration),
+        ):
+            return bucket.bucket_id
+    return "UNBUCKETED"
+
+
+def _v4_fill_product_buckets_side_balanced(
+    profile: "ActivityMomentumProfile",
+    *,
+    queue: list,
+    session_date: date,
+    expiry_evidence,
+    share_left: int,
+    take,
+    incremental,
+) -> int:
+    """G106 AL8 (ON): `_v4_fill_product_buckets` with a call/put balance, in (expiry, side) pairs. A bucket's eligible
+    single-contract groups keep the queue's one quality ranking for both sides (the ladder's two expiries interleaved,
+    primary first, as today). The best admissible group leads (either side); it is followed by the best admissible
+    group of the other side at the same expiry (from the same ranking, so about the same |delta| distance from the
+    target), or, when that expiry has none, of the other side at any expiry of the bucket. Each side is capped at half
+    the bucket (rounded up); a side without supply leaves its slots to the later side-balanced rounds."""
+    _product, ladder, ordinals, buckets = _v4_bucket_context(
+        profile,
+        groups=queue,
+        session_date=session_date,
+        expiry_evidence=expiry_evidence,
+    )
+    used = 0
+    for bucket in buckets:
+        eligible = [
+            row
+            for row in queue
+            if len(row.candidates) == 1
+            and bucket.matches(
+                expiration=row.candidates[0].expiration,
+                dte=row.candidates[0].dte_for(session_date),
+                ladder=ladder,
+                ordinal=ordinals.get(row.candidates[0].expiration),
+            )
+        ]
+        if bucket.selector == "WEEKLY_LADDER" and len(ladder) > 1:
+            lanes = [
+                [row for row in eligible if row.candidates[0].expiration == expiration]
+                for expiration in ladder
+            ]
+            eligible = [
+                lane[position]
+                for position in range(max((len(lane) for lane in lanes), default=0))
+                for lane in lanes
+                if position < len(lane)
+            ]
+        side_cap = (bucket.unique_contracts + 1) // 2
+        taken = 0
+        by_side: Counter = Counter()
+
+        def admissible(group) -> bool:
+            cost = incremental(group)
+            return (
+                by_side[group.candidates[0].option_side] < side_cap
+                and cost > 0
+                and used + cost <= share_left
+                and group in queue
+            )
+
+        while taken < bucket.unique_contracts:
+            leader = next((row for row in eligible if admissible(row)), None)
+            if leader is None:
+                break
+            side = leader.candidates[0].option_side
+            expiration = leader.candidates[0].expiration
+            cost = incremental(leader)
+            used += take(leader)
+            taken += cost
+            by_side[side] += cost
+            if taken >= bucket.unique_contracts:
+                break
+            other = OptionSide.PUT if side is OptionSide.CALL else OptionSide.CALL
+            follower = next(
+                (
+                    row
+                    for row in eligible
+                    if row.candidates[0].option_side is other
+                    and row.candidates[0].expiration == expiration
+                    and admissible(row)
+                ),
+                None,
+            ) or next(
+                (
+                    row
+                    for row in eligible
+                    if row.candidates[0].option_side is other
+                    and admissible(row)
+                ),
+                None,
+            )
+            if follower is None:
+                continue
+            cost = incremental(follower)
+            used += take(follower)
+            taken += cost
+            by_side[other] += cost
+    return used
+
+
 def allocate_activity_momentum(
     profile: ActivityMomentumProfile,
     *,
@@ -5182,13 +5364,26 @@ def allocate_activity_momentum(
     effective_provider_project_ceiling: int | None = None,
     resolution: ActivityMomentumResolution | None = None,
     priority_order: Iterable[str] | None = None,
+    side_balance: bool = False,
 ) -> ActivityMomentumAllocation:
     """`priority_order` (G102 universe sizing O-5, Nov 15): the operator's underlying priority (first = most
     important). Used only when the budget cannot give every eligible underlying a contract: underlyings are then
     served in priority order, so the lowest-priority ones are the ones left without contracts (UNAVAILABLE for the
-    day) instead of a hash-rotated choice. Otherwise the allocation is unchanged."""
+    day) instead of a hash-rotated choice. Otherwise the allocation is unchanged.
+
+    `side_balance` (G106 AL8, Nov 17; v4 profile only; False = the allocation as it was, byte for byte): calls and
+    puts share one quality ranking (no call priority in the sort), the product buckets fill per (expiry, side) lanes
+    with each side capped at half a bucket (`_v4_fill_product_buckets_side_balanced`), and every later round takes
+    the next group of the side with fewer contracts (per basket in the basket rounds, per underlying after)."""
     if not isinstance(profile, ActivityMomentumProfile):
         raise TypeError("activity/momentum profile is invalid")
+    if side_balance is not False and (
+        side_balance is not True
+        or profile.version != V4_ACTIVITY_MOMENTUM_PROFILE_VERSION
+    ):
+        raise ValueError(
+            "activity/momentum side balance requires the v4 profile"
+        )
     configured_budget = (
         profile.active_quote_contract_budget
         if active_contract_budget is None
@@ -5312,6 +5507,7 @@ def allocate_activity_momentum(
                 row,
                 profile,
                 session_date=session_date,
+                neutral_side=side_balance,
             )
         )
     eligible = tuple(sorted(
@@ -5463,7 +5659,11 @@ def allocate_activity_momentum(
             expiry_targets = []
             if profile.version == V4_ACTIVITY_MOMENTUM_PROFILE_VERSION:
                 # V4.1: the product buckets replace v3's near / end-of-week expiry targets.
-                used_by_underlying[underlying] += _v4_fill_product_buckets(
+                used_by_underlying[underlying] += (
+                    _v4_fill_product_buckets_side_balanced
+                    if side_balance
+                    else _v4_fill_product_buckets
+                )(
                     profile,
                     queue=queue,
                     session_date=session_date,
@@ -5676,26 +5876,46 @@ def allocate_activity_momentum(
                     }
                     if len(basket_tickers) >= target:
                         break
-                    group = next(
-                        (
-                            row
-                            for row in remaining[underlying]
-                            if (
-                                row_basket := profile.basket_for(
-                                    dte=row.dte_bounds(
-                                        session_date
-                                    )[1],
-                                    roles=row.roles,
-                                )
+                    basket_rows = (
+                        row
+                        for row in remaining[underlying]
+                        if (
+                            row_basket := profile.basket_for(
+                                dte=row.dte_bounds(
+                                    session_date
+                                )[1],
+                                roles=row.roles,
                             )
-                            is not None
-                            and row_basket.basket_id
-                            == basket.basket_id
-                            and used_by_underlying[underlying]
-                            + incremental(row)
-                            <= initial_share
-                        ),
-                        None,
+                        )
+                        is not None
+                        and row_basket.basket_id
+                        == basket.basket_id
+                        and used_by_underlying[underlying]
+                        + incremental(row)
+                        <= initial_share
+                    )
+                    group = (
+                        _side_balanced_next(
+                            basket_rows,
+                            _side_counts(
+                                selected_group
+                                for selected_group in selected_groups
+                                if selected_group.underlying == underlying
+                                and (
+                                    selected_basket := profile.basket_for(
+                                        dte=selected_group.dte_bounds(
+                                            session_date
+                                        )[1],
+                                        roles=selected_group.roles,
+                                    )
+                                )
+                                is not None
+                                and selected_basket.basket_id
+                                == basket.basket_id
+                            ),
+                        )
+                        if side_balance
+                        else next(basket_rows, None)
                     )
                     if group is None:
                         break
@@ -5704,19 +5924,28 @@ def allocate_activity_momentum(
                         group,
                     )
         while remaining[underlying]:
-            group = next(
-                (
-                    row
-                    for row in remaining[underlying]
-                    if used_by_underlying[underlying]
-                    + incremental(row)
-                    <= initial_share
-                    and within_v3_basket_limit(
-                        underlying,
-                        row,
-                    )
-                ),
-                None,
+            share_rows = (
+                row
+                for row in remaining[underlying]
+                if used_by_underlying[underlying]
+                + incremental(row)
+                <= initial_share
+                and within_v3_basket_limit(
+                    underlying,
+                    row,
+                )
+            )
+            group = (
+                _side_balanced_next(
+                    share_rows,
+                    _side_counts(
+                        selected_group
+                        for selected_group in selected_groups
+                        if selected_group.underlying == underlying
+                    ),
+                )
+                if side_balance
+                else next(share_rows, None)
             )
             if group is None:
                 break
@@ -5732,22 +5961,31 @@ def allocate_activity_momentum(
             queue = remaining[underlying]
             if not queue:
                 continue
-            group = next(
-                (
-                    row
-                    for row in queue
-                    if used_by_underlying[underlying]
-                    + incremental(row)
-                    <= per_underlying_limit
-                    and len(selected_tickers)
-                    + incremental(row)
-                    <= budget
-                    and within_v3_basket_limit(
-                        underlying,
-                        row,
-                    )
-                ),
-                None,
+            budget_rows = (
+                row
+                for row in queue
+                if used_by_underlying[underlying]
+                + incremental(row)
+                <= per_underlying_limit
+                and len(selected_tickers)
+                + incremental(row)
+                <= budget
+                and within_v3_basket_limit(
+                    underlying,
+                    row,
+                )
+            )
+            group = (
+                _side_balanced_next(
+                    budget_rows,
+                    _side_counts(
+                        selected_group
+                        for selected_group in selected_groups
+                        if selected_group.underlying == underlying
+                    ),
+                )
+                if side_balance
+                else next(budget_rows, None)
             )
             if group is None:
                 continue

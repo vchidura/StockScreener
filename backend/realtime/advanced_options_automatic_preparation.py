@@ -62,6 +62,11 @@ from .advanced_options_activity_momentum_c6 import (
     load_activity_momentum_profile,
     resolve_activity_momentum_selection,
 )
+from .advanced_options_slot_side_balance import (
+    SlotSideBalanceMode,
+    allocate_with_side_balance,
+    parse_slot_side_balance_mode,
+)
 from .advanced_options_lifecycle import (
     AdvancedOptionsPreparationClaim,
     AdvancedOptionsPreparationExecutor,
@@ -311,7 +316,21 @@ class PostgresAutomaticOptionsPreparationExecutor(
         clock=lambda: datetime.now(UTC),
         selection_source_factory=None,
         combined_capture_factory=None,
+        slot_side_balance: SlotSideBalanceMode | str = SlotSideBalanceMode.OFF,
     ) -> None:
+        # G106 AL8: REALTIME_V3_OPTIONS_SLOT_SIDE_BALANCE (OFF / RECORD / ON); anything else, or not OFF with a
+        # non-v4 admission profile, refuses the configuration (the lifecycle service does not start).
+        slot_side_balance = parse_slot_side_balance_mode(slot_side_balance)
+        if (
+            slot_side_balance is not SlotSideBalanceMode.OFF
+            and admission_profile_version
+            != V4_ACTIVITY_MOMENTUM_PROFILE_VERSION
+        ):
+            raise ValueError(
+                "automatic Options preparation configuration is invalid: "
+                "the slot side balance requires the v4 admission profile"
+            )
+        self._slot_side_balance = slot_side_balance
         if (
             not isinstance(provider, V2ConnectionProvider)
             or not api_key.strip()
@@ -1184,8 +1203,7 @@ class PostgresAutomaticOptionsPreparationExecutor(
             enabled_strategies=self._enabled_strategies,
             **resolution_arguments,
         )
-        allocation = allocate_activity_momentum(
-            profile,
+        allocation_arguments = dict(
             session_date=claim.session_date,
             rotation_key=f"advanced-realtime-v3:{claim.revision_id}",
             ready_underlyings=claim.option_underlyings,
@@ -1202,6 +1220,20 @@ class PostgresAutomaticOptionsPreparationExecutor(
             ),
             resolution=resolution,
             priority_order=self._underlying_priority_order(claim),
+        )
+        # G106 AL8: OFF = this call alone (today's allocation); RECORD = the same allocation, the balanced one only
+        # logged; ON = the balanced allocation.
+        allocation = allocate_with_side_balance(
+            allocate_activity_momentum,
+            mode=getattr(
+                self,
+                "_slot_side_balance",
+                SlotSideBalanceMode.OFF,
+            ),
+            profile=profile,
+            resolution=resolution,
+            session_date=claim.session_date,
+            arguments=allocation_arguments,
         )
         selected = set(allocation.selected_contract_tickers)
         if not selected:
