@@ -156,7 +156,8 @@ class ShardWorker:
         started = time.perf_counter()
         loader, state, warm = self.pair.take(scope["cohort_id"], scope["cutoff"])
         self._cycle = dict(cohort_id=scope["cohort_id"], cutoff=scope["cutoff"], loader=loader, state=state,
-                           warm=warm, sequence=sequence)
+                           warm=warm, sequence=sequence,
+                           depth={key: scope[key] for key in ("intraday_depth",) if key in scope})  # R83-0
         try:
             if self._database is None:
                 self._database = self._database_factory()
@@ -188,7 +189,7 @@ class ShardWorker:
             projection = project_realtime_ticker_workspace(
                 cycle["inputs"], market_events=events, market_event_coverage=event_coverage,
                 fundamental_reports=reports, fundamental_coverage=coverage, state=cycle["state"],
-                member_filter=frozenset(cycle["group"]), screening_override=screening,
+                member_filter=frozenset(cycle["group"]), screening_override=screening, **cycle["depth"],
             )
         except BaseException:
             self._settle(complete=False)
@@ -314,15 +315,16 @@ class TickerProjectionShardPool:
         except (EOFError, OSError) as error:
             raise ShardWorkerFailed(f"ticker shard {index} connection lost: {error}") from error
 
-    def project(self, inputs, *, state, should_stop=None):
-        """The cycle's projection: the coordinator's prologue and screening, then every group's workspaces."""
+    def project(self, inputs, *, state, should_stop=None, **depth):
+        """The cycle's projection: the coordinator's prologue and screening, then every group's workspaces.
+        `depth` (R83-0): the cycle's `intraday_depth`, when set."""
         with self._lock:
             if not self._prepared:
                 raise RuntimeError("ticker shard pool was not prepared for this cycle")
             self._prepared = False
             self._drained = False
             try:
-                return self._project(inputs, state=state, should_stop=should_stop)
+                return self._project(inputs, state=state, should_stop=should_stop, **depth)
             except BaseException:
                 # A cancelled or broken cycle leaves replies in flight: start over (the workers start cold). After
                 # every reply was read (a worker raised, or no member is available) the workers are idle and keep
@@ -331,10 +333,10 @@ class TickerProjectionShardPool:
                     self.reset()
                 raise
 
-    def _project(self, inputs, *, state, should_stop):
+    def _project(self, inputs, *, state, should_stop, **depth):
         started = time.perf_counter()
         base = project_realtime_ticker_workspace(inputs, state=state, should_stop=should_stop,
-                                                 member_filter=frozenset())
+                                                 member_filter=frozenset(), **depth)
         screened = time.perf_counter()
         tickers = [member["ticker"] for member in inputs.members]
         expected = [shard_tickers(tickers, index, self.count) for index in range(self.count)]

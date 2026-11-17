@@ -3377,6 +3377,125 @@ export const getOptionFlow = async (
   return response.data
 }
 
+/** G106 OV1 (Nov 16): dealer exposure per strike and expiry from the stored chain capture (`/api/options/exposure`). */
+export type OptionExposureGreek = 'gamma' | 'delta' | 'charm' | 'vanna'
+export type OptionExposureWeight = 'oi' | 'oi_volume'
+export type OptionExposureScope = '0dte' | '7d' | 'all'
+
+export interface OptionExposureStrike {
+  strike: string
+  call: number
+  put: number
+  net: number
+  call_open_interest: number
+  put_open_interest: number
+}
+
+export interface OptionExposureExpiry {
+  expiration_date: string
+  calendar_dte: number
+  call: number
+  put: number
+  net: number
+  absolute: number
+  share: number
+  contracts: number
+}
+
+export interface OptionExposureLevel {
+  strike: string
+  gamma_notional_per_percent: number
+  distance_to_spot_fraction: number
+}
+
+export interface OptionExposureRead {
+  contract: 'options-exposure-read-v1'
+  available: boolean
+  reason: string | null
+  underlyer: string
+  greek: OptionExposureGreek
+  weight: OptionExposureWeight
+  scope: OptionExposureScope
+  greeks_enabled: OptionExposureGreek[]
+  underlyers?: string[]
+  session_date?: string
+  observed_at?: string
+  spot?: string
+  convention?: string
+  units?: { value: string; shares: string }
+  definitions?: string
+  totals?: { net: number; call: number; put: number; absolute: number; net_shares: number; contracts: number }
+  levels?: {
+    flip_spot: string | null
+    flip_distance_to_spot_fraction: number | null
+    regime_at_spot: 'POSITIVE_GAMMA' | 'NEGATIVE_GAMMA' | 'UNDETERMINED'
+    flip_search: { low: string; high: string; crossings: number }
+    call_wall: OptionExposureLevel | null
+    put_wall: OptionExposureLevel | null
+    peak_gamma_strike: string | null
+    gamma_walls: Array<{ strike: string; share: number; distance_to_spot_fraction: number }>
+    net_gamma_notional_per_percent: number
+  }
+  strikes?: OptionExposureStrike[]
+  expiries?: OptionExposureExpiry[]
+  /** [strike index, expiry index, call, put] for every filled cell. */
+  grid?: Array<[number, number, number, number]>
+  largest_levels?: Array<{ strike: string; net: number; call: number; put: number; share: number;
+    distance_to_spot_fraction: number; tags: string[] }>
+  expiring_today_share?: number
+  coverage?: {
+    capture_contracts: number
+    earlier_capture_rows_excluded: number
+    scope_contracts: number
+    contributing_contracts: number
+    skipped: { zero_weight: number; expired: number; no_greek: number }
+    weight_in_scope: number
+    weight_with_greeks: number
+    weight_coverage_fraction: number | null
+    provider_iv_contracts: number
+    strike_low: string | null
+    strike_high: string | null
+    strike_band_fraction: [number, number] | null
+    expiry_first: string | null
+    expiry_last: string | null
+    expiry_count: number
+    /** The capture's spot (equity bar at its cutoff) against the provider's underlying price on the quotes. */
+    spot_check?: { spot: string; quote_underlying_price: string | null; gap_fraction: number | null }
+  }
+  cross_check?: {
+    source: string
+    contracts_compared: number
+    provider_missing_contracts: number
+    local_absolute: number
+    provider_absolute: number
+    local_net: number
+    provider_net: number
+    difference_fraction: number | null
+    net_difference_fraction: number | null
+  }
+  capture?: { latest_capture_state: string; latest_capture_at: string; latest_capture_reason: string | null } | null
+  quality_reasons: string[]
+  execution_permission: false
+}
+
+export const getOptionExposure = async (params: {
+  underlyer: string
+  greek: OptionExposureGreek
+  weight: OptionExposureWeight
+  scope: OptionExposureScope
+  sessionDate?: string
+}): Promise<OptionExposureRead> => {
+  requireRealtimeOptionsReads()
+  const response = await api.get<OptionExposureRead>('/options/exposure', { params: optionParams({
+    underlyer: params.underlyer,
+    greek: params.greek,
+    weight: params.weight,
+    scope: params.scope,
+    session_date: params.sessionDate,
+  }) })
+  return response.data
+}
+
 export const getOptionCandidates = async (params?: {
   category?: OptionCandidatePersona
   session_date?: string

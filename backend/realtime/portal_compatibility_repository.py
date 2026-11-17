@@ -577,6 +577,24 @@ class _RealtimeCompatibilityRepository:
 
 
 class RealtimeOptionFlowRepository(_RealtimeCompatibilityRepository):
+    def iv_summary(
+        self,
+        *,
+        available_by: datetime,
+        underlyer: str,
+        session_date: date | None = None,
+    ) -> dict[str, object]:
+        """G106 A2: IV summary per tenor from the stored chain capture (`options_iv_summary_read`)."""
+        from .options_iv_summary_read import iv_summary_from_breadth_cursor
+
+        cutoff = _utc(available_by, "available_by")
+        symbol = (underlyer or "").strip().upper()
+        if not _TICKER_PATTERN.fullmatch(symbol):
+            raise ValueError("Invalid Options IV summary underlying")
+        with self._cursor() as cursor:
+            self._begin(cursor)
+            return iv_summary_from_breadth_cursor(cursor, underlyer=symbol, available_by=cutoff, session_date=session_date)
+
     def gamma(
         self,
         *,
@@ -594,6 +612,29 @@ class RealtimeOptionFlowRepository(_RealtimeCompatibilityRepository):
         with self._cursor() as cursor:
             self._begin(cursor)
             return gamma_from_breadth_cursor(cursor, underlyer=symbol, available_by=cutoff, session_date=session_date)
+
+    def exposure(
+        self,
+        *,
+        available_by: datetime,
+        underlyer: str,
+        greek: str = "gamma",
+        weight: str = "oi",
+        scope: str = "all",
+        session_date: date | None = None,
+    ) -> dict[str, object]:
+        """G106 OV1: dealer exposure per strike, expiry and strike x expiry from the stored chain capture
+        (`options_exposure_read`)."""
+        from .options_exposure_read import exposure_from_breadth_cursor
+
+        cutoff = _utc(available_by, "available_by")
+        symbol = (underlyer or "").strip().upper()
+        if not _TICKER_PATTERN.fullmatch(symbol):
+            raise ValueError("Invalid Options exposure underlying")
+        with self._cursor() as cursor:
+            self._begin(cursor)
+            return exposure_from_breadth_cursor(cursor, underlyer=symbol, available_by=cutoff, greek=greek,
+                                                weight=weight, scope=scope, session_date=session_date)
 
     def flow(
         self,

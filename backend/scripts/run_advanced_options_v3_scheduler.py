@@ -45,6 +45,10 @@ def parse_args(argv=None):
     )
     if args.poll_seconds <= 0 or not args.continuous or not args.execute:
         parser.error("Options scheduler requires --continuous --execute and positive polling")
+    # G106 OV1-F2: an invalid REALTIME_V3_BREADTH_SPOT_SOURCE stops the scheduler at start (never silently BAR).
+    from realtime.options_breadth_spot import breadth_spot_mode
+
+    breadth_spot_mode()
     return args
 
 

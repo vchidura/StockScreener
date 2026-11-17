@@ -3436,3 +3436,96 @@ Options Alerts Nov 10-16, strategies without drift; `/strategies/daily?interval=
 produced by the JOB mode, not R84), scheduler r128 22:31:41-22:32:21 (re-ran AFTER_CLOSE once with the new content identity:
 PUBLISHED generation 16). A second scheduler restart (22:33) to test restart stability hit R95 (prepared lookup vs the kept
 Dashboard); products stay served.
+
+## Nov 17 (Tue) 04:20-05:30 UTC - R83-0: the Equity window carries a shorter 1m/5m/15m history (build session; not deployed)
+
+Build session from the live session's brief. Worktree `StockScreener.worktrees/r83-0-intraday-history`, branch
+`r83-0-intraday-history` from main 67d47b9 (= r128 code), **uncommitted, no image built, nothing deployed, no live
+write**. Rehearsal only on `g102-test-pg` (`g102-test-net`), copy `test_realtime_v2_recovery_20261104r120svc` (Nov 15
+backup: Nov 12 and 13 sessions), worktree code mounted on the r128 image, one 8 GB-capped process at a time.
+
+**Audit (who needs 1m/5m/15m in the window path).**
+- Window load (`include_portal_history`): 1m/5m/15m/30m/1h RAW for 90 sessions, then the source closure. Nov 13 close
+  at 45 names: 743,872 bars = 1m 210,208 (4,671 per ticker, about 12 sessions: every stream session since Oct 23 plus
+  the REST backfill; the predicate admits 90, so this grows by ~390 bars per ticker per session), 5m 315,900 (90
+  sessions), 15m 105,300 (90).
+- Projection: 1m chart = 5 sessions (completeness check); 5m chart = 90 sessions; every stream 5m bar is re-derived from
+  its 1m bars (this is why all stream-session minutes are loaded); 15m/30m/1h/raw daily are re-derived per session from
+  5m (why 5m is loaded for 90 sessions). Screening: adjusted daily 283, raw daily and 1h last 20 sessions plus their
+  5m/1m closure. Setups/trade plans 30m/1h (last 500), 1d/1wk/1mo; Pattern Watch 30m/1h/1d/1wk/1mo (last 300); retired
+  5m/15m price channels last 300 bars (5m >= 4 full sessions, 15m >= 12); quote = latest 5m bar; summary charts 1d/1wk.
+- Not the window: Ticker page chart API serves points from `rt.bar_head` at read time over the published lineage head
+  (count, range, chain), no fixed length; frontend defaults 1m 1d, 5m 5d, 15m/30m 1mo, 1h 3mo (indicators client side,
+  hidden when short); canonical Stock Alerts read their own bars (5m today; research rules 30m 45 sessions, 1h 60, 1d
+  330) and bind to INPUT_READY (identity independent of the window's bars); Options O3/OS1/OS2/P8 read the bar tables;
+  R78 daily products have their own narrow loader; preparation/readiness count 1m/5m sessions in the bar tables.
+
+**Change (switch `REALTIME_V2_EQUITY_INTRADAY_HISTORY_SESSIONS`, scheduler only; unset/empty/OFF/FULL = today).**
+Value `1m:<n>,5m:<n>,15m:<n>` (bounds 1-5 / 6-90 / 14-90; invalid = warning + today's behaviour). Proposed
+`1m:2,5m:10,15m:22` (22 = the 15m default 1mo view). ON: the window load keeps the last n sessions of 1m/5m/15m
+(`BAR_DEPTH_PREDICATE`, parameters appended to the loader identity), closes the source lineage only of the derived bars it
+re-verifies (stream 5m inside the 1m sessions; 15m/30m/1h/raw daily inside the 5m sessions), and marks the input
+`STORED_ACCEPTED` (R78's mode: older derived bars keep their stored lineage); the projection checks and charts the bounded
+groups. Files: `realtime/equity_intraday_history.py` (new), `screening_repository.py`, `screening_delta_loader.py`,
+`ticker_projection.py`, `ticker_repository.py`, `ticker_projection_shards.py`; tests
+`tests/realtime/test_equity_intraday_history_r83.py` (new).
+
+**Tests.** New file 55 passed (switch parsing, window and closure roots, bounded counts, OFF statements/params identical,
+ON loader keeps the depth and the re-verified closure only, ON delta = bounded full load over 6 cutoffs, identity change
+= full reload, ON projection keeps every golden digest of the nine-name fixture except the input digests, stream 5m inside
+the 1m depth still rejected when corrupt, cycle wiring). Neighbour suites, new vs r128 code (same files): 8 suites 441
+passed / 3 failed vs 441 / 3 (same 3: `test_ticker_vertical_slice` closing picker, nine-ticker parity, evidence drift
+[split]); 26 suites 366 passed / 9 failed vs 366 / 9 (same 9). The golden test (`test_ticker_projection_golden`) passes:
+OFF output on the fixture unchanged.
+
+**Rehearsal** (`runner/r120_equity_window_parity.py` copy with the depth passed as `_project_ticker_cycle` passes it,
+per-snapshot payload/manifest digests raw, with the ticker_projection.py source digest mapped ("canon") and normalized,
+screening rows/manifest keys, every evidence row, `inputs_sha256`, bars per interval, VmHWM/VmRSS from /proc;
+`REALTIME_V2_PATTERN_WATCH=LIGHT`; writes rolled back). BASE = r128 code (main), OFF = this branch with the switch unset,
+ON = `1m:2,5m:10,15m:22`. Nov 13 cohort `e2ad1a24` (45 names): 14:40 cold + 14:45/14:50 warm, 16:15 cold + 16:20/16:25
+warm, 21:00 cold; Nov 12 cohort `6567e0d5` (25 names): 15:30 cold + 15:35 warm. Every run: 0 unavailable members.
+- **OFF vs BASE, 9 cutoffs:** workspace payloads byte-identical (raw); workspace manifests differ only by `code_sha256`
+  (the ticker_projection.py source digest, as with any edit of that file); the PLATFORM summary and Pattern Watch
+  publications only by their workspace-set digests (which embed those manifests); normalized 0 differences; screening
+  rows and manifest, evidence, `inputs_sha256`, bars equal. With the r128 ticker_projection.py digest stamped into the OFF run (21:00 cold): **every published snapshot (payload
+  and manifest), the screening generation, the evidence and `inputs_sha256` byte-identical** to BASE.
+- **ON vs BASE, 9 cutoffs:** screening rows equal; evidence equal (2,050 rows at the close); setups/trade plans
+  (`multi`), Pattern Watch rows and channels (`patterns`, `channels`, `cross_patterns`), quote, frames and evidence index
+  equal (every workspace payload key except `context` and CRWD's chart keys below); changed by design: workspace `context.cohort.generation`
+  (screening digest), manifest `bar_lineage` (1m/5m/15m heads) and `input_sha256`, screening manifest `input_sha256`
+  and `generation`, cycle `inputs_sha256`, PLATFORM workspace sets. With `context.cohort.generation` removed (14:40 cold), 44 of 45 workspace payloads are byte-identical;
+  the 45th is CRWD. One content change: **CRWD's 1m chart is
+  published again** (chart_refs + `1m`, `chart:1m` NATIVE_1M_HISTORY_INCOMPLETE gone): its Nov 9 no-trade minute is
+  outside the 2-session 1m depth. AAPL heads at the close: 1m 1,950 -> 780 (Nov 12-13), 5m 7,020 -> 780 (Nov 2-13),
+  15m 2,340 -> 572 (Oct 15-Nov 13), 30m 1,170 and 1h 630 unchanged.
+- **Memory and time** (process VmHWM; warm = VmRSS after gc at the warm cutoffs; one process per segment):
+
+  | Cutoff (Nov 13, 45 names) | bars BASE -> ON | peak GB BASE -> ON | seconds BASE -> ON (load) |
+  |---|---|---|---|
+  | 14:40 cold | 724,739 -> 185,760 | 5.34 -> 1.67 | 115 (52) -> 47 (13) |
+  | 14:45 / 14:50 warm | +270 per window | 5.40 / 5.39 -> 1.69 / 1.69 | 25 / 23 -> 14 / 15 |
+  | 16:15 cold | 730,409 -> 191,430 | 5.39 -> 1.72 | 141 (45) -> 81 (14) |
+  | 16:20 / 16:25 warm | | 5.44 / 5.43 -> 1.73 / 1.73 | 28 / 30 -> 17 / 18 |
+  | 21:00 cold | 743,872 -> 208,403 | 5.50 -> 1.84 | 191-201 (55-57) -> 93-121 (19-24) |
+  | Nov 12 15:30 cold (25 names) | 441,300 -> 104,991 | 3.31 -> 1.04 | 81 -> 46 |
+
+  ON at the close: 1m 210,208 -> 35,099, 5m 315,900 -> 35,100, 15m 105,300 -> 25,740, every other interval identical
+  (no closure rows outside the depth). OFF = BASE in memory and time (within run-to-run noise).
+- **Recovery equivalence (ON):** the stateless full load (`load_realtime_screening_input`, what rehydration uses) and the
+  delta loader return the same bar ids in the same order and the same `inputs_sha256` at 14:40 (cold; 185,760 bars, 225
+  closure rows), 14:45 (delta, 270 new rows) and 16:15 (delta, 5,535 new rows).
+
+**Not verified:** the R75-v2 shard path with the switch ON (shards are off live; wiring passes the depth, unit tests of the
+shard module pass with the switch unset); a whole live session (the stream finalizer's new bars over many windows; the
+rehearsal covers delta advances over three windows); `test_screening_delta_loader_db.py` (the real-schema SQL suite) was
+not run (the bounded SQL ran on the copy instead).
+
+**Deploy note.** Scheduler only (`realtime-v2-advanced-scheduler`), image from main + this branch; set
+`REALTIME_V2_EQUITY_INTRADAY_HISTORY_SESSIONS=1m:2,5m:10,15m:22` with a restart outside the session (a cycle computed
+in the other mode fails its recovery closed); log line `equity_intraday_history depth=... bars=...` per window. Undo:
+unset the switch (restart) - the image is inert without it. The API, frontend and other services need nothing.
+
+
+**Artifacts (scratchpad of the build session, not in the repo):** runner copy `r83_equity_window_parity.py`,
+`r83_full_vs_delta.py`, `summarize.py`, outputs `out/*.json`. `g102-test-pg` stopped afterwards as found; the
+`hopeful_neumann` container (r121 image) seen during the runs is not this session's and was left alone.

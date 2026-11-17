@@ -37,7 +37,7 @@ test('both deployment modes retain the full portal shell and shared realtime ada
     '/', '/overview', '/market-conditions', '/sector-intelligence', '/pattern-watch',
     '/ticker/:symbol', '/stocks/screener', '/stocks/alerts', '/stocks/persistence',
     '/gaps', '/ma-crossover', '/momentum-pullback', '/bearish-bounce', '/fibonacci',
-    '/options/activity', '/options/flow', '/options/screener', '/options/alerts',
+    '/options/overview', '/options/activity', '/options/flow', '/options/screener', '/options/alerts',
   ]) {
     assert.ok(app.includes(`path="${route}"`), `missing restored route ${route}`)
   }

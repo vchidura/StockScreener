@@ -412,9 +412,36 @@ def _docker_service_main(argv) -> int | None:
     )
     if kind is AdvancedOptionsProcessKind.WINDOW:
         # G106 AL2: an invalid REALTIME_V3_O1_DEBIT_VERTICAL stops the window service at start (never silently OFF).
-        from realtime.advanced_options_o1_debit_vertical import o1_debit_vertical_mode
+        from realtime.advanced_options_o1_debit_vertical import o1_debit_vertical_mode, o1_debit_vertical_policy
 
         o1_debit_vertical_mode()
+        # G102 R87: likewise REALTIME_V3_O1_LIQUIDITY_FLOOR (OFF / RECORD / ON), and (Nov 17) the thresholds of both
+        # liquidity rules from the environment (REALTIME_V3_O1_LIQUIDITY_FLOOR_MIN_*, REALTIME_V3_O1_DEBIT_VERTICAL_LEG_
+        # MIN_*): a value that is not a non-negative integer stops the service here. Read once per process: the
+        # windows of this process use these values.
+        from realtime.advanced_options_o1_liquidity_floor import o1_liquidity_floor_mode, o1_liquidity_floor_policy
+
+        o1_liquidity_floor_mode()
+        o1_liquidity_floor_policy()
+        o1_debit_vertical_policy()
+        # G106 AL5: REALTIME_V3_OS_PARTICIPATION (OFF / RECORD / ON) and its record-only alternative thresholds.
+        from realtime.advanced_options_os_participation import os_participation_mode, os_participation_policy
+
+        os_participation_mode()
+        os_participation_policy()
+        # G106 AL6 / AL7: REALTIME_V3_O1_ZERO_DTE and REALTIME_V3_O1_AGGRESSOR_SIDE (OFF / RECORD / ON) and their
+        # thresholds (REALTIME_V3_O1_MIN_DTE, REALTIME_V3_O1_AGGRESSOR_MIN_DOMINANCE_PCT / _MIN_SIDE_PREMIUM).
+        from realtime.advanced_options_o1_gates import (
+            o1_aggressor_side_mode,
+            o1_aggressor_side_policy,
+            o1_min_dte_policy,
+            o1_zero_dte_mode,
+        )
+
+        o1_zero_dte_mode()
+        o1_min_dte_policy()
+        o1_aggressor_side_mode()
+        o1_aggressor_side_policy()
     provider = None
     pool = None
     if args.state_source == POSTGRES_STATE_SOURCE:

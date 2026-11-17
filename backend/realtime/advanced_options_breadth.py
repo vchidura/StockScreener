@@ -35,6 +35,10 @@ from .acquisition_ledger import (
 from .contracts import canonical_sha256
 from .database_access_v2 import APP_ROLE
 from .fault_journal import emit_fault
+from .options_breadth_spot import (
+    SOURCE_BAR, BreadthSpotMode, ParitySpot, ProviderSpot, SpotChoice, breadth_spot_mode, choose_breadth_spot,
+    log_record, record_document, spot_effect,
+)
 from .provider_budget import (
     MASSIVE_ADVANCED_ACCOUNT_DECODED_BYTE_CEILING, MASSIVE_ADVANCED_ACCOUNT_REQUEST_CEILING, ProviderBudgetExceeded,
     ProviderBudgetScope, reserve_coordinated_provider_request_cursor,
@@ -84,6 +88,10 @@ class BreadthRow:
     theta: float | None
     vega: float | None
     underlying_price: Decimal | None
+    # G106 OV1-F2: when the provider's underlying price was last updated and whether it is real-time; read only by the
+    # quote spot (`options_breadth_spot`), never stored.
+    underlying_price_at: datetime | None = None
+    underlying_timeframe: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -184,6 +192,9 @@ def parse_breadth_page(document: Mapping[str, object], *, underlying: str) -> tu
             theta=_ratio(greeks.get("theta")),
             vega=_ratio(greeks.get("vega")),
             underlying_price=_decimal(asset.get("price")),
+            underlying_price_at=_nanoseconds(asset.get("last_updated")),
+            underlying_timeframe=(str(asset.get("timeframe")).strip().upper()[:16] or None)
+            if asset.get("timeframe") is not None else None,
         ))
     return rows, skipped
 
@@ -502,6 +513,7 @@ def capture_options_breadth(
     except Exception as error:  # noqa: BLE001 - our Greeks then read VALUATION_INPUT_UNAVAILABLE
         _LOGGER.warning("options_breadth_valuation_inputs_unavailable error=%s", error)
         valuation_inputs = ()
+    spot_mode = _spot_mode()
     for underlying in underlyings:
         started = clock()
         spot = spots.get(underlying)
@@ -519,13 +531,38 @@ def capture_options_breadth(
             _LOGGER.warning("options_breadth_capture_failed underlying=%s error=%s", underlying, error)
             captured = UnderlyingBreadth(underlying, (), 0, 0, 0, "FAILED", f"{type(error).__name__}: {error}"[:160])
         observed = clock()
+        # G106 OV1-F2: REALTIME_V3_BREADTH_SPOT_SOURCE. BAR (the default) solves at the bar spot exactly as before;
+        # RECORD and QUOTE also work out the quote spot (`options_breadth_spot`), and QUOTE solves at it.
+        choice = None
+        if spot_mode is not BreadthSpotMode.BAR and captured.rows:
+            choice = _choose_spot(captured, spot, valuation_inputs, max(observed, started))
+        solve_spot = (
+            choice.quote_spot
+            if choice is not None and spot_mode is BreadthSpotMode.QUOTE and choice.quote_spot is not None else spot
+        )
         try:
             local = breadth_local_greeks(
-                captured.rows, spot=spot, valuation_inputs=valuation_inputs, observed_at=max(observed, started),
+                captured.rows, spot=solve_spot, valuation_inputs=valuation_inputs, observed_at=max(observed, started),
             ) if captured.rows else {}
         except Exception as error:  # noqa: BLE001 - the provider's values still store; ours read unavailable
             _LOGGER.warning("options_breadth_local_greeks_failed underlying=%s error=%s", underlying, error)
             local = {}
+            if solve_spot is not spot:
+                # The quote spot never costs us our values: solve again at the bar spot.
+                solve_spot, choice = spot, _bar_fallback(choice, f"QUOTE_SOLVE_FAILED:{type(error).__name__}")
+                try:
+                    local = breadth_local_greeks(
+                        captured.rows, spot=spot, valuation_inputs=valuation_inputs,
+                        observed_at=max(observed, started),
+                    )
+                except Exception as retry:  # noqa: BLE001
+                    _LOGGER.warning("options_breadth_local_greeks_failed underlying=%s error=%s", underlying, retry)
+                    local = {}
+        if choice is not None:
+            _record_spot(
+                spot_mode, captured, choice, local=local, used_spot=solve_spot, valuation_inputs=valuation_inputs,
+                session_date=session_date, equity_cutoff=equity_cutoff, observed_at=max(observed, started),
+            )
         try:
             with provider.transaction(APP_ROLE) as unit:
                 persist_breadth_cursor(
@@ -541,10 +578,61 @@ def capture_options_breadth(
             "state": captured.state, "contracts": len(captured.rows), "pages": captured.pages,
             "seconds": round((observed - started).total_seconds(), 1),
             **({"reason": captured.reason} if captured.reason else {}),
+            **({"spot_source": choice.source} if choice is not None and spot_mode is BreadthSpotMode.QUOTE else {}),
         }
         if captured.state != "COMPLETE":
             _report_capture_fault(underlying, equity_cutoff, summary[underlying])
     return summary
+
+
+def _spot_mode() -> BreadthSpotMode:
+    """The OV1-F2 switch; the scheduler refuses an invalid value at start, so here it only falls back to BAR."""
+    try:
+        return breadth_spot_mode()
+    except ValueError as error:
+        _LOGGER.warning("options_breadth_spot_source_invalid error=%s", error)
+        return BreadthSpotMode.BAR
+
+
+def _choose_spot(captured, bar_spot, valuation_inputs, observed_at) -> SpotChoice:
+    try:
+        return choose_breadth_spot(
+            captured.rows, underlying=captured.underlying, bar_spot=bar_spot, valuation_inputs=valuation_inputs,
+            observed_at=observed_at,
+        )
+    except Exception as error:  # noqa: BLE001 - never fails a capture: the bar spot remains
+        return SpotChoice(spot=bar_spot, source=SOURCE_BAR, reason=f"CHOICE_FAILED:{type(error).__name__}"[:160],
+                          bar_spot=bar_spot, parity=ParitySpot(spot=None), provider=ProviderSpot(spot=None))
+
+
+def _bar_fallback(choice: SpotChoice, reason: str) -> SpotChoice:
+    return SpotChoice(spot=choice.bar_spot, source=SOURCE_BAR, reason=reason[:160], bar_spot=choice.bar_spot,
+                      parity=choice.parity, provider=choice.provider)
+
+
+def _record_spot(mode, captured, choice, *, local, used_spot, valuation_inputs, session_date, equity_cutoff,
+                 observed_at) -> None:
+    """One BREADTH_SPOT_RECORD line per underlying and capture (RECORD and QUOTE): the bar and quote spots and what
+    the quote spot changes, from a second solve at the spot that was not used. Never raises."""
+    started = datetime.now(UTC)
+    effect, error = None, None
+    try:
+        if choice.quote_spot is not None:
+            other_spot = choice.bar_spot if used_spot == choice.quote_spot else choice.quote_spot
+            other = breadth_local_greeks(captured.rows, spot=other_spot, valuation_inputs=valuation_inputs,
+                                         observed_at=observed_at)
+            before, after = (other, local) if used_spot == choice.quote_spot else (local, other)
+            effect = spot_effect(captured.rows, before, after, choice=choice, session_date=session_date)
+    except Exception as failure:  # noqa: BLE001 - recording never fails a capture
+        error = f"{type(failure).__name__}: {failure}"[:200]
+    try:
+        log_record(record_document(
+            mode=mode, underlying=captured.underlying, session_date=session_date, equity_cutoff=equity_cutoff,
+            observed_at=observed_at, choice=choice, used_spot=used_spot, effect=effect,
+            seconds=(datetime.now(UTC) - started).total_seconds(), error=error,
+        ))
+    except Exception:  # noqa: BLE001
+        _LOGGER.warning("options_breadth_spot_record_failed underlying=%s", captured.underlying)
 
 
 def _report_capture_fault(underlying, equity_cutoff, outcome) -> None:

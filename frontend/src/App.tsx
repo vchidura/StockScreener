@@ -21,6 +21,7 @@ const PatternWatch = lazy(() => import('./pages/PatternWatch'))
 const TickerWorkspace = lazy(() => import('./pages/ticker/TickerWorkspace'))
 const OptionsActivityPage = lazy(() => import('./pages/OptionsActivityPage'))
 const OptionsFlowPage = lazy(() => import('./pages/OptionsFlowPage'))
+const OptionsOverviewPage = lazy(() => import('./pages/OptionsOverviewPage'))
 const OptionsScreenerPage = lazy(() => import('./pages/OptionsScreeningWorkspace'))
 const StockScreenerPage = lazy(() => import('./pages/StockScreeningPage'))
 const StockAlertsPage = lazy(() => import('./pages/StockAlertsPage'))
@@ -67,6 +68,7 @@ function PortalRoutes({ realtimeOnly }: { realtimeOnly: boolean }) {
         <Route path="/stocks/persistence" element={<PersistencePage />} />
         <Route path="/stock-research/*" element={<PersistenceRedirect />} />
         <Route path="/options/activity" element={<OptionsActivityPage />} />
+        <Route path="/options/overview" element={<OptionsOverviewPage />} />
         <Route path="/options/flow" element={<OptionsFlowPage />} />
         <Route path="/options/screener" element={<OptionsScreenerPage />} />
         <Route path="/options/alerts" element={<OptionsAlertsPage />} />
@@ -98,6 +100,7 @@ function PortalRoutes({ realtimeOnly }: { realtimeOnly: boolean }) {
         <Route path="/stocks/persistence" element={<PersistencePage />} />
         <Route path="/stock-research/*" element={<PersistenceRedirect />} />
         <Route path="/options/activity" element={<OptionsActivityPage />} />
+        <Route path="/options/overview" element={<OptionsOverviewPage />} />
         <Route path="/options/flow" element={<OptionsFlowPage />} />
         <Route path="/options/screener" element={<OptionsScreenerPage />} />
         <Route path="/options/alerts" element={<OptionsAlertsPage />} />

@@ -887,6 +887,23 @@ def create_realtime_portal_app(
             logging.getLogger(__name__).exception("Realtime Options Flow stored read failed")
             raise unavailable(error) from error
 
+    @app.get("/api/options/iv-summary")
+    def option_iv_summary(underlyer: str, session_date: date | None = None):
+        """G106 A2 (Nov 17 night): research read behind `REALTIME_V2_OPTIONS_IV_SUMMARY_READ` (off by default: 404)."""
+        from .options_iv_summary_read import options_iv_summary_read_enabled
+
+        if not options_iv_summary_read_enabled():
+            raise HTTPException(404, "Options IV summary read is off")
+        if repositories.option_flow is None:
+            raise HTTPException(503, "Realtime Options Flow repository is unavailable")
+        try:
+            return repositories.option_flow.iv_summary(available_by=cutoff(), underlyer=underlyer, session_date=session_date)
+        except ValueError as error:
+            raise HTTPException(422, str(error)) from error
+        except Exception as error:
+            logging.getLogger(__name__).exception("Realtime Options IV summary read failed")
+            raise unavailable(error) from error
+
     @app.get("/api/options/gamma")
     def option_gamma(underlyer: str, session_date: date | None = None):
         """G106 A3 (Nov 12 night): research read behind `REALTIME_V2_OPTIONS_GAMMA_READ` (off by default: 404)."""
@@ -902,6 +919,33 @@ def create_realtime_portal_app(
             raise HTTPException(422, str(error)) from error
         except Exception as error:
             logging.getLogger(__name__).exception("Realtime Options gamma read failed")
+            raise unavailable(error) from error
+
+    @app.get("/api/options/exposure")
+    def option_exposure(
+        underlyer: str,
+        greek: Literal["gamma", "delta", "charm", "vanna"] = "gamma",
+        weight: Literal["oi", "oi_volume"] = "oi",
+        scope: Literal["0dte", "7d", "all"] = "all",
+        session_date: date | None = None,
+    ):
+        """G106 OV1 (Nov 16): Options Overview exposure read behind `REALTIME_V2_OPTIONS_EXPOSURE_READ` (off by default:
+        404); each Greek also needs `REALTIME_V2_OPTIONS_EXPOSURE_GREEKS` (default gamma,delta)."""
+        from .options_exposure_read import options_exposure_read_enabled
+
+        if not options_exposure_read_enabled():
+            raise HTTPException(404, "Options exposure read is off")
+        if repositories.option_flow is None:
+            raise HTTPException(503, "Realtime Options Flow repository is unavailable")
+        try:
+            return repositories.option_flow.exposure(
+                available_by=cutoff(), underlyer=underlyer, greek=greek, weight=weight, scope=scope,
+                session_date=session_date,
+            )
+        except ValueError as error:
+            raise HTTPException(422, str(error)) from error
+        except Exception as error:
+            logging.getLogger(__name__).exception("Realtime Options exposure read failed")
             raise unavailable(error) from error
 
     @app.get("/api/options/discovery-catalog")

@@ -6,6 +6,7 @@ import {
   FlaskConical,
   History,
   Layers,
+  LayoutGrid,
   LayoutDashboard,
   Radar,
   Route,
@@ -115,6 +116,7 @@ export const NAV_GROUPS: NavGroup[] = [
     label: 'Options',
     icon: FlaskConical,
     items: [
+      { to: '/options/overview', label: 'Options Overview', icon: LayoutGrid },
       { to: '/options/activity', label: 'Option Activity', icon: Activity },
       { to: '/options/flow', label: 'Options Flow', icon: Route },
       { to: '/options/screener', label: 'Options Screener', icon: ScanSearch },

@@ -39,6 +39,7 @@ from .equity_materialization_adapter import (
     RealtimeEquityMaterializationResult,
     materialize_realtime_equity_evidence,
 )
+from .equity_intraday_history import BoundedIntradayCounts, resolve_intraday_history_window
 from .equity_portal_history import build_realtime_equity_portal_history_plan
 from .lineage_head import (
     BOUNDED_WORKSPACE_PAYLOAD_BYTES, assemble_lineage_head, group_head, reference_set, require_bounded_manifest,
@@ -879,13 +880,17 @@ def project_realtime_ticker_workspace(
     inputs: RealtimeScreeningInput, *, market_events=(), market_event_coverage=(),
     fundamental_reports=(), fundamental_coverage=(), state: TickerProjectionState | None = None,
     should_stop: Callable[[], bool] | None = None, member_filter=None, screening_override=None,
+    intraday_depth=None,
 ):
     """Pass a long-lived `state` to reuse unchanged facts, derivation checks and interval
     materializations across cycles. The result is identical with or without it.
 
     R75-v2 (Nov 14, `ticker_projection_shards`): `member_filter` projects only those tickers' workspaces (an empty
     set: the shared prologue and the screening only), and `screening_override` supplies the cycle's screening
-    generation instead of computing it. Both default to the serial cycle, unchanged."""
+    generation instead of computing it. Both default to the serial cycle, unchanged.
+
+    R83-0 (Nov 17, `equity_intraday_history`): `intraday_depth` (the depth the input was loaded with; None = the
+    full history, unchanged) charts the depth's 1m/5m/15m sessions and re-verifies derived bars only inside it."""
     state = TickerProjectionState() if state is None else state
     _check_cancelled(should_stop)
     with state.cycle():
@@ -893,13 +898,13 @@ def project_realtime_ticker_workspace(
             inputs, market_events=market_events, market_event_coverage=market_event_coverage,
             fundamental_reports=fundamental_reports, fundamental_coverage=fundamental_coverage,
             state=state, should_stop=should_stop, member_filter=member_filter,
-            screening_override=screening_override,
+            screening_override=screening_override, intraday_depth=intraday_depth,
         )
 
 
 def _project_realtime_ticker_workspace(
     inputs, *, market_events, market_event_coverage, fundamental_reports, fundamental_coverage, state,
-    should_stop, member_filter=None, screening_override=None,
+    should_stop, member_filter=None, screening_override=None, intraday_depth=None,
 ):
     _check_cancelled(should_stop)
     calendar = exchange_calendars.get_calendar("XNYS")
@@ -924,6 +929,11 @@ def _project_realtime_ticker_workspace(
         if partial_session
         else plan
     )
+    # R83-0: the bounded 1m/5m/15m sessions and their expected counts (None: the plan's, unchanged).
+    intraday_window = (
+        None if intraday_depth is None else resolve_intraday_history_window(inputs.session, intraday_depth)
+    )
+    intraday_counts = intraday_plan if intraday_window is None else BoundedIntradayCounts(intraday_plan, intraday_window)
     allowed = {(interval, basis) for interval, basis, _ in plan.expected_counts_per_ticker}
     if any((row["interval"], row["adjustment_basis"]) not in allowed for row in inputs.bars):
         raise ValueError("Ticker retained interval/basis contract drift")
@@ -945,6 +955,8 @@ def _project_realtime_ticker_workspace(
         for source in row["source_revision_ids"]:
             key = str(source)
             if key not in indexed:
+                if intraday_window is not None:
+                    continue  # R83-0: outside the verified depth the stored lineage is accepted (not loaded)
                 raise ValueError("Ticker causal bar evidence is missing")
             if key not in selected:
                 selected.add(key)
@@ -964,6 +976,8 @@ def _project_realtime_ticker_workspace(
         "1h": frozenset(intraday_plan.raw_sessions),
         "1d": frozenset(plan.raw_sessions),
     }
+    if intraday_window is not None:
+        raw_session_sets.update(intraday_window.session_sets())
     rows_by_ticker = {}
     for row in inputs.bars:
         rows_by_ticker.setdefault(row["ticker"], []).append(row)
@@ -1088,14 +1102,14 @@ def _project_realtime_ticker_workspace(
                 missing.pop("fundamentals")
             available = {}
             five = groups[("5m", "RAW_UNADJUSTED")]
-            five_sessions = intraday_plan.raw_sessions
+            five_sessions = intraday_plan.raw_sessions if intraday_window is None else intraday_window.sessions("5m")
             five_expected = _intraday_expected_count(
-                calendar, intraday_plan, inputs.session, inputs.cutoff, "5m",
+                calendar, intraday_counts, inputs.session, inputs.cutoff, "5m",
             )
             if five:
                 five_visible_expected = _intraday_expected_count(
                     calendar,
-                    intraday_plan,
+                    intraday_counts,
                     inputs.session,
                     min(inputs.cutoff, five[-1].revision.bar_end),
                     "5m",
@@ -1126,9 +1140,11 @@ def _project_realtime_ticker_workspace(
             else:
                 missing["raw_history"] = "NATIVE_5M_HISTORY_NOT_RETAINED"
             one = groups[("1m", "RAW_UNADJUSTED")]
-            one_sessions = intraday_plan.one_minute_sessions
+            one_sessions = (
+                intraday_plan.one_minute_sessions if intraday_window is None else intraday_window.sessions("1m")
+            )
             one_expected = _intraday_expected_count(
-                calendar, intraday_plan, inputs.session, inputs.cutoff, "1m",
+                calendar, intraday_counts, inputs.session, inputs.cutoff, "1m",
             )
             if (
                 len(one) == one_expected
@@ -1152,6 +1168,8 @@ def _project_realtime_ticker_workspace(
             stream_five = tuple(
                 fact for fact in five
                 if fact.revision.source_kind is BarSourceKind.DERIVED
+                # R83-0: re-derived from their minutes inside the 1m sessions; older ones keep their stored lineage
+                and (intraday_window is None or fact.revision.session_date in raw_session_sets["1m"])
             )
             if stream_five:
                 # The source closure holds the parents of sessions older than the 1m chart window.
@@ -1173,7 +1191,7 @@ def _project_realtime_ticker_workspace(
                     "5m:session",
                     stream_five,
                 )
-            complete_raw_sessions = len(intraday_plan.raw_sessions) - int(partial_session)
+            complete_raw_sessions = len(five_sessions) - int(partial_session)
             if (
                 "5m" in available
                 and verifier.windows("1d", "5m", available["5m"]) != complete_raw_sessions
@@ -1261,7 +1279,7 @@ def _project_realtime_ticker_workspace(
                     continue
                 stored_expected_count = (
                     _intraday_expected_count(
-                        calendar, intraday_plan, inputs.session, inputs.cutoff, interval,
+                        calendar, intraday_counts, inputs.session, inputs.cutoff, interval,
                     )
                     if basis == "RAW_UNADJUSTED" and interval in _INTRADAY_WIDTH_MINUTES
                     else expected_count
@@ -1284,7 +1302,8 @@ def _project_realtime_ticker_workspace(
                         source_label,
                         sources,
                         f"{interval}:{basis}",
-                        stored,
+                        # R83-0: the sessions with 5m sources; older bars keep their stored lineage
+                        stored if intraday_window is None else intraday_window.verified(stored),
                     )
                 )
                 if len(stored) != stored_expected_count:

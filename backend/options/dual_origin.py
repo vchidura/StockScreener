@@ -124,9 +124,14 @@ class ActivityFinding(Contract):
     publication_permission: Literal[False] = False
     execution_permission: Literal[False] = False
 
+    def expected_policy_sha256(self) -> str:
+        """The activity policy a finding of this schema must carry (v2 below: the liquidity floor, from its stamped
+        thresholds). A method, not a field, so the v1 finding's canonical JSON and hash are unchanged."""
+        return ACTIVITY_POLICY.sha256
+
     @model_validator(mode="after")
     def validate_finding(self):
-        if self.detector_policy_sha256 != ACTIVITY_POLICY.sha256:
+        if self.detector_policy_sha256 != self.expected_policy_sha256():
             raise ValueError("unsupported activity policy")
         if self.market_cutoff > self.decision_at:
             raise ValueError("activity decision must follow market cutoff")
@@ -185,6 +190,128 @@ def detect_option_participation(
     return ActivityFinding(episode_id=episode_id, source_sha256=source.sha256,
         decision_at=decision_at, market_cutoff=market_cutoff, valid_until=valid_until,
         volume_oi_ratio=ratio, disposition=disposition, reasons=tuple(reasons))
+
+
+class ActivityLiquidityFloorPolicy(Contract):
+    """G102 R87 / G106 Q2 (Nov 17): O1's activity rule v1 (volume / prior OI >= 3, unchanged) plus a liquidity floor.
+
+    v1 alone selected AAPL 362.5P 11/27 on Nov 16 with prior open interest 27 and day volume 109 (ratio 4.04): a high
+    ratio is easiest on a contract nobody holds or trades. The floor requires both the prior session's open interest
+    and the day's cumulative volume at the event (the two numbers the ratio is made of, the same `ActivitySource`
+    fields) to clear a minimum. Replay Nov 10-16 (docs/g106/G106_EVIDENCE.md, Nov 17): 7 of 71 O1 session alerts
+    dropped, every one with OI < 100; no 0DTE index strike dropped (their prior OI can be small while they trade
+    100,000+ contracts, which an OI >= 250 floor would drop). Because the ratio is >= 3, OI >= 100 already implies day
+    volume >= 300 at detection; the volume minimum is the backstop for OI 100-166 (never bound Nov 10-16).
+    Missing input fails closed: a DETECTED finding whose floor input is absent becomes UNAVAILABLE (v1 already makes
+    such a finding UNAVAILABLE, so this cannot loosen anything).
+
+    The two minimums are stamped into the policy document (Nov 17: the Options window may set them from its environment,
+    `realtime.advanced_options_o1_liquidity_floor.o1_liquidity_floor_policy`), so the policy hash, the v2 finding's
+    episode and every v2 evaluation change with them; the defaults give the original hash
+    951693f49bf16d749d351e120c6a3857662734362b814073545880f0099ef265."""
+
+    version: Literal["option_participation_origin_v2_liquidity_floor"] = "option_participation_origin_v2_liquidity_floor"
+    base_policy_sha256: Literal[ACTIVITY_POLICY.sha256] = ACTIVITY_POLICY.sha256
+    minimum_prior_open_interest: int = Field(default=100, ge=0, strict=True)
+    minimum_day_volume: int = Field(default=500, ge=0, strict=True)
+    floor_basis: Literal["PRIOR_SESSION_OPEN_INTEREST_AND_DAY_VOLUME_AT_EVENT"] = (
+        "PRIOR_SESSION_OPEN_INTEREST_AND_DAY_VOLUME_AT_EVENT")
+    missing_input_basis: Literal["FAIL_CLOSED_UNAVAILABLE"] = "FAIL_CLOSED_UNAVAILABLE"
+    execution_permission: Literal[False] = False
+
+
+ACTIVITY_LIQUIDITY_FLOOR_POLICY = ActivityLiquidityFloorPolicy()
+
+O1LF_OPEN_INTEREST_BELOW_POLICY = "O1LF_OPEN_INTEREST_BELOW_POLICY"
+O1LF_DAY_VOLUME_BELOW_POLICY = "O1LF_DAY_VOLUME_BELOW_POLICY"
+O1LF_OPEN_INTEREST_UNAVAILABLE = "O1LF_OPEN_INTEREST_UNAVAILABLE"
+O1LF_DAY_VOLUME_UNAVAILABLE = "O1LF_DAY_VOLUME_UNAVAILABLE"
+
+
+def activity_liquidity_floor_reasons(open_interest: int | None, day_volume: int | None,
+                                     policy: ActivityLiquidityFloorPolicy = ACTIVITY_LIQUIDITY_FLOOR_POLICY,
+                                     ) -> tuple[str, ...]:
+    """Why a contract is below the floor; () when it clears it. Missing input is a reason of its own."""
+    reasons = []
+    if open_interest is None:
+        reasons.append(O1LF_OPEN_INTEREST_UNAVAILABLE)
+    elif open_interest < policy.minimum_prior_open_interest:
+        reasons.append(O1LF_OPEN_INTEREST_BELOW_POLICY)
+    if day_volume is None:
+        reasons.append(O1LF_DAY_VOLUME_UNAVAILABLE)
+    elif day_volume < policy.minimum_day_volume:
+        reasons.append(O1LF_DAY_VOLUME_BELOW_POLICY)
+    return tuple(reasons)
+
+
+class LiquidityFloorActivityFinding(ActivityFinding):
+    """An O1 finding under the liquidity-floor policy: the v1 finding's fields, the floor's thresholds (stamped, so the
+    finding names its own policy: `detector_policy_sha256` must be the policy those thresholds make), the floor's
+    inputs and its reasons."""
+
+    schema_version: Literal["option_participation_finding_v2"] = "option_participation_finding_v2"
+    detector_policy_sha256: Sha256 = ACTIVITY_LIQUIDITY_FLOOR_POLICY.sha256
+    floor_minimum_prior_open_interest: int = Field(ge=0, strict=True)
+    floor_minimum_day_volume: int = Field(ge=0, strict=True)
+    open_interest: int | None = Field(ge=0, strict=True)
+    day_volume: int | None = Field(ge=0, strict=True)
+    liquidity_reasons: tuple[Name, ...]
+
+    def floor_policy(self) -> ActivityLiquidityFloorPolicy:
+        return ActivityLiquidityFloorPolicy(minimum_prior_open_interest=self.floor_minimum_prior_open_interest,
+                                            minimum_day_volume=self.floor_minimum_day_volume)
+
+    def expected_policy_sha256(self) -> str:
+        return self.floor_policy().sha256
+
+    @model_validator(mode="after")
+    def validate_liquidity_floor(self):
+        if self.liquidity_reasons != activity_liquidity_floor_reasons(
+                self.open_interest, self.day_volume, self.floor_policy()):
+            raise ValueError("liquidity floor reasons do not match its inputs")
+        if self.disposition == "DETECTED" and self.liquidity_reasons:
+            raise ValueError("detected activity must clear the liquidity floor")
+        return self
+
+
+def apply_activity_liquidity_floor(
+    source: ActivitySource, finding: ActivityFinding,
+    policy: ActivityLiquidityFloorPolicy = ACTIVITY_LIQUIDITY_FLOOR_POLICY,
+) -> LiquidityFloorActivityFinding:
+    """The v2 finding for `source` from its v1 finding under `policy`: a DETECTED finding below the floor becomes
+    NOT_DETECTED (a missing floor input: UNAVAILABLE) with the floor's reasons; any other finding keeps its disposition
+    and reasons. The episode is the policy's (the episode basis is per policy, so it changes with the thresholds)."""
+    source = ActivitySource.model_validate_json(source.canonical_json())
+    policy = ActivityLiquidityFloorPolicy.model_validate_json(policy.canonical_json())
+    if type(finding) is not ActivityFinding or finding.source_sha256 != source.sha256:
+        raise ValueError("liquidity floor requires the v1 finding of this exact source")
+    liquidity = activity_liquidity_floor_reasons(source.open_interest, source.day_volume, policy)
+    disposition, reasons = finding.disposition, finding.reasons
+    if disposition == "DETECTED" and liquidity:
+        disposition = (
+            "UNAVAILABLE"
+            if any(reason in (O1LF_OPEN_INTEREST_UNAVAILABLE, O1LF_DAY_VOLUME_UNAVAILABLE) for reason in liquidity)
+            else "NOT_DETECTED"
+        )
+        reasons = liquidity
+    episode_id = uuid5(NAMESPACE_URL,
+        f"option-participation:{policy.sha256}:{source.security_id}:{source.contract_id}:{source.volume_session}")
+    return LiquidityFloorActivityFinding(episode_id=episode_id, source_sha256=finding.source_sha256,
+        detector_policy_sha256=policy.sha256, decision_at=finding.decision_at, market_cutoff=finding.market_cutoff,
+        valid_until=finding.valid_until, volume_oi_ratio=finding.volume_oi_ratio, disposition=disposition,
+        reasons=reasons, floor_minimum_prior_open_interest=policy.minimum_prior_open_interest,
+        floor_minimum_day_volume=policy.minimum_day_volume, open_interest=source.open_interest,
+        day_volume=source.day_volume, liquidity_reasons=liquidity)
+
+
+def detect_option_participation_with_liquidity_floor(
+    source: ActivitySource, *, market_cutoff: datetime, decision_at: datetime,
+    calendar: OptionExchangeCalendar | None = None,
+    policy: ActivityLiquidityFloorPolicy = ACTIVITY_LIQUIDITY_FLOOR_POLICY,
+) -> LiquidityFloorActivityFinding:
+    """O1 under a liquidity-floor policy (default `ACTIVITY_LIQUIDITY_FLOOR_POLICY`): v1 detection, then the floor."""
+    return apply_activity_liquidity_floor(source, detect_option_participation(
+        source, market_cutoff=market_cutoff, decision_at=decision_at, calendar=calendar), policy)
 
 
 def bind_activity_source(*, snapshot, open_interest_record, lineage, security,

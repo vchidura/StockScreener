@@ -19,6 +19,7 @@ from .corporate_action_drift import corporate_action_drift_params, corporate_act
 from .contracts import canonical_sha256
 from .database_access import RealtimeDatabaseRole
 from .equity_bar_repository import load_bar_groups_cursor
+from .equity_intraday_history import intraday_history_depth
 from .equity_history import EquityHistoryScope
 from .equity_evidence_repository import (
     EvidenceRef,
@@ -299,18 +300,28 @@ def _project_ticker_cycle(
     `shards` (R75-v2, compute only): a `TickerProjectionShardPool`; its workers load and project their ticker groups
     while this process loads the full input and computes the screening (`ticker_projection_shards`)."""
     load_inputs = loader.load if loader is not None else load_realtime_screening_input
+    # R83-0 (Nov 17): REALTIME_V2_EQUITY_INTRADAY_HISTORY_SESSIONS bounds the 1m/5m/15m history the cycle loads and
+    # charts. Unset: no depth is passed anywhere (today's calls, byte-identical). Recovery reads the same switch; a
+    # switch changed between the two stages rebuilds another input and fails closed (CycleRehydrationMismatch).
+    intraday_depth = intraday_history_depth()
+    depth = {} if intraday_depth is None else {"intraday_depth": intraday_depth}
     _projection_checkpoint(should_stop)
     if shards is not None:
-        shards.prepare(scope)
+        shards.prepare({**scope, **depth})
     with database.transaction(
         read_only=True, dict_cursor=True, isolation_level="REPEATABLE READ",
     ) as cursor:
         _projection_checkpoint(should_stop)
-        inputs = load_inputs(cursor, **scope, include_portal_history=True)
+        inputs = load_inputs(cursor, **scope, include_portal_history=True, **depth)
+        if intraday_depth is not None:
+            logging.getLogger(__name__).info(
+                "equity_intraday_history depth=%s cutoff=%s bars=%d",
+                intraday_depth.label, inputs.cutoff.isoformat(), len(inputs.bars),
+            )
         _projection_checkpoint(should_stop)
         if shards is not None:
             # Each worker loads its own members' calendar and fundamental rows.
-            projection = shards.project(inputs, state=state, should_stop=should_stop)
+            projection = shards.project(inputs, state=state, should_stop=should_stop, **depth)
         else:
             market_events, market_event_coverage = _load_ticker_calendar_inputs(
                 cursor, inputs.members, inputs.cutoff,
@@ -321,7 +332,7 @@ def _project_ticker_cycle(
             projection = project_realtime_ticker_workspace(
                 inputs, market_events=market_events, market_event_coverage=market_event_coverage,
                 fundamental_reports=fundamental_reports, fundamental_coverage=fundamental_coverage,
-                state=state, should_stop=should_stop,
+                state=state, should_stop=should_stop, **depth,
             )
         _projection_checkpoint(should_stop)
         snapshots = projection.snapshots
@@ -1869,10 +1880,14 @@ class RealtimeTickerWorkspaceRepository(_RealtimeCompatibilityRepository):
             return result
         if contract == "context":
             result = deepcopy(payload["context"])
+            # G102 R88 (Nov 16): the cohort clock is the window's cutoff while the session runs; checked against the
+            # 1d watermark (the previous close) it was always "ahead" and every in-session context read was refused.
+            # Check the publication's own quote, with the quote's interval, as the publication contract does.
+            quote = payload["quote"]
             state = _read_availability(
-                result["cohort"]["market_time"],
+                quote["as_of"],
                 cutoff,
-                "1d",
+                "5m" if quote["source"] == "5m" else "1d",
                 read_state,
                 provider_tier,
             )

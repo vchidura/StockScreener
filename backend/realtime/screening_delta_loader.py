@@ -103,6 +103,7 @@ from datetime import date, datetime
 from itertools import chain
 from uuid import UUID
 
+from .equity_intraday_history import IntradayHistoryDepth
 from .screening_projection import RealtimeScreeningInput
 from .screening_repository import (
     BAR_IDENTITY_FIELDS,
@@ -169,10 +170,12 @@ class _RetainedBars:
     """The winners visible under `clocks`, their source index and the source closure of the last result."""
 
     __slots__ = ("identity", "clocks", "visible_total", "group_order", "series", "winner_ids", "source_refs",
-                 "unresolved", "closure", "winner_count", "_flat")
+                 "unresolved", "closure", "winner_count", "_flat", "closure_root")
 
-    def __init__(self, identity: tuple, clocks: BarClocks, visible_total: int) -> None:
+    def __init__(self, identity: tuple, clocks: BarClocks, visible_total: int, closure_root=None) -> None:
         self.identity = identity
+        # R83-0: with an intraday depth only the re-verified derived winners register their sources (None: all).
+        self.closure_root = closure_root
         self.clocks = clocks
         self.visible_total = visible_total
         self.group_order: list[tuple] = []
@@ -188,7 +191,9 @@ class _RetainedBars:
 
     @classmethod
     def build(cls, request: BarRequest, ranked: list, visible_total: int) -> "_RetainedBars":
-        state = cls(request.identity, request.clocks, visible_total)
+        window = request.scope.intraday_history
+        state = cls(request.identity, request.clocks, visible_total,
+                    None if window is None else window.closure_root)
         for row, rank in ranked:
             group = _group(row)
             series = state.series.get(group)
@@ -206,6 +211,8 @@ class _RetainedBars:
         revision = str(row["bar_revision_id"])
         self.winner_ids.add(revision)
         self.unresolved.discard(revision)
+        if self.closure_root is not None and not self.closure_root(row):
+            return
         for source in row["source_revision_ids"]:
             source = str(source)
             count = self.source_refs.get(source, 0)
@@ -218,6 +225,8 @@ class _RetainedBars:
         self.winner_ids.discard(revision)
         if revision in self.source_refs:
             self.unresolved.add(revision)
+        if self.closure_root is not None and not self.closure_root(row):
+            return
         for source in row["source_revision_ids"]:
             source = str(source)
             count = self.source_refs[source] - 1
@@ -290,6 +299,8 @@ class _RetainedBars:
         rows = [row for group in self.group_order for row in self.series[group].rows]
         refs: dict[str, int] = {}
         for row in rows:
+            if self.closure_root is not None and not self.closure_root(row):
+                continue
             for source in row["source_revision_ids"]:
                 refs[str(source)] = refs.get(str(source), 0) + 1
         ids = {str(row["bar_revision_id"]) for row in rows}
@@ -319,7 +330,8 @@ class ScreeningInputLoader:
              include_strategy_action_details: bool = False,
              known_by: datetime | None = None,
              allow_late_identity_continuity: bool = False,
-             bar_shard: tuple[int, int] | None = None) -> RealtimeScreeningInput:
+             bar_shard: tuple[int, int] | None = None,
+             intraday_depth: IntradayHistoryDepth | None = None) -> RealtimeScreeningInput:
         with self._lock:
             return load_screening_input(
                 cursor, cohort_id=cohort_id, session=session, cutoff=cutoff, source_generation=source_generation,
@@ -328,6 +340,7 @@ class ScreeningInputLoader:
                 known_by=known_by, bar_loader=self._load_bars,
                 allow_late_identity_continuity=allow_late_identity_continuity,
                 bar_shard=bar_shard,
+                intraday_depth=intraday_depth,
             )
 
     def reset(self) -> None:

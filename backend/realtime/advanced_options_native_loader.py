@@ -38,6 +38,7 @@ from .advanced_options_equity_input import (
 from .advanced_options_native_adapters import (
     AdvancedO1Invocation,
     AdvancedOSInvocation,
+    AdvancedOSParticipationInvocation,
     AdvancedOptionsLaneInputs,
     AdvancedOptionsNativeInputBundle,
     advanced_o3_invocation_document,
@@ -48,17 +49,40 @@ from .advanced_options_o1_debit_vertical import (
     O1DebitVerticalOutcome,
     debit_vertical_for_event,
     is_o1_debit_vertical_package,
+    load_o1_vertical_inputs_cursor,
     load_o1_vertical_inputs_guarded,
     o1_debit_vertical_mode,
     o1_debit_vertical_package,
     o1_debit_vertical_policy,
 )
+from .advanced_options_o1_gates import (
+    O1AggressorPrint,
+    O1AggressorPrints,
+    O1GateMode,
+    o1_aggressor_side_mode,
+    o1_aggressor_side_policy,
+)
 from .advanced_options_o3_inputs import o3_inputs_enabled
+from .advanced_options_os_participation import (
+    EXTENDED_5M_BARS,
+    OSParticipationLaneRecord,
+    OSParticipationMode,
+    OSParticipationPrint,
+    contract_participation,
+    flow20_by_underlying,
+    evaluate_os_participation,
+    live_signals,
+    os_participation_event_id,
+    os_participation_mode,
+    os_participation_policy,
+    signal_view,
+)
 from .advanced_options_producers import AdvancedOptionsProducerPlan
 from .advanced_options_reference_state import AdvancedOptionsReferenceState
 from .advanced_options_rolling_state import AdvancedOptionsRollingState
 from .contracts import canonical_sha256
 from .database_access_v2 import APP_ROLE, V2ConnectionProvider
+from .equity_bar_repository import load_known_bar_revisions_cursor
 from .option_portal_adapter import RealtimeOptionPackage
 from .option_portal_repository import load_realtime_option_packages_cursor
 from .option_source_flow import OptionSourceFlowIdentity
@@ -941,6 +965,12 @@ def _load_o1(
     if vertical_mode is not O1DebitVerticalMode.OFF and rows:
         vertical_policy = o1_debit_vertical_policy()
         vertical_inputs, vertical_inputs_reason = load_o1_vertical_inputs_guarded(cursor, plan)
+    # G106 AL7: REALTIME_V3_O1_AGGRESSOR_SIDE (OFF = today: nothing read). An invalid value raises here, so the window
+    # fails loudly. RECORD/ON: one guarded read of the session's stored prints of the contracts at O1's ratio.
+    aggressor_mode = o1_aggressor_side_mode()
+    aggressor_prints = None
+    if aggressor_mode is not O1GateMode.OFF and rows:
+        aggressor_prints = load_o1_aggressor_prints_guarded(cursor, plan, rows)
     calendar = OptionExchangeCalendar()
     invocations = []
     rejected: dict[str, int] = {}
@@ -1026,6 +1056,11 @@ def _load_o1(
             source,
             package,
             vertical_outcome,
+            aggressor=(
+                None
+                if aggressor_prints is None
+                else aggressor_prints.tally(source.contract_ticker, source.market_time, o1_aggressor_side_policy())
+            ),
         ))
     if rejected:
         print(
@@ -1047,7 +1082,67 @@ def _load_o1(
         )
         for row in invocations
     )
+    if aggressor_mode is O1GateMode.ON:
+        # G106 AL7 ON: the tallies decide selection, so they join the input identity (OFF / RECORD: unchanged).
+        identity = tuple(
+            (*item, None if row.aggressor is None else row.aggressor.identity())
+            for item, row in zip(identity, invocations)
+        )
     return AdvancedOptionsLaneInputs(tuple(invocations)), identity
+
+
+_O1_AGGRESSOR_PRINTS_SQL = (
+    "SELECT event.contract_ticker,event.event_time,event.event_id::text AS event_id,event.premium,"
+    "event.side_class,event.side_confidence "
+    "FROM rt.option_flow_events AS event "
+    "WHERE event.cohort_id=%s AND event.contract_ticker=ANY(%s) "
+    "AND event.event_time>%s AND event.event_time<=%s "
+    "AND event.session_date=%s AND event.source_flow_id=%s AND event.source_offset<=%s "
+    "AND event.trade_treatment='INCLUDED' AND event.revision=1 "
+    "ORDER BY event.contract_ticker,event.event_time,event.event_id"
+)
+
+
+def load_o1_aggressor_prints_guarded(cursor, plan, rows) -> O1AggressorPrints:
+    """G106 AL7 (RECORD/ON): the session's stored prints (INCLUDED, revision 1; the window's cohort, source flow and
+    committed offset, up to the cutoff) of the contracts whose O1 event reached O1's ratio (day volume >= 3x prior OI;
+    no other event can be detected). Index (cohort_id, contract_ticker, event_time). A failed read never fails the
+    window: every tally then says O1AG_INPUTS_UNAVAILABLE (RECORD records it; ON makes the events UNCLEAR: no package)."""
+    tickers = sorted({
+        str(row["contract_ticker"]) for row in rows
+        if row["prior_open_interest"] and row["cumulative_volume_after"] is not None
+        and int(row["cumulative_volume_after"]) >= 3 * int(row["prior_open_interest"])
+    })
+    if not tickers:
+        return O1AggressorPrints()
+    try:
+        cursor.execute("SAVEPOINT o1_aggressor_inputs")
+    except Exception as error:  # noqa: BLE001
+        return O1AggressorPrints(inputs_reason=f"{type(error).__name__}")
+    try:
+        session_start = datetime.combine(plan.control_plane.session_date, datetime.min.time(), timezone.utc)
+        cursor.execute(_O1_AGGRESSOR_PRINTS_SQL, (
+            str(plan.control_plane.cohort_id),
+            tickers,
+            session_start,
+            plan.cutoff,
+            plan.control_plane.session_date,
+            str(plan.source_flow.source_flow_id),
+            plan.rolling_state.committed_offset,
+        ))
+        prints = tuple(
+            O1AggressorPrint(
+                contract_ticker=str(row["contract_ticker"]), event_time=row["event_time"],
+                event_id=str(row["event_id"]), premium=Decimal(str(row["premium"])),
+                side_class=str(row["side_class"]), side_confidence=str(row["side_confidence"]),
+            )
+            for row in cursor.fetchall()
+        )
+    except Exception as error:  # noqa: BLE001
+        cursor.execute("ROLLBACK TO SAVEPOINT o1_aggressor_inputs")
+        return O1AggressorPrints(inputs_reason=f"{type(error).__name__}")
+    cursor.execute("RELEASE SAVEPOINT o1_aggressor_inputs")
+    return O1AggressorPrints(prints)
 
 
 _O3_ACCEPTED_INPUTS_SQL = (
@@ -1380,6 +1475,7 @@ def _load_os(
     contexts,
     o1_inputs: AdvancedOptionsLaneInputs,
     evidence: list[AdvancedOptionsNativeInputEvidence],
+    bars_out: dict | None = None,
 ) -> tuple[AdvancedOptionsLaneInputs, object]:
     if detector not in {DetectorFamily.OS1, DetectorFamily.OS2}:
         raise ValueError("Advanced stock-first Options lane is invalid")
@@ -1467,6 +1563,10 @@ def _load_os(
             ),
             detector_ids=("OS1", "OS2"),
         ))
+    if bars_out is not None:
+        # G106 AL5 (REALTIME_V3_OS_PARTICIPATION RECORD/ON): the context bars (15 daily + the last 5m) and this
+        # window's own signals, for the v2 evaluation. Read nothing more here; OFF passes None.
+        bars_out.update(by_ticker=by_ticker, signals=tuple(signals), known_by=known_by)
     invocations = []
     for signal in signals:
         if signal.detector_id != detector.value:
@@ -1514,6 +1614,253 @@ def _load_os(
     return AdvancedOptionsLaneInputs(tuple(invocations)), identity
 
 
+_OS_PARTICIPATION_PRINTS_SQL = (
+    "SELECT event.contract_ticker,event.underlyer,version.call_put,event.event_time,event.size,event.premium,"
+    "event.side_class,event.is_multi_leg,event.cumulative_volume_after,event.prior_open_interest,"
+    # flow20 (Nov 17): the side confidence and the revision of each print (RECORD/ON only; OFF reads nothing here)
+    "event.side_confidence,event.revision "
+    "FROM rt.option_flow_events AS event "
+    "JOIN ref.option_contracts AS contract ON contract.contract_ticker=event.contract_ticker "
+    "JOIN rt.slot_set_current AS current ON current.cohort_id=event.cohort_id "
+    "JOIN rt.slot_set_members AS member ON member.cohort_id=current.cohort_id "
+    "AND member.version=current.version AND member.channel='T' "
+    "JOIN rt.instruments AS instrument ON instrument.instrument_id=member.instrument_id "
+    "AND instrument.contract_id=contract.contract_id "
+    "JOIN ref.option_contract_versions AS version ON version.version_id=member.catalog_version_id "
+    "AND version.contract_id=contract.contract_id "
+    "WHERE event.cohort_id=%s AND event.session_date=%s AND event.source_flow_id=%s AND event.source_offset<=%s "
+    "AND event.event_time>%s AND event.event_time<=%s AND event.underlyer=ANY(%s) "
+    "AND event.trade_treatment='INCLUDED' "
+    "ORDER BY event.event_time,event.event_id"
+)
+
+
+def os_participation_package(contract, mark, *, event_id, cohort_id, matrix_id, session_date):
+    """G106 AL5 (ON): one bought contract at the window's cutoff mark (as AL2 prices its legs); the v1 single-contract
+    candidate identity, so the projection and the session alerts treat it as today's single contract."""
+    from options.domain import ContractType
+    from options.strategies.domain import OptionSide
+
+    from .option_portal_adapter import RealtimeOptionPackageLeg
+    from .preflight import ProviderTier
+
+    multiplier = int(contract.multiplier)
+    identity = {
+        "policy": "os-participation-v2-cutoff-mark-single-contract",
+        "cohort_id": str(cohort_id), "event_id": str(event_id), "contract_id": int(contract.contract_id),
+        "catalog_version_id": int(contract.catalog_version_id), "entry_mark": str(mark.mark),
+        "entry_market_time": mark.market_time.isoformat(), "mark_evidence_id": str(mark.evidence_id),
+    }
+    premium = mark.mark * multiplier
+    close = OptionExchangeCalendar().session_close(session_date)
+    return RealtimeOptionPackage(
+        candidate_id=options_alert_v1_candidate_id(cohort_id, event_id),
+        event_id=event_id,
+        matrix_id=matrix_id,
+        candidate_identity_sha256=canonical_sha256(identity),
+        cohort_id=cohort_id,
+        provider_tier=ProviderTier.MASSIVE_ADVANCED,
+        entry_market_time=mark.market_time,
+        entry_net_premium=-premium,
+        capital_at_risk=premium,
+        exit_deadline=close if close > mark.market_time else None,
+        legs=(RealtimeOptionPackageLeg(
+            leg_index=0,
+            instrument_id=int(contract.instrument_id),
+            contract_id=int(contract.contract_id),
+            catalog_version_id=int(contract.catalog_version_id),
+            contract_ticker=str(contract.contract_ticker),
+            side=OptionSide.BUY,
+            ratio=1,
+            multiplier=multiplier,
+            strike=contract.strike,
+            expiration_date=contract.expiration,
+            contract_type=ContractType.CALL if contract.call_put == "C" else ContractType.PUT,
+            entry_mark=mark.mark,
+            entry_market_time=mark.market_time,
+            valuation_policy_sha256=session_valuation_policy_sha256(),
+        ),),
+    )
+
+
+def _os_participation_inputs(cursor, plan, captured):
+    """The v2 reads, all read-only: the last 5m bars of the session (to keep earlier signals alive), the signals alive
+    now per detector, the session's prints on watched contracts of their underlyings, and the cutoff marks."""
+    equity_cutoff = plan.equity_input_receipt.cutoff
+    security_ids = dict(plan.enrollment.equity_plan.security_ids)
+    underlyings = tuple(plan.control_plane.universe.option_underlyings)
+    usable = [value for value in captured.values() if value.get("by_ticker") is not None]
+    if not usable:
+        return {}, (), None
+    known_by = max(value["known_by"] for value in usable)
+    cursor.execute(
+        "SELECT instrument_id,security_id::text AS security_id FROM rt.instruments "
+        "WHERE security_id=ANY(%s::uuid[]) AND contract_id IS NULL",
+        ([str(security_ids[ticker]) for ticker in underlyings],),
+    )
+    ticker_by_security = {str(security_ids[ticker]): ticker for ticker in underlyings}
+    instruments = {int(row["instrument_id"]): ticker_by_security[str(row["security_id"])] for row in cursor.fetchall()}
+    cutoff_day = datetime.combine(equity_cutoff.date(), datetime.min.time(), timezone.utc)
+    loaded = load_known_bar_revisions_cursor(
+        cursor,
+        instrument_ids=tuple(instruments),
+        interval="5m",
+        basis="RAW_UNADJUSTED",
+        known_by=known_by,
+        start=cutoff_day,
+        end=equity_cutoff,
+        scopes=("RTH",),
+        latest=EXTENDED_5M_BARS,
+    )
+    intraday: dict[str, list] = {}
+    for instrument_id, rows in loaded.items():
+        for row in rows:
+            if (row["availability_mode"] == "LIVE_OBSERVED" and row["is_final"]
+                    and row["session_date"] == equity_cutoff.date()):
+                intraday.setdefault(instruments[instrument_id], []).append((_equity_bar(row), row["created_at"]))
+    calendar = OptionExchangeCalendar()
+    session_close = calendar.session_close(plan.control_plane.session_date)
+    signals: dict[str, list] = {"OS1": [], "OS2": []}
+    current_ids = {
+        str(signal.signal_id) for value in usable for signal in value.get("signals", ())
+    }
+    for ticker in underlyings:
+        daily = []
+        for value in usable:
+            daily = [item for item in value["by_ticker"].get(ticker, ()) if item[0].interval == "1d"]
+            if daily:
+                break
+        bars = (*daily, *intraday.get(ticker, ()))
+        for signal, first_window in live_signals(
+            security_id=security_ids[ticker], underlyer=ticker, bars=bars, equity_cutoff=equity_cutoff,
+            decision_at=plan.cutoff, session_close=session_close, current_ids=current_ids,
+        ):
+            signals[signal.detector_id].append((signal, first_window))
+    live_underlyings = sorted({signal.underlyer for items in signals.values() for signal, _ in items})
+    prints = ()
+    if live_underlyings:
+        cursor.execute(_OS_PARTICIPATION_PRINTS_SQL, (
+            str(plan.control_plane.cohort_id),
+            plan.control_plane.session_date,
+            str(plan.source_flow.source_flow_id),
+            plan.rolling_state.committed_offset,
+            cutoff_day,
+            plan.cutoff,
+            live_underlyings,
+        ))
+        prints = tuple(
+            OSParticipationPrint(
+                contract_ticker=str(row["contract_ticker"]), underlyer=str(row["underlyer"]),
+                call_put=str(row["call_put"]).upper()[:1], event_time=row["event_time"], size=int(row["size"]),
+                premium=Decimal(str(row["premium"])), side_class=str(row["side_class"]),
+                multi_leg=bool(row["is_multi_leg"]),
+                day_volume=None if row["cumulative_volume_after"] is None else int(row["cumulative_volume_after"]),
+                open_interest=None if row["prior_open_interest"] is None else int(row["prior_open_interest"]),
+                side_confidence=str(row.get("side_confidence") or "NONE"),
+                revision=int(row.get("revision") or 1),
+            )
+            for row in cursor.fetchall()
+        )
+    vertical = load_o1_vertical_inputs_cursor(cursor, plan) if live_underlyings else None
+    return signals, prints, vertical
+
+
+def _apply_os_participation(cursor, plan, mode, lanes, captured):
+    """G106 AL5: v2 for OS1/OS2. RECORD: the lanes as they are, plus what v2 decided (never hashed, logged by the
+    executors). ON: v2's invocations replace the v1 pairings. A failed read never fails the window: RECORD keeps v1 with
+    the reason recorded; ON blocks the lane with it (fail closed)."""
+    policy = os_participation_policy()
+    reason = None
+    signals, prints, vertical = {}, (), None
+    try:
+        cursor.execute("SAVEPOINT os_participation_inputs")
+    except Exception as error:  # noqa: BLE001
+        reason = f"OS_PARTICIPATION_INPUTS_UNAVAILABLE:{type(error).__name__}"
+    else:
+        try:
+            signals, prints, vertical = _os_participation_inputs(cursor, plan, captured)
+        except Exception as error:  # noqa: BLE001
+            cursor.execute("ROLLBACK TO SAVEPOINT os_participation_inputs")
+            reason = f"OS_PARTICIPATION_INPUTS_UNAVAILABLE:{type(error).__name__}"
+            signals, prints, vertical = {}, (), None
+        else:
+            cursor.execute("RELEASE SAVEPOINT os_participation_inputs")
+    participation = contract_participation(prints, plan.cutoff)
+    flow20 = flow20_by_underlying(prints, plan.cutoff)  # recorded per signal (Nov 17); a decision only with FLOW20
+    unmarked = frozenset(int(value) for value in plan.unmarked_instrument_ids)
+
+    def marked(ticker):
+        if vertical is None or ticker not in vertical.by_ticker:
+            return None
+        from .advanced_options_o1_debit_vertical import usable_mark
+
+        contract = vertical.by_ticker[ticker]
+        return usable_mark(contract, vertical.marks, unmarked, plan.cutoff)
+
+    result = []
+    for detector in (DetectorFamily.OS1, DetectorFamily.OS2):
+        lane, identity = lanes[detector]
+        if lane.blocked_reason_codes:
+            record = OSParticipationLaneRecord(detector.value, mode, policy, plan.cutoff, status="LANE_BLOCKED",
+                                               reasons=tuple(lane.blocked_reason_codes))
+            result.append((replace(lane, record=record), identity))
+            continue
+        if reason is not None:
+            record = OSParticipationLaneRecord(detector.value, mode, policy, plan.cutoff, status=reason)
+            if mode is OSParticipationMode.ON:
+                result.append((AdvancedOptionsLaneInputs(blocked_reason_codes=(reason,), record=record),
+                               {"blocked_reason_codes": (reason,)}))
+            else:
+                result.append((replace(lane, record=record), identity))
+            continue
+        outcomes = tuple(
+            evaluate_os_participation(
+                signal_view(signal, first_window), participation, cutoff=plan.cutoff, policy=policy,
+                packageable=lambda ticker: marked(ticker) is not None,
+                flow20=flow20.get(signal.underlyer),
+            )
+            for signal, first_window in signals.get(detector.value, ())
+        )
+        record = OSParticipationLaneRecord(detector.value, mode, policy, plan.cutoff, outcomes=outcomes)
+        if mode is not OSParticipationMode.ON:
+            result.append((replace(lane, record=record), identity))
+            continue
+        by_signal = {str(signal.signal_id): signal for signal, _ in signals.get(detector.value, ())}
+        event_ids = {
+            outcome.signal.signal_id: os_participation_event_id(
+                detector.value, outcome.signal.signal_id, outcome.confirmed_contract)
+            for outcome in outcomes
+        }
+        stored = _packages_for_events(
+            cursor,
+            cohort_id=plan.control_plane.cohort_id,
+            event_ids=tuple(event_ids[outcome.signal.signal_id] for outcome in outcomes if outcome.confirmed),
+            unmarked_instrument_ids=plan.unmarked_instrument_ids,
+        )
+        invocations = []
+        for outcome in outcomes:
+            event_id = event_ids[outcome.signal.signal_id]
+            package = None
+            if outcome.confirmed:
+                package = stored.get(event_id)
+                mark = marked(outcome.confirmed_contract)
+                if package is None and mark is not None:
+                    package = os_participation_package(
+                        vertical.by_ticker[outcome.confirmed_contract], mark, event_id=event_id,
+                        cohort_id=plan.control_plane.cohort_id, matrix_id=plan.rolling_state.state_id,
+                        session_date=plan.control_plane.session_date,
+                    )
+            invocations.append(AdvancedOSParticipationInvocation(
+                event_id, by_signal[outcome.signal.signal_id], outcome, package, policy.policy_sha256))
+        v2_identity = tuple(
+            (str(row.event_id), row.outcome.signal.signal_id, row.outcome.confirmed_contract,
+             None if row.package is None else str(row.package.candidate_id), row.policy_sha256)
+            for row in invocations
+        )
+        result.append((AdvancedOptionsLaneInputs(tuple(invocations), record=record), v2_identity))
+    return result[0], result[1]
+
+
 def assemble_advanced_options_native_inputs_cursor(
     cursor,
     plan: AdvancedOptionsNativeInputPlan,
@@ -1527,6 +1874,12 @@ def assemble_advanced_options_native_inputs_cursor(
         evidence,
     )
     o1, o1_identity = _load_o1(cursor, plan, evidence)
+    # G106 AL5: REALTIME_V3_OS_PARTICIPATION (OFF = today: nothing captured, nothing read). Invalid value: raises.
+    os_mode = os_participation_mode()
+    os_captured = (
+        None if os_mode is OSParticipationMode.OFF
+        else {DetectorFamily.OS1: {}, DetectorFamily.OS2: {}}
+    )
     os1, os1_identity = _load_os(
         cursor,
         plan,
@@ -1534,6 +1887,7 @@ def assemble_advanced_options_native_inputs_cursor(
         contexts=equity_contexts,
         o1_inputs=o1,
         evidence=evidence,
+        bars_out=None if os_captured is None else os_captured[DetectorFamily.OS1],
     )
     os2, os2_identity = _load_os(
         cursor,
@@ -1542,7 +1896,16 @@ def assemble_advanced_options_native_inputs_cursor(
         contexts=equity_contexts,
         o1_inputs=o1,
         evidence=evidence,
+        bars_out=None if os_captured is None else os_captured[DetectorFamily.OS2],
     )
+    if os_captured is not None:
+        (os1, os1_identity), (os2, os2_identity) = _apply_os_participation(
+            cursor,
+            plan,
+            os_mode,
+            {DetectorFamily.OS1: (os1, os1_identity), DetectorFamily.OS2: (os2, os2_identity)},
+            os_captured,
+        )
     o3, o3_identity, o3_accepted_unavailable = _load_o3(
         cursor,
         plan,

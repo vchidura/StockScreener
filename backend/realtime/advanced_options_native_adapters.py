@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import os
-from dataclasses import asdict, dataclass, is_dataclass
+from dataclasses import asdict, dataclass, field, is_dataclass
 from datetime import date, datetime
 from decimal import Decimal
 from enum import Enum
@@ -15,6 +15,7 @@ from options.dual_origin import (
     ActivitySource,
     CanonicalTrendSignalDecision,
     LatestCompletedSignalDecision,
+    apply_activity_liquidity_floor,
     assess_canonical_stock_first,
 )
 from options.stock_bar_detection import CanonicalStockSignal
@@ -36,6 +37,15 @@ from .advanced_options_cycle import (
     NativeDetectorExecutor,
     NativeLaneState,
 )
+from .advanced_options_o1_liquidity_floor import (
+    O1LiquidityFloorMode,
+    log_o1_liquidity_floor_documents,
+    o1_liquidity_floor_documents,
+    o1_liquidity_floor_entry,
+    o1_liquidity_floor_mode,
+    o1_liquidity_floor_policy,
+)
+from .advanced_options_o1_gates import O1GateRun
 from .contracts import canonical_sha256
 from .detector_adapters import (
     run_o1_adapter,
@@ -89,6 +99,9 @@ def _input_sha256(
 class AdvancedOptionsLaneInputs:
     invocations: tuple[object, ...] = ()
     blocked_reason_codes: tuple[str, ...] = ()
+    # G106 AL5 (REALTIME_V3_OS_PARTICIPATION RECORD/ON): what OS policy v2 decided for this lane, logged by the
+    # executor once per window. Never part of any identity or comparison; None when the switch is OFF.
+    record: object | None = field(default=None, compare=False)
 
     def __post_init__(self) -> None:
         reasons = tuple(
@@ -112,6 +125,9 @@ class AdvancedO1Invocation:
     # G106 AL2 (REALTIME_V3_O1_DEBIT_VERTICAL RECORD/ON): what the debit-vertical rule decided for this event, logged
     # once per window (O1_DEBIT_VERTICAL_RECORD). Not part of any input identity; None when the switch is OFF.
     debit_vertical: object | None = None
+    # G106 AL7 (REALTIME_V3_O1_AGGRESSOR_SIDE RECORD/ON): the premium of the contract's stored prints this session at or
+    # before the event, by aggressor side (an O1AggressorTally). Never compared; in the input identity only under ON.
+    aggressor: object | None = field(default=None, compare=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -132,6 +148,18 @@ class AdvancedOSInvocation:
     signal: CanonicalStockSignal
     source: ActivitySource | None
     package: RealtimeOptionPackage | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class AdvancedOSParticipationInvocation:
+    """G106 AL5 (REALTIME_V3_OS_PARTICIPATION=ON only): one live stock signal and what OS policy v2 decided for it at
+    this cutoff (`outcome`: an OSParticipationOutcome); `package` = the confirming contract at the cutoff mark."""
+
+    event_id: UUID
+    signal: CanonicalStockSignal
+    outcome: object
+    package: RealtimeOptionPackage | None
+    policy_sha256: str
 
 
 def advanced_o3_invocation_document(
@@ -438,6 +466,29 @@ def _log_o1_debit_vertical_record(context, entries) -> None:
         })
 
 
+def _log_o1_liquidity_floor_record(context, mode, entries, failures, policy=None) -> None:
+    """G102 R87: when REALTIME_V3_O1_LIQUIDITY_FLOOR is RECORD or ON, one O1_LIQUIDITY_FLOOR_RECORD line per detected
+    event below the floor and one O1_LIQUIDITY_FLOOR_WINDOW line per window. Logging never fails the window."""
+    if mode is O1LiquidityFloorMode.OFF:
+        return
+    try:
+        window, events = o1_liquidity_floor_documents(
+            mode=mode,
+            cutoff=context.cutoff,
+            entries=entries,
+            selection_enabled=O1_PACKAGE_SELECTION_ENABLED,
+            policy=policy,
+        )
+        if failures:
+            window["floor_failures"] = dict(sorted(failures.items()))
+        log_o1_liquidity_floor_documents(window, events)
+    except Exception as error:  # noqa: BLE001
+        log_o1_liquidity_floor_documents({
+            "contract": "o1-liquidity-floor-window-v1", "mode": mode.value, "status": "RECORD_FAILED",
+            "reason": f"{type(error).__name__}: {error}"[:200],
+        }, ())
+
+
 def build_advanced_o1_executor(
     inputs: AdvancedOptionsLaneInputs,
 ) -> NativeDetectorExecutor:
@@ -453,7 +504,18 @@ def build_advanced_o1_executor(
         evaluations = []
         unavailable_reasons = None
         vertical_entries = []
+        # G102 R87: REALTIME_V3_O1_LIQUIDITY_FLOOR (OFF = today, byte for byte). An invalid value raises here, so the
+        # window fails loudly (the window service also refuses to start with one).
+        floor_mode = o1_liquidity_floor_mode()
+        # The thresholds are the process's (read once, validated at service start): one policy per process.
+        floor_policy = None if floor_mode is O1LiquidityFloorMode.OFF else o1_liquidity_floor_policy()
+        floor_entries = []
+        floor_failures: dict[str, int] = {}
+        # G106 AL6 / AL7: REALTIME_V3_O1_ZERO_DTE and REALTIME_V3_O1_AGGRESSOR_SIDE (both OFF = no object: today's path,
+        # byte for byte). Applied after the floor: floor, then the 0DTE gate, then the aggressor side. Invalid: raises.
+        gates = O1GateRun.for_window()
         for invocation in inputs.invocations:
+            below_floor = None  # G106 AL6/AL7 record: whether the floor (RECORD or ON) takes this event out
             result = run_o1_adapter(
                 invocation.source,
                 cohort_id=context.input_gate.closure.cycle_input.cohort_id,
@@ -463,6 +525,36 @@ def build_advanced_o1_executor(
                 decision_at=invocation.source.received_at,
             )
             finding = result.output
+            if floor_mode is not O1LiquidityFloorMode.OFF:
+                try:
+                    floored = apply_activity_liquidity_floor(invocation.source, finding, floor_policy)
+                    floor_entry = o1_liquidity_floor_entry(invocation, finding, floored)
+                except Exception as error:  # noqa: BLE001
+                    # Never fails the window. RECORD keeps today's finding; ON leaves the event out (fail closed:
+                    # no alert from an event whose floor could not be judged), as an unavailable contract.
+                    reason = f"O1LF_FLOOR_FAILED:{type(error).__name__}"
+                    floor_failures[reason] = floor_failures.get(reason, 0) + 1
+                    if floor_mode is O1LiquidityFloorMode.ON:
+                        unavailable_reasons = unavailable_reasons or (reason,)
+                        continue
+                else:
+                    floor_entries.append(floor_entry)
+                    below_floor = floor_entry.below_floor
+                    if floor_mode is O1LiquidityFloorMode.ON:
+                        # The v2 finding (its policy hash, the floor's inputs and reasons) is the evaluation's payload.
+                        finding = floored
+            gate_permits = True
+            if gates is not None:
+                try:
+                    # RECORD gates leave the finding as it is; an ON gate makes it the v3 finding (gate policy hash).
+                    finding, gate_permits = gates.apply(invocation, finding, below_floor)
+                except Exception as error:  # noqa: BLE001
+                    # Never fails the window. RECORD keeps the finding; ON leaves the event out (fail closed).
+                    reason = f"O1GATE_FAILED:{type(error).__name__}"
+                    gates.failures[reason] += 1
+                    if gates.any_on:
+                        unavailable_reasons = unavailable_reasons or (reason,)
+                        continue
             vertical_entries.append((invocation.event_id, finding.disposition, invocation.debit_vertical))
             if finding.disposition == "UNAVAILABLE":
                 # Per-contract outcome, Nov 9: one contract without positive prior-day open interest made
@@ -473,6 +565,7 @@ def build_advanced_o1_executor(
                 O1_PACKAGE_SELECTION_ENABLED
                 and finding.disposition == "DETECTED"
                 and invocation.package is not None
+                and gate_permits  # G106 AL7 ON: a SOLD / UNCLEAR aggressor side is an observation, no package
             )
             evaluations.append(AdvancedOptionsNativeEvaluation(
                 invocation.event_id,
@@ -489,6 +582,9 @@ def build_advanced_o1_executor(
                 invocation.package if selected else None,
             ))
         _log_o1_debit_vertical_record(context, vertical_entries)
+        _log_o1_liquidity_floor_record(context, floor_mode, floor_entries, floor_failures, floor_policy)
+        if gates is not None:
+            gates.log(context.cutoff, O1_PACKAGE_SELECTION_ENABLED)  # never raises
         if unavailable_reasons is not None and not evaluations:
             return AdvancedOptionsNativeLaneResult(
                 NativeLaneState.UNAVAILABLE,
@@ -557,7 +653,7 @@ def build_advanced_os_executor(
     if detector not in {DetectorFamily.OS1, DetectorFamily.OS2}:
         raise ValueError("Advanced stock-first Options detector is invalid")
     if any(
-        not isinstance(row, AdvancedOSInvocation)
+        not isinstance(row, (AdvancedOSInvocation, AdvancedOSParticipationInvocation))
         for row in inputs.invocations
     ):
         raise TypeError("Advanced stock-first Options invocation is invalid")
@@ -567,6 +663,7 @@ def build_advanced_os_executor(
     ) -> AdvancedOptionsNativeLaneResult:
         blocked = _blocked_or_none(context, detector, inputs)
         if blocked is not None:
+            _log_os_participation(inputs.record, ())
             return blocked
         evaluations = []
         for invocation in inputs.invocations:
@@ -574,6 +671,9 @@ def build_advanced_os_executor(
                 raise ValueError(
                     "Advanced stock-first Options signal changed detector"
                 )
+            if isinstance(invocation, AdvancedOSParticipationInvocation):
+                evaluations.append(_os_participation_evaluation(detector, invocation, context.cutoff))
+                continue
             market_cutoff = max(
                 invocation.signal.market_time,
                 (
@@ -616,6 +716,7 @@ def build_advanced_os_executor(
                 },
                 invocation.package if selected else None,
             ))
+        _log_os_participation(inputs.record, evaluations)
         return AdvancedOptionsNativeLaneResult(
             NativeLaneState.COMPLETE,
             (),
@@ -623,6 +724,51 @@ def build_advanced_os_executor(
         )
 
     return execute
+
+
+def _log_os_participation(record, evaluations) -> None:
+    """G106 AL5: the OS_PARTICIPATION_RECORD / OS_PARTICIPATION_WINDOW lines when the lane carries a v2 record (switch
+    RECORD or ON). Never fails the window."""
+    if record is None:
+        return
+    try:
+        from .advanced_options_os_participation import log_os_participation
+
+        log_os_participation(record, evaluations)
+    except Exception:  # noqa: BLE001 - recording never fails the window
+        pass
+
+
+def _os_participation_evaluation(detector, invocation, cutoff):
+    """G106 AL5 (ON): the evaluation of one live stock signal under OS policy v2."""
+    from .advanced_options_os_participation import OS_PARTICIPATION_POLICY_VERSION
+
+    outcome = invocation.outcome
+    confirmed = outcome.confirmed_contract is not None
+    selected = confirmed and invocation.package is not None
+    return AdvancedOptionsNativeEvaluation(
+        invocation.event_id,
+        invocation.signal.underlyer,
+        "SELECTED" if selected else "OBSERVATION" if confirmed else "NOT_SELECTED",
+        cutoff,
+        {
+            "contract": "advanced-options-stock-first-evaluation-v2",
+            "detector_id": detector.value,
+            "signal": _plain(invocation.signal),
+            "decision": {
+                "policy": OS_PARTICIPATION_POLICY_VERSION,
+                "policy_sha256": invocation.policy_sha256,
+                "direction": int(invocation.signal.direction),
+                "disposition": "CONFIRMED" if confirmed else "UNMATCHED",
+                "reasons": list(outcome.reasons),
+                "contract": outcome.confirmed_contract,
+                "first_window": outcome.signal.first_window,
+                "best": _plain(outcome.best),
+            },
+            "source_event_id": None,
+        },
+        invocation.package if selected else None,
+    )
 
 
 @dataclass(frozen=True, slots=True)

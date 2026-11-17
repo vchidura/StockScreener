@@ -20,6 +20,13 @@ Switch `REALTIME_V3_O1_DEBIT_VERTICAL` on the Options window: OFF (default / uns
 RECORD (build every vertical, log one `O1_DEBIT_VERTICAL_RECORD {json}` line per window, publish today's single-contract
 package unchanged), ON (the O1 package is the debit vertical when one qualifies, otherwise today's single contract).
 Any other value fails the window service at start and every window that reads it.
+
+Leg liquidity thresholds (Nov 17): `REALTIME_V3_O1_DEBIT_VERTICAL_LEG_MIN_OPEN_INTEREST` and
+`REALTIME_V3_O1_DEBIT_VERTICAL_LEG_MIN_DAY_VOLUME` on the same service override the policy file's
+`minimum_leg_open_interest` (250) and `minimum_leg_day_volume` (100). Unset or blank = the file's document unchanged
+(same policy hash); a set value must be a non-negative integer or the window service refuses to start; it is written
+into the policy document before hashing, so the policy hash (in the record line and every vertical's candidate
+identity) changes with it. Read once per process with the policy file (`o1_debit_vertical_policy`, cached).
 """
 from __future__ import annotations
 
@@ -39,6 +46,8 @@ from uuid import NAMESPACE_URL, UUID, uuid5
 from .contracts import canonical_sha256
 
 O1_DEBIT_VERTICAL_SETTING = "REALTIME_V3_O1_DEBIT_VERTICAL"
+O1_DEBIT_VERTICAL_LEG_MIN_OPEN_INTEREST_SETTING = "REALTIME_V3_O1_DEBIT_VERTICAL_LEG_MIN_OPEN_INTEREST"
+O1_DEBIT_VERTICAL_LEG_MIN_DAY_VOLUME_SETTING = "REALTIME_V3_O1_DEBIT_VERTICAL_LEG_MIN_DAY_VOLUME"
 O1_DEBIT_VERTICAL_RECORD_EVENT = "O1_DEBIT_VERTICAL_RECORD"
 O1_DEBIT_VERTICAL_POLICY_PATH = (
     Path(__file__).parents[1] / "options" / "policies" / "o1_debit_vertical_v1.json"
@@ -105,11 +114,31 @@ class O1DebitVerticalPolicy:
         return policy
 
 
+def o1_debit_vertical_policy_document(document: Mapping[str, object], environ: Mapping[str, str]) -> dict:
+    """The policy document with the environment's leg thresholds written in. Unset = the document unchanged."""
+    from .advanced_options_o1_liquidity_floor import non_negative_int_setting
+
+    document = dict(document)
+    for key, setting in (
+        ("minimum_leg_open_interest", O1_DEBIT_VERTICAL_LEG_MIN_OPEN_INTEREST_SETTING),
+        ("minimum_leg_day_volume", O1_DEBIT_VERTICAL_LEG_MIN_DAY_VOLUME_SETTING),
+    ):
+        value = non_negative_int_setting(environ, setting, int(document[key]))
+        if value != document[key]:
+            document[key] = value
+    return document
+
+
+def o1_debit_vertical_policy_from(environ: Mapping[str, str]) -> O1DebitVerticalPolicy:
+    return O1DebitVerticalPolicy.from_document(o1_debit_vertical_policy_document(
+        json.loads(O1_DEBIT_VERTICAL_POLICY_PATH.read_text(encoding="utf-8")), environ))
+
+
 @lru_cache(maxsize=1)
 def o1_debit_vertical_policy() -> O1DebitVerticalPolicy:
-    return O1DebitVerticalPolicy.from_document(
-        json.loads(O1_DEBIT_VERTICAL_POLICY_PATH.read_text(encoding="utf-8"))
-    )
+    """The process's policy: the file plus the environment's leg thresholds, read once (the window service calls this
+    at start)."""
+    return o1_debit_vertical_policy_from(os.environ)
 
 
 @dataclass(frozen=True, slots=True)
@@ -561,6 +590,9 @@ def o1_debit_vertical_record(
         "contract": "o1-debit-vertical-record-v1",
         "mode": mode.value,
         "policy": policy.version,
+        "policy_sha256": policy.policy_sha256,
+        "minimum_leg_open_interest": policy.minimum_leg_open_interest,
+        "minimum_leg_day_volume": policy.minimum_leg_day_volume,
         "cutoff": cutoff.isoformat(),
         "o1_events": counts["o1_events"],
         "detected": counts["detected"],
@@ -585,7 +617,9 @@ def log_o1_debit_vertical_record(document: Mapping[str, object]) -> None:
 
 __all__ = [
     "DebitVertical", "O1DebitVerticalMode", "O1DebitVerticalOutcome", "O1DebitVerticalPolicy", "O1VerticalInputs",
-    "O1_DEBIT_VERTICAL_RECORD_EVENT", "O1_DEBIT_VERTICAL_SETTING", "debit_vertical_for_event",
+    "O1_DEBIT_VERTICAL_LEG_MIN_DAY_VOLUME_SETTING", "O1_DEBIT_VERTICAL_LEG_MIN_OPEN_INTEREST_SETTING",
+    "O1_DEBIT_VERTICAL_RECORD_EVENT", "O1_DEBIT_VERTICAL_SETTING", "o1_debit_vertical_policy_document",
+    "o1_debit_vertical_policy_from", "debit_vertical_for_event",
     "debit_vertical_structure", "is_o1_debit_vertical_package", "load_o1_vertical_inputs_cursor",
     "log_o1_debit_vertical_record", "o1_debit_vertical_candidate_id", "o1_debit_vertical_mode",
     "o1_debit_vertical_package", "o1_debit_vertical_policy", "o1_debit_vertical_record", "select_debit_vertical",

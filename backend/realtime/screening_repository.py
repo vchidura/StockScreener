@@ -11,6 +11,9 @@ import exchange_calendars
 
 from .contracts import canonical_sha256
 from .database_access import RealtimeDatabaseRole
+from .equity_intraday_history import (
+    BAR_DEPTH_PREDICATE, IntradayHistoryDepth, IntradayHistoryWindow, resolve_intraday_history_window,
+)
 from .equity_portal_history import build_realtime_equity_portal_history_plan
 from .equity_history import EquityHistoryScope, resolve_equity_history_scopes_cursor
 from .portal_projection_repository import persist_screening_generation_cursor
@@ -105,6 +108,16 @@ class BarScope:
     history_before: datetime | None = None
     history_binding_sha256: str | None = None
     history_scopes: tuple[EquityHistoryScope, ...] = ()
+    # R83-0: the window's bounded 1m/5m/15m history (None: the full history, today's SQL). Its parameters are the
+    # tail of `history_params`, so the loader identity changes with it.
+    intraday_history: IntradayHistoryWindow | None = None
+
+
+def closure_roots(scope: BarScope, rows: Iterable[dict]) -> Iterable[dict]:
+    """The rows whose source lineage the load closes: every row, or with an intraday depth only the derived bars
+    the window re-verifies (`IntradayHistoryWindow.closure_root`)."""
+    window = scope.intraday_history
+    return rows if window is None else (row for row in rows if window.closure_root(row))
 
 
 BAR_IDENTITY_FIELDS = (
@@ -287,6 +300,7 @@ def _bar_candidate_sql(scope: BarScope) -> str:
         + " AND ticker=ANY(%s) AND session_scope='RTH' AND is_final AND "
         + _BAR_VISIBLE_AT
         + bar_history_predicate(scope.include_portal_history)
+        + (BAR_DEPTH_PREDICATE if scope.intraday_history is not None else "")
     )
 
 
@@ -399,7 +413,8 @@ def load_full_bars(cursor, request: BarRequest) -> tuple:
     scope, clocks = request.scope, request.clocks
     indexed = {str(row["bar_revision_id"]): row for row in select_winning_bars(cursor, scope, clocks)}
     tail = close_source_lineage(
-        (source for source in referenced_source_ids(indexed.values()) if source not in indexed), indexed,
+        (source for source in referenced_source_ids(closure_roots(scope, indexed.values())) if source not in indexed),
+        indexed,
         lambda ids: select_source_bars(cursor, scope, ids, clocks),
     )
     return (*indexed.values(), *tail)
@@ -410,10 +425,12 @@ def load_realtime_screening_input(cursor, *, cohort_id: UUID, session: date,
                                   include_portal_history: bool = False,
                                   include_strategy_action_details: bool = False,
                                   known_by: datetime | None = None,
-                                  allow_late_identity_continuity: bool = False) -> RealtimeScreeningInput:
+                                  allow_late_identity_continuity: bool = False,
+                                  intraday_depth: IntradayHistoryDepth | None = None) -> RealtimeScreeningInput:
     """`cutoff` is the market boundary and the identity of the input; `known_by` (timezone-aware, not before
     the cutoff; default the cutoff) is the instant by which a bar must have been recorded (observed_at,
-    created_at, replay_available_at, provider_published_at). Bars ending after the cutoff are never loaded."""
+    created_at, replay_available_at, provider_published_at). Bars ending after the cutoff are never loaded.
+    `intraday_depth` (R83-0, the window's portal-history load only): see `load_screening_input`."""
     return load_screening_input(
         cursor, cohort_id=cohort_id, session=session, cutoff=cutoff, source_generation=source_generation,
         include_portal_history=include_portal_history,
@@ -421,6 +438,7 @@ def load_realtime_screening_input(cursor, *, cohort_id: UUID, session: date,
         known_by=known_by,
         allow_late_identity_continuity=allow_late_identity_continuity,
         bar_loader=load_full_bars,
+        intraday_depth=intraday_depth,
     )
 
 
@@ -706,18 +724,29 @@ def load_screening_input(cursor, *, cohort_id: UUID, session: date,
                          known_by: datetime | None,
                          bar_loader: Callable[[object, BarRequest], tuple],
                          allow_late_identity_continuity: bool = False,
-                         bar_shard: tuple[int, int] | None = None) -> RealtimeScreeningInput:
+                         bar_shard: tuple[int, int] | None = None,
+                         intraday_depth: IntradayHistoryDepth | None = None) -> RealtimeScreeningInput:
     """The screening input with the bar set supplied by `bar_loader` (the full read or a retained one).
     Manifest, members, actions and coverage are read on every call, with the cutoff.
 
     `bar_shard=(index, count)` (R75-v2, a ticker-group projection worker): only the bars of that group of the members
     (`shard_tickers`) are read; members, actions and coverage stay the whole cohort's. Not a screening input: the
-    cross-sectional screening needs every member's bars."""
+    cross-sectional screening needs every member's bars.
+
+    `intraday_depth` (R83-0, `equity_intraday_history`; None = today's load): the portal-history load keeps only
+    the depth's last sessions of 1m, 5m and 15m bars, closes the source lineage of the re-verified derived bars
+    only, and marks the input `STORED_LINEAGE_ACCEPTED` (older derived bars keep their stored lineage)."""
     start, history_params = screening_history_window(
         session,
         include_portal_history=include_portal_history,
         cutoff=cutoff,
     )
+    intraday_history = None
+    if intraday_depth is not None:
+        if not include_portal_history:
+            raise ValueError("An intraday history depth bounds only the portal-history load")
+        intraday_history = resolve_intraday_history_window(session, intraday_depth)
+        history_params = (*history_params, *intraday_history.params)
     requested_known_by = known_by
     if known_by is None:
         known_by = cutoff
@@ -814,6 +843,7 @@ def load_screening_input(cursor, *, cohort_id: UUID, session: date,
         history_before=history_before,
         history_binding_sha256=history_binding_sha256,
         history_scopes=history_scopes,
+        intraday_history=intraday_history,
     )
     request = BarRequest(
         scope=scope, cutoff=cutoff, known_by=known_by,
@@ -900,6 +930,7 @@ def load_screening_input(cursor, *, cohort_id: UUID, session: date,
             else None
         ),
         known_by=requested_known_by,
+        **({"source_lineage": STORED_LINEAGE_ACCEPTED} if intraday_history is not None else {}),
     )
 
 

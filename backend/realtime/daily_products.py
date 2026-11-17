@@ -67,7 +67,7 @@ from .lineage_head import inputs_bar_lineage_sha256
 from .portal_compatibility_repository import SNAPSHOT_RELATION
 from .portal_projection import build_portal_snapshot
 from .portal_projection_repository import (
-    RELEASE_CLASS_SESSION_CLOSE, PortalReleaseReceipt, publish_portal_release_cursor,
+    RELEASE_CLASS_SESSION_CLOSE, PortalReleaseReceipt, publish_portal_release_cursor, session_close_snapshot,
 )
 from .preflight import ProviderTier
 from .screening_repository import load_daily_products_input
@@ -234,7 +234,12 @@ def stored_daily_products_cursor(cursor, cohort_id, mode: str, sessions: int = 5
 
 def prepared_daily_products_cursor(cursor, cohort_id, mode: str, input_sha256: str, sessions: int = 5) -> dict:
     """Products already stored for this input identity (a run before the open), rebuilt from their stored rows and
-    proven equal to them (same snapshot id and hashes). Empty unless every product of the mode is there."""
+    proven equal to them (same snapshot id and hashes). Empty unless every product of the mode is there.
+
+    A session's close also keeps a frozen copy of its Dashboard (`session_close_snapshot`: same manifest and payload,
+    its own snapshot id). That copy carries the same input identity, so it is recognised and skipped here: the
+    prepared product is the regular snapshot (G102 R95: a scheduler restart after AFTER_CLOSE raised identity drift
+    on the kept copy). Any other id or hash difference still raises."""
     wanted = set(products_for(mode, sessions))
     cursor.execute(
         "SELECT snapshot.snapshot_id, snapshot.cohort_id, snapshot.provider_tier, snapshot.snapshot_type, "
@@ -256,6 +261,11 @@ def prepared_daily_products_cursor(cursor, cohort_id, mode: str, input_sha256: s
             source_generation=int(row["source_generation"]), source_manifest=row["source_manifest"],
             payload=row["payload"], generated_at=row["generated_at"], valid_until=row["valid_until"],
         )
+        if (str(snapshot.snapshot_id) != str(row["snapshot_id"])
+                and snapshot.source_manifest_sha256 == row["source_manifest_sha256"]
+                and snapshot.payload_sha256 == row["payload_sha256"]
+                and str(session_close_snapshot(snapshot).snapshot_id) == str(row["snapshot_id"])):
+            continue  # the kept session-close copy of this product, not the product itself
         if (str(snapshot.snapshot_id) != str(row["snapshot_id"])
                 or snapshot.source_manifest_sha256 != row["source_manifest_sha256"]
                 or snapshot.payload_sha256 != row["payload_sha256"]):

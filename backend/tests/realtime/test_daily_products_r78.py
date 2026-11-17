@@ -832,6 +832,34 @@ def test_prepared_products_are_found_by_input_identity_and_proven_equal_to_their
                                            job_products.input_sha256)
 
 
+
+def test_the_kept_session_close_dashboard_is_skipped_not_drift(job_products):
+    """G102 R95 (Nov 16 22:34): after AFTER_CLOSE the session's kept Dashboard copy (own snapshot id, same input
+    identity) is stored beside the regular one; a scheduler restart's prepared lookup must not raise on it."""
+    from realtime.portal_projection_repository import session_close_snapshot
+    strategy, dashboard = job_products.strategy.snapshot, job_products.dashboard
+    kept = session_close_snapshot(dashboard)
+    assert kept.snapshot_id != dashboard.snapshot_id
+    for rows in ([_stored_row(kept), _stored_row(dashboard), _stored_row(strategy)],
+                 [_stored_row(dashboard), _stored_row(kept), _stored_row(strategy)]):
+        found = job.prepared_daily_products_cursor(_PreparedCursor(rows), strategy.cohort_id, job.MODE_JOB,
+                                                   job_products.input_sha256)
+        assert found[("DASHBOARD_V1", "COHORT")].snapshot_id == dashboard.snapshot_id
+        assert found[(HISTORY_VERSION, "COHORT")].snapshot_id == strategy.snapshot_id
+    # only the kept copy left (the HOT row expired): not prepared, the run computes again
+    assert job.prepared_daily_products_cursor(_PreparedCursor([_stored_row(kept), _stored_row(strategy)]),
+                                              strategy.cohort_id, job.MODE_JOB, job_products.input_sha256) == {}
+    # a kept copy whose content changed is still drift
+    with pytest.raises(ValueError, match="Prepared daily product"):
+        job.prepared_daily_products_cursor(
+            _PreparedCursor([_stored_row(kept, payload_sha256="0" * 64), _stored_row(strategy)]),
+            strategy.cohort_id, job.MODE_JOB, job_products.input_sha256)
+    # an unrelated id with equal hashes is still drift
+    with pytest.raises(ValueError, match="Prepared daily product"):
+        job.prepared_daily_products_cursor(
+            _PreparedCursor([_stored_row(dashboard, snapshot_id=strategy.snapshot_id), _stored_row(strategy)]),
+            strategy.cohort_id, job.MODE_JOB, job_products.input_sha256)
+
 def test_compute_returns_prepared_products_without_computing(monkeypatch, job_products):
     inputs = job_products.inputs
     _patch_load(monkeypatch, inputs, {})

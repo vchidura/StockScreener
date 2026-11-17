@@ -378,6 +378,42 @@ def black_scholes_gamma(
     return np.where(valid, gamma, np.nan)
 
 
+def black_scholes_delta(
+    spot: np.ndarray,
+    strike: np.ndarray,
+    maturity: np.ndarray,
+    rate: np.ndarray,
+    dividend: np.ndarray,
+    volatility: np.ndarray,
+    is_call: np.ndarray,
+) -> np.ndarray:
+    """Vectorized delta with a continuous dividend yield (G106 OV1): exp(-qT) N(d1) for a call, exp(-qT) (N(d1) - 1)
+    for a put, the same model as `solve_local_greeks`. Invalid inputs yield NaN."""
+    spot = np.asarray(spot, dtype=np.float64)
+    strike = np.asarray(strike, dtype=np.float64)
+    maturity = np.asarray(maturity, dtype=np.float64)
+    rate = np.asarray(rate, dtype=np.float64)
+    dividend = np.asarray(dividend, dtype=np.float64)
+    volatility = np.asarray(volatility, dtype=np.float64)
+    is_call = np.asarray(is_call, dtype=np.bool_)
+    valid = (
+        np.isfinite(spot) & np.isfinite(strike) & np.isfinite(maturity) & np.isfinite(rate)
+        & np.isfinite(dividend) & np.isfinite(volatility)
+        & (spot > 0) & (strike > 0) & (maturity > 0) & (volatility > 0)
+    )
+    safe_spot = np.where(valid, spot, 1.0)
+    safe_strike = np.where(valid, strike, 1.0)
+    safe_maturity = np.where(valid, maturity, 1.0)
+    safe_volatility = np.where(valid, volatility, 1.0)
+    d1 = (
+        np.log(safe_spot / safe_strike)
+        + (rate - dividend + 0.5 * safe_volatility * safe_volatility) * safe_maturity
+    ) / (safe_volatility * np.sqrt(safe_maturity))
+    carry = np.exp(-dividend * safe_maturity)
+    delta = np.where(is_call, carry * ndtr(d1), carry * (ndtr(d1) - 1.0))
+    return np.where(valid, delta, np.nan)
+
+
 def _price_and_vega(spot, strike, maturity, rate, dividend, volatility, is_call):
     root_time = np.sqrt(maturity)
     d1 = (
