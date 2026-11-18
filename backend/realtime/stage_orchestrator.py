@@ -19,6 +19,7 @@ context.transaction() (the only supported write path).
 """
 from __future__ import annotations
 
+import json
 import logging
 import re
 import threading
@@ -29,7 +30,10 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from uuid import UUID, uuid4
 
+from psycopg2 import Error as PsycopgError
+
 from .database_access_v2 import StageRunFence, V2ConnectionProvider
+from .fault_journal import emit_fault
 from .orchestration_repository import (
     OWNER_LOST,
     CycleReceiptSpec,
@@ -68,6 +72,8 @@ TRANSIENT_STAGE_REASONS = frozenset({
     "ROLE_NOT_COMPLETE",
 })
 DEFERRED_ATTEMPTS_EXHAUSTED = "DEFERRED_ATTEMPTS_EXHAUSTED"
+WINDOW_DEADLINE_RECORD_FAILED = "WINDOW_DEADLINE_RECORD_FAILED"  # R98 fault kind
+DEADLINE_CLOSE_FAILED = "DEADLINE_CLOSE_FAILED"  # R98 report status: the window could not be closed MISSED
 _EXCEPTION_DETAIL_LIMIT = 240
 _SECRET_ASSIGNMENT = re.compile(
     r"(?i)\b(token|secret|password|passwd|api[_ -]?key|authorization|cookie)"
@@ -617,18 +623,8 @@ class StageOrchestrator:
                          or (records[name].state == "FAILED" and OWNER_LOST in records[name].reason_codes
                              and records[name].attempt < self._attempt_limit(records[name])))
         if pending and now >= claim.window.deadline:
-            readiness = self._repository.readiness(plan.cohort_id)
-            for name in pending:
-                waiting_on = next((item for item in self._stages[name].prerequisites
-                                   if self._stages[item].schedule_kind in RESIDENT_SCHEDULES
-                                   and readiness.get(item) != "READY"), None)
-                reason = f"PREREQUISITE_NOT_READY:{waiting_on}" if waiting_on else "WINDOW_DEADLINE_PASSED"
-                self._repository.record_missed(claim, name, plan.stage_catalog_version, reason, now)
-                self._repository.upsert_readiness(plan.cohort_id, name, plan.stage_catalog_version, "BLOCKED",
-                                                  (reason,), None, now)
-                report.executed.append((name, "MISSED"))
-            records, _ = self._decision_states(claim)
-            pending = []
+            self._close_missed(claim, plan, pending, report, now)
+            return
         if pending:
             self._repository.release_window(claim, now)
             report.status, report.window_state = "PENDING_STAGES", "PENDING"
@@ -642,3 +638,77 @@ class StageOrchestrator:
             final = "FAILED"
         self._repository.finish_window(claim, final, now)
         report.status, report.window_state = "FINISHED", final
+
+    def _close_missed(self, claim: WindowClaim, plan: ServicePlan, pending: list[str], report: WindowReport,
+                      now: datetime) -> None:
+        """Record every stage still pending at the window deadline MISSED, then close the window MISSED (the only
+        final state once a stage is MISSED).
+
+        R98 (Nov 17): a stages_v5 Options target-window stage may hold a row only once the window's cycle authority
+        is consumed, which happens when OPTIONS_INPUT_GATE starts. For a window whose deadline passed first,
+        record_missed returns None for those stages and they are MISSED without a row. A database error on this path
+        is logged (one JSON line and a fault) and never escapes: on Nov 17 19:27 the trigger's refusal ended the
+        Options WINDOW role and left the window RUNNING past its deadline."""
+        try:
+            readiness = self._repository.readiness(plan.cohort_id)
+        except PsycopgError as error:
+            self._deadline_fault(claim, "READ_READINESS", None, error)
+            readiness = None
+        without_row = []
+        for name in pending:
+            waiting_on = None if readiness is None else next(
+                (item for item in self._stages[name].prerequisites
+                 if self._stages[item].schedule_kind in RESIDENT_SCHEDULES and readiness.get(item) != "READY"),
+                None)
+            reason = f"PREREQUISITE_NOT_READY:{waiting_on}" if waiting_on else "WINDOW_DEADLINE_PASSED"
+            try:
+                if self._repository.record_missed(claim, name, plan.stage_catalog_version, reason, now) is None:
+                    without_row.append(name)
+            except PsycopgError as error:
+                self._deadline_fault(claim, "RECORD_MISSED", name, error)
+            try:
+                self._repository.upsert_readiness(plan.cohort_id, name, plan.stage_catalog_version, "BLOCKED",
+                                                  (reason,), None, now)
+            except PsycopgError as error:
+                self._deadline_fault(claim, "RECORD_READINESS", name, error)
+            report.executed.append((name, "MISSED"))
+        if without_row:
+            _json_line({
+                "event": "window_deadline_stages_missed_without_rows",
+                "window_id": str(claim.window.window_id),
+                "window_key": claim.window.window_key,
+                "stages": without_row,
+                "reason": "WINDOW_CYCLE_AUTHORITY_NOT_CONSUMED",
+            })
+        try:
+            self._repository.finish_window(claim, "MISSED", now)
+        except PsycopgError as error:
+            self._deadline_fault(claim, "FINISH_WINDOW", None, error)
+            report.status = DEADLINE_CLOSE_FAILED  # left RUNNING; self-heal WINDOW_PAST_DEADLINE reports it
+            return
+        report.status, report.window_state = "FINISHED", "MISSED"
+
+    @staticmethod
+    def _deadline_fault(claim: WindowClaim, step: str, stage_id: str | None, error: BaseException) -> None:
+        sqlstate = getattr(error, "pgcode", None) or type(error).__name__
+        detail = _stage_exception_reason(error).removeprefix("STAGE_EXCEPTION:")
+        _json_line({
+            "event": "window_deadline_record_failed",
+            "window_id": str(claim.window.window_id),
+            "window_key": claim.window.window_key,
+            "step": step,
+            "stage_id": stage_id,
+            "sqlstate": sqlstate,
+            "error": detail,
+        })
+        emit_fault(
+            kind=WINDOW_DEADLINE_RECORD_FAILED, severity="ERROR", recoverable=True, action="CONTINUE",
+            key=f"{step}|{stage_id or '-'}|{sqlstate}",
+            message=f"window {claim.window.window_key} past its deadline: {step} {stage_id or ''} failed: {detail}",
+            context={"window_id": str(claim.window.window_id), "window_key": claim.window.window_key, "step": step,
+                     "stage_id": stage_id, "sqlstate": sqlstate},
+        )
+
+
+def _json_line(payload: Mapping[str, object]) -> None:
+    print(json.dumps(payload, sort_keys=True, default=str), flush=True)

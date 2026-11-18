@@ -28,6 +28,14 @@ from realtime.advanced_options_continuous_scheduler import (  # noqa: E402
     STALE_SNAPSHOT_SKIPPED,
     run_continuous_options_schedule_cycle,
 )
+from realtime.advanced_options_levels import (  # noqa: E402
+    options_levels_mode,
+    start_options_levels,
+)
+from realtime.advanced_options_slot_rotation import (  # noqa: E402
+    slot_rotation_mode,
+    start_slot_rotation,
+)
 from realtime.migrations import validate_target_database_v2  # noqa: E402
 from scripts.run_advanced_options_v3_lifecycle import _provider  # noqa: E402
 
@@ -49,6 +57,10 @@ def parse_args(argv=None):
     from realtime.options_breadth_spot import breadth_spot_mode
 
     breadth_spot_mode()
+    # G106 AL10: an invalid REALTIME_V3_OPTIONS_SLOT_ROTATION stops the scheduler at start as well.
+    slot_rotation_mode()
+    # G106 levels: an invalid REALTIME_V3_OPTIONS_LEVELS stops the scheduler at start as well.
+    options_levels_mode()
     return args
 
 
@@ -65,6 +77,10 @@ def main(argv=None):
     if not api_key:
         raise RuntimeError("POLYGON_API_KEY is required")
     provider, pool = _provider()
+    # G106 AL10 phase 1: None when OFF (no line, nothing runs); RECORD / ON log their start lines here.
+    slot_rotation = start_slot_rotation(slot_rotation_mode())
+    # G106 levels: None when OFF (no line, nothing runs); RECORD / ON log their start lines here.
+    levels = start_options_levels(options_levels_mode())
     stop = threading.Event()
     signal.signal(signal.SIGINT, lambda *_: stop.set())
     signal.signal(signal.SIGTERM, lambda *_: stop.set())
@@ -86,6 +102,7 @@ def main(argv=None):
                 result = run_continuous_options_schedule_cycle(
                     provider, session_date=lifecycle.processing_session_date,
                     api_key=api_key, skipped_receipts=frozenset(skipped),
+                    slot_rotation=slot_rotation, levels=levels,
                 )
             except Exception as error:  # noqa: BLE001 - reported, retried, bounded
                 failures += 1

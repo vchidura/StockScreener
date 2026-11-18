@@ -257,9 +257,13 @@ def run_continuous_options_schedule_cycle(
     clock=lambda: datetime.now(UTC),
     transport_factory=SingleAttemptPolygonHttpTransport,
     skipped_receipts=frozenset(),
+    slot_rotation=None,
+    levels=None,
 ):
     """`skipped_receipts`: Equity INPUT_READY receipt ids this process already skipped as stale (G74); the cycle
-    waits for the next Equity window instead of replaying them."""
+    waits for the next Equity window instead of replaying them. `slot_rotation`: the G106 AL10 recorder
+    (`advanced_options_slot_rotation.start_slot_rotation`), None when the switch is OFF. `levels`: the G106 levels
+    recorder (`advanced_options_levels.start_options_levels`), None when the switch is OFF."""
     with provider.transaction(APP_ROLE) as unit:
         unit.cursor.execute(
             "SELECT pg_try_advisory_xact_lock(hashtextextended(%s,0))",
@@ -270,7 +274,7 @@ def run_continuous_options_schedule_cycle(
         return _run_schedule_cycle(
             provider, session_date=session_date, api_key=api_key,
             clock=clock, transport_factory=transport_factory,
-            skipped_receipts=frozenset(skipped_receipts),
+            skipped_receipts=frozenset(skipped_receipts), slot_rotation=slot_rotation, levels=levels,
         )
 
 
@@ -282,7 +286,8 @@ def _stale_skip(receipt, reason):
 
 
 def _run_schedule_cycle(
-    provider, *, session_date, api_key, clock, transport_factory, skipped_receipts=frozenset(),
+    provider, *, session_date, api_key, clock, transport_factory, skipped_receipts=frozenset(), slot_rotation=None,
+    levels=None,
 ):
     from scripts.run_advanced_options_v3_production import _authorize_window
 
@@ -410,7 +415,7 @@ def _run_schedule_cycle(
         provider, package=package, acquisition=acquisition, equity_cutoff=receipt[1], api_key=api_key,
         clock=clock, transport_factory=transport_factory,
     )
-    return {
+    result = {
         "status": "ATTACHED", "window_id": str(target_window_id),
         "equity_cutoff": receipt[1].isoformat(), "options_cutoff": options_cutoff.isoformat(),
         "contracts": len(acquisition.contract_tickers), "sequence": downstream.sequence,
@@ -421,6 +426,47 @@ def _run_schedule_cycle(
         ),
         "breadth": breadth,
     }
+    if slot_rotation is not None:
+        rotation = _record_slot_rotation(
+            slot_rotation, provider, acquisition=acquisition, equity_cutoff=receipt[1],
+            window_id=target_window_id, breadth=breadth, clock=clock,
+        )
+        if rotation is not None:
+            result["slot_rotation"] = rotation
+    if levels is not None:
+        recorded = _record_levels(
+            levels, provider, acquisition=acquisition, equity_cutoff=receipt[1], window_id=target_window_id,
+            breadth=breadth,
+        )
+        if recorded is not None:
+            result["levels"] = recorded
+    return result
+
+
+def _record_slot_rotation(recorder, provider, *, acquisition, equity_cutoff, window_id, breadth, clock):
+    """G106 AL10 phase 1 (RECORD only): after the window is attached and the chain captured, the rotation policy reads
+    the chain it just stored (one short read-only transaction on the pool's other connection) and logs what it would
+    swap. It never changes the window or the watched set and never fails the cycle."""
+    try:
+        return recorder.record_window(
+            provider, session_date=acquisition.authority.session_date, equity_cutoff=equity_cutoff,
+            window_id=str(window_id), watched=acquisition.contract_tickers, breadth=breadth, clock=clock,
+        )
+    except Exception as error:  # noqa: BLE001 - the recorder never raises; this only guards the call itself
+        return {"status": "FAILED", "reason": f"{type(error).__name__}: {str(error)[:160]}"}
+
+
+def _record_levels(recorder, provider, *, acquisition, equity_cutoff, window_id, breadth):
+    """G106 levels (RECORD only): after the chain capture, dealer gamma and delta levels per name from the capture just
+    stored (one short read-only transaction on the pool's other connection), logged. It never changes the window and
+    never fails the cycle."""
+    try:
+        return recorder.record_window(
+            provider, session_date=acquisition.authority.session_date, equity_cutoff=equity_cutoff,
+            window_id=str(window_id), breadth=breadth,
+        )
+    except Exception as error:  # noqa: BLE001 - the recorder never raises; this only guards the call itself
+        return {"status": "FAILED", "reason": f"{type(error).__name__}: {str(error)[:160]}"}
 
 
 BREADTH_SECONDS = 150

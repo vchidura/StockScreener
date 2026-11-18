@@ -652,6 +652,57 @@ def _session_slices(group):
     return slices
 
 
+def _bar_key(fact):
+    return fact.revision.interval, fact.revision.adjusted, fact.revision.bar_start
+
+
+def _keep_bar_key_winners(buckets, facts, ticker):
+    """R96 (Nov 17): keeps one fact per bar key in `buckets` (in place) and returns the superseded source revisions.
+
+    A provider correction of a finalized minute is a second final revision of its bar key (CVX and INTC 14:49, re-sent
+    at 14:51:01 after the 5m bar 14:45 was derived from the first one). The window load lists every winner, one per
+    bar key, before the source closure of the derived bars (`load_full_bars`, `_RetainedBars.result`), so the first
+    fact of a bar key is its winner and a later one is a superseded revision a stored derived bar still names. Charts,
+    counts and lineage heads keep the winners (what the current-bar view composes); the superseded revisions only verify
+    the stored derived bars that name them (`_as_named_by`). A second revision no bar names is not a source closure
+    row and still fails the ticker. Without a repeated bar key `buckets` is left untouched (the normal case)."""
+    superseded = []
+    for key, rows in buckets.items():
+        if len({fact.revision.bar_start for fact in rows}) == len(rows):
+            continue
+        winners, seen = [], set()
+        for fact in rows:
+            if fact.revision.bar_start in seen:
+                superseded.append(fact)
+            else:
+                seen.add(fact.revision.bar_start)
+                winners.append(fact)
+        buckets[key] = winners
+    if superseded:
+        named = {source for fact in facts for source in fact.revision.source_bar_revision_ids}
+        stray = next((fact for fact in superseded if fact.revision.bar_revision_id not in named), None)
+        if stray is not None:
+            raise ValueError(
+                f"duplicate canonical source window: {ticker} {stray.revision.interval} "
+                f"bar_start={stray.revision.bar_start.isoformat()} revision {stray.revision.bar_revision_id} "
+                "is not a derived bar's source"
+            )
+    return tuple(superseded)
+
+
+def _as_named_by(sources, superseded, stored):
+    """`sources` with a winner replaced by the superseded revision of its bar key that a `stored` derived bar names
+    (R96), so each stored bar is re-derived from exactly the sources it was derived from. `sources` itself when no
+    stored bar names a superseded revision."""
+    if not superseded:
+        return sources
+    named = {source for fact in stored for source in fact.revision.source_bar_revision_ids}
+    replacements = {_bar_key(fact): fact for fact in superseded if fact.revision.bar_revision_id in named}
+    if not replacements:
+        return sources
+    return tuple(replacements.get(_bar_key(fact), fact) for fact in sources)
+
+
 class _DerivationVerifier:
     """Verifies one ticker's stored derived intervals against their source bars, reusing verdicts.
 
@@ -1068,6 +1119,7 @@ def _project_realtime_ticker_workspace(
             buckets = {}
             for fact in facts:
                 buckets.setdefault((fact.revision.interval, fact.revision.adjusted), []).append(fact)
+            superseded = _keep_bar_key_winners(buckets, facts, security.ticker)  # R96
             groups = {
                 (interval, basis): tuple(sorted(
                     (fact for fact in buckets.get((interval, basis == "ADJUSTED"), ())
@@ -1176,7 +1228,8 @@ def _project_realtime_ticker_workspace(
                 stream_sessions = {fact.revision.session_date for fact in stream_five}
                 stream_minutes = tuple(sorted(
                     (
-                        fact for fact in buckets.get(("1m", False), ())
+                        # R96: each stored 5m is re-derived from the minutes it names, a superseded one included
+                        fact for fact in _as_named_by(buckets.get(("1m", False), ()), superseded, stream_five)
                         if fact.revision.session_date in stream_sessions
                         and fact.revision.source_kind in native_source_kinds
                     ),

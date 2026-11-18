@@ -24,6 +24,15 @@ TERMINAL_WINDOW_STATES = frozenset({
     "UNAVAILABLE",
 })
 OWNER_LOST = "OWNER_LOST"
+# R98: stages_v5 stages that may hold an rt.stage_runs row (any state but UNAVAILABLE) only once their target window's
+# cycle authority is consumed: trigger rt.validate_advanced_options_v3_stage_effect (sql_v2/035, re-created in 042).
+# The authority is consumed when OPTIONS_INPUT_GATE starts (start_stage).
+V5_TARGET_WINDOW_EFFECT_STAGES = frozenset({
+    "OPTIONS_INPUT_GATE",
+    "OPTIONS_CYCLE",
+    "OPTIONS_PROJECTION",
+    "OPTIONS_PUBLISH",
+})
 EQUITY_WINDOW_BUILD_ID = "v2-10-developer-window-v1"
 OPTIONS_INPUT_READY = "OPTIONS_INPUT_READY"
 OPTIONS_CYCLE = "OPTIONS_CYCLE"
@@ -353,7 +362,10 @@ class OrchestrationRepository(Protocol):
                        blocker_state: str, now: datetime) -> StageRunRecord: ...
 
     def record_missed(self, claim: WindowClaim, stage_id: str, version: str, reason: str,
-                      now: datetime) -> StageRunRecord: ...
+                      now: datetime) -> StageRunRecord | None:
+        """The MISSED row, or None when the stage may hold no row in this window (a stages_v5 target-window
+        stage whose cycle authority was never consumed, R98); the stage is then MISSED without a row."""
+        ...
 
     def record_receipt(self, claim: WindowClaim, spec: CycleReceiptSpec, run: StageRunRecord) -> UUID: ...
 
@@ -749,9 +761,21 @@ class PostgresOrchestrationRepository:
             return _run(unit.cursor.fetchone())
 
     def record_missed(self, claim: WindowClaim, stage_id: str, version: str, reason: str,
-                      now: datetime) -> StageRunRecord:
+                      now: datetime) -> StageRunRecord | None:
         with self._transaction() as unit:
             self._fence(unit.cursor, claim)
+            if version == "stages_v5" and stage_id in V5_TARGET_WINDOW_EFFECT_STAGES:
+                # R98 (Nov 17): the same test as rt.validate_advanced_options_v3_stage_effect. Without a consumed
+                # cycle authority the INSERT below is refused (RT003); the stage is MISSED without a row and the
+                # orchestrator closes the window MISSED.
+                unit.cursor.execute(
+                    "SELECT 1 FROM rt.advanced_options_window_cycle_authorizations AS authority "
+                    "JOIN rt.advanced_options_authority_receipts AS receipt "
+                    "ON receipt.window_cycle_authorization_id = authority.authorization_id "
+                    "WHERE authority.target_window_id = %s AND receipt.authority_kind = 'WINDOW_CYCLE' LIMIT 1",
+                    (str(claim.window.window_id),))
+                if unit.cursor.fetchone() is None:
+                    return None
             attempt = self._next_attempt(unit.cursor, claim.window.window_id, stage_id)
             unit.cursor.execute(
                 "INSERT INTO rt.stage_runs (stage_run_id, window_id, stage_id, stage_version, attempt, state, "

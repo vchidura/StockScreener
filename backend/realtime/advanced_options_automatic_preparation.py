@@ -67,6 +67,13 @@ from .advanced_options_slot_side_balance import (
     allocate_with_side_balance,
     parse_slot_side_balance_mode,
 )
+from .advanced_options_slot_selection import (
+    SLOT_SELECTION_SETTING,
+    SlotSelectionMode,
+    allocate_with_slot_selection,
+    load_previous_session_chain,
+    parse_slot_selection_mode,
+)
 from .advanced_options_lifecycle import (
     AdvancedOptionsPreparationClaim,
     AdvancedOptionsPreparationExecutor,
@@ -317,6 +324,7 @@ class PostgresAutomaticOptionsPreparationExecutor(
         selection_source_factory=None,
         combined_capture_factory=None,
         slot_side_balance: SlotSideBalanceMode | str = SlotSideBalanceMode.OFF,
+        slot_selection: SlotSelectionMode | str = SlotSelectionMode.OFF,
     ) -> None:
         # G106 AL8: REALTIME_V3_OPTIONS_SLOT_SIDE_BALANCE (OFF / RECORD / ON); anything else, or not OFF with a
         # non-v4 admission profile, refuses the configuration (the lifecycle service does not start).
@@ -331,6 +339,19 @@ class PostgresAutomaticOptionsPreparationExecutor(
                 "the slot side balance requires the v4 admission profile"
             )
         self._slot_side_balance = slot_side_balance
+        # G106 AL11: REALTIME_V3_OPTIONS_SLOT_SELECTION (OFF / RECORD / ON); anything else, or not OFF with a non-v4
+        # admission profile, refuses the configuration (the lifecycle service does not start).
+        slot_selection = parse_slot_selection_mode(slot_selection)
+        if (
+            slot_selection is not SlotSelectionMode.OFF
+            and admission_profile_version
+            != V4_ACTIVITY_MOMENTUM_PROFILE_VERSION
+        ):
+            raise ValueError(
+                "automatic Options preparation configuration is invalid: "
+                f"{SLOT_SELECTION_SETTING} requires the v4 admission profile"
+            )
+        self._slot_selection = slot_selection
         if (
             not isinstance(provider, V2ConnectionProvider)
             or not api_key.strip()
@@ -1235,6 +1256,24 @@ class PostgresAutomaticOptionsPreparationExecutor(
             session_date=claim.session_date,
             arguments=allocation_arguments,
         )
+        # G106 AL11: OFF = the allocation above untouched (no read, no second allocation); RECORD = the same, the
+        # previous-session-volume selection only logged; ON = that selection's allocation (today's on any failure).
+        slot_selection = getattr(
+            self,
+            "_slot_selection",
+            SlotSelectionMode.OFF,
+        )
+        if slot_selection is not SlotSelectionMode.OFF:
+            allocation = self._slot_selection_allocation(
+                claim,
+                slot_selection,
+                allocation=allocation,
+                profile=profile,
+                resolution=resolution,
+                candidates=candidates,
+                resolution_arguments=resolution_arguments,
+                allocation_arguments=allocation_arguments,
+            )
         selected = set(allocation.selected_contract_tickers)
         if not selected:
             raise AdvancedOptionsPreparationRetryable(
@@ -1275,6 +1314,76 @@ class PostgresAutomaticOptionsPreparationExecutor(
         filtered.pop("semantic_sha256", None)
         filtered["semantic_sha256"] = canonical_sha256(filtered)
         return filtered, allocation
+
+    def _slot_selection_allocation(
+        self,
+        claim,
+        mode,
+        *,
+        allocation,
+        profile,
+        resolution,
+        candidates,
+        resolution_arguments,
+        allocation_arguments,
+    ):
+        """G106 AL11 (advanced_options_slot_selection): the rule's set, allocated by the same V4 allocation over the
+        chosen candidates only; AL8 ON keeps its side balance flag. Reads the previous session's close chain once."""
+        side_balance = (
+            getattr(self, "_slot_side_balance", SlotSideBalanceMode.OFF)
+            is SlotSideBalanceMode.ON
+        )
+
+        def resolve(rows):
+            present = {row.underlying for row in rows}
+            arguments = dict(resolution_arguments)
+            if "expiry_calendars" in arguments:
+                arguments["expiry_calendars"] = tuple(
+                    row
+                    for row in arguments["expiry_calendars"]
+                    if row.underlying in present
+                )
+            return resolve_activity_momentum_selection(
+                profile,
+                session_date=claim.session_date,
+                candidates=rows,
+                enabled_strategies=self._enabled_strategies,
+                **arguments,
+            )
+
+        def allocate(restricted):
+            arguments = {
+                **allocation_arguments,
+                "groups": restricted.groups,
+                "resolution": restricted,
+            }
+            if side_balance:
+                arguments["side_balance"] = True
+            return allocate_activity_momentum(profile, **arguments)
+
+        def previous():
+            with self._provider.transaction(
+                APP_ROLE,
+                read_only=True,
+            ) as unit:
+                return load_previous_session_chain(
+                    unit.cursor,
+                    session_date=claim.session_date,
+                    underlyings=claim.option_underlyings,
+                )
+
+        return allocate_with_slot_selection(
+            mode=mode,
+            used=allocation,
+            profile=profile,
+            resolution=resolution,
+            candidates=candidates,
+            session_date=claim.session_date,
+            side_balance=side_balance,
+            previous=previous,
+            resolve=resolve,
+            allocate=allocate,
+        )
 
     def _activate_session(self, claim):
         if (
