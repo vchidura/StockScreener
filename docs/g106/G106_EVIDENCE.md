@@ -1041,3 +1041,19 @@ names are not replayed). The OI rule alone drops 3 / 9.
 set and the market-state / provider subscription (the allocation document's schema is unchanged and its contract count
 the same, but no live or DB-backed run); O1 / OS outcomes on the balanced set (passes counted at the close only, not
 alerts); whether the lifecycle restart near the open interrupts a stage lease (the stages were idle / RETRY at 08:5x).
+
+## Nov 17 (Tue) - live: AL4/AL6/AL7 ON, AL8 RECORD, AL9 full-chain scan, AL10 design + value report (times UTC)
+- **AL4 floor** ON 15:04 after 4 clean RECORD windows; **AL6 0DTE gate + AL7 aggressor side** ON 15:30 (user's yes after the
+  research recap: contract type as direction points against the day ~70%). Day: O1 1 alert contract (NFLX 11/27 60C, 19:38,
+  repeated), ~138 OBSERVATION (gates), 6,657 NOT_SELECTED (ratio < 3 on a high-OI watched set: median prior OI ~4,200); OS1 1
+  alert (SPY 11/17 738P, 15:52).
+- **AL8 RECORD:** stored allocation 213 calls / 171 puts; balanced would be 192/192; 17 record lines, no failures.
+- **AL9 full-chain scan (RECORD side process, read-only, 17:49-21:06):** 21,000+ contracts/window, ~1,050-1,250 tradable
+  (~100 watched), 10-92 burst candidates/window (0-8 watched). Watched set = 9.3% of tradable 5-min premium (14.8% volume).
+- **AL10 design (code map):** the watched set is sealed per session (pointer move fails every window; out-of-set contracts are
+  quarantined); target = declared superset + in-place subscribe/unsubscribe; phase 1 (policy + Options scheduler RECORD) built.
+- **VALUE REPORT** (`recovery-20261104/evidence/chain-scan-20261117/VALUE_REPORT.md`): pre-open top-24/name by prior OI near the
+  money = 32.6% of tradable premium (3.5x watched), one midday re-selection 43%, best static 62.5%, perfect rotation 82% (needs
+  ~118 swaps/window); bursts last ~1 window (90%); no outcome edge on one afternoon -> AL10 phases 2-3 no-go/defer; next: better
+  selection rule + snapshot alert lane, RECORD-first.
+- **H1-lite:** close chain export `recovery-20261104/evidence/chain-daily/2026-11-17.jsonl.gz` (21,232 rows, 16 names).

@@ -3529,3 +3529,17 @@ unset the switch (restart) - the image is inert without it. The API, frontend an
 **Artifacts (scratchpad of the build session, not in the repo):** runner copy `r83_equity_window_parity.py`,
 `r83_full_vs_delta.py`, `summarize.py`, outputs `out/*.json`. `g102-test-pg` stopped afterwards as found; the
 `hopeful_neumann` container (r121 image) seen during the runs is not this session's and was left alone.
+
+## Nov 17 (Tue) - live session 9a3dba58: run, in-session changes and close (times UTC)
+- **Pre-open:** audit 13:01 PASS; dry run 13:31 FAIL only on COIN/MSTR capture (all rows NON_POSITIVE_ASK at 08:31 ET, pre-open
+  quotes pulled) - GO; the real AT_OPEN capture 14:31:37-14:34 captured all 16 names, Options ACTIVE 14:37:58, 384 contracts.
+- **Deploy 13:36-13:46:** r133 `867f80b5db26` on scheduler (R83-0 1m:2,5m:10,15m:22), Options lifecycle (AL8 RECORD), Options
+  scheduler (OV1-F2 spot QUOTE), Options window (floor/OS v2/0DTE/aggressor RECORD). Scheduler 1.6-1.75 GB vs 5.4 GB on Nov 16 (R83-0).
+- **In session:** floor ON 15:04; AL6 + AL7 ON 15:30 (user's yes; lost E:15:25 to an early release during the hotfix); R96
+  CVX/INTC frozen ticker pages from 14:55 (corrected 14:49 minute, two final 1m revisions) - fix r134 built 15:38, deployed on the
+  scheduler 21:08, verified 45/45 workspaces at the 21:00 close; R97 network degradation 19:10-19:26 (Options stream up to ~7 min
+  behind, E:19:10/19:15/19:20 lost); R98 Options window crash 19:27 on a deadline-passed stage (restart 2 s).
+- **Windows:** Equity 78/78 (E:21:00 via R77 retry4 22:28:52, AFTER_CLOSE PUBLISHED 22:29:12); Options 73 COMPLETE, 4 lost,
+  run time 113-206 s at 384 contracts (Nov 16 ~67 s at 216). Journals 0 bad. Alerts open: STOCK 20, OPTION 2; packages 8.
+- **Evidence:** recovery-20261104/HANDOVER-20261117-LIVE.md takeover block, data-audit/watch/watch-20261117-*, faults-2026-11-17.*,
+  profiles *20261117T2047* (market-state 35.5% avg CPU, 65% in the SQLite journal read).
