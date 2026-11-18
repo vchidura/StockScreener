@@ -2833,7 +2833,9 @@ export interface OptionO3CreditObservation {
     valuation_policy_sha256: string }>
 }
 
-export type OptionDetectorId = 'O1' | 'O2' | 'O3' | 'OS1' | 'OS2'
+// G106 D5 (Nov 18): F0DTE, the 0DTE intraday lane, is an alert's detector id (its evaluations ride the O1 lane).
+// The API's ?detector= filter does not accept it yet (portal_api Literal lists move with the next API package).
+export type OptionDetectorId = 'O1' | 'O2' | 'O3' | 'OS1' | 'OS2' | 'F0DTE'
 
 export interface OptionDetectorEvaluationReview {
   storage_ready: boolean

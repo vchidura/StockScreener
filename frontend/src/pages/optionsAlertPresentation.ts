@@ -45,6 +45,20 @@ export function optionPackageStrategyName(strategy: string | null | undefined): 
   return optionAlertLabel(strategy)
 }
 
+/** G106 D5 (Nov 18): an alert's category for display; F0DTE alerts carry ZERO_DTE_INTRADAY. */
+export function optionAlertCategoryName(category: string | null | undefined): string {
+  if (!category) return 'Unavailable'
+  if (category === 'ZERO_DTE_INTRADAY') return '0DTE intraday'
+  return optionAlertLabel(category)
+}
+
+/** G106 D5 (Nov 18): what an alert's trigger time is, by detector (the triggered-at tooltip). */
+export function optionAlertTriggerBasis(detector: string): string {
+  if (detector === 'F0DTE') return 'End of the 5-minute print window (window cutoff); entry limit = the ask then'
+  if (detector === 'O1' || detector === 'O3') return 'Original option source time'
+  return 'Original stock trigger-bar time'
+}
+
 export function optionAlertTabParams(params: URLSearchParams, view: OptionAlertView): URLSearchParams {
   const next = new URLSearchParams(params)
   next.set('view', view)

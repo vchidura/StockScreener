@@ -1,10 +1,11 @@
-import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
+import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type FocusEvent, type KeyboardEvent, type PointerEvent, type ReactNode } from 'react'
+import { createPortal } from 'react-dom'
 import { keepPreviousData, useQuery } from '@tanstack/react-query'
 import { useSearchParams } from 'react-router-dom'
 import axios from 'axios'
 import { AlertTriangle, BarChart3, CalendarRange, Database, Info, LayoutGrid, ListOrdered, Radio } from 'lucide-react'
 import { usePublishPageContext } from '../layout/pageContext'
-import { useSessionDate } from '../layout/sessionDate'
+import { marketSessionOpen, useSessionDate } from '../layout/sessionDate'
 import {
   getOptionExposure,
   type OptionExposureExpiry,
@@ -16,8 +17,11 @@ import {
 } from '../services/api'
 import { msUntilWindowRead, OPTIONS_FIRST_CHECK_MS, windowTimeMs } from '../utils/refreshTiming'
 import {
+  barsExtent,
   cellStrength,
+  CONVENTION_NOTE,
   defaultStrikeBand,
+  exposureSummary,
   formatCell,
   formatExposure,
   formatPercent,
@@ -27,22 +31,31 @@ import {
   heatmapGrid,
   inUnit,
   labelStride,
+  LEVEL_DEFINITIONS,
   markerRows,
   nearestStrikeIndex,
+  netLinePath,
   niceTicks,
+  opposingSize,
+  partsInUnit,
   priceToX,
   qualityNotes,
   regimeText,
   robustMaximum,
   SCOPE_LABELS,
+  signLabels,
+  strikeBar,
   strikeSegments,
   strikesInBand,
   unavailableText,
-  valueExtent,
   WEIGHT_LABELS,
+  zeroDteByStrike,
+  zeroDteSplitState,
   type ExposureUnit,
   type ExposureView,
   type HeatmapMode,
+  type LevelKind,
+  type ZeroDteParts,
 } from './optionsExposureModel'
 import './OptionsFlowPage.css'
 import './OptionsOverviewPage.css'
@@ -110,22 +123,154 @@ function Segmented<T extends string>({ label, value, options, onChange }: {
   )
 }
 
-function Legend({ view }: { view: ExposureView }) {
+/**
+ * A definition that opens on hover (mouse), keyboard focus, or a tap/click (which pins it until the next tap, a tap
+ * elsewhere, Escape or blur). The bubble is portalled to <body> with fixed coordinates clamped to the viewport, so it
+ * never widens the page on a phone. Works for an HTML button and for an SVG group (Enter/Space toggle there).
+ */
+function useInfoTip<T extends Element>(text: string) {
+  const id = useId()
+  const triggerRef = useRef<T | null>(null)
+  const bubbleRef = useRef<HTMLDivElement | null>(null)
+  const [open, setOpen] = useState(false)
+  const [pinned, setPinned] = useState(false)
+  const [place, setPlace] = useState<{ left: number; top: number } | null>(null)
+  const close = useCallback(() => { setOpen(false); setPinned(false); setPlace(null) }, [])
+  const position = useCallback(() => {
+    const trigger = triggerRef.current, bubble = bubbleRef.current
+    if (!trigger || !bubble) return
+    // A chart marker's group also holds its line down the plot: anchor at its label instead.
+    const rect = (trigger.querySelector('[data-tip-anchor]') ?? trigger).getBoundingClientRect()
+    const viewWidth = document.documentElement.clientWidth, viewHeight = window.innerHeight
+    const width = bubble.offsetWidth, height = bubble.offsetHeight
+    const left = Math.min(Math.max(8, rect.left + rect.width / 2 - width / 2), Math.max(8, viewWidth - width - 8))
+    const below = rect.bottom + 6
+    const top = below + height > viewHeight - 8 && rect.top - height - 6 >= 8 ? rect.top - height - 6 : below
+    setPlace({ left, top })
+  }, [])
+  useLayoutEffect(() => { if (open) position() }, [open, position])
+  useEffect(() => {
+    if (!open) return
+    const outside = (event: globalThis.PointerEvent) => {
+      const target = event.target as Node
+      if (!triggerRef.current?.contains(target) && !bubbleRef.current?.contains(target)) close()
+    }
+    const escape = (event: globalThis.KeyboardEvent) => { if (event.key === 'Escape') close() }
+    document.addEventListener('pointerdown', outside)
+    document.addEventListener('keydown', escape)
+    window.addEventListener('scroll', position, true)
+    window.addEventListener('resize', position)
+    return () => {
+      document.removeEventListener('pointerdown', outside)
+      document.removeEventListener('keydown', escape)
+      window.removeEventListener('scroll', position, true)
+      window.removeEventListener('resize', position)
+    }
+  }, [open, close, position])
+  const toggle = () => { if (pinned) close(); else { setOpen(true); setPinned(true) } }
+  const handlers = {
+    'aria-describedby': id,
+    onPointerEnter: (event: PointerEvent) => { if (event.pointerType === 'mouse') setOpen(true) },
+    onPointerLeave: (event: PointerEvent) => { if (event.pointerType === 'mouse' && !pinned) close() },
+    // Keyboard focus opens it; a tap or click focuses too, but there the click decides (a tap would otherwise open
+    // on focus and close again on the click that follows).
+    onFocus: (event: FocusEvent<Element>) => {
+      let keyboard = true
+      try { keyboard = event.currentTarget.matches(':focus-visible') } catch { /* older browsers: treat as keyboard */ }
+      if (keyboard) setOpen(true)
+    },
+    onBlur: close,
+    onClick: toggle,
+  }
+  // Always mounted (hidden while closed) so aria-describedby has its text; outside the chart's SVG and any transformed
+  // ancestor, so fixed coordinates are the viewport's.
+  const bubble = text ? createPortal(
+    <div ref={bubbleRef} id={id} role="tooltip" className="ov-tip" hidden={!open}
+      style={{ left: place?.left ?? 0, top: place?.top ?? 0, visibility: place ? 'visible' : 'hidden' }}>{text}</div>,
+    document.body,
+  ) : null
+  return { triggerRef, handlers, toggle, bubble, open }
+}
+
+/** A level name (call wall, put wall, flip) as an inline term with its definition. */
+function LevelTerm({ kind, children }: { kind: LevelKind; children: ReactNode }) {
+  const tip = useInfoTip<HTMLButtonElement>(LEVEL_DEFINITIONS[kind])
+  return (
+    <>
+      <button type="button" ref={tip.triggerRef} className={`ov-term${tip.open ? ' is-open' : ''}`} {...tip.handlers}>{children}</button>
+      {tip.bubble}
+    </>
+  )
+}
+
+/** Today's (0 DTE) and later-expiry parts in the legend (Nov 18). */
+function SplitLegend({ split }: { split: 'split' | 'no-today' | 'off' }) {
+  if (split === 'split') {
+    return <><span><i className="ov-swatch ov-swatch--pos ov-swatch--today" />Expires today (0 DTE)</span><span><i className="ov-swatch ov-swatch--pos" />Later expiries</span></>
+  }
+  return split === 'no-today' ? <span className="ov-legend__note">Nothing in range expires today</span> : null
+}
+
+function Legend({ view, greek, split = 'off', netMarks = false, netLabel = 'Net per strike', note = false }: {
+  view: ExposureView; greek: string; split?: 'split' | 'no-today' | 'off'; netMarks?: boolean; netLabel?: string; note?: boolean
+}) {
+  const signs = signLabels(greek)
   return (
     <div className="ov-legend" aria-label="Legend">
       {view === 'net'
-        ? <><span><i className="ov-swatch ov-swatch--pos" />Positive (dealers long)</span><span><i className="ov-swatch ov-swatch--neg" />Negative (dealers short)</span></>
+        ? <><span><i className="ov-swatch ov-swatch--pos" />{signs.positive}</span><span><i className="ov-swatch ov-swatch--neg" />{signs.negative}</span></>
         : <><span><i className="ov-swatch ov-swatch--pos" />Calls</span><span><i className="ov-swatch ov-swatch--neg ov-swatch--hatch" />Puts</span></>}
+      {view === 'overlay' && <span><i className="ov-swatch-line" />{netLabel}</span>}
+      {view === 'net' && netMarks && <span><i className="ov-swatch-dot" />Net where today and later point opposite ways</span>}
+      <SplitLegend split={split} />
+      {note && <span className="ov-legend__note">{CONVENTION_NOTE}</span>}
     </div>
   )
 }
 
-type Marker = { key: string; label: string; x: number; className: string }
+type Marker = { key: string; label: string; x: number; className: string; level?: LevelKind }
 
-/** Exposure by strike: one bar (Net) or stacked call/put segments per strike, with spot, flip and walls marked. */
-function StrikeChart({ rows, view, unit, spot, levels, greek }: {
-  rows: OptionExposureStrike[]; view: ExposureView; unit: ExposureUnit; spot: number
-  levels: OptionExposureRead['levels']; greek: string
+/** A level marker's label in the strike chart; flip and walls carry their definition (hover, focus, tap). */
+function MarkerLabel({ marker, row, x, left, right, width, plotBottom }: {
+  marker: Marker; row: number; x: number; left: number; right: number; width: number; plotBottom: number
+}) {
+  const level = marker.level
+  const tip = useInfoTip<SVGGElement>(level ? LEVEL_DEFINITIONS[level] : '')
+  const textX = Math.min(Math.max(x, left + 30), width - right - 30)
+  const textY = 10 + row * 15
+  const lineAndText = (
+    <>
+      <line x1={x} x2={x} y1={textY + 4} y2={plotBottom} />
+      <text x={textX} y={textY} textAnchor="middle">{marker.label}</text>
+    </>
+  )
+  if (!level) return <g className={`ov-marker ${marker.className}`}>{lineAndText}</g>
+  const hitWidth = marker.label.length * 6.2 + 10
+  const keys = (event: KeyboardEvent<SVGGElement>) => {
+    if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); tip.toggle() }
+  }
+  return (
+    <>
+      <g ref={tip.triggerRef} className={`ov-marker ov-marker--tip ${marker.className}${tip.open ? ' is-open' : ''}`}
+        tabIndex={0} role="button" {...tip.handlers} onKeyDown={keys}>
+        <rect className="ov-marker__hit" data-tip-anchor x={textX - hitWidth / 2} y={textY - 11} width={hitWidth} height={15} rx={2} />
+        {lineAndText}
+      </g>
+      {tip.bubble}
+    </>
+  )
+}
+
+type ChartRow = OptionExposureStrike & { parts: ZeroDteParts | null }
+
+/**
+ * Exposure by strike: one bar (Net), stacked call/put segments (Calls vs puts), or those segments with the net per
+ * strike as a line (Overlay); with spot, flip and walls marked. When the scope reaches past today, each bar splits into
+ * today's (0 DTE) and later expiries (Nov 18).
+ */
+function StrikeChart({ rows, view, unit, spot, levels, greek, split }: {
+  rows: ChartRow[]; view: ExposureView; unit: ExposureUnit; spot: number
+  levels: OptionExposureRead['levels']; greek: string; split: 'split' | 'no-today' | 'off'
 }) {
   const [containerRef, width] = useElementWidth<HTMLDivElement>()
   const [hover, setHover] = useState<number | null>(null)
@@ -135,20 +280,23 @@ function StrikeChart({ rows, view, unit, spot, levels, greek }: {
   const step = rows.length ? plotWidth / rows.length : 0
   const centers = rows.map((_, index) => left + step * (index + 0.5))
   const markers: Marker[] = []
-  const addMarker = (key: string, label: string, price: number | null | undefined, className: string) => {
+  const addMarker = (key: string, label: string, price: number | null | undefined, className: string, level?: LevelKind) => {
     if (price == null) return
     const x = priceToX(price, strikes, centers)
-    if (x != null) markers.push({ key, label, x, className })
+    if (x != null) markers.push({ key, label, x, className, level })
   }
   addMarker('spot', `Spot ${formatStrike(spot)}`, spot, 'ov-marker--spot')
-  if (levels?.flip_spot) addMarker('flip', `Flip ${formatStrike(levels.flip_spot)}`, Number(levels.flip_spot), 'ov-marker--flip')
-  if (levels?.call_wall) addMarker('call-wall', `Call wall ${formatStrike(levels.call_wall.strike)}`, Number(levels.call_wall.strike), 'ov-marker--wall')
-  if (levels?.put_wall) addMarker('put-wall', `Put wall ${formatStrike(levels.put_wall.strike)}`, Number(levels.put_wall.strike), 'ov-marker--wall')
+  if (levels?.flip_spot) addMarker('flip', `Flip ${formatStrike(levels.flip_spot)}`, Number(levels.flip_spot), 'ov-marker--flip', 'flip')
+  if (levels?.call_wall) addMarker('call-wall', `Call wall ${formatStrike(levels.call_wall.strike)}`, Number(levels.call_wall.strike), 'ov-marker--wall', 'call_wall')
+  if (levels?.put_wall) addMarker('put-wall', `Put wall ${formatStrike(levels.put_wall.strike)}`, Number(levels.put_wall.strike), 'ov-marker--wall', 'put_wall')
   const rowsOfLabels = markerRows(markers.map(marker => marker.x), 104)
   const top = 12 + (Math.max(-1, ...rowsOfLabels) + 1) * 15
   const plotHeight = height - top - bottom
-  const [rawLow, rawHigh] = valueExtent(rows, view)
-  const low = inUnit(rawLow, unit, spot) * 1.08, high = inUnit(rawHigh, unit, spot) * 1.08
+  const parted = split === 'split'
+  const bars = rows.map(row => strikeBar(inUnit(row.call, unit, spot), inUnit(row.put, unit, spot), view,
+    parted && row.parts ? partsInUnit(row.parts, unit, spot) : null))
+  const [rawLow, rawHigh] = barsExtent(bars)
+  const low = rawLow * 1.08, high = rawHigh * 1.08
   const ticks = niceTicks(low, high, 5)
   const domainLow = Math.min(low, ticks[0] ?? low), domainHigh = Math.max(high, ticks[ticks.length - 1] ?? high)
   const y = (value: number) => domainHigh === domainLow ? top + plotHeight / 2
@@ -156,58 +304,91 @@ function StrikeChart({ rows, view, unit, spot, levels, greek }: {
   const barWidth = Math.max(1, Math.min(18, step * 0.72))
   const stride = labelStride(rows.length, plotWidth, 46)
   const hovered = hover == null ? null : rows[hover]
+  const hoveredParts = parted && hovered?.parts ? hovered.parts : null
+  // Net dots: every strike in Overlay (when the strikes are wide enough to tell apart); in Net only where today's and
+  // the later part point opposite ways by at least 2 px each, so near-zero strikes do not fill with dots.
+  const pixelsPerUnit = domainHigh === domainLow ? 0 : plotHeight / (domainHigh - domainLow)
+  const dotted = bars.map(bar => bar.netMarker && (view === 'net' ? opposingSize(bar) * pixelsPerUnit >= 2 : step >= 5))
+  const netMarks = dotted.some(Boolean)
+  const tooltipWidth = hoveredParts ? 262 : 230
 
   return (
-    <div className="ov-chart" ref={containerRef}>
-      {width > 0 && rows.length > 0 && (
-        <svg width={width} height={height} role="img" aria-label={`${greekName(greek)} exposure by strike`}
-          onMouseLeave={() => setHover(null)}>
-          <defs>
-            <pattern id="ov-put-hatch" width="5" height="5" patternUnits="userSpaceOnUse" patternTransform="rotate(45)">
-              <rect width="5" height="5" className="ov-hatch-base" /><line x1="0" y1="0" x2="0" y2="5" className="ov-hatch-line" />
-            </pattern>
-          </defs>
-          {ticks.map(tick => (
-            <g key={tick} className={tick === 0 ? 'ov-axis ov-axis--zero' : 'ov-axis'}>
-              <line x1={left} x2={width - right} y1={y(tick)} y2={y(tick)} />
-              <text x={left - 8} y={y(tick)} dy="0.32em" textAnchor="end">{formatScaled(tick, unit)}</text>
-            </g>
-          ))}
-          {rows.map((row, index) => strikeSegments(inUnit(row.call, unit, spot), inUnit(row.put, unit, spot), view).map((segment, part) => {
-            const start = y(segment.from), end = y(segment.to)
-            const gap = segment.from === 0 ? 0 : 1
-            const yTop = Math.min(start, end) + (segment.to > segment.from ? 0 : gap)
-            const size = Math.max(1, Math.abs(end - start) - gap)
-            const tone = segment.kind === 'net' ? (segment.value > 0 ? 'pos' : 'neg') : segment.kind === 'call' ? 'pos' : 'neg ov-bar--hatch'
-            return <rect key={`${row.strike}:${part}`} className={`ov-bar ov-bar--${tone}${hover === index ? ' is-hover' : ''}`}
-              x={centers[index] - barWidth / 2} width={barWidth} y={yTop} height={size} rx={Math.min(2, barWidth / 2)} />
-          }))}
-          {rows.map((row, index) => (index % stride === 0 || index === rows.length - 1) && (
-            <text key={row.strike} className="ov-axis-label" x={centers[index]} y={height - bottom + 16} textAnchor="middle">{formatStrike(row.strike)}</text>
-          ))}
-          {markers.map((marker, index) => (
-            <g key={marker.key} className={`ov-marker ${marker.className}`}>
-              <line x1={marker.x} x2={marker.x} y1={10 + rowsOfLabels[index] * 15 + 4} y2={top + plotHeight} />
-              <text x={Math.min(Math.max(marker.x, left + 30), width - right - 30)} y={10 + rowsOfLabels[index] * 15} textAnchor="middle">{marker.label}</text>
-            </g>
-          ))}
-          {rows.map((row, index) => (
-            <rect key={`hit:${row.strike}`} className="ov-hit" x={centers[index] - step / 2} width={Math.max(step, 1)} y={top} height={plotHeight}
-              onMouseEnter={() => setHover(index)} />
-          ))}
-        </svg>
-      )}
-      {hovered && hover != null && (
-        <div className="ov-tooltip" role="status" style={{ left: Math.min(centers[hover] + 12, Math.max(0, width - 230)), top: top }}>
-          <strong>Strike {formatStrike(hovered.strike)}<small>{formatSignedPercent((Number(hovered.strike) - spot) / spot, 2)} from spot</small></strong>
-          <span><i className="ov-swatch ov-swatch--pos" />Calls<b>{formatExposure(hovered.call, unit, spot)}</b></span>
-          <span><i className="ov-swatch ov-swatch--neg ov-swatch--hatch" />Puts<b>{formatExposure(hovered.put, unit, spot)}</b></span>
-          <span className="ov-tooltip__net">Net<b>{formatExposure(hovered.call + hovered.put, unit, spot)}</b></span>
-          <span className="ov-tooltip__oi">OI calls {formatCount(hovered.call_open_interest)} · puts {formatCount(hovered.put_open_interest)}</span>
-        </div>
-      )}
-      {!rows.length && <p className="ov-empty">No strikes with exposure in this window.</p>}
-    </div>
+    <>
+      <Legend view={view} greek={greek} split={split} netMarks={view === 'net' && netMarks} note />
+      <div className="ov-chart" ref={containerRef}>
+        {width > 0 && rows.length > 0 && (
+          <svg width={width} height={height} role="img" aria-label={`${greekName(greek)} exposure by strike`}
+            onMouseLeave={() => setHover(null)}>
+            <defs>
+              <pattern id="ov-put-hatch" width="5" height="5" patternUnits="userSpaceOnUse" patternTransform="rotate(45)">
+                <rect width="5" height="5" className="ov-hatch-base" /><line x1="0" y1="0" x2="0" y2="5" className="ov-hatch-line" />
+              </pattern>
+            </defs>
+            {ticks.map(tick => (
+              <g key={tick} className={tick === 0 ? 'ov-axis ov-axis--zero' : 'ov-axis'}>
+                <line x1={left} x2={width - right} y1={y(tick)} y2={y(tick)} />
+                <text x={left - 8} y={y(tick)} dy="0.32em" textAnchor="end">{formatScaled(tick, unit)}</text>
+              </g>
+            ))}
+            {rows.map((row, index) => bars[index].segments.map((segment, part) => {
+              const start = y(segment.from), end = y(segment.to)
+              const gap = segment.from === 0 ? 0 : 1
+              const yTop = Math.min(start, end) + (segment.to > segment.from ? 0 : gap)
+              const size = Math.max(1, Math.abs(end - start) - gap)
+              const tone = segment.kind === 'net' ? (segment.value > 0 ? 'pos' : 'neg') : segment.kind === 'call' ? 'pos' : 'neg ov-bar--hatch'
+              return <rect key={`${row.strike}:${part}`} className={`ov-bar ov-bar--${tone}${segment.part === 'today' ? ' is-today' : ''}${hover === index ? ' is-hover' : ''}`}
+                x={centers[index] - barWidth / 2} width={barWidth} y={yTop} height={size} rx={Math.min(2, barWidth / 2)} />
+            }))}
+            {view === 'overlay' && (
+              <path className="ov-net-line" d={netLinePath(bars.map((bar, index) => [centers[index], y(bar.net)]))} />
+            )}
+            {bars.map((bar, index) => dotted[index] && (
+              <circle key={`net:${rows[index].strike}`} className={`ov-net-dot${hover === index ? ' is-hover' : ''}`}
+                cx={centers[index]} cy={y(bar.net)} r={Math.max(1.5, Math.min(3, barWidth / 3))} />
+            ))}
+            {rows.map((row, index) => (index % stride === 0 || index === rows.length - 1) && (
+              <text key={row.strike} className="ov-axis-label" x={centers[index]} y={height - bottom + 16} textAnchor="middle">{formatStrike(row.strike)}</text>
+            ))}
+            {rows.map((row, index) => (
+              <rect key={`hit:${row.strike}`} className="ov-hit" x={centers[index] - step / 2} width={Math.max(step, 1)} y={top} height={plotHeight}
+                onMouseEnter={() => setHover(index)} />
+            ))}
+            {markers.map((marker, index) => (
+              <MarkerLabel key={marker.key} marker={marker} row={rowsOfLabels[index]} x={marker.x} left={left} right={right}
+                width={width} plotBottom={top + plotHeight} />
+            ))}
+          </svg>
+        )}
+        {hovered && hover != null && (
+          <div className={`ov-tooltip${hoveredParts ? ' ov-tooltip--parts' : ''}`} role="status"
+            style={{ left: Math.min(centers[hover] + 12, Math.max(0, width - tooltipWidth)), top: top }}>
+            <strong>Strike {formatStrike(hovered.strike)}<small>{formatSignedPercent((Number(hovered.strike) - spot) / spot, 2)} from spot</small></strong>
+            {hoveredParts ? (
+              <div className="ov-tooltip__parts">
+                <em /><em>0 DTE</em><em>Later</em><em>Total</em>
+                <span><i className="ov-swatch ov-swatch--pos" />Calls</span>
+                <b>{formatExposure(hoveredParts.todayCall, unit, spot)}</b><b>{formatExposure(hoveredParts.laterCall, unit, spot)}</b><b>{formatExposure(hovered.call, unit, spot)}</b>
+                <span><i className="ov-swatch ov-swatch--neg ov-swatch--hatch" />Puts</span>
+                <b>{formatExposure(hoveredParts.todayPut, unit, spot)}</b><b>{formatExposure(hoveredParts.laterPut, unit, spot)}</b><b>{formatExposure(hovered.put, unit, spot)}</b>
+                <span className="ov-tooltip__net">Net</span>
+                <b className="ov-tooltip__net">{formatExposure(hoveredParts.todayCall + hoveredParts.todayPut, unit, spot)}</b>
+                <b className="ov-tooltip__net">{formatExposure(hoveredParts.laterCall + hoveredParts.laterPut, unit, spot)}</b>
+                <b className="ov-tooltip__net">{formatExposure(hovered.call + hovered.put, unit, spot)}</b>
+              </div>
+            ) : (
+              <>
+                <span><i className="ov-swatch ov-swatch--pos" />Calls<b>{formatExposure(hovered.call, unit, spot)}</b></span>
+                <span><i className="ov-swatch ov-swatch--neg ov-swatch--hatch" />Puts<b>{formatExposure(hovered.put, unit, spot)}</b></span>
+                <span className="ov-tooltip__net">Net<b>{formatExposure(hovered.call + hovered.put, unit, spot)}</b></span>
+              </>
+            )}
+            {hoveredParts && <span className="ov-tooltip__oi">0 DTE expires today at 4:00 PM ET; later = every later expiry in range</span>}
+            <span className="ov-tooltip__oi">OI calls {formatCount(hovered.call_open_interest)} · puts {formatCount(hovered.put_open_interest)}</span>
+          </div>
+        )}
+        {!rows.length && <p className="ov-empty">No strikes with exposure in this window.</p>}
+      </div>
+    </>
   )
 }
 
@@ -302,11 +483,35 @@ function ExpiryStrip({ rows, view, unit, spot }: { rows: OptionExposureExpiry[];
                     ? { left: `calc(50% + ${Math.abs(segment.from) / reach * 50}%)`, width: width(segment.value) }
                     : { right: `calc(50% + ${Math.abs(segment.from) / reach * 50}%)`, width: width(segment.value) }} />
               ))}
+            {view === 'overlay' && <span className="ov-expiry__net" style={{ left: `${50 + row.net / reach * 50}%` }} />}
           </div>
           <div className="ov-expiry__value"><strong>{formatExposure(row.net, unit, spot)}</strong><small>{formatPercent(row.share)} of gross</small></div>
         </div>
       ))}
     </div>
+  )
+}
+
+/**
+ * The factual summary line at the top of the page (Nov 18): flip and regime at spot, walls, today's expiring share and
+ * the capture time (stale after 10 minutes while the market is open). Re-checks the clock every 30 s so the stale
+ * mark appears even when no new capture arrives.
+ */
+function SummaryLine({ data }: { data: OptionExposureRead }) {
+  const [now, setNow] = useState(() => Date.now())
+  useEffect(() => {
+    const timer = window.setInterval(() => setNow(Date.now()), 30_000)
+    return () => window.clearInterval(timer)
+  }, [])
+  const summary = exposureSummary(data, { nowMs: now, marketOpen: marketSessionOpen({ session_date: data.session_date }, new Date(now)) })
+  return (
+    <section className={`ov-brief${summary.stale ? ' is-stale' : ''}`} aria-label={`${data.underlyer} summary`}>
+      <p>{summary.tokens.map((token, index) => token.term
+        ? <LevelTerm key={index} kind={token.term}>{token.text}</LevelTerm>
+        : token.stale
+          ? <strong key={index} className="ov-brief__stale">{token.text}</strong>
+          : <span key={index}>{token.text}</span>)}</p>
+    </section>
   )
 }
 
@@ -325,7 +530,7 @@ export default function OptionsOverviewPage() {
   const greek = pick(searchParams.get('greek'), GREEKS, 'gamma')
   const weight = pick(searchParams.get('weight'), WEIGHTS, 'oi')
   const scope = pick(searchParams.get('scope'), SCOPES, 'all')
-  const view = pick<ExposureView>(searchParams.get('view'), ['net', 'split'], 'net')
+  const view = pick<ExposureView>(searchParams.get('view'), ['net', 'split', 'overlay'], 'net')
   const unit = pick<ExposureUnit>(searchParams.get('unit'), ['usd', 'shares'], 'usd')
   const { pinned: sessionDate } = useSessionDate()
   const [bandChoice, setBandChoice] = useState<number | null | undefined>(undefined)
@@ -372,7 +577,8 @@ export default function OptionsOverviewPage() {
         value: item, label: greekName(item), disabled: !enabled.has(item),
         title: enabled.has(item) ? undefined : 'Second-order Greeks (phase 2): not available yet',
       }))} />
-      <Segmented label="View" value={view} onChange={value => setParam('view', value)} options={[{ value: 'net', label: 'Net' }, { value: 'split', label: 'Calls vs puts' }]} />
+      <Segmented label="View" value={view} onChange={value => setParam('view', value)} options={[{ value: 'net', label: 'Net' }, { value: 'split', label: 'Calls vs puts' },
+        { value: 'overlay', label: 'Overlay', title: 'Calls vs puts bars with the net per strike as a line on top' }]} />
       <Segmented label="Weight" value={weight} onChange={value => setParam('weight', value)} options={WEIGHTS.map(item => ({ value: item, label: WEIGHT_LABELS[item] }))} />
       <Segmented label="Expiries" value={scope} onChange={value => setParam('scope', value)} options={SCOPES.map(item => ({ value: item, label: SCOPE_LABELS[item] }))} />
       <Segmented label="Units" value={unit} onChange={value => setParam('unit', value)} options={[{ value: 'usd', label: 'Dollars' }, { value: 'shares', label: 'Shares' }]} />
@@ -386,6 +592,7 @@ export default function OptionsOverviewPage() {
     const text = unavailableText(data.reason, data.underlyer, data.scope)
     return (
       <div className="options-flow-page">
+        <SummaryLine data={data} />
         {controls}
         <div className="flow-state flow-state--warning" role="status"><AlertTriangle size={20} /><div><strong>{text.title}</strong>
           <span>{text.detail}{data.observed_at ? ` Chain captured ${formatTime(data.observed_at)}.` : ''}</span>
@@ -399,7 +606,10 @@ export default function OptionsOverviewPage() {
   const totals = data.totals!
   const coverage = data.coverage!
   const cross = data.cross_check
-  const strikeRows = strikesInBand(data.strikes ?? [], spot, band)
+  // Nov 18: today's (0 DTE) and later parts of each strike, from the strike x expiry cells, when the scope reaches past today.
+  const split = zeroDteSplitState(data.scope, data.expiries ?? [])
+  const strikeParts = split === 'split' ? zeroDteByStrike(data.grid ?? [], data.expiries ?? [], data.strikes?.length ?? 0) : null
+  const strikeRows: ChartRow[] = strikesInBand((data.strikes ?? []).map((row, index) => ({ ...row, parts: strikeParts?.[index] ?? null })), spot, band)
   const notes = qualityNotes(data.quality_reasons, {
     underlyer: data.underlyer, providerIvContracts: coverage.provider_iv_contracts, weightCoverage: coverage.weight_coverage_fraction,
     crossCheck: cross?.difference_fraction, crossCheckNet: cross?.net_difference_fraction,
@@ -412,6 +622,7 @@ export default function OptionsOverviewPage() {
 
   return (
     <div className="options-flow-page ov-page">
+      <SummaryLine data={data} />
       {controls}
       <section className="flow-command__context ov-stamp" aria-label="Data stamp">
         <Radio size={15} />
@@ -426,10 +637,12 @@ export default function OptionsOverviewPage() {
         <div><span>Net {name.toLowerCase()} · {SCOPE_LABELS[data.scope]}</span><strong>{formatExposure(totals.net, unit, spot)}</strong>
           <small><i className="ov-text-pos">calls {formatExposure(totals.call, unit, spot)}</i> · <i className="ov-text-neg">puts {formatExposure(totals.put, unit, spot)}</i></small></div>
         <div><span>Gamma at spot</span><strong>{regimeText(levels?.regime_at_spot)}</strong>
-          <small>{levels?.flip_spot ? `Flip ${formatStrike(levels.flip_spot)} (${formatSignedPercent(levels.flip_distance_to_spot_fraction, 2)})` : 'No flip within ±20% of spot'}</small></div>
-        <div><span>Call wall</span><strong>{levels?.call_wall ? formatStrike(levels.call_wall.strike) : '—'}</strong>
+          <small>{levels?.flip_spot
+            ? <><LevelTerm kind="flip">Flip</LevelTerm> {formatStrike(levels.flip_spot)} ({formatSignedPercent(levels.flip_distance_to_spot_fraction, 2)})</>
+            : <>No <LevelTerm kind="flip">flip</LevelTerm> within ±20% of spot</>}</small></div>
+        <div><span><LevelTerm kind="call_wall">Call wall</LevelTerm></span><strong>{levels?.call_wall ? formatStrike(levels.call_wall.strike) : '—'}</strong>
           <small>{levels?.call_wall ? `${formatSignedPercent(levels.call_wall.distance_to_spot_fraction, 2)} · ${formatExposure(levels.call_wall.gamma_notional_per_percent, 'usd', spot, false)} gamma per 1%` : 'No call gamma'}</small></div>
-        <div><span>Put wall</span><strong>{levels?.put_wall ? formatStrike(levels.put_wall.strike) : '—'}</strong>
+        <div><span><LevelTerm kind="put_wall">Put wall</LevelTerm></span><strong>{levels?.put_wall ? formatStrike(levels.put_wall.strike) : '—'}</strong>
           <small>{levels?.put_wall ? `${formatSignedPercent(levels.put_wall.distance_to_spot_fraction, 2)} · ${formatExposure(levels.put_wall.gamma_notional_per_percent, 'usd', spot, false)} gamma per 1%` : 'No put gamma'}</small></div>
         <div><span>Expiring today</span><strong>{formatPercent(data.expiring_today_share)}</strong><small>of all captured {name.toLowerCase()} exposure (gross)</small></div>
         <div><span>Provider Greeks check</span><strong>{formatSignedPercent(cross?.difference_fraction)}</strong>
@@ -438,10 +651,10 @@ export default function OptionsOverviewPage() {
 
       <Section icon={<BarChart3 size={17} />} title={`${data.underlyer} ${name.toLowerCase()} exposure by strike`}
         detail={`${SCOPE_LABELS[data.scope]} · ${WEIGHT_LABELS[data.weight]} · ${data.units?.[unit === 'usd' ? 'value' : 'shares'] ?? ''} · strikes within ${bandLabel} of spot (${strikeRows.length} of ${data.strikes?.length ?? 0})`}
-        aside={<div className="ov-section__tools"><Legend view={view} />
+        aside={<div className="ov-section__tools">
           <Segmented label="Strike window" value={String(band)} onChange={value => setBandChoice(value === 'null' ? null : Number(value))}
             options={BANDS.map(item => ({ value: String(item.value), label: item.label }))} /></div>}>
-        <StrikeChart rows={strikeRows} view={view} unit={unit} spot={spot} levels={levels} greek={data.greek} />
+        <StrikeChart rows={strikeRows} view={view} unit={unit} spot={spot} levels={levels} greek={data.greek} split={split} />
         <div className="ov-chart-foot">
           <span>Levels are gamma levels on the same contracts and weight in every view: flip = where net gamma changes sign (spot moved, IVs held); walls = strikes with the most call or put gamma.</span>
           <button type="button" className="ov-link" aria-expanded={showTable} onClick={() => setShowTable(value => !value)}>{showTable ? 'Hide table' : 'Show as table'}</button>
@@ -468,14 +681,16 @@ export default function OptionsOverviewPage() {
                   <td>{formatExposure(row.call, unit, spot)}</td><td>{formatExposure(row.put, unit, spot)}</td>
                   <td title="Share of the range's gross exposure at this strike">{formatPercent(row.share)}</td>
                   <td>{formatSignedPercent(row.distance_to_spot_fraction, 2)}</td>
-                  <td>{row.tags.map(tag => <span key={tag} className="ov-tag">{TAG_LABELS[tag] ?? tag}</span>)}</td>
+                  <td>{row.tags.map(tag => <span key={tag} className="ov-tag">{tag === 'CALL_WALL' || tag === 'PUT_WALL'
+                    ? <LevelTerm kind={tag === 'CALL_WALL' ? 'call_wall' : 'put_wall'}>{TAG_LABELS[tag]}</LevelTerm>
+                    : TAG_LABELS[tag] ?? tag}</span>)}</td>
                 </tr>
               ))}</tbody>
             </table>
           </div>
         </Section>
-        <Section icon={<CalendarRange size={17} />} title="Exposure by expiry" detail={`Net ${name.toLowerCase()} per expiry · share of the range's gross exposure`}
-          aside={<Legend view={view} />}>
+        <Section icon={<CalendarRange size={17} />} title="Exposure by expiry" detail={`Net ${name.toLowerCase()} per expiry · share of the range's gross exposure`}>
+          <Legend view={view} greek={data.greek} netLabel="Net per expiry" />
           <ExpiryStrip rows={data.expiries ?? []} view={view} unit={unit} spot={spot} />
         </Section>
       </div>

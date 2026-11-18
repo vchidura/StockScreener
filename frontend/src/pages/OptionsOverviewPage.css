@@ -104,6 +104,44 @@
 .ov-expiry__bar--pos { background: var(--ov-pos); }
 .ov-expiry__bar--neg { background: var(--ov-neg); }
 
+/* Nov 18 short list: summary line, level definitions, legend rows, Overlay net line, 0 DTE parts. */
+.ov-brief { padding: 8px 11px; background: var(--tm-surface); border: 1px solid var(--tm-line); border-left: 3px solid var(--tm-accent); }
+.ov-brief.is-stale { border-left-color: var(--tm-warn); }
+.ov-brief p { margin: 0; color: var(--tm-ink); font-size: 11px; line-height: 1.55; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.ov-brief p > span:last-child { color: var(--tm-muted); font-weight: 700; }
+.ov-brief__stale { color: var(--tm-warn); font-weight: 800; }
+
+.ov-term { display: inline; margin: 0; padding: 0; color: inherit; background: none; border: 0; font: inherit; letter-spacing: inherit; line-height: inherit; text-align: inherit; text-transform: inherit; cursor: help; text-decoration: underline dotted; text-decoration-thickness: 1px; text-underline-offset: 2px; }
+.ov-term:hover, .ov-term.is-open { color: var(--tm-accent); }
+.ov-term:focus-visible { outline: 2px solid var(--tm-accent); outline-offset: 1px; }
+.ov-tip { position: fixed; z-index: 1000; box-sizing: border-box; width: max-content; max-width: min(300px, calc(100vw - 16px)); padding: 8px 10px; color: var(--tm-ink); background: var(--tm-surface-raised); border: 1px solid var(--tm-line-strong); box-shadow: 0 6px 18px rgba(0, 0, 0, 0.25); font-size: 11px; font-weight: 500; line-height: 1.45; letter-spacing: 0; text-align: left; text-transform: none; white-space: normal; }
+.ov-tip[hidden] { display: none; }
+
+.ov-section > .ov-legend { padding: 8px 11px 0; }
+.ov-legend__note { color: var(--tm-faint); font-weight: 600; white-space: normal !important; }
+.ov-swatch--today { background: color-mix(in srgb, var(--ov-pos) 42%, transparent); box-shadow: inset 0 0 0 1px var(--ov-pos); }
+.ov-swatch-line { position: relative; display: inline-block; width: 16px; height: 2px; background: var(--tm-ink); border-radius: 1px; }
+.ov-swatch-line::after, .ov-swatch-dot { content: ''; display: inline-block; width: 6px; height: 6px; background: var(--tm-ink); border-radius: 50%; }
+.ov-swatch-line::after { position: absolute; left: 5px; top: -2px; }
+.ov-bar.is-today { fill-opacity: 0.42; stroke-width: 1; }
+.ov-bar--pos.is-today { stroke: var(--ov-pos); }
+.ov-bar--neg.is-today { stroke: var(--ov-neg); }
+.ov-net-line { fill: none; stroke: var(--tm-ink); stroke-width: 1.5; stroke-linejoin: round; pointer-events: none; }
+.ov-net-dot { fill: var(--tm-ink); stroke: var(--tm-surface); stroke-width: 1; pointer-events: none; }
+.ov-net-dot.is-hover { stroke: var(--tm-accent); stroke-width: 1.5; }
+.ov-expiry__net { position: absolute; top: -1px; bottom: -1px; width: 2px; margin-left: -1px; background: var(--tm-ink); border-radius: 1px; }
+.ov-marker line { pointer-events: none; }
+.ov-marker--tip { cursor: help; outline: none; }
+.ov-marker--tip text { text-decoration: underline dotted; text-decoration-thickness: 1px; }
+.ov-marker__hit { fill: transparent; stroke: none; }
+.ov-marker--tip:focus-visible .ov-marker__hit, .ov-marker--tip.is-open .ov-marker__hit { stroke: var(--tm-accent); stroke-width: 1.5; }
+.ov-tooltip--parts { width: 262px; }
+.ov-tooltip__parts { display: grid; grid-template-columns: auto repeat(3, minmax(0, 1fr)); row-gap: 3px; align-items: center; }
+.ov-tooltip__parts > * { padding-left: 8px; }
+.ov-tooltip__parts > :nth-child(4n + 1) { padding-left: 0; }
+.ov-tooltip__parts em { color: var(--tm-muted); font-style: normal; font-weight: 700; text-align: right; }
+.ov-tooltip__parts b { text-align: right; }
+
 .ov-notes ul { display: grid; gap: 5px; margin: 0; padding: 10px 12px 12px 28px; color: var(--tm-muted); font-size: 11px; line-height: 1.45; }
 .ov-notes strong { color: var(--tm-ink); }
 

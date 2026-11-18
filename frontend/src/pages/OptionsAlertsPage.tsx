@@ -13,7 +13,7 @@ import {
 } from '../services/api'
 import { Modal } from './ScreenLibrary'
 import { optionContractExpired, optionFlowPath, optionModelExitView, optionDetectorSort, optionDetectorSortChange, optionPackageStrategyName, detectorAlertColumns, detectorAlertColumnsForView, detectorObservationFieldStates, detectorColumnPresets, detectorViewPreset, readDetectorPresets, writeDetectorPresets, type DetectorViewPreset } from './optionsAlertPresentation'
-import { emptyOptionAlertForm, optionAlertTabParams, optionCandidateBoardFacts, optionContractSummary, optionCurrentPackagePrice, optionLegMarketValues, optionMarketColumns, optionMarkAge, optionPackagePremium, optionPackagePrice, optionPlanTerms, optionAlertLabel as label, optionAlertMoney as money, optionAlertPercent, optionAlertPreviewRequest, optionAlertTime as time, optionEntryWindow, optionGateTimeframe, optionGateValue, type OptionAlertForm, type OptionAlertView } from './optionsAlertPresentation'
+import { emptyOptionAlertForm, optionAlertTabParams, optionCandidateBoardFacts, optionContractSummary, optionCurrentPackagePrice, optionLegMarketValues, optionMarketColumns, optionMarkAge, optionPackagePremium, optionPackagePrice, optionPlanTerms, optionAlertCategoryName, optionAlertTriggerBasis, optionAlertLabel as label, optionAlertMoney as money, optionAlertPercent, optionAlertPreviewRequest, optionAlertTime as time, optionEntryWindow, optionGateTimeframe, optionGateValue, type OptionAlertForm, type OptionAlertView } from './optionsAlertPresentation'
 import { msUntilWindowRead, OPTIONS_FIRST_CHECK_MS, windowTimeMs } from '../utils/refreshTiming'
 import './StockDiscoveryPage.css'
 import './StockScreeningPage.css'
@@ -313,7 +313,11 @@ function CandidateDetail({ candidateId, close }: { candidateId: string; close: (
 const detectorNames = { O1: 'High Volume/OI Participation', O2: 'Local IV Surface Distortion',
   O3: 'Defined-Risk Credit',
   OS1: 'Range Breakout Acceptance',
-  OS2: 'Relative Trend Resumption' }
+  OS2: 'Relative Trend Resumption',
+  F0DTE: '0DTE Intraday Flow' }
+// The models the API's ?detector= filter accepts (the Model selects send it). G106 D5: F0DTE alerts show under all
+// models; F0DTE joins this list when the API accepts it (next API package).
+const apiDetectorFilters = ['O1', 'O2', 'O3', 'OS1', 'OS2'] as const
 const selectionNames: Record<string, string> = { SELECTED: 'Selected', NOT_SELECTED: 'Not selected', REPEAT: 'Repeat', OBSERVATION: 'Observation' }
 
 function DetectorSortHeader({ title, field, params, update }: {
@@ -427,7 +431,7 @@ function DetectorAlertSidecar({ row, asOf, dataTier, close, openCandidate }: { r
       <AlertSidecarFacts title="Alert selection" values={[
         ['Triggered (ET)', time(row.triggered_at)], ['First selected (ET)', time(row.first_selected_at)],
         ['Run (ET)', time(row.scheduled_cycle)], ['Direction', row.direction === 1 ? <span className="sd-positive">Bullish</span> : <span className="sd-negative">Bearish</span>],
-        ['Category', label(row.category)], ['Package strategy', optionPackageStrategyName(row.strategy_name)],
+        ['Category', optionAlertCategoryName(row.category)], ['Package strategy', optionPackageStrategyName(row.strategy_name)],
         ['Occurrences', `${row.hit_count} (${row.repeat_count} repeats)`], ['Last observed (ET)', time(row.last_seen_at)],
       ]} />
       {credit ? <CreditObservationDetails observation={credit} /> : surface ? <>
@@ -601,7 +605,7 @@ function DetectorAlertsPanel({ view, params, update, offset, onSessionContext, t
       <label>Underlying<input aria-label="Detector alert underlying" type="search" placeholder="All underlyings" maxLength={12}
         value={params.get('underlyer') || ''} onChange={event => { setSelectedPreset(''); update({ underlyer: event.target.value.toUpperCase() }) }} /></label>
       <label>Model<select aria-label="Detector alert model" value={detector || ''} onChange={event => { setSelectedPreset(''); update({ evaluation_detector: event.target.value }) }}>
-        <option value="">All models</option>{(['O1', 'O2', 'O3', 'OS1', 'OS2'] as const).map(id => <option key={id} value={id}>{detectorNames[id]}</option>)}
+        <option value="">All models</option>{apiDetectorFilters.map(id => <option key={id} value={id}>{detectorNames[id]}</option>)}
       </select></label>
       {data?.latest_attempt && view === 'behavior' ? <div className="oa-filter-status oa-filter-status--warning" role="status"><span>Latest attempted run</span><strong>{time(data.latest_attempt.scheduled_cycle)} ET / {label(data.status)}</strong></div>
         : showNextWindow ? <div className={`oa-filter-status${schedule?.warning ? ' oa-filter-status--warning' : ''}`} role="status"><span>Next alert window</span><strong>{time(schedule?.window_start)}-{time(schedule?.window_end)} ET</strong></div>
@@ -634,11 +638,11 @@ function DetectorAlertsPanel({ view, params, update, offset, onSessionContext, t
               entryLimit: row.entry_limit, entryKind: credit ? 'MINIMUM_CREDIT' : 'MAXIMUM_DEBIT', exitDeadline: row.exit_deadline ?? undefined,
             }, row.model_exit, row.underlyer)
             return <tr key={row.evaluation_id}><ColumnCells columns={columns} values={{
-              triggered_at: <span title={row.detector_id === 'O1' || row.detector_id === 'O3' ? 'Original option source time' : 'Original stock trigger-bar time'}>{time(row.triggered_at)}</span>,
+              triggered_at: <span title={optionAlertTriggerBasis(row.detector_id)}>{time(row.triggered_at)}</span>,
               // Nov 12 (user): the ticker opens its Options Flow; the View column still opens the alert's details.
               underlyer: <><Link className="oa-row-link" to={optionFlowPath(row.underlyer)} title={`Open ${row.underlyer} Options Flow`}>{row.underlyer}</Link><small className={surface ? '' : markTone(row.direction)}>{credit ? `O3 / ${row.direction === 1 ? 'Bullish put credit' : 'Bearish call credit'}` : surface ? 'O2 / IV observation' : `${row.detectors && row.detectors.length > 1 ? row.detectors.join(' + ') : row.detector_id} / ${row.direction === 1 ? 'Bullish' : 'Bearish'}`}</small></>,
               detector: <>{detectorNames[row.detector_id]}<small>{label(row.origin)}</small></>,
-              category: label(row.category), strategy: row.strategy_name ? optionPackageStrategyName(row.strategy_name) : 'Unavailable',
+              category: optionAlertCategoryName(row.category), strategy: row.strategy_name ? optionPackageStrategyName(row.strategy_name) : 'Unavailable',
               contract_summary: legs.length ? <>{label(original?.structure_type || '')}<small>{optionContractSummary(row.underlyer, legs)}</small></> : 'Unavailable',
               contracts: legs.length ? <>{label(original?.structure_type || '')}{legs.map(leg => <small key={leg.leg_index}>{leg.side} {leg.ratio} {leg.contract_ticker}</small>)}</> : 'Unavailable',
               expiry: original?.expiration_date ? <>{original.expiration_date}<small>{original.calendar_dte ?? 'Unavailable'} DTE at source</small></> : 'Unavailable',
@@ -719,7 +723,7 @@ function DetectorEvaluationPanel({ params, update, offset, onSessionContext }: {
   const data = review.data?.available ? review.data.data : undefined
   const detectorChoices = data?.models?.length
     ? data.models.map(model => model.detector_id)
-    : (Object.keys(detectorNames) as Array<keyof typeof detectorNames>)
+    : apiDetectorFilters
   const surfaceObservation = observationDetail ? detectorSurfaceObservation(observationDetail) : null
   const creditObservation = observationDetail ? detectorCreditObservation(observationDetail) : null
   useEffect(() => { setObservationDetail(null) }, [params])
@@ -770,7 +774,7 @@ function DetectorEvaluationPanel({ params, update, offset, onSessionContext }: {
           <td>{time(row.scheduled_cycle)}</td><td>{selectionNames[row.selection_status]}<small>{label(row.selection_reason)}</small>{surface && <><small>{label(surface.finding_disposition)}</small><small>{surface.findings.length} residual findings</small></>}{credit && <><small>{label(credit.structure_type)}</small><small>{label(credit.pricing_basis)}</small></>}</td>
           <td>{row.candidate_rank ?? 'Not applicable'}</td><td>{row.observation ? 'Not applicable' : <>{money(row.entry_limit)}<small>Not a fill</small></>}</td><td>{row.observation ? 'Not applicable' : optionAlertPercent(row.net_return)}</td>
           <td>{detectorNames[row.detector_id]}<small>{label(row.origin)}</small>{row.shared_model_exposure && <small>Shared exposure</small>}</td>
-          <td>{label(row.category)}</td><td>{credit ? optionPackageStrategyName(row.strategy_name) : row.observation ? 'Not applicable' : row.strategy_name ? optionPackageStrategyName(row.strategy_name) : 'Unavailable'}</td>
+          <td>{optionAlertCategoryName(row.category)}</td><td>{credit ? optionPackageStrategyName(row.strategy_name) : row.observation ? 'Not applicable' : row.strategy_name ? optionPackageStrategyName(row.strategy_name) : 'Unavailable'}</td>
           <td><button className="oa-icon" aria-label={`View ${row.underlyer} ${row.detector_id} evaluation package`} title={surface ? 'View surface observation evidence' : credit ? 'View indicative credit evidence' : row.observation ? 'Observation detail unavailable in this table' : 'View original candidate evidence'}
             disabled={Boolean(row.observation && !surface && !credit)} onClick={() => surface || credit ? setObservationDetail(row) : !row.observation && update({ candidate: row.candidate_id, offset: String(offset) })}><Eye size={15} /></button></td>
         </tr> })}</tbody>
