@@ -442,6 +442,19 @@ def _docker_service_main(argv) -> int | None:
         o1_min_dte_policy()
         o1_aggressor_side_mode()
         o1_aggressor_side_policy()
+        # G106 O1 tuning (Nov 18): REALTIME_V3_O1_AGGRESSOR_POLICY (STRICT / CONTRADICTION_ONLY) is read by
+        # o1_aggressor_side_policy() above; REALTIME_V3_OPTIONS_ALERT_CONTEXT (OFF / RECORD), RECORD loads the page's
+        # exposure modules here.
+        from realtime.advanced_options_alert_context import prepare_options_alert_context
+
+        prepare_options_alert_context()
+        # --- G106 D5 F0DTE BEGIN: REALTIME_V3_F0DTE (OFF / RECORD / ON) and its integer thresholds
+        # (REALTIME_V3_F0DTE_*): an invalid value stops the window service here (never silently OFF).
+        from realtime.advanced_options_f0dte import f0dte_mode, f0dte_policy
+
+        f0dte_mode()
+        f0dte_policy()
+        # --- G106 D5 F0DTE END
     provider = None
     pool = None
     if args.state_source == POSTGRES_STATE_SOURCE:

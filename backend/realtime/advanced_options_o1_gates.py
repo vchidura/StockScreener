@@ -52,6 +52,22 @@ non-negative integer (digits only); the dominance must be >= 100. Anything else,
 stamped into the policy documents, so the gate policy hash, the v3 episode ids and every v3 evaluation change with them.
 They are read ONCE per process (cached; the window service reads them at start). Recording never fails the window; a gate
 error never fails the window (RECORD keeps today's finding; ON leaves the event out as unavailable, fail closed).
+
+Aggressor policy v2, contradiction only (G106 O1 tuning, Nov 18 2026): `REALTIME_V3_O1_AGGRESSOR_POLICY` on the same
+window, read with the thresholds (once per process, checked at service start):
+| STRICT (default, unset, blank) | the v1 policy above, byte for byte (same policy, hash, records and ON behaviour) |
+| CONTRADICTION_ONLY | policy `option_participation_aggressor_side_v2` (same thresholds and classification): ON keeps a
+                       BOUGHT event (direction = type) AND an UNCLEAR event (direction = type, its gate reasons say
+                       `O1AG_UNCLEAR` + why); only a SOLD event (the side contradicts the alert's direction) becomes an
+                       OBSERVATION without a package (implied direction -type, recorded, never published or flipped) |
+Anything else refuses start. Why (Nov 17, 63 windows, 143 O1 detections): 104 had no classifiable side (prints inside
+the spread, stale quotes, little premium), so STRICT ON left 5 alerts; under v2 an unclear side is "no evidence against
+the alert" and keeps today's alert, while a clear contradiction still drops it. Flipping a SOLD alert's direction is NOT
+done: the research's S1 (bid-dominant, direction -type) agreed with the day 85% of the time but had no forward edge
+(underlying +60 min hit 0.52, to the close 0.50, n=26), and the package is the bought contract itself, so a flipped
+direction would need another package (G106_DETECTOR_RESEARCH.md section 4, "record it as an observation"). Under v2 an
+unreadable prints read (O1AG_INPUTS_UNAVAILABLE) is UNCLEAR and keeps the alert: no evidence of a contradiction. In
+RECORD with v2 the window line also says what STRICT would have kept (`alerts_with_strict`, `selected_with_strict`).
 """
 from __future__ import annotations
 
@@ -80,6 +96,10 @@ O1_MIN_DTE_SETTING = "REALTIME_V3_O1_MIN_DTE"
 O1_AGGRESSOR_SIDE_SETTING = "REALTIME_V3_O1_AGGRESSOR_SIDE"
 O1_AGGRESSOR_MIN_DOMINANCE_PCT_SETTING = "REALTIME_V3_O1_AGGRESSOR_MIN_DOMINANCE_PCT"
 O1_AGGRESSOR_MIN_SIDE_PREMIUM_SETTING = "REALTIME_V3_O1_AGGRESSOR_MIN_SIDE_PREMIUM"
+O1_AGGRESSOR_POLICY_SETTING = "REALTIME_V3_O1_AGGRESSOR_POLICY"
+O1_AGGRESSOR_POLICY_STRICT = "STRICT"
+O1_AGGRESSOR_POLICY_CONTRADICTION_ONLY = "CONTRADICTION_ONLY"
+O1_AGGRESSOR_POLICIES = (O1_AGGRESSOR_POLICY_STRICT, O1_AGGRESSOR_POLICY_CONTRADICTION_ONLY)
 O1_ZERO_DTE_RECORD_EVENT = "O1_ZERO_DTE_RECORD"
 O1_AGGRESSOR_RECORD_EVENT = "O1_AGGRESSOR_RECORD"
 O1_AGGRESSOR_WINDOW_EVENT = "O1_AGGRESSOR_WINDOW"
@@ -149,9 +169,29 @@ class AggressorSidePolicy(Contract):
         "BOUGHT_IS_TYPE_SOLD_IS_OPPOSITE_OBSERVATION_UNCLEAR_IS_NONE")
     execution_permission: Literal[False] = False
 
+    def keeps(self, aggressor_class: str) -> bool:
+        """Whether ON keeps the alert (its package) for this aggressor class: STRICT keeps BOUGHT only."""
+        return aggressor_class == "BOUGHT"
+
+
+class AggressorContradictionPolicy(AggressorSidePolicy):
+    """G106 O1 tuning (Nov 18), `REALTIME_V3_O1_AGGRESSOR_POLICY=CONTRADICTION_ONLY`: the same classification (E1 / S1
+    thresholds), but only a clear contradiction (SOLD: the side opposes the contract type's direction) drops the alert;
+    BOUGHT and UNCLEAR keep it with direction = type."""
+
+    version: Literal["option_participation_aggressor_side_v2"] = "option_participation_aggressor_side_v2"
+    direction_basis: Literal["BOUGHT_AND_UNCLEAR_KEEP_TYPE_SOLD_IS_OPPOSITE_OBSERVATION"] = (
+        "BOUGHT_AND_UNCLEAR_KEEP_TYPE_SOLD_IS_OPPOSITE_OBSERVATION")
+
+    def keeps(self, aggressor_class: str) -> bool:
+        return aggressor_class != "SOLD"
+
 
 MIN_DTE_POLICY = MinimumDtePolicy()
 AGGRESSOR_SIDE_POLICY = AggressorSidePolicy()
+AGGRESSOR_CONTRADICTION_POLICY = AggressorContradictionPolicy()
+# The policy a v3 finding names: v1 (STRICT) or v2 (CONTRADICTION_ONLY), told apart by `version`.
+AggressorGatePolicy = Annotated[AggressorContradictionPolicy | AggressorSidePolicy, Field(discriminator="version")]
 
 
 class ActivityGatePolicy(Contract):
@@ -161,7 +201,7 @@ class ActivityGatePolicy(Contract):
     version: Literal["option_participation_origin_v3_gates"] = "option_participation_origin_v3_gates"
     base_policy_sha256: Sha256
     minimum_dte: MinimumDtePolicy | None = None
-    aggressor_side: AggressorSidePolicy | None = None
+    aggressor_side: AggressorGatePolicy | None = None
     gate_order: Literal["LIQUIDITY_FLOOR_THEN_MINIMUM_DTE_THEN_AGGRESSOR_SIDE"] = (
         "LIQUIDITY_FLOOR_THEN_MINIMUM_DTE_THEN_AGGRESSOR_SIDE")
     execution_permission: Literal[False] = False
@@ -178,8 +218,20 @@ def o1_min_dte_policy_from(environ: Mapping[str, str]) -> MinimumDtePolicy:
     return MIN_DTE_POLICY if value == MIN_DTE_POLICY.minimum_dte else MinimumDtePolicy(minimum_dte=value)
 
 
+def o1_aggressor_policy_name(environ: Mapping[str, str] | None = None) -> str:
+    """`REALTIME_V3_O1_AGGRESSOR_POLICY`: STRICT (unset or blank) or CONTRADICTION_ONLY, any case; anything else raises."""
+    raw = (os.environ if environ is None else environ).get(O1_AGGRESSOR_POLICY_SETTING)
+    value = (raw or "").strip().upper() or O1_AGGRESSOR_POLICY_STRICT
+    if value not in O1_AGGRESSOR_POLICIES:
+        raise ValueError(f"{O1_AGGRESSOR_POLICY_SETTING} must be STRICT or CONTRADICTION_ONLY, not {raw!r}")
+    return value
+
+
 def o1_aggressor_side_policy_from(environ: Mapping[str, str]) -> AggressorSidePolicy:
-    default = AGGRESSOR_SIDE_POLICY
+    """The thresholds, under the policy `REALTIME_V3_O1_AGGRESSOR_POLICY` names (STRICT: the v1 policy, unchanged;
+    CONTRADICTION_ONLY: the v2 policy)."""
+    contradiction_only = o1_aggressor_policy_name(environ) == O1_AGGRESSOR_POLICY_CONTRADICTION_ONLY
+    default = AGGRESSOR_CONTRADICTION_POLICY if contradiction_only else AGGRESSOR_SIDE_POLICY
     dominance = non_negative_int_setting(
         environ, O1_AGGRESSOR_MIN_DOMINANCE_PCT_SETTING, default.minimum_dominance_pct)
     if dominance < 100:
@@ -187,7 +239,7 @@ def o1_aggressor_side_policy_from(environ: Mapping[str, str]) -> AggressorSidePo
     premium = non_negative_int_setting(environ, O1_AGGRESSOR_MIN_SIDE_PREMIUM_SETTING, default.minimum_side_premium)
     if (dominance, premium) == (default.minimum_dominance_pct, default.minimum_side_premium):
         return default
-    return AggressorSidePolicy(minimum_dominance_pct=dominance, minimum_side_premium=premium)
+    return type(default)(minimum_dominance_pct=dominance, minimum_side_premium=premium)
 
 
 @lru_cache(maxsize=1)
@@ -376,6 +428,16 @@ class AggressorSideEvidence(Contract):
             inputs_reason=O1AG_INPUTS_UNAVAILABLE if O1AG_INPUTS_UNAVAILABLE in self.reasons else None)
 
 
+def aggressor_gate_outcome(evidence: AggressorSideEvidence,
+                           policy: AggressorSidePolicy) -> tuple[int | None, tuple[str, ...]]:
+    """(the alert's direction, the gate reasons) of an event the aggressor gate (ON) judges. A kept event's direction is
+    its type (STRICT keeps BOUGHT; CONTRADICTION_ONLY keeps BOUGHT and UNCLEAR); a dropped one has none. Every class but
+    BOUGHT is named in the reasons (`O1AG_SOLD`, `O1AG_UNCLEAR` + why), kept or not."""
+    aggressor_class = evidence.aggressor_class
+    reasons = () if aggressor_class == "BOUGHT" else (f"O1AG_{aggressor_class}",) + tuple(evidence.reasons)
+    return (type_direction(evidence.contract_type) if policy.keeps(aggressor_class) else None), reasons
+
+
 def aggressor_side_evidence(tally: O1AggressorTally, contract_type: str,
                             policy: AggressorSidePolicy = AGGRESSOR_SIDE_POLICY) -> AggressorSideEvidence:
     aggressor_class, reasons = classify_aggressor(tally, policy)
@@ -403,10 +465,11 @@ class GatedActivityFinding(ActivityFinding):
     contract_type: Literal["CALL", "PUT"]
     dte: int = Field(ge=0, strict=True)
     gate_minimum_dte: MinimumDtePolicy | None = None
-    gate_aggressor_side: AggressorSidePolicy | None = None
+    gate_aggressor_side: AggressorGatePolicy | None = None
     gate_reasons: tuple[Name, ...] = ()
     aggressor: AggressorSideEvidence | None = None
-    # Set only when the aggressor gate is ON and the side is BOUGHT: the alert's direction (call +1, put -1).
+    # Set only when the aggressor gate is ON and keeps the event (STRICT: BOUGHT; CONTRADICTION_ONLY: BOUGHT or
+    # UNCLEAR): the alert's direction (call +1, put -1).
     direction: Literal[-1, 1] | None = None
 
     def gate_policy(self) -> ActivityGatePolicy:
@@ -418,9 +481,10 @@ class GatedActivityFinding(ActivityFinding):
 
     @property
     def permits_package(self) -> bool:
-        """The aggressor gate (ON) keeps a package only on a BOUGHT side; without it, nothing changes."""
+        """The aggressor gate (ON) keeps a package only on a side its policy keeps (STRICT: BOUGHT; CONTRADICTION_ONLY:
+        not SOLD); without it, nothing changes."""
         return self.gate_aggressor_side is None or (
-            self.aggressor is not None and self.aggressor.aggressor_class == "BOUGHT")
+            self.aggressor is not None and self.gate_aggressor_side.keeps(self.aggressor.aggressor_class))
 
     @model_validator(mode="after")
     def validate_gates(self):
@@ -442,8 +506,8 @@ class GatedActivityFinding(ActivityFinding):
             aggressor_class, reasons = classify_aggressor(self.aggressor.tally(), self.gate_aggressor_side)
             if (aggressor_class, reasons) != (self.aggressor.aggressor_class, self.aggressor.reasons):
                 raise ValueError("aggressor class does not match its premiums under the policy")
-            direction = self.aggressor.implied_direction if aggressor_class == "BOUGHT" else None
-            gate_reasons = dte_reasons + (() if aggressor_class == "BOUGHT" else (f"O1AG_{aggressor_class}",) + reasons)
+            direction, aggressor_reasons = aggressor_gate_outcome(self.aggressor, self.gate_aggressor_side)
+            gate_reasons = dte_reasons + aggressor_reasons
         else:
             if self.aggressor is not None:
                 raise ValueError("aggressor evidence only on a detected event under the aggressor gate")
@@ -482,10 +546,8 @@ def apply_o1_gates(
         if tally is None:
             raise ValueError("a detected event under the aggressor gate needs its tally")
         aggressor = aggressor_side_evidence(tally, source.contract_type, aggressor_side)
-        if aggressor.aggressor_class == "BOUGHT":
-            direction = aggressor.implied_direction
-        else:
-            gate_reasons = gate_reasons + (f"O1AG_{aggressor.aggressor_class}",) + aggressor.reasons
+        direction, aggressor_reasons = aggressor_gate_outcome(aggressor, aggressor_side)
+        gate_reasons = gate_reasons + aggressor_reasons
     episode_id = uuid5(NAMESPACE_URL,
         f"option-participation:{policy.sha256}:{source.security_id}:{source.contract_id}:{source.volume_session}")
     return GatedActivityFinding(
@@ -637,7 +699,7 @@ def o1_aggressor_documents(*, mode: O1GateMode, cutoff: datetime, entries: Seque
     `alerts_all_gates` = the alerts if the floor (when evaluated), the 0DTE gate (when evaluated) and this gate were ON."""
     judged = [e for e in entries if e.after_zero_dte == "DETECTED" and e.aggressor is not None]
     selected = [e for e in judged if _selectable(e, selection_enabled)]
-    kept = [e for e in selected if e.aggressor.aggressor_class == "BOUGHT"]
+    kept = [e for e in selected if policy.keeps(e.aggressor.aggressor_class)]
     all_gates = [e for e in kept if e.below_floor is not True and not e.dte_reasons]
     alerts_without, alerts_with = _alerts(selected), _alerts(kept)
     selected_ids = {e.event_id for e in selected}
@@ -689,6 +751,15 @@ def o1_aggressor_documents(*, mode: O1GateMode, cutoff: datetime, entries: Seque
         },
         "instead": _instead(alerts_without, alerts_with)[:_RECORD_LIST_LIMIT],
     }
+    if policy.version != AGGRESSOR_SIDE_POLICY.version:
+        # v2 (CONTRADICTION_ONLY) only: what STRICT would keep, for the comparison (STRICT lines stay as they were).
+        strict = [e for e in selected if e.aggressor.aggressor_class == "BOUGHT"]
+        window.update({
+            "aggressor_policy": O1_AGGRESSOR_POLICY_CONTRADICTION_ONLY,
+            "selected_with_strict": len(strict),
+            "alerts_with_strict": len(_alerts(strict)),
+            "kept_unclear": sum(e.aggressor.aggressor_class == "UNCLEAR" for e in kept),
+        })
     events = []
     for e in sorted(judged, key=lambda item: (item.observed_at, str(item.event_id))):
         a = e.aggressor
@@ -730,7 +801,7 @@ def o1_aggressor_documents(*, mode: O1GateMode, cutoff: datetime, entries: Seque
             "below_floor": e.below_floor,
             "zero_dte_would_drop": bool(e.dte_reasons),
             "without_gate": "SELECTED" if e.event_id in selected_ids else "OBSERVATION",
-            "with_gate": ("SELECTED" if e.event_id in selected_ids and a.aggressor_class == "BOUGHT"
+            "with_gate": ("SELECTED" if e.event_id in selected_ids and policy.keeps(a.aggressor_class)
                           else "OBSERVATION"),
             "window_alert": e.event_id in alert_ids,
             "applied": mode is O1GateMode.ON,
@@ -843,6 +914,9 @@ class O1GateRun:
 
 
 __all__ = [
+    "AGGRESSOR_CONTRADICTION_POLICY", "AggressorContradictionPolicy", "AggressorGatePolicy",
+    "O1_AGGRESSOR_POLICY_CONTRADICTION_ONLY", "O1_AGGRESSOR_POLICY_SETTING", "O1_AGGRESSOR_POLICY_STRICT",
+    "aggressor_gate_outcome", "o1_aggressor_policy_name",
     "AGGRESSOR_SIDE_POLICY", "ActivityGatePolicy", "AggressorSideEvidence", "AggressorSidePolicy",
     "GatedActivityFinding", "MIN_DTE_POLICY", "MinimumDtePolicy", "O1AG_INPUTS_UNAVAILABLE",
     "O1AG_NO_CLASSIFIED_PREMIUM", "O1AG_NO_DOMINANT_SIDE", "O1AG_NO_STORED_PRINTS", "O1AG_SIDE_PREMIUM_BELOW_POLICY",

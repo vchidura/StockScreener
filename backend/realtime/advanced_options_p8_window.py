@@ -24,6 +24,7 @@ from .advanced_options_equity_input import (
     initial_advanced_options_equity_context_requirements,
 )
 from .advanced_options_cycle import AdvancedOptionsDatasetFlowIdentity
+from .advanced_options_alert_context import record_options_alert_context  # G106 alert context (Nov 18)
 from .fault_journal import emit_fault
 from .advanced_options_loaders import (
     build_canonical_advanced_options_runtime_binding,
@@ -77,6 +78,7 @@ from .advanced_options_rolling_producer import (
     PostgresAdvancedOptionsRollingProducer,
     build_advanced_options_rolling_producer_plan,
 )
+from .advanced_options_f0dte import is_f0dte_payload, run_f0dte_window  # G106 D5 F0DTE
 from .advanced_options_o3_inputs import o3_inputs_enabled
 from .advanced_options_o3_producer import produce_o3_inputs
 from .advanced_options_service import OPTIONS_V3_STAGE_ORDER
@@ -511,6 +513,12 @@ def _evidence_builder(
 
     def observations_for(evaluation):
         own = observations_by_event.get(evaluation.event_id)
+        # --- G106 D5 F0DTE BEGIN: an F0DTE alert binds no stored flow event (its prints are the journal's, in its
+        # payload); its evidence carries one stored print, its underlyer's newest (else the window's newest), which
+        # the evidence contract needs, instead of the underlyer's whole session.
+        if own is None and is_f0dte_payload(evaluation.payload):
+            return tuple((observations_by_underlyer.get(str(evaluation.underlyer).upper()) or flow_observations)[-1:])
+        # --- G106 D5 F0DTE END
         rows = (
             observations_by_contract[own.contract_ticker]
             if own is not None
@@ -1016,6 +1024,13 @@ def build_and_run_p8_serial_window(
         binding,
         cutoff,
     )
+    # --- G106 D5 F0DTE BEGIN (REALTIME_V3_F0DTE): this window's 0DTE lane (journal prints, decision, record lines);
+    # ON leaves its alerts for the O1 lane of this cycle. OFF: nothing at all. Never raises (a failure is one
+    # RECORD_FAILED line and a DEGRADED fault).
+    run_f0dte_window(provider=provider, binding=binding, rolling=rolling, marks=marks,
+                     flow_environment=flow_environment, barrier_offset=barrier_offset, cutoff=cutoff,
+                     unpackageable_instrument_ids=unmarked_instrument_ids)
+    # --- G106 D5 F0DTE END
     native_candidate = build_advanced_options_native_input_plan(
         enrollment=binding.enrollment,
         producer_plan=producer_plan,
@@ -1209,6 +1224,13 @@ def build_and_run_p8_serial_window(
     )
     started = orchestrator.start(control.plan_id)
     report = orchestrator.run_window(binding.window_id)
+    # --- G106 O1 tuning (Nov 18): REALTIME_V3_OPTIONS_ALERT_CONTEXT (OFF = nothing). After the window's run: the gamma /
+    # delta context of the O1 / OS items the lanes noted, logged; one read-only read; never raises. ---
+    record_options_alert_context(
+        provider, session_date=control.session_date, cutoff=cutoff,
+        equity_cutoff=binding.equity_input.equity_cutoff, window_id=str(binding.window_id),
+    )
+    # --- end G106 alert context ---
     if started.enabled != frozenset(runners):
         raise RuntimeError("P8 serial stage membership changed")
     return {

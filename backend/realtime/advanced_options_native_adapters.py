@@ -46,6 +46,7 @@ from .advanced_options_o1_liquidity_floor import (
     o1_liquidity_floor_policy,
 )
 from .advanced_options_o1_gates import O1GateRun
+from .advanced_options_alert_context import note_o1_alert_context, note_os_alert_context  # G106 alert context
 from .contracts import canonical_sha256
 from .detector_adapters import (
     run_o1_adapter,
@@ -489,6 +490,19 @@ def _log_o1_liquidity_floor_record(context, mode, entries, failures, policy=None
         }, ())
 
 
+# --- G106 D5 F0DTE BEGIN
+def _f0dte_evaluations(context) -> tuple:
+    """G106 D5 (REALTIME_V3_F0DTE=ON): the F0DTE alerts the window's F0DTE run left for this cutoff
+    (`advanced_options_f0dte.run_f0dte_window`); () when OFF / RECORD or on any error. Never raises."""
+    try:
+        from .advanced_options_f0dte import f0dte_lane_evaluations
+
+        return tuple(f0dte_lane_evaluations(context.cutoff))
+    except Exception:  # noqa: BLE001 - F0DTE never fails the window
+        return ()
+# --- G106 D5 F0DTE END
+
+
 def build_advanced_o1_executor(
     inputs: AdvancedOptionsLaneInputs,
 ) -> NativeDetectorExecutor:
@@ -585,6 +599,15 @@ def build_advanced_o1_executor(
         _log_o1_liquidity_floor_record(context, floor_mode, floor_entries, floor_failures, floor_policy)
         if gates is not None:
             gates.log(context.cutoff, O1_PACKAGE_SELECTION_ENABLED)  # never raises
+        # --- G106 O1 tuning (Nov 18): REALTIME_V3_OPTIONS_ALERT_CONTEXT (OFF = nothing); notes only, never raises ---
+        note_o1_alert_context(context.cutoff, evaluations, inputs.invocations)
+        # --- end G106 alert context ---
+        # --- G106 D5 F0DTE BEGIN (REALTIME_V3_F0DTE=ON): this window's 0DTE alerts ride the O1 lane (the cycle's
+        # detector set is fixed by the control plane). OFF / RECORD: nothing is added. An UNAVAILABLE O1 lane cannot
+        # carry evaluations, so F0DTE adds none then. Never raises.
+        if unavailable_reasons is None or evaluations:
+            evaluations.extend(_f0dte_evaluations(context))
+        # --- G106 D5 F0DTE END
         if unavailable_reasons is not None and not evaluations:
             return AdvancedOptionsNativeLaneResult(
                 NativeLaneState.UNAVAILABLE,
@@ -717,6 +740,9 @@ def build_advanced_os_executor(
                 invocation.package if selected else None,
             ))
         _log_os_participation(inputs.record, evaluations)
+        # --- G106 O1 tuning (Nov 18): REALTIME_V3_OPTIONS_ALERT_CONTEXT (OFF = nothing); notes only, never raises ---
+        note_os_alert_context(detector.value, context.cutoff, evaluations, inputs.record)
+        # --- end G106 alert context ---
         return AdvancedOptionsNativeLaneResult(
             NativeLaneState.COMPLETE,
             (),

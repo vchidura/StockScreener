@@ -1153,6 +1153,34 @@ def _flow_response(
     }
 
 
+# --- G106 D5 F0DTE BEGIN: an F0DTE alert rides the O1 lane (the cycle's detector set is fixed by the control plane)
+# and is told apart by its payload contract; on the alert it is detector F0DTE, category ZERO_DTE_INTRADAY.
+_F0DTE_EVALUATION_CONTRACT = "f0dte-evaluation-v1"
+_F0DTE_DETECTOR_ID = "F0DTE"
+
+
+def _f0dte_payload(evaluation) -> Mapping | None:
+    payload = getattr(evaluation, "payload", None)
+    if isinstance(payload, Mapping) and payload.get("contract") == _F0DTE_EVALUATION_CONTRACT:
+        return payload
+    return None
+
+
+def _evaluation_detector_id(evaluation) -> str:
+    """The detector id an alert shows: F0DTE for an F0DTE alert, else the evaluation's lane."""
+    return _F0DTE_DETECTOR_ID if _f0dte_payload(evaluation) is not None else evaluation.detector.value
+
+
+def _f0dte_session_variant(evaluation) -> str:
+    """One session alert per F0DTE trigger (a repeat on a contract after the block is its own alert): its window."""
+    try:
+        at = datetime.fromisoformat(str(evaluation.payload["cutoff"]))
+    except (KeyError, TypeError, ValueError):
+        at = evaluation.observed_at
+    return f"F0DTE:{at.astimezone(timezone.utc):%H%M}"
+# --- G106 D5 F0DTE END
+
+
 def _alert_evaluation_row(evaluation, cutoff: datetime):
     direction = evaluation.payload.get("direction")
     if direction not in (-1, 1):
@@ -1161,7 +1189,8 @@ def _alert_evaluation_row(evaluation, cutoff: datetime):
             direction = decision.get("direction")
     if direction not in (-1, 1):
         direction = None
-    detector = evaluation.detector.value
+    detector = _evaluation_detector_id(evaluation)  # G106 D5: F0DTE alerts carry their own id
+    f0dte = _f0dte_payload(evaluation)
     return {
         "evaluation_id": str(evaluation.evaluation_id),
         "candidate_id": (
@@ -1183,8 +1212,8 @@ def _alert_evaluation_row(evaluation, cutoff: datetime):
         ),
         "underlyer": evaluation.underlyer,
         "direction": direction,
-        "category": detector,
-        "strategy_name": detector,
+        "category": str(f0dte.get("category")) if f0dte is not None else detector,
+        "strategy_name": str(f0dte.get("structure_type")) if f0dte is not None else detector,
         "candidate_rank": None,
         "selection_status": evaluation.selection_status,
         "selection_reason": evaluation.selection_status,
@@ -1323,6 +1352,9 @@ def _session_alert_key(evaluation):
     """(contract id, variant) of a session alert: v1 single contract -> (contract, "") as before; G106 AL2 O1 debit
     vertical -> (long leg contract, "O1_DEBIT_VERTICAL:<short contract>"), a session alert of its own so a single
     contract and a vertical on one contract never share a row (their marks differ). None: one row per evaluation."""
+    f0dte = _f0dte_payload(evaluation)
+    if f0dte is not None and evaluation.package is not None:  # G106 D5: one session alert per F0DTE trigger
+        return evaluation.package.legs[0].contract_id, _f0dte_session_variant(evaluation)
     contract_id = _session_alert_contract(evaluation)
     if contract_id is not None:
         return contract_id, ""
@@ -1491,6 +1523,7 @@ def _alert_run_row(
     package = evaluation.package
     if package is None:
         return None
+    f0dte = _f0dte_payload(evaluation)  # G106 D5: the F0DTE management policy and entry limit
     direction = row["direction"]
     vertical = _o1_debit_vertical_fields(package)
     if direction not in (-1, 1):
@@ -1526,19 +1559,30 @@ def _alert_run_row(
             ] is not None
             else "UNAVAILABLE"
         ),
-        "entry_limit": str(package.entry_net_premium),
+        # G106 D5: an F0DTE alert's limit is the ask at detection per package (a positive maximum debit, the basis
+        # the portal's plan cells read with its management policy); others as before.
+        "entry_limit": (
+            str(f0dte["entry_limit_per_package"]) if f0dte is not None and f0dte.get("entry_limit_per_package")
+            else str(package.entry_net_premium)
+        ),
         "entry_deadline": row["entry_deadline"],
         "exit_deadline": row["exit_deadline"],
-        "management_policy": {},
+        "management_policy": (
+            dict(f0dte["management_policy"]) if f0dte is not None and isinstance(f0dte.get("management_policy"), Mapping)
+            else {}
+        ),
         "event_horizon_status": None,
         "original_package": {
             "status": "AVAILABLE",
             "basis": "ORIGINAL_CANDIDATE_SNAPSHOTS",
-            "structure_type": vertical["structure_type"] if vertical else None,
+            "structure_type": (
+                vertical["structure_type"] if vertical
+                else str(f0dte["structure_type"]) if f0dte is not None and f0dte.get("structure_type") else None
+            ),
             "expiration_date": (
                 max(leg.expiration_date for leg in package.legs).isoformat()
             ),
-            "calendar_dte": None,
+            "calendar_dte": 0 if f0dte is not None else None,
             "net_premium": str(package.entry_net_premium),
             "capital_at_risk": str(package.capital_at_risk),
             "maximum_loss": str(package.capital_at_risk),
@@ -1630,6 +1674,8 @@ def _candidate_detail(evaluation, policy_sha256: str):
     # The source contract stays leg 0 for every package (O3's is its short anchor); a debit vertical's leg 0 is its
     # BUY leg, the O1 event's contract.
     bought = package.legs[0]
+    f0dte = _f0dte_payload(evaluation)  # G106 D5: an F0DTE alert names itself, its structure and management
+    detector_id = _evaluation_detector_id(evaluation)
     return {
         "candidate": {
             "candidate_id": candidate_id,
@@ -1638,16 +1684,20 @@ def _candidate_detail(evaluation, policy_sha256: str):
                 package.candidate_identity_sha256
             ),
             "matrix_id": str(package.matrix_id),
-            "strategy_name": evaluation.detector.value,
+            "strategy_name": detector_id,
             "strategy_version": "advanced-options-v2",
             "display_name": (
-                f"{evaluation.detector.value} {evaluation.underlyer}"
+                f"{detector_id} {evaluation.underlyer}"
             ),
             "underlying": evaluation.underlyer,
             "candidate_kind": candidate_kind,
-            "strategy_archetype": evaluation.detector.value,
+            "strategy_archetype": detector_id,
             "persona_tags": [],
-            "structure_type": vertical["structure_type"] if vertical else "ADVANCED_CANONICAL_PACKAGE",
+            "structure_type": (
+                vertical["structure_type"] if vertical
+                else str(f0dte["structure_type"]) if f0dte is not None and f0dte.get("structure_type")
+                else "ADVANCED_CANONICAL_PACKAGE"
+            ),
             "structure_risk_class": "PREMIUM_AT_RISK_DEBIT" if vertical else "DEFINED_RISK",
             "expiration_date": expiration.isoformat(),
             "candidate_rank": 1,
@@ -1666,8 +1716,14 @@ def _candidate_detail(evaluation, policy_sha256: str):
             "breakevens": vertical["breakevens"] if vertical else [],
             "execution_eligibility": None,
             "reason_codes": [],
-            "management_policy_version": None,
-            "management_policy": {},
+            "management_policy_version": (
+                str(f0dte["management_policy"]["policy_version"])
+                if f0dte is not None and isinstance(f0dte.get("management_policy"), Mapping) else None
+            ),
+            "management_policy": (
+                dict(f0dte["management_policy"])
+                if f0dte is not None and isinstance(f0dte.get("management_policy"), Mapping) else {}
+            ),
             "policy_sha256": policy_sha256,
             "model_version": "advanced-options-v2",
             "market_data_time": package.entry_market_time.isoformat(),
@@ -3352,7 +3408,7 @@ def persist_options_session_alerts_cursor(cursor, *, cohort_id, session_date, al
     for evaluation in evaluations:
         alert_key = _session_alert_key(evaluation)
         if alert_key is not None:
-            groups.setdefault((evaluation.detector.value, *alert_key), []).append(evaluation)
+            groups.setdefault((_evaluation_detector_id(evaluation), *alert_key), []).append(evaluation)
     rows = {}
     for row in alert_rows:
         evaluation = evaluations_by_id.get(str(row["evaluation_id"]))

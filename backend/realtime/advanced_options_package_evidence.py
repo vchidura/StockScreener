@@ -741,6 +741,15 @@ class AdvancedOptionsFlowPackageEvidence:
         }
 
 
+# --- G106 D5 F0DTE BEGIN
+def _is_f0dte_evaluation(evaluation) -> bool:
+    """G106 D5: an F0DTE alert (payload contract `f0dte-evaluation-v1`, carried by the O1 lane). Its package binds the
+    window's journal prints (in its payload) under its own event id, so it never names a stored flow event."""
+    payload = getattr(evaluation, "payload", None)
+    return isinstance(payload, Mapping) and payload.get("contract") == "f0dte-evaluation-v1"
+# --- G106 D5 F0DTE END
+
+
 def build_flow_package_evidence(
     evaluation: AdvancedOptionsDetectorEvaluation,
     *,
@@ -758,7 +767,7 @@ def build_flow_package_evidence(
     package = evaluation.package
     if package is not None and package.event_id not in {
         row.event_id for row in flow_observations
-    }:
+    } and not _is_f0dte_evaluation(evaluation):  # G106 D5: an F0DTE alert binds its own event, never a flow event
         raise ValueError("selected package does not bind a flow event")
     leg_evidence: tuple[AdvancedOptionsPackageLegEvidence, ...] = ()
     equity_spot_sha256 = None
