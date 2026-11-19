@@ -125,3 +125,4 @@ docs/agent-context/advanced-realtime.md
 .claude/settings.local.json
 backend/tests/.artifacts/v3-review-corrections-products-20261103.xml
 backend/tests/.artifacts/v3-review-current-20261104.xml
+backend/.env.live-switches
