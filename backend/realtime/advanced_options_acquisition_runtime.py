@@ -23,6 +23,7 @@ from .advanced_gateway import (
     GatewayFeedState,
     GatewayOverload,
 )
+from .advanced_equity_ingress import AdvancedJournalDecodeError
 from .advanced_options_ingress import AdvancedOptionsJournalPump
 from .advanced_options_v3_authority import (
     SessionAcquisitionAuthorization,
@@ -85,6 +86,118 @@ ZERO_FORBIDDEN_EFFECTS = {
 }
 _OPTION_UNDERLYING = re.compile(r"^O:([A-Z]{1,6})")
 _EQUITY_SYMBOL = re.compile(r"^[A-Z]{1,6}$")
+
+# --- G102 R100c (Nov 19 2026): operator attempt extension for the CURRENT session, without re-used attempt numbers.
+# Nov 18 a local crash loop spent the session's 12 connection attempts; the recovery lowered `connection_attempts` in the
+# status file by hand (12 -> 9 -> 7 -> 4), which re-used attempt numbers. Attempt N streams under
+# uuid5(binding stream session, "connection-attempt:N"), and a re-used N whose message 0 is already in the journal fails
+# "raw message identity conflicts with committed payload". Instead the status field `operator_extra_connection_attempts`
+# (written only by scripts/extend_options_acquisition_attempts.py while acquisition is stopped) RAISES the ceiling for this
+# session: numbering continues 13, 14, ... so no stream session id repeats. Absent or 0 = the binding's ceiling exactly.
+# The effective ceiling is capped at 64, far below the 256 derived ids the Options ingress accepts
+# (advanced_options_ingress._MAXIMUM_DERIVED_CONNECTION_ATTEMPTS). A status file of another journal generation is the
+# last session's (`_load_status` starts fresh), so an extension never carries into the next session.
+OPERATOR_EXTRA_CONNECTION_ATTEMPTS = "operator_extra_connection_attempts"
+MAXIMUM_EFFECTIVE_CONNECTION_ATTEMPTS = 64
+
+
+def _operator_extra_connection_attempts(status: Mapping[str, object]) -> int:
+    value = status.get(OPERATOR_EXTRA_CONNECTION_ATTEMPTS, 0)
+    if type(value) is not int or value < 0:
+        raise ValueError("Options acquisition durable status changed")
+    return value
+
+
+def effective_connection_attempt_ceiling(
+    binding: "AdvancedOptionsAcquisitionBinding",
+    status: Mapping[str, object],
+) -> int:
+    """The binding's ceiling plus the operator extension, never above 64 (and never below the binding's ceiling)."""
+    extra = _operator_extra_connection_attempts(status)
+    ceiling = binding.connection_attempt_ceiling
+    if extra == 0 or ceiling >= MAXIMUM_EFFECTIVE_CONNECTION_ATTEMPTS:
+        return ceiling
+    return min(ceiling + extra, MAXIMUM_EFFECTIVE_CONNECTION_ATTEMPTS)
+
+
+# --- G102 R100d (Nov 19 2026): restart backoff after a LOCAL failure (switch REALTIME_V3_ACQUISITION_LOCAL_BACKOFF).
+# A local failure is one on our side of the socket: the journal pump or decoder died (AdvancedJournalDecodeError, incl.
+# ADVANCED_JOURNAL_PUMP_FAILED), the handoff to a dead pump filled up (GatewayOverload ADVANCED_HANDOFF_*), or another
+# non-transport error inside the session (state FAILED_INTERNAL). It ends the process, the container restarts at once and
+# reconnects: Nov 18 spent all 12 attempts in 5.3 min (14:37:50-14:43:08), about one every 30 s. With ON:
+# - the process that ends on a local failure records `local_failures` in the status file: count (consecutive local
+#   failures since the last successful capture), total, last_at_utc, last_class, last_attempt, pending=true;
+# - the next start, when `pending`, waits min(2^(count-1) * 15 s, 300 s) BEFORE opening a socket (state
+#   LOCAL_FAILURE_BACKOFF, heartbeat kept, one `ACQUISITION_LOCAL_FAILURE_BACKOFF {json}` line; a stop ends the wait) and
+#   clears `pending` (an operator stop/start afterwards connects at once); no wait when no socket would be opened;
+# - a successful capture (state CAPTURING and new normalized events) resets count to 0;
+# - an in-process reconnect never opens a socket into a dead pump (it ends with the pump's error instead).
+# Transport failures keep today's in-process reconnect. Provider rejections (GatewayControlError) are not local.
+# OFF (unset/blank, the default) = today exactly: nothing recorded, no wait (an existing field is only carried along).
+LOCAL_BACKOFF_SETTING = "REALTIME_V3_ACQUISITION_LOCAL_BACKOFF"
+LOCAL_FAILURES = "local_failures"
+LOCAL_BACKOFF_BASE_SECONDS = 15.0
+LOCAL_BACKOFF_MAXIMUM_SECONDS = 300.0
+LOCAL_FAILURE_BACKOFF_STATE = "LOCAL_FAILURE_BACKOFF"
+
+
+def local_backoff_enabled(environ: Mapping[str, str] | None = None) -> bool:
+    """`REALTIME_V3_ACQUISITION_LOCAL_BACKOFF`: unset or blank is OFF. Anything but OFF or ON raises (before any socket)."""
+    raw = (os.environ if environ is None else environ).get(LOCAL_BACKOFF_SETTING)
+    value = (raw or "").strip().upper() or "OFF"
+    if value not in ("OFF", "ON"):
+        raise ValueError(f"{LOCAL_BACKOFF_SETTING} must be OFF or ON, not {raw!r}")
+    return value == "ON"
+
+
+def local_failure_backoff_seconds(consecutive: int) -> float:
+    """min(2^(k-1) * 15 s, 300 s) for k consecutive local failures; 0 for none."""
+    if type(consecutive) is not int or consecutive <= 0:
+        return 0.0
+    return min(
+        LOCAL_BACKOFF_BASE_SECONDS * 2 ** min(consecutive - 1, 16),
+        LOCAL_BACKOFF_MAXIMUM_SECONDS,
+    )
+
+
+def local_failure_class(
+    error: BaseException,
+    state: object = None,
+) -> str | None:
+    """The class of a local (non-transport, non-provider) failure, or None."""
+    if isinstance(error, AdvancedJournalDecodeError):
+        return f"PUMP:{error}"
+    if isinstance(error, GatewayOverload) and str(
+        error.reason_code
+    ).startswith("ADVANCED_HANDOFF_"):
+        return f"HANDOFF:{error.reason_code}"
+    if state == "FAILED_INTERNAL":
+        return f"INTERNAL:{type(error).__name__}"
+    return None
+
+
+def _local_failures(status: Mapping[str, object]) -> dict[str, object]:
+    value = status.get(LOCAL_FAILURES)
+    if (
+        not isinstance(value, Mapping)
+        or type(value.get("count")) is not int
+        or value["count"] < 0
+    ):
+        return {}
+    return dict(value)
+
+
+def _pump_failed(pump) -> bool:
+    # The pump keeps its first error until join() raises it; a dead pump never drains the handoff again.
+    return getattr(pump, "_error", None) is not None
+
+
+def _emit(event: str, document: Mapping[str, object]) -> None:
+    print(
+        f"{event} {json.dumps(document, sort_keys=True, default=str)}",
+        file=sys.stderr,
+        flush=True,
+    )
 
 
 def _utc(value: datetime, name: str) -> datetime:
@@ -474,6 +587,8 @@ def _load_status(
         != str(binding.authority.journal_generation)
     ):
         raise ValueError("Options acquisition durable status changed")
+    # R100c: an operator extension must be a whole number >= 0 (the CLI writes nothing else).
+    _operator_extra_connection_attempts(value)
     return value
 
 
@@ -756,6 +871,44 @@ def acquisition_health(
     }
 
 
+def _record_local_failure(
+    publisher: "_AcquisitionStatusPublisher | None",
+    error: BaseException,
+    clock: Callable[[], datetime],
+) -> None:
+    """R100d (ON only): note a local failure in the status file before the process ends on it."""
+    if publisher is None:
+        return
+    snapshot = publisher.snapshot()
+    failure_class = local_failure_class(error, snapshot.get("state"))
+    if failure_class is None:
+        return
+    previous = _local_failures(snapshot)
+    count = int(previous.get("count") or 0) + 1
+    total = previous.get("total")
+    record = {
+        **previous,
+        "count": count,
+        "total": (total if type(total) is int else 0) + 1,
+        "last_at_utc": _utc(clock(), "clock").isoformat(),
+        "last_class": failure_class,
+        "last_attempt": snapshot.get("connection_attempts"),
+        "pending": True,
+    }
+    record.pop("backoff_seconds", None)
+    document = {
+        **record,
+        "next_backoff_seconds": local_failure_backoff_seconds(count),
+        "journal_generation": snapshot.get("journal_generation"),
+    }
+    try:
+        publisher.update(**{LOCAL_FAILURES: record})
+        publisher.persist()
+    except BaseException as status_error:  # never hide the original failure
+        document["status_write"] = f"FAILED:{type(status_error).__name__}"
+    _emit("ACQUISITION_LOCAL_FAILURE", document)
+
+
 def run_acquisition(
     binding: AdvancedOptionsAcquisitionBinding,
     *,
@@ -774,6 +927,51 @@ def run_acquisition(
 ) -> dict[str, object]:
     if not api_key.strip():
         raise ValueError("Options acquisition provider key is required")
+    # R100d: read (and validate) the switch before anything else, so an invalid value opens no socket.
+    local_backoff = local_backoff_enabled()
+    session: dict[str, object] = {}
+    try:
+        return _run_acquisition(
+            binding,
+            provider=provider,
+            api_key=api_key,
+            journal_root=journal_root,
+            status_path=status_path,
+            lock_path=lock_path,
+            stop_event=stop_event,
+            connection_factory=connection_factory,
+            clock=clock,
+            selection_plan=selection_plan,
+            monotonic_ns=monotonic_ns,
+            diagnostic=diagnostic,
+            journal_guard=journal_guard,
+            local_backoff=local_backoff,
+            session=session,
+        )
+    except BaseException as error:
+        if local_backoff:
+            _record_local_failure(session.get("publisher"), error, clock)
+        raise
+
+
+def _run_acquisition(
+    binding: AdvancedOptionsAcquisitionBinding,
+    *,
+    provider,
+    api_key: str,
+    journal_root: Path,
+    status_path: Path,
+    lock_path: Path,
+    stop_event: Event,
+    connection_factory,
+    clock: Callable[[], datetime],
+    selection_plan: C6SelectionPlan | None,
+    monotonic_ns: Callable[[], int],
+    diagnostic: bool,
+    journal_guard: OptionsJournalHeadroomGuard | None,
+    local_backoff: bool,
+    session: dict[str, object],
+) -> dict[str, object]:
     guard = (
         options_journal_headroom_guard(os.environ)
         if journal_guard is None
@@ -798,6 +996,36 @@ def run_acquisition(
     )
     status = _load_status(status_path, binding)
     attempts = int(status["connection_attempts"])
+    # R100c: binding ceiling + operator extension (absent/0 = the binding's ceiling, as before).
+    connection_attempt_ceiling = effective_connection_attempt_ceiling(
+        binding,
+        status,
+    )
+    # R100d: the previous run's local failures (carried along whatever the switch; acted on only with ON).
+    carried_local_failures = (
+        dict(status[LOCAL_FAILURES])
+        if isinstance(status.get(LOCAL_FAILURES), Mapping)
+        else None
+    )
+    previous_local_failures = _local_failures(status)
+    pending_backoff_seconds = None
+    if (
+        local_backoff
+        and previous_local_failures.get("pending") is True
+        and int(previous_local_failures["count"]) > 0
+    ):
+        pending_backoff_seconds = local_failure_backoff_seconds(
+            int(previous_local_failures["count"])
+        )
+        carried_local_failures = {
+            **previous_local_failures,
+            "pending": False,
+            "backoff_seconds": pending_backoff_seconds,
+        }
+    reset_local_failures = [
+        local_backoff and int(previous_local_failures.get("count") or 0) > 0
+    ]
+    event_baseline = [None]
     (
         decoded_messages,
         decoded_bytes,
@@ -854,6 +1082,9 @@ def run_acquisition(
 
     def progress(value):
         latest[0] = value
+        if event_baseline[0] is None:
+            # The pump's first report is the recovered journal, before any socket: the baseline for "new events".
+            event_baseline[0] = value.last_event_offset
         publisher = publisher_holder[0]
         if publisher is not None:
             publisher.update(
@@ -863,6 +1094,21 @@ def run_acquisition(
                     _utc(clock(), "clock").isoformat()
                 ),
             )
+            if (
+                reset_local_failures[0]
+                and value.last_event_offset > event_baseline[0]
+            ):
+                # R100d: a successful capture (CAPTURING with new events) resets the consecutive count. Runs on the
+                # pump thread, so no disk write here: the 1 s status heartbeat persists it.
+                current = publisher.snapshot()
+                if current.get("state") == "CAPTURING":
+                    reset_local_failures[0] = False
+                    publisher.update(**{LOCAL_FAILURES: {
+                        **_local_failures(current),
+                        "count": 0,
+                        "pending": False,
+                        "reset_at_utc": _utc(clock(), "clock").isoformat(),
+                    }})
 
     pump = AdvancedOptionsJournalPump(
         buffer,
@@ -926,10 +1172,51 @@ def run_acquisition(
             "transport_gaps": gaps,
             "diagnostic": diagnostic,
             "forbidden_effects": dict(ZERO_FORBIDDEN_EFFECTS),
+            # R100c / R100d: kept on every status write (absent stays absent).
+            **(
+                {
+                    OPERATOR_EXTRA_CONNECTION_ATTEMPTS: status[
+                        OPERATOR_EXTRA_CONNECTION_ATTEMPTS
+                    ]
+                }
+                if OPERATOR_EXTRA_CONNECTION_ATTEMPTS in status
+                else {}
+            ),
+            **(
+                {LOCAL_FAILURES: carried_local_failures}
+                if carried_local_failures is not None
+                else {}
+            ),
         },
         clock=clock,
     )
     publisher_holder[0] = publisher
+    session["publisher"] = publisher
+    if OPERATOR_EXTRA_CONNECTION_ATTEMPTS in status:
+        _emit("ACQUISITION_ATTEMPT_EXTENSION", {
+            "journal_generation": str(
+                binding.authority.journal_generation
+            ),
+            "binding_connection_attempt_ceiling": (
+                binding.connection_attempt_ceiling
+            ),
+            OPERATOR_EXTRA_CONNECTION_ATTEMPTS: status[
+                OPERATOR_EXTRA_CONNECTION_ATTEMPTS
+            ],
+            "effective_connection_attempt_ceiling": (
+                connection_attempt_ceiling
+            ),
+            "capped": (
+                connection_attempt_ceiling
+                < binding.connection_attempt_ceiling
+                + int(status[OPERATOR_EXTRA_CONNECTION_ATTEMPTS])
+            ),
+            "connection_attempts": attempts,
+            "next_attempt": attempts + 1,
+            "remaining_attempts": max(
+                0, connection_attempt_ceiling - attempts
+            ),
+        })
     publisher.start()
 
     headroom_paused = [False]
@@ -948,7 +1235,7 @@ def run_acquisition(
             and not diagnostic
             and _utc(clock(), "clock")
             < binding.authority.acquisition_stop
-            and attempts < binding.connection_attempt_ceiling
+            and attempts < connection_attempt_ceiling
             and decoded_messages + CONTROL_MESSAGES_PER_ATTEMPT
             < binding.decoded_message_ceiling
             and decoded_bytes < binding.decoded_byte_ceiling
@@ -960,10 +1247,55 @@ def run_acquisition(
             not stop_event.is_set()
             and _utc(clock(), "clock")
             < binding.authority.acquisition_stop
-            and attempts < binding.connection_attempt_ceiling
+            and attempts < connection_attempt_ceiling
             and decoded_messages < binding.decoded_message_ceiling
             and decoded_bytes < binding.decoded_byte_ceiling
         ):
+            if pending_backoff_seconds is not None:
+                # R100d: the previous run ended on a local failure; wait before this run's first socket.
+                remaining_authority = max(0.0, (
+                    binding.authority.acquisition_stop
+                    - _utc(clock(), "clock")
+                ).total_seconds())
+                wait_seconds = min(
+                    pending_backoff_seconds,
+                    remaining_authority,
+                )
+                pending_backoff_seconds = None
+                _emit("ACQUISITION_LOCAL_FAILURE_BACKOFF", {
+                    "journal_generation": str(
+                        binding.authority.journal_generation
+                    ),
+                    "consecutive_local_failures": (
+                        previous_local_failures.get("count")
+                    ),
+                    "last_class": previous_local_failures.get(
+                        "last_class"
+                    ),
+                    "last_at_utc": previous_local_failures.get(
+                        "last_at_utc"
+                    ),
+                    "last_attempt": previous_local_failures.get(
+                        "last_attempt"
+                    ),
+                    "wait_seconds": wait_seconds,
+                    "connection_attempts": attempts,
+                    "next_attempt": attempts + 1,
+                    "effective_connection_attempt_ceiling": (
+                        connection_attempt_ceiling
+                    ),
+                })
+                publisher.update(
+                    persist=True,
+                    state=LOCAL_FAILURE_BACKOFF_STATE,
+                    socket_state=GatewayFeedState.DISCONNECTED.value,
+                    subscription_ready=False,
+                )
+                stop_event.wait(wait_seconds)
+                continue
+            if local_backoff and _pump_failed(pump):
+                # R100d: never open a socket into a dead journal pump; end with the pump's error (a local failure).
+                break
             attempts += 1
             remaining_messages = (
                 binding.decoded_message_ceiling
@@ -1319,6 +1651,10 @@ def run_acquisition(
         "diagnostic": diagnostic,
         "forbidden_effects": dict(ZERO_FORBIDDEN_EFFECTS),
     }
+    # R100c / R100d: the final status keeps the extension and the local-failure record (absent stays absent).
+    for kept in (OPERATOR_EXTRA_CONNECTION_ATTEMPTS, LOCAL_FAILURES):
+        if kept in current_status:
+            report[kept] = current_status[kept]
     report["semantic_sha256"] = canonical_sha256(report)
     _write_json(status_path, report)
     return report

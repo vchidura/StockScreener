@@ -22,10 +22,13 @@ if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
 from realtime.advanced_options_acquisition_runtime import (  # noqa: E402
+    LOCAL_BACKOFF_SETTING,
     acquisition_binding_from_payload,
     acquisition_binding_payload,
     acquisition_health,
     build_acquisition_binding,
+    local_backoff_enabled,
+    local_failure_backoff_seconds,
     run_acquisition,
 )
 from realtime.advanced_realtime_fencing import (  # noqa: E402
@@ -292,8 +295,26 @@ class _FixtureConnection:
         del code, reason
 
 
+def announce_local_backoff(environ=None) -> bool:
+    """G102 R100d: check REALTIME_V3_ACQUISITION_LOCAL_BACKOFF when the process starts (an invalid value raises here,
+    not first at the session start); one setting line only when the key is set, so unset stays silent as before."""
+    environment = os.environ if environ is None else environ
+    enabled = local_backoff_enabled(environment)
+    if (environment.get(LOCAL_BACKOFF_SETTING) or "").strip():
+        print("ACQUISITION_LOCAL_BACKOFF_SETTING " + json.dumps({
+            "setting": LOCAL_BACKOFF_SETTING,
+            "mode": "ON" if enabled else "OFF",
+            "backoff_seconds": [
+                local_failure_backoff_seconds(k) for k in range(1, 7)
+            ] if enabled else [],
+        }, sort_keys=True), file=sys.stderr, flush=True)
+    return enabled
+
+
 def main(argv=None) -> int:
     args = parse_args(argv)
+    if args.command == "run":
+        announce_local_backoff()
     if args.command == "prepare":
         authority_document = _read(args.pre_session_authority)
         authority = session_acquisition_authorization_from_payload(
