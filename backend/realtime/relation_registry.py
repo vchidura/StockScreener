@@ -349,6 +349,8 @@ RELATIONS: dict[str, Relation] = {
     # G75 breadth: the current row per contract is replaced each capture (pruning old sessions belongs to retention).
     "rt.option_breadth_current": _r("options", "BOUNDED", mutable=True, api=True),
     "rt.option_breadth_captures": _r("options", "BOUNDED", append=True, api=True),
+    # G106 H1: each session's final chain, copied once after the close (history: IV rank, OI change, skew, research).
+    "rt.option_breadth_daily": _r("options", "BOUNDED", append=True, api=True),
     "rt.option_flow_event_profiles": _r(
         "options", "ARCHIVE_FIRST", append=True, partitioned=True, api=True
     ),

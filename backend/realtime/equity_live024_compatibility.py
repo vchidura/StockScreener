@@ -115,6 +115,7 @@ POST024_RELATIONS = frozenset({
     "rt.bar_head",
     "rt.option_breadth_current",
     "rt.option_breadth_captures",
+    "rt.option_breadth_daily",
 })
 SYMBOLS = ("SPY",)
 CHANNELS = ("AM",)

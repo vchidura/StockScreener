@@ -351,6 +351,13 @@ def _normalize_event(
     )
 
 
+def _is_success_status_row(row: Mapping[str, Any]) -> bool:
+    return (
+        str(row.get("ev") or "").strip().lower() == "status"
+        and str(row.get("status") or "").strip().lower() == "success"
+    )
+
+
 def normalize_raw_message(
     raw: RawJournalRecord,
     admissions: Mapping[str, InstrumentAdmission],
@@ -431,6 +438,13 @@ def normalize_raw_message(
                     _payload_hash(row),
                 )
             )
+            continue
+        if _is_success_status_row(row):
+            # Nov 18 2026 (R100): the provider can put subscription acknowledgements ({"ev":"status","status":"success",
+            # "message":"subscribed to: Q.O:..."}) in the same frame as market rows while a large subscription is still
+            # being acknowledged. The gateway only filters frames made of status rows alone, so such a frame reaches the
+            # journal; a success acknowledgement is not a market event and is skipped. Any other status row (error,
+            # rejected, ...) is still quarantined, so the decoder keeps refusing what it does not understand.
             continue
         try:
             events.append(

@@ -307,3 +307,37 @@ def test_normalizer_is_deterministic_and_retains_invalid_json():
     assert invalid.events == ()
     assert invalid.quarantines[0].reason_code == "INVALID_JSON"
     assert invalid.quarantines[0].event_index == -1
+
+def test_normalizer_skips_success_status_rows_mixed_into_a_market_frame_r100():
+    # Nov 18 2026 (R100): subscription acknowledgements arrived in the same frame as option quotes; the decoder
+    # quarantined them and the Options acquisition crash-looped. A success status row is skipped; others still quarantine.
+    timestamp = int((RECEIVED.timestamp() - 0.1) * 1000)
+    batch = normalize_raw_message(
+        _raw(
+            (
+                '[{"ev":"Q","sym":"O:SPY261218C00600000","bp":2.4,"ap":2.5,"bs":3,'
+                f'"as":4,"t":{timestamp}}},'
+                '{"ev":"status","status":"success","message":"subscribed to: Q.O:SPY261218C00600000"},'
+                '{"ev":"status","status":"success","message":"subscribed to: T.O:SPY261218C00600000"}]'
+            ).encode("ascii"),
+            feed=MarketFeed.OPTIONS,
+        ),
+        ADMISSIONS,
+    )
+    assert len(batch.events) == 1
+    assert batch.events[0].event_index == 0
+    assert batch.quarantines == ()
+
+    failed = normalize_raw_message(
+        _raw(
+            (
+                '[{"ev":"Q","sym":"O:SPY261218C00600000","bp":2.4,"ap":2.5,"bs":3,'
+                f'"as":4,"t":{timestamp}}},'
+                '{"ev":"status","status":"error","message":"not subscribed to: Q.O:SPY261218C00600000"}]'
+            ).encode("ascii"),
+            feed=MarketFeed.OPTIONS,
+        ),
+        ADMISSIONS,
+    )
+    assert len(failed.events) == 1
+    assert [row.reason_code for row in failed.quarantines] == ["UNSUPPORTED_EVENT_TYPE"]

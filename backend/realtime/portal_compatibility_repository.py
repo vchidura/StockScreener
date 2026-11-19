@@ -2191,7 +2191,7 @@ class RealtimeOptionAlertRepository(_RealtimeCompatibilityRepository):
         cohort_id: UUID | None = None,
     ) -> dict[str, object]:
         cutoff = _utc(available_by, "available_by")
-        if detector not in {None, "O1", "O2", "O3", "OS1", "OS2"}:
+        if detector not in {None, "O1", "O2", "O3", "OS1", "OS2", "F0DTE"}:
             raise ValueError("unsupported option detector")
         if offset < 0 or not 1 <= limit <= 200:
             raise ValueError("invalid option evaluation page bounds")

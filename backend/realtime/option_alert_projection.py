@@ -54,7 +54,8 @@ class DetectorEvaluationQuery(BaseModel):
     model_config = ConfigDict(extra="forbid")
     session_date: date | None = None
     dataset_id: str | None = Field(default=None, min_length=1, max_length=80)
-    detector: Literal["O1", "O2", "O3", "OS1", "OS2"] | None = None
+    # G106 D5 (r138): F0DTE is an alert's own detector id (its evaluations ride the O1 lane).
+    detector: Literal["O1", "O2", "O3", "OS1", "OS2", "F0DTE"] | None = None
     selection_status: Literal["SELECTED", "NOT_SELECTED", "REPEAT", "OBSERVATION"] | None = None
     underlyer: str | None = None
     sort_by: Literal["triggered_at", "run", "underlyer", "detector", "category", "strategy", "rank", "entry_limit"] = "run"

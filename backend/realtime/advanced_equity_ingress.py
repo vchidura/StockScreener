@@ -290,6 +290,20 @@ class AdvancedJournalPump:
                         last_raw_offset,
                         limit=self.maximum_batch_messages,
                     )
+                    # R100b (Nov 18 2026): after a restart the normalized offset can trail the raw journal by more
+                    # than one batch (a crash loop leaves raw records that were never normalized). Read that backlog
+                    # in batch-sized chunks up to the new commit instead of refusing the commit as unreadable.
+                    while (
+                        raw_records
+                        and raw_records[-1].raw_offset < commit.last_offset
+                    ):
+                        more = reader.read_after(
+                            raw_records[-1].raw_offset,
+                            limit=self.maximum_batch_messages,
+                        )
+                        if not more:
+                            break
+                        raw_records = raw_records + more
                     if (
                         not raw_records
                         or raw_records[-1].raw_offset != commit.last_offset

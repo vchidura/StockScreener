@@ -9,7 +9,7 @@ import {
   optionsDataTierLabel,
   type OptionAlertModelExit, type OptionCurrentMark, type OptionAlertPreviewRequest, type OptionCandidateDetailData, type OptionCandidateLeg,
   type OptionCandidateResearchEvidence, type OptionStockBehaviorGateEvidence,
-  type OptionDetectorEvaluationReview, type OptionDetectorAlertReview, type OptionDetectorSort, type OptionDetectorDatasets, type OptionDetectorRunSummary, type OptionLocalSurfaceObservation, type OptionO3CreditObservation,
+  type OptionDetectorEvaluationReview, type OptionDetectorAlertReview, type OptionDetectorId, type OptionDetectorSort, type OptionDetectorDatasets, type OptionDetectorRunSummary, type OptionLocalSurfaceObservation, type OptionO3CreditObservation,
 } from '../services/api'
 import { Modal } from './ScreenLibrary'
 import { optionContractExpired, optionFlowPath, optionModelExitView, optionDetectorSort, optionDetectorSortChange, optionPackageStrategyName, detectorAlertColumns, detectorAlertColumnsForView, detectorObservationFieldStates, detectorColumnPresets, detectorViewPreset, readDetectorPresets, writeDetectorPresets, type DetectorViewPreset } from './optionsAlertPresentation'
@@ -315,9 +315,12 @@ const detectorNames = { O1: 'High Volume/OI Participation', O2: 'Local IV Surfac
   OS1: 'Range Breakout Acceptance',
   OS2: 'Relative Trend Resumption',
   F0DTE: '0DTE Intraday Flow' }
-// The models the API's ?detector= filter accepts (the Model selects send it). G106 D5: F0DTE alerts show under all
-// models; F0DTE joins this list when the API accepts it (next API package).
-const apiDetectorFilters = ['O1', 'O2', 'O3', 'OS1', 'OS2'] as const
+// The models the API's ?detector= filter accepts (the Model selects send it). G106 D5: F0DTE, the 0DTE intraday alerts,
+// is accepted from API r138 (its evaluations ride the O1 lane, so the evaluation list offers it beside that lane).
+const apiDetectorFilters = ['O1', 'O2', 'O3', 'OS1', 'OS2', 'F0DTE'] as const
+type ApiDetectorFilter = typeof apiDetectorFilters[number]
+const apiDetectorFilter = (value: string | null): ApiDetectorFilter | undefined =>
+  apiDetectorFilters.find(id => id === value)
 const selectionNames: Record<string, string> = { SELECTED: 'Selected', NOT_SELECTED: 'Not selected', REPEAT: 'Repeat', OBSERVATION: 'Observation' }
 
 function DetectorSortHeader({ title, field, params, update }: {
@@ -526,7 +529,7 @@ function DetectorAlertsPanel({ view, params, update, offset, onSessionContext, t
   const explicitDataset = params.get('evaluation_dataset') || ''
   const dataset = explicitDataset || (requestedSession ? index?.session_datasets[requestedSession] : undefined) || index?.default_dataset_id || ''
   const rawDetector = params.get('evaluation_detector')
-  const detector = rawDetector === 'O1' || rawDetector === 'O2' || rawDetector === 'O3' || rawDetector === 'OS1' || rawDetector === 'OS2' ? rawDetector : undefined
+  const detector = apiDetectorFilter(rawDetector)
   const underlyer = useDeferredValue((params.get('underlyer') || '').trim().toUpperCase())
   const requestSession = requestedSession || (view === 'day_history' ? index?.current_session_date : undefined)
   const request = { dataset_id: dataset, scope: view === 'behavior' ? 'LATEST' : 'HISTORY',
@@ -715,14 +718,14 @@ function DetectorEvaluationPanel({ params, update, offset, onSessionContext }: {
   const requestedSession = params.get('session_date') || ''
   const requestedDataset = params.get('evaluation_dataset') || (requestedSession ? index?.session_datasets[requestedSession] : undefined) || index?.default_dataset_id
   const request = { session_date: requestedSession || undefined, dataset_id: requestedDataset || undefined,
-    detector: detector === 'O1' || detector === 'O2' || detector === 'O3' || detector === 'OS1' || detector === 'OS2' ? detector : undefined,
+    detector: apiDetectorFilter(detector),
     selection_status: status === 'SELECTED' || status === 'NOT_SELECTED' || status === 'REPEAT' || status === 'OBSERVATION' ? status : undefined,
     underlyer: underlyer || undefined, ...optionDetectorSort(params), limit: pageSize, offset } as const
   const review = useQuery({ queryKey: ['option-detector-evaluations', request], queryFn: () => getOptionDetectorEvaluations(request), retry: false,
     enabled: Boolean(index), refetchInterval: optionRunRefetch })
   const data = review.data?.available ? review.data.data : undefined
-  const detectorChoices = data?.models?.length
-    ? data.models.map(model => model.detector_id)
+  const detectorChoices: readonly OptionDetectorId[] = data?.models?.length
+    ? [...data.models.map(model => model.detector_id), ...(data.models.some(model => model.detector_id === 'O1') ? ['F0DTE' as const] : [])]
     : apiDetectorFilters
   const surfaceObservation = observationDetail ? detectorSurfaceObservation(observationDetail) : null
   const creditObservation = observationDetail ? detectorCreditObservation(observationDetail) : null

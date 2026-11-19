@@ -74,6 +74,12 @@ from .advanced_options_slot_selection import (
     load_previous_session_chain,
     parse_slot_selection_mode,
 )
+from .advanced_options_stock_same_day import (
+    STOCK_SAME_DAY_SETTING,
+    StockSameDayMode,
+    allocate_with_stock_same_day,
+    parse_stock_same_day_mode,
+)
 from .advanced_options_lifecycle import (
     AdvancedOptionsPreparationClaim,
     AdvancedOptionsPreparationExecutor,
@@ -325,6 +331,7 @@ class PostgresAutomaticOptionsPreparationExecutor(
         combined_capture_factory=None,
         slot_side_balance: SlotSideBalanceMode | str = SlotSideBalanceMode.OFF,
         slot_selection: SlotSelectionMode | str = SlotSelectionMode.OFF,
+        stock_same_day: StockSameDayMode | str = StockSameDayMode.OFF,
     ) -> None:
         # G106 AL8: REALTIME_V3_OPTIONS_SLOT_SIDE_BALANCE (OFF / RECORD / ON); anything else, or not OFF with a
         # non-v4 admission profile, refuses the configuration (the lifecycle service does not start).
@@ -352,6 +359,19 @@ class PostgresAutomaticOptionsPreparationExecutor(
                 f"{SLOT_SELECTION_SETTING} requires the v4 admission profile"
             )
         self._slot_selection = slot_selection
+        # G106 D5 follow-up: REALTIME_V3_OPTIONS_STOCK_SAME_DAY (OFF / RECORD / ON); anything else, or not OFF with a
+        # non-v4 admission profile, refuses the configuration (the lifecycle service does not start).
+        stock_same_day = parse_stock_same_day_mode(stock_same_day)
+        if (
+            stock_same_day is not StockSameDayMode.OFF
+            and admission_profile_version
+            != V4_ACTIVITY_MOMENTUM_PROFILE_VERSION
+        ):
+            raise ValueError(
+                "automatic Options preparation configuration is invalid: "
+                f"{STOCK_SAME_DAY_SETTING} requires the v4 admission profile"
+            )
+        self._stock_same_day = stock_same_day
         if (
             not isinstance(provider, V2ConnectionProvider)
             or not api_key.strip()
@@ -1244,18 +1264,34 @@ class PostgresAutomaticOptionsPreparationExecutor(
         )
         # G106 AL8: OFF = this call alone (today's allocation); RECORD = the same allocation, the balanced one only
         # logged; ON = the balanced allocation.
-        allocation = allocate_with_side_balance(
-            allocate_activity_momentum,
-            mode=getattr(
-                self,
-                "_slot_side_balance",
-                SlotSideBalanceMode.OFF,
-            ),
-            profile=profile,
-            resolution=resolution,
-            session_date=claim.session_date,
-            arguments=allocation_arguments,
+        # G106 D5 stock same-day (REALTIME_V3_OPTIONS_STOCK_SAME_DAY): OFF = the AL8 call alone, as it was; RECORD /
+        # ON = `_stock_same_day_allocation` (the same AL8 call, the single-stock same-day rule logged or used).
+        stock_same_day = getattr(
+            self,
+            "_stock_same_day",
+            StockSameDayMode.OFF,
         )
+        if stock_same_day is StockSameDayMode.OFF:
+            allocation = allocate_with_side_balance(
+                allocate_activity_momentum,
+                mode=getattr(
+                    self,
+                    "_slot_side_balance",
+                    SlotSideBalanceMode.OFF,
+                ),
+                profile=profile,
+                resolution=resolution,
+                session_date=claim.session_date,
+                arguments=allocation_arguments,
+            )
+        else:
+            allocation = self._stock_same_day_allocation(
+                claim,
+                stock_same_day,
+                profile=profile,
+                resolution=resolution,
+                allocation_arguments=allocation_arguments,
+            )
         # G106 AL11: OFF = the allocation above untouched (no read, no second allocation); RECORD = the same, the
         # previous-session-volume selection only logged; ON = that selection's allocation (today's on any failure).
         slot_selection = getattr(
@@ -1314,6 +1350,45 @@ class PostgresAutomaticOptionsPreparationExecutor(
         filtered.pop("semantic_sha256", None)
         filtered["semantic_sha256"] = canonical_sha256(filtered)
         return filtered, allocation
+
+    def _stock_same_day_allocation(
+        self,
+        claim,
+        mode,
+        *,
+        profile,
+        resolution,
+        allocation_arguments,
+    ):
+        """G106 D5 follow-up (advanced_options_stock_same_day): today's allocation through the AL8 helper (its lines
+        once), with the single-stock same-day rule (`stock_same_day=True`) logged (RECORD) or used (ON)."""
+        side_mode = getattr(self, "_slot_side_balance", SlotSideBalanceMode.OFF)
+
+        def allocate_used(arguments):
+            return allocate_with_side_balance(
+                allocate_activity_momentum,
+                mode=side_mode,
+                profile=profile,
+                resolution=resolution,
+                session_date=claim.session_date,
+                arguments=arguments,
+            )
+
+        def allocate_plain(arguments):
+            # The allocation the AL8 helper returns, without its lines.
+            if side_mode is SlotSideBalanceMode.ON:
+                return allocate_activity_momentum(profile, **arguments, side_balance=True)
+            return allocate_activity_momentum(profile, **arguments)
+
+        return allocate_with_stock_same_day(
+            mode=mode,
+            profile=profile,
+            resolution=resolution,
+            session_date=claim.session_date,
+            arguments=allocation_arguments,
+            allocate_used=allocate_used,
+            allocate_plain=allocate_plain,
+        )
 
     def _slot_selection_allocation(
         self,

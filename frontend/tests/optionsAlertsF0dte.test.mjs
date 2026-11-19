@@ -1,7 +1,8 @@
 // G106 D5 (Nov 18): F0DTE, the 0DTE intraday lane, on the Options Alerts page. An F0DTE alert row (as the window's
 // projection writes it to rt.alert_current) shows its model name, the 0DTE intraday category, a long call / long put
-// package, its stop / target from its management policy and its exit deadline. The API's ?detector= filter does not
-// accept F0DTE yet, so the Model selects do not offer it (F0DTE rows show under all models).
+// package, its stop / target from its management policy and its exit deadline. f42 (with API r138): the Model selects
+// offer F0DTE and send ?detector=F0DTE (the alert list filters on the row's detector id; the evaluation list offers it
+// beside the O1 lane its evaluations ride).
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import test from 'node:test'
@@ -78,12 +79,31 @@ test('the triggered-at tooltip says an F0DTE trigger is the end of its print win
   assert.match(page, /title=\{optionAlertTriggerBasis\(row\.detector_id\)\}/)
 })
 
-test('the Model selects and the saved-view check do not send F0DTE to the API (its filter does not accept it yet)', () => {
-  assert.match(page, /const apiDetectorFilters = \['O1', 'O2', 'O3', 'OS1', 'OS2'\] as const/)
-  assert.match(page, /apiDetectorFilters\.map\(id => <option key=\{id\} value=\{id\}>/)
+test('f42: the Model selects offer F0DTE and send it to the API (accepted from API r138)', () => {
+  assert.match(page, /const apiDetectorFilters = \['O1', 'O2', 'O3', 'OS1', 'OS2', 'F0DTE'\] as const/)
+  assert.match(page, /apiDetectorFilters\.map\(id => <option key=\{id\} value=\{id\}>\{detectorNames\[id\]\}/)
+  // Both panels parse the URL's model through the one list: the alert list and the evaluation list send F0DTE.
+  assert.match(page, /const detector = apiDetectorFilter\(rawDetector\)/)
+  assert.match(page, /detector: apiDetectorFilter\(detector\),/)
+  assert.doesNotMatch(page, /rawDetector === 'O1'|detector === 'O1' \|\|/)
+  // The evaluation list offers F0DTE beside the O1 lane its evaluations ride, and the full list without lanes.
+  assert.match(page, /data\.models\.some\(model => model\.detector_id === 'O1'\) \? \['F0DTE' as const\] : \[\]/)
   assert.match(page, /: apiDetectorFilters\r?\n/)
-  assert.doesNotMatch(page, /rawDetector === 'F0DTE'|detector === 'F0DTE'/)
   assert.doesNotMatch(page, /Object\.keys\(detectorNames\)/)
+  // A saved view with the F0DTE model is valid; an unknown model is still refused.
   const params = new URLSearchParams({ evaluation_detector: 'F0DTE' })
-  assert.throws(() => model.detectorViewPreset('0DTE', params, []), /Invalid detector model/)
+  assert.deepEqual(model.detectorViewPreset('0DTE', params, []).query, { evaluation_detector: 'F0DTE' })
+  assert.throws(() => model.detectorViewPreset('bad', new URLSearchParams({ evaluation_detector: 'F0' }), []), /Invalid detector model/)
+})
+
+test('f42: the parse helper keeps only the models the API accepts', () => {
+  const source = page.match(/const apiDetectorFilters = (\[[^\]]+\]) as const/)[1]
+  const filters = JSON.parse(source.replaceAll("'", '"'))
+  const parse = value => filters.find(id => id === value)
+  assert.deepEqual(filters, ['O1', 'O2', 'O3', 'OS1', 'OS2', 'F0DTE'])
+  assert.equal(parse('F0DTE'), 'F0DTE')
+  assert.equal(parse('OS2'), 'OS2')
+  assert.equal(parse('f0dte'), undefined)
+  assert.equal(parse(null), undefined)
+  assert.equal(parse('S1'), undefined)
 })

@@ -37,6 +37,11 @@ from realtime.advanced_options_slot_rotation import (  # noqa: E402
     start_slot_rotation,
 )
 from realtime.migrations import validate_target_database_v2  # noqa: E402
+from realtime.option_breadth_daily import (  # noqa: E402
+    ClosedSessionSnapshotter,
+    setting_line as breadth_daily_setting_line,
+    snapshot_mode as breadth_daily_snapshot_mode,
+)
 from scripts.run_advanced_options_v3_lifecycle import _provider  # noqa: E402
 
 
@@ -61,6 +66,8 @@ def parse_args(argv=None):
     slot_rotation_mode()
     # G106 levels: an invalid REALTIME_V3_OPTIONS_LEVELS stops the scheduler at start as well.
     options_levels_mode()
+    # G106 H1: an invalid REALTIME_V3_OPTIONS_BREADTH_DAILY_SNAPSHOT (only OFF or ON) stops the scheduler at start too.
+    breadth_daily_snapshot_mode()
     return args
 
 
@@ -87,6 +94,11 @@ def main(argv=None):
     planner = AdvancedEquityLifecyclePlanner()
     # G74: Equity windows whose Options snapshot was stale; never retried in this process (bounded, newest kept).
     skipped = deque(maxlen=256)
+    # G106 H1: after the decision stop, copy the closed session's chain into rt.option_breadth_daily once
+    # (REALTIME_V3_OPTIONS_BREADTH_DAILY_SNAPSHOT, default OFF: no read, no write).
+    daily_snapshot = ClosedSessionSnapshotter(provider)
+    if daily_snapshot.enabled:
+        print(breadth_daily_setting_line("ON"), file=sys.stderr, flush=True)
     failures = 0
     try:
         while not stop.is_set():
@@ -118,6 +130,10 @@ def main(argv=None):
             if result.get("status") == STALE_SNAPSHOT_SKIPPED:
                 skipped.append(result["equity_receipt_id"])
             print(json.dumps(result, sort_keys=True), flush=True)
+            if result.get("status") == "WAITING_FOR_SESSION":
+                snapshot = daily_snapshot.maybe_run()
+                if snapshot is not None:
+                    print(json.dumps(snapshot, sort_keys=True, default=str), flush=True)
             stop.wait(args.poll_seconds)
     finally:
         pool.closeall()

@@ -1007,7 +1007,7 @@ def create_realtime_portal_app(
     def option_alert_evaluations(
         session_date: date | None = None,
         dataset_id: str | None = Query(None, min_length=1, max_length=80),
-        detector: Literal["O1", "O2", "O3", "S1", "S2", "OS1", "OS2"] | None = None,
+        detector: Literal["O1", "O2", "O3", "S1", "S2", "OS1", "OS2", "F0DTE"] | None = None,
         selection_status: Literal["SELECTED", "NOT_SELECTED", "REPEAT", "OBSERVATION"] | None = None,
         underlyer: str | None = None,
         sort_by: Literal["triggered_at", "run", "underlyer", "detector", "category", "strategy", "rank", "entry_limit"] = "run",
@@ -1024,7 +1024,7 @@ def create_realtime_portal_app(
         dataset_id: str | None = Query(None, min_length=1, max_length=80),
         scope: Literal["LATEST", "HISTORY"] = "LATEST", session_date: date | None = None,
         session_rollup: bool = False,
-        detector: Literal["O1", "O2", "O3", "S1", "S2", "OS1", "OS2"] | None = None,
+        detector: Literal["O1", "O2", "O3", "S1", "S2", "OS1", "OS2", "F0DTE"] | None = None,
         underlyer: str | None = None,
         sort_by: Literal["triggered_at", "run", "underlyer", "detector", "category", "strategy", "rank", "entry_limit"] = "run",
         sort_order: Literal["asc", "desc"] = "asc",
@@ -1340,7 +1340,7 @@ def create_realtime_portal_app(
     @app.get("/api/realtime/option-alerts")
     def option_alerts(
         dataset_id: UUID | None = None,
-        detector: Literal["O1", "O2", "O3", "OS1", "OS2"] | None = None,
+        detector: Literal["O1", "O2", "O3", "OS1", "OS2", "F0DTE"] | None = None,
         underlyer: str | None = None,
         offset: int = Query(0, ge=0),
         limit: int = Query(100, ge=1, le=200),

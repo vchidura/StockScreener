@@ -49,6 +49,10 @@ from realtime.advanced_options_slot_selection import (  # noqa: E402
     log_slot_selection_setting,
     slot_selection_mode,
 )
+from realtime.advanced_options_stock_same_day import (  # noqa: E402
+    log_stock_same_day_setting,
+    stock_same_day_mode,
+)
 from realtime.fault_journal import emit_fault  # noqa: E402
 from realtime.database_access_v2 import (  # noqa: E402
     APP_ROLE,
@@ -327,6 +331,9 @@ def main(argv=None) -> int:
     # G106 AL11: REALTIME_V3_OPTIONS_SLOT_SELECTION (OFF / RECORD / ON, unset = OFF); an invalid value raises here and
     # the service does not start.
     slot_selection = slot_selection_mode(environment)
+    # G106 D5 follow-up: REALTIME_V3_OPTIONS_STOCK_SAME_DAY (OFF / RECORD / ON, unset = OFF); an invalid value raises
+    # here and the service does not start.
+    stock_same_day = stock_same_day_mode(environment)
     api_key = str(environment.get("POLYGON_API_KEY") or "").strip()
     if not api_key:
         raise RuntimeError(
@@ -405,9 +412,11 @@ def main(argv=None) -> int:
         ),
         slot_side_balance=slot_side_balance,
         slot_selection=slot_selection,
+        stock_same_day=stock_same_day,
     )
     log_slot_side_balance_setting(slot_side_balance)
     log_slot_selection_setting(slot_selection)
+    log_stock_same_day_setting(stock_same_day)
     owner_id = uuid4()
     treasury = TreasuryRefreshOwner(provider, owner_id=owner_id)
     planner = AdvancedEquityLifecyclePlanner()

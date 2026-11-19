@@ -1157,6 +1157,8 @@ def _flow_response(
 # and is told apart by its payload contract; on the alert it is detector F0DTE, category ZERO_DTE_INTRADAY.
 _F0DTE_EVALUATION_CONTRACT = "f0dte-evaluation-v1"
 _F0DTE_DETECTOR_ID = "F0DTE"
+# The page's evaluation filter: a detector id that is not a cycle lane, and the lane its evaluations ride (r138).
+_EVALUATION_LANE = {_F0DTE_DETECTOR_ID: "O1"}
 
 
 def _f0dte_payload(evaluation) -> Mapping | None:
@@ -2219,10 +2221,12 @@ class AdvancedOptionsAlertsPagePublication:
         lane_by_detector = {
             row["detector"]: row for row in stored["lanes"]
         }
+        # G106 D5 (r138): F0DTE evaluations ride the O1 lane under their own detector id; the F0DTE filter needs that lane.
+        lane_needed = _EVALUATION_LANE.get(request.detector, request.detector)
         if (
             len(lane_by_detector) != len(stored["lanes"])
-            or request.detector is not None
-            and request.detector not in lane_by_detector
+            or lane_needed is not None
+            and lane_needed not in lane_by_detector
         ):
             return self._envelope(
                 stored,

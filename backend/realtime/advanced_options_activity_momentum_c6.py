@@ -5119,10 +5119,15 @@ def _v4_fill_product_buckets(
     share_left: int,
     take,
     incremental,
+    weekly_reserved: Counter | None = None,
 ) -> int:
     """Fill one underlying's v4 buckets in order from its ranked queue (the profile's one quality ranking: calls and
     puts together, no side quota). Single-contract groups only; a bucket stops at its unique-contract count or when
-    the share is used. Returns the slots used; the normal rounds fill what the buckets leave."""
+    the share is used. Returns the slots used; the normal rounds fill what the buckets leave.
+
+    `weekly_reserved` (G106 D5 stock same-day, ON only; None = as it was): the single-stock same-day contracts already
+    taken by `v4_stock_same_day_plan`, by side; they count in the WEEKLY_LADDER bucket, as today's expiry does on a
+    Friday."""
     product = v4_product_kind(expiry_evidence, session_date)
     expiries = set(() if expiry_evidence is None else expiry_evidence.candidate_expiries)
     expiries.update(candidate.expiration for group in queue for candidate in group.candidates)
@@ -5137,6 +5142,8 @@ def _v4_fill_product_buckets(
         key=lambda row: row.order,
     ):
         taken = 0
+        if weekly_reserved and bucket.selector == "WEEKLY_LADDER":
+            taken = sum(weekly_reserved.values())
         eligible = [
             row
             for row in queue
@@ -5261,13 +5268,15 @@ def _v4_fill_product_buckets_side_balanced(
     share_left: int,
     take,
     incremental,
+    weekly_reserved: Counter | None = None,
 ) -> int:
     """G106 AL8 (ON): `_v4_fill_product_buckets` with a call/put balance, in (expiry, side) pairs. A bucket's eligible
     single-contract groups keep the queue's one quality ranking for both sides (the ladder's two expiries interleaved,
     primary first, as today). The best admissible group leads (either side); it is followed by the best admissible
     group of the other side at the same expiry (from the same ranking, so about the same |delta| distance from the
     target), or, when that expiry has none, of the other side at any expiry of the bucket. Each side is capped at half
-    the bucket (rounded up); a side without supply leaves its slots to the later side-balanced rounds."""
+    the bucket (rounded up); a side without supply leaves its slots to the later side-balanced rounds.
+    `weekly_reserved`: as in `_v4_fill_product_buckets` (the reserved same-day contracts also count for their side)."""
     _product, ladder, ordinals, buckets = _v4_bucket_context(
         profile,
         groups=queue,
@@ -5301,6 +5310,9 @@ def _v4_fill_product_buckets_side_balanced(
         side_cap = (bucket.unique_contracts + 1) // 2
         taken = 0
         by_side: Counter = Counter()
+        if weekly_reserved and bucket.selector == "WEEKLY_LADDER":
+            taken = sum(weekly_reserved.values())
+            by_side.update(weekly_reserved)
 
         def admissible(group) -> bool:
             cost = incremental(group)
@@ -5351,6 +5363,109 @@ def _v4_fill_product_buckets_side_balanced(
     return used
 
 
+# G106 D5 follow-up (Nov 18): single-stock same-day contracts on every expiry day (switch and record:
+# advanced_options_stock_same_day). K = the Friday count: on a Friday a single stock's own expiry shares the WEEKLY
+# bucket (8) with next week's, about 4 contracts; Mon / Wed it was never a bucket and the buckets fill the whole share.
+V4_STOCK_SAME_DAY_CONTRACTS = 4
+V4_STOCK_SAME_DAY_PER_SIDE = 2
+V4_STOCK_SAME_DAY_MINIMUM_ABS_DELTA = Decimal("0.20")
+V4_STOCK_SAME_DAY_MAXIMUM_ABS_DELTA = Decimal("0.60")
+V4_STOCK_SAME_DAY_TARGET_ABS_DELTA = Decimal("0.40")
+
+
+def v4_stock_same_day_eligible(
+    candidate: ActivityMomentumCandidate,
+    profile: ActivityMomentumProfile,
+    session_date: date,
+) -> bool:
+    """A same-day contract held to the profile criterion's own admission limits for DTE 0: standard deliverable, a
+    two-sided dated quote (bid > 0, ask >= bid) within the quote age, the role spread and the strike distance."""
+    if candidate.dte_for(session_date) != 0:
+        return False
+    criterion = next(
+        (row for row in profile.selection_criteria if row.minimum_dte <= 0 <= row.maximum_dte),
+        None,
+    )
+    if criterion is None or candidate.deliverable != "STANDARD" or candidate.unavailable_reasons:
+        return False
+    if candidate.bid is None or candidate.ask is None or candidate.quote_as_of is None:
+        return False
+    if candidate.bid <= 0 or candidate.ask < candidate.bid:
+        return False
+    if (candidate.observed_at - candidate.quote_as_of).total_seconds() > criterion.maximum_quote_age_seconds:
+        return False
+    spread = candidate.relative_spread
+    if spread is None or spread > criterion.maximum_relative_spread:
+        return False
+    return (
+        candidate.spot is not None
+        and abs(candidate.strike - candidate.spot) / candidate.spot <= criterion.maximum_moneyness_fraction
+    )
+
+
+def v4_stock_same_day_rank(candidate: ActivityMomentumCandidate) -> tuple[object, ...]:
+    """|delta| in the F0DTE band (0.20-0.60) first, then nearest 0.40, then prior OI (larger first), then the ticker."""
+    delta = None if candidate.delta is None else abs(candidate.delta)
+    in_band = (
+        delta is not None
+        and V4_STOCK_SAME_DAY_MINIMUM_ABS_DELTA <= delta <= V4_STOCK_SAME_DAY_MAXIMUM_ABS_DELTA
+    )
+    return (
+        not in_band,
+        Decimal("Infinity") if delta is None else abs(delta - V4_STOCK_SAME_DAY_TARGET_ABS_DELTA),
+        -(-1 if candidate.prior_open_interest is None else candidate.prior_open_interest),
+        candidate.contract_ticker,
+    )
+
+
+def v4_stock_same_day_plan(
+    profile: ActivityMomentumProfile,
+    *,
+    groups: Iterable[ActivityMomentumGroup],
+    session_date: date,
+    expiry_evidence,
+) -> tuple[str, tuple[ActivityMomentumGroup, ...]]:
+    """(reason, picks) for one underlying's admitted groups. Picks only for a WEEKLY_EXPIRY product (a single stock)
+    whose listed expiries include the session date while the weekly ladder does not (a Friday's ladder already holds
+    today's expiry: no double count): up to `V4_STOCK_SAME_DAY_PER_SIDE` calls and puts by `v4_stock_same_day_rank`
+    from the eligible single-contract same-day groups, a side short of supply topped up from the other side up to
+    `V4_STOCK_SAME_DAY_CONTRACTS`. Reasons: APPLIED, SHORTFALL (fewer than K), NO_ELIGIBLE_SAME_DAY,
+    SAME_DAY_IN_LADDER, NO_SAME_DAY_EXPIRY, NOT_WEEKLY_EXPIRY."""
+    values = tuple(groups)
+    product, ladder, _ordinals, _buckets = _v4_bucket_context(
+        profile,
+        groups=values,
+        session_date=session_date,
+        expiry_evidence=expiry_evidence,
+    )
+    if product != "WEEKLY_EXPIRY":
+        return "NOT_WEEKLY_EXPIRY", ()
+    listed = set(() if expiry_evidence is None else expiry_evidence.candidate_expiries)
+    listed.update(candidate.expiration for group in values for candidate in group.candidates)
+    if session_date not in listed:
+        return "NO_SAME_DAY_EXPIRY", ()
+    if session_date in ladder:
+        return "SAME_DAY_IN_LADDER", ()
+    by_ticker: dict[str, ActivityMomentumGroup] = {}
+    for group in values:
+        if len(group.candidates) != 1:
+            continue
+        row = group.candidates[0]
+        if row.contract_ticker not in by_ticker and v4_stock_same_day_eligible(row, profile, session_date):
+            by_ticker[row.contract_ticker] = group
+    ranked = sorted(by_ticker.values(), key=lambda group: v4_stock_same_day_rank(group.candidates[0]))
+    picks = [
+        group
+        for side in (OptionSide.CALL, OptionSide.PUT)
+        for group in [row for row in ranked if row.candidates[0].option_side is side][:V4_STOCK_SAME_DAY_PER_SIDE]
+    ]
+    picks += [row for row in ranked if row not in picks][: max(0, V4_STOCK_SAME_DAY_CONTRACTS - len(picks))]
+    if not picks:
+        return "NO_ELIGIBLE_SAME_DAY", ()
+    picks.sort(key=lambda group: v4_stock_same_day_rank(group.candidates[0]))
+    return ("APPLIED" if len(picks) >= V4_STOCK_SAME_DAY_CONTRACTS else "SHORTFALL"), tuple(picks)
+
+
 def allocate_activity_momentum(
     profile: ActivityMomentumProfile,
     *,
@@ -5365,6 +5480,7 @@ def allocate_activity_momentum(
     resolution: ActivityMomentumResolution | None = None,
     priority_order: Iterable[str] | None = None,
     side_balance: bool = False,
+    stock_same_day: bool = False,
 ) -> ActivityMomentumAllocation:
     """`priority_order` (G102 universe sizing O-5, Nov 15): the operator's underlying priority (first = most
     important). Used only when the budget cannot give every eligible underlying a contract: underlyings are then
@@ -5374,7 +5490,13 @@ def allocate_activity_momentum(
     `side_balance` (G106 AL8, Nov 17; v4 profile only; False = the allocation as it was, byte for byte): calls and
     puts share one quality ranking (no call priority in the sort), the product buckets fill per (expiry, side) lanes
     with each side capped at half a bucket (`_v4_fill_product_buckets_side_balanced`), and every later round takes
-    the next group of the side with fewer contracts (per basket in the basket rounds, per underlying after)."""
+    the next group of the side with fewer contracts (per basket in the basket rounds, per underlying after).
+
+    `stock_same_day` (G106 D5 follow-up, Nov 18; v4 profile only; False = the allocation as it was, byte for byte): a
+    single stock (WEEKLY_EXPIRY product) whose listed expiries include the session date, on a day its weekly ladder
+    does not hold that expiry (Mon / Wed), first takes up to 4 same-day contracts (`v4_stock_same_day_plan`: 2 calls +
+    2 puts by |delta| nearest 0.40 in 0.20-0.60, then prior OI) inside its own share; they count in its WEEKLY bucket
+    (Friday's split), so the share, budget and every other bucket are unchanged."""
     if not isinstance(profile, ActivityMomentumProfile):
         raise TypeError("activity/momentum profile is invalid")
     if side_balance is not False and (
@@ -5383,6 +5505,13 @@ def allocate_activity_momentum(
     ):
         raise ValueError(
             "activity/momentum side balance requires the v4 profile"
+        )
+    if stock_same_day is not False and (
+        stock_same_day is not True
+        or profile.version != V4_ACTIVITY_MOMENTUM_PROFILE_VERSION
+    ):
+        raise ValueError(
+            "activity/momentum stock same-day reservation requires the v4 profile"
         )
     configured_budget = (
         profile.active_quote_contract_budget
@@ -5658,6 +5787,31 @@ def allocate_activity_momentum(
             )
             expiry_targets = []
             if profile.version == V4_ACTIVITY_MOMENTUM_PROFILE_VERSION:
+                fill_arguments = {}
+                if stock_same_day:
+                    # G106 D5 follow-up: the single stock's own same-day contracts first, inside its share.
+                    _reason, same_day_picks = v4_stock_same_day_plan(
+                        profile,
+                        groups=queue,
+                        session_date=session_date,
+                        expiry_evidence=expiry_evidence,
+                    )
+                    reserved: Counter = Counter()
+                    for group in same_day_picks:
+                        slot_cost = incremental(group)
+                        if (
+                            slot_cost == 0
+                            or group not in queue
+                            or used_by_underlying[underlying] + slot_cost
+                            > initial_share
+                        ):
+                            continue
+                        used_by_underlying[underlying] += take(
+                            underlying,
+                            group,
+                        )
+                        reserved[group.candidates[0].option_side] += slot_cost
+                    fill_arguments["weekly_reserved"] = reserved
                 # V4.1: the product buckets replace v3's near / end-of-week expiry targets.
                 used_by_underlying[underlying] += (
                     _v4_fill_product_buckets_side_balanced
@@ -5673,6 +5827,7 @@ def allocate_activity_momentum(
                     ),
                     take=lambda group, _u=underlying: take(_u, group),
                     incremental=incremental,
+                    **fill_arguments,
                 )
             elif (
                 expiry_evidence is not None

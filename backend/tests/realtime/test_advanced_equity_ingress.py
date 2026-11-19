@@ -249,3 +249,45 @@ def test_journal_pump_survives_postgresql_progress_outage(tmp_path):
     assert RawJournalReader(path).read_normalized_after(0)
     assert reporter.failure_count >= 1
     assert reporter.last_failure_name == "ConnectionError"
+
+
+def test_journal_pump_catches_up_a_raw_backlog_longer_than_one_batch_r100b(tmp_path):
+    # Nov 18 2026 (R100b): a crash loop left raw records that were never normalized; on restart the pump read one
+    # batch after the normalized offset, did not reach the new commit and refused it ("commit is not readable").
+    from realtime.bridge import drain_raw_buffer_once
+    from realtime.journal import RawJournalWriter
+
+    def bar(index):
+        start = int(NOW.timestamp() * 1000) - 60_000 * (20 - index)
+        return json.dumps([{
+            "ev": "AM", "sym": "SPY", "o": 100, "h": 101, "l": 99, "c": 100.5,
+            "v": 1000, "vw": 100.25, "s": start, "e": start + 60_000,
+        }]).encode()
+
+    path = tmp_path / "advanced.sqlite"
+    with RawJournalWriter(path, generation=GENERATION) as writer:
+        backlog = _buffer()
+        for index in range(7):
+            backlog.put_nowait(_message(bar(index), number=index))
+        while drain_raw_buffer_once(
+            backlog, writer, maximum_events=3, maximum_bytes=64 * 1024,
+        ) is not None:
+            pass
+    assert len(RawJournalReader(path).read_normalized_after(0)) == 0
+
+    buffer = _buffer()
+    buffer.put_nowait(_message(bar(7), number=7))
+    pump = AdvancedEquityJournalPump(
+        buffer,
+        path,
+        GENERATION,
+        _admissions(),
+        maximum_batch_messages=3,
+        maximum_batch_bytes=64 * 1024,
+    )
+    pump.start()
+    pump.request_stop()
+    progress = pump.join(5)
+
+    assert progress.last_raw_offset == 8
+    assert len(RawJournalReader(path).read_normalized_after(0)) == 8
