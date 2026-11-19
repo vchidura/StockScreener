@@ -3153,7 +3153,40 @@ def _run_window(
             load_v3_pending_window_bindings,
             run_v3_serial_window,
         )
+        from .advanced_options_p8_window import (
+            AdvancedOptionsWindowStopRequested,
+            window_safe_stop_enabled,
+        )
 
+        # G102 R90 (Nov 18 night): REALTIME_V3_WINDOW_SAFE_STOP=ON lets an attempt that has not claimed its
+        # window end at the next pre-stage checkpoint once a stop is requested; OFF (default) passes nothing.
+        stop_before_claim = window_safe_stop_enabled(
+            environment if isinstance(environment, dict) else None
+        )
+        # Only a stop requested before the session's end (a restart, a deploy) counts: at the session's end (the
+        # service loop stops the role at the bundle's stop_utc) the role finishes its pass as before.
+        session_end = None
+        try:
+            session_end = datetime.fromisoformat(
+                str(bundle["window"]["stop_utc"]).replace("Z", "+00:00")
+            )
+            if session_end.tzinfo is None:
+                session_end = None
+        except (KeyError, TypeError, ValueError):
+            session_end = None
+
+        def stop_before_session_end() -> bool:
+            return (
+                stop_event.is_set()
+                and session_end is not None
+                and datetime.now(UTC) < session_end
+            )
+
+        attempt_extra = (
+            {"stop_requested": stop_before_session_end}
+            if stop_before_claim
+            else {}
+        )
         results: dict[str, dict[str, object]] = {}
         observed_bindings: set[UUID] = set()
         terminal_windows: set[UUID] = set()
@@ -3171,6 +3204,10 @@ def _run_window(
             progressed = False
             blocked = False
             for window_binding in windows:
+                if stop_before_session_end():
+                    # G102 R90: a stop requested during this pass (before the session's end) starts no further
+                    # attempt (nothing is claimed; the next container picks the window up).
+                    break
                 if window_binding.window_id in terminal_windows:
                     continue
                 if (
@@ -3213,7 +3250,23 @@ def _run_window(
                         bundle=bundle,
                         environment=environment,
                         dependency_evidence=dependencies,
+                        **attempt_extra,
                     )
+                except AdvancedOptionsWindowStopRequested as error:
+                    # G102 R90 (switch ON only): the attempt ended before its claim; the window stays PENDING.
+                    results[window_key] = {
+                        "status": "STOPPED",
+                        "reason_codes": [
+                            f"STOP_REQUESTED_BEFORE_CLAIM:{error.step}"
+                        ],
+                    }
+                    _log_window_attempt(
+                        attempt_outcomes,
+                        window_key,
+                        results[window_key],
+                        time.monotonic() - attempt_started,
+                    )
+                    break
                 except (
                     AdvancedOptionsRollingPreflightBlocked,
                     AdvancedOptionsMarkPreflightBlocked,
@@ -3270,6 +3323,16 @@ def _run_window(
                 stop_event.wait(_BLOCKED_WINDOW_RETRY_SECONDS)
             elif not progressed:
                 stop_event.wait(0.1)
+        if stop_before_claim:
+            # G102 R90 (switch ON only): when the role saw the stop, for the next stop's timeline.
+            print(json.dumps({
+                "event": "advanced_options_window_stop",
+                "observed_at": datetime.now(UTC).isoformat(),
+                "stopped_before_claim": sorted(
+                    key for key, value in results.items()
+                    if value.get("status") == "STOPPED"
+                ),
+            }, sort_keys=True), flush=True)
         return {
             "status": "COMPLETE",
             "kind": AdvancedOptionsProcessKind.WINDOW.value,

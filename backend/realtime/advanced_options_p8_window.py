@@ -79,6 +79,8 @@ from .advanced_options_rolling_producer import (
     build_advanced_options_rolling_producer_plan,
 )
 from .advanced_options_f0dte import is_f0dte_payload, run_f0dte_window  # G106 D5 F0DTE
+from .advanced_options_vterm import record_vterm  # G106 D11 V-TERM (Nov 18 night)
+from .advanced_options_window_snapshot import window_input_reads  # G102 R93 (Nov 18 night)
 from .advanced_options_o3_inputs import o3_inputs_enabled
 from .advanced_options_o3_producer import produce_o3_inputs
 from .advanced_options_service import OPTIONS_V3_STAGE_ORDER
@@ -113,6 +115,40 @@ from .stage_runners_v2 import (
 
 UTC = timezone.utc
 _LOGGER = logging.getLogger(__name__)
+
+# --- G102 R90 (Nov 18 night): REALTIME_V3_WINDOW_SAFE_STOP on the window service (OFF default = today). ON:
+# (1) the stop signal handler takes no lock (`run_advanced_options_v3_production.relayed_stop_handler`: today's
+#     handler deadlocks when the wrapper's second SIGTERM lands inside the first one's Event.set(), the R90 root cause);
+# (2) an attempt that has not claimed its window ends at the next pre-stage checkpoint once a stop is requested before
+#     the session's end (the window stays PENDING for the next container, as after a blocked preflight);
+# (3) a claimed window gets up to 170 s (inside the 180 s compose grace) to finish, instead of 60 s.
+# Invalid value: the window service refuses to start.
+WINDOW_SAFE_STOP_SETTING = "REALTIME_V3_WINDOW_SAFE_STOP"
+
+
+def window_safe_stop_enabled(environ: Mapping[str, str] | None = None) -> bool:
+    """`REALTIME_V3_WINDOW_SAFE_STOP`; unset or blank is OFF. Anything but OFF or ON raises."""
+    import os
+
+    raw = (os.environ if environ is None else environ).get(WINDOW_SAFE_STOP_SETTING)
+    value = (raw or "").strip().upper() or "OFF"
+    if value not in ("OFF", "ON"):
+        raise ValueError(f"{WINDOW_SAFE_STOP_SETTING} must be OFF or ON, not {raw!r}")
+    return value == "ON"
+
+
+class AdvancedOptionsWindowStopRequested(RuntimeError):
+    """A stop was requested before this attempt claimed its window: nothing claimed, nothing to finish."""
+
+    def __init__(self, step: str) -> None:
+        self.step = step
+        super().__init__(f"stop requested before the window claim ({step})")
+
+
+def _stop_checkpoint(stop_requested, step: str) -> None:
+    if stop_requested is not None and stop_requested():
+        raise AdvancedOptionsWindowStopRequested(step)
+# --- end G102 R90
 
 
 def _resident_owner_epoch(flow: Mapping[str, object]) -> int:
@@ -772,12 +808,19 @@ def build_and_run_p8_serial_window(
     canonical_publisher=None,
     window_stage_effect_authorizer=None,
     window_cutoff=None,
+    stop_requested=None,
 ):
     if catalog_version not in {
         STAGE_CATALOG_VERSION_V4,
         STAGE_CATALOG_VERSION_V5,
     }:
         raise ValueError("Advanced Options WINDOW catalog changed")
+    # G102 R90: `stop_requested` (REALTIME_V3_WINDOW_SAFE_STOP=ON only; None = today) is checked between the
+    # pre-stage steps, all before the orchestrator claims the window.
+    _stop_checkpoint(stop_requested, "START")
+    # G102 R93: REALTIME_V3_WINDOW_INPUT_SNAPSHOT=ON moves this window's read-only reads at the default isolation to a
+    # REPEATABLE READ snapshot; OFF: `reads` is `provider` itself.
+    reads = window_input_reads(provider)
     control = binding.enrollment.control_plane
     cutoff = (
         control.receipts.options_input_ready.spec.cutoff
@@ -787,7 +830,7 @@ def build_and_run_p8_serial_window(
     expires = control.expires_at
     reference_generation = 1
     if control.stored_identity is not None:
-        with provider.transaction(APP_ROLE, read_only=True) as unit:
+        with reads.transaction(APP_ROLE, read_only=True) as unit:
             unit.cursor.execute(
                 "SELECT COALESCE(MAX(reference_generation),0)+1 "
                 "FROM rt.advanced_options_reference_states"
@@ -811,6 +854,7 @@ def build_and_run_p8_serial_window(
         provider,
         reference_plan,
     ).produce()
+    _stop_checkpoint(stop_requested, "REFERENCE")
     market = dependency_evidence["MARKET_STATE"]
     flow = dependency_evidence["FLOW"]
     owner_epoch = _journal_owner_epoch(flow_environment)
@@ -869,6 +913,7 @@ def build_and_run_p8_serial_window(
         provider,
         rolling_plan,
     ).produce()
+    _stop_checkpoint(stop_requested, "ROLLING")
     valuation_policy = load_valuation_policy(
         Path(__file__).parents[1]
         / "options"
@@ -963,6 +1008,7 @@ def build_and_run_p8_serial_window(
         mark_plan,
         cutoff_quotes=published_cutoff_quotes,
     ).produce()
+    _stop_checkpoint(stop_requested, "MARKS")
     marked = {row.instrument_id for row in marks}
     unmarked_instrument_ids = tuple(sorted(
         row.instrument_id
@@ -1020,14 +1066,14 @@ def build_and_run_p8_serial_window(
         },
     )
     equity_receipt_id, equity_window_id, equity_receipt = _equity_receipt(
-        provider,
+        reads,
         binding,
         cutoff,
     )
     # --- G106 D5 F0DTE BEGIN (REALTIME_V3_F0DTE): this window's 0DTE lane (journal prints, decision, record lines);
     # ON leaves its alerts for the O1 lane of this cycle. OFF: nothing at all. Never raises (a failure is one
     # RECORD_FAILED line and a DEGRADED fault).
-    run_f0dte_window(provider=provider, binding=binding, rolling=rolling, marks=marks,
+    run_f0dte_window(provider=reads, binding=binding, rolling=rolling, marks=marks,
                      flow_environment=flow_environment, barrier_offset=barrier_offset, cutoff=cutoff,
                      unpackageable_instrument_ids=unmarked_instrument_ids)
     # --- G106 D5 F0DTE END
@@ -1055,12 +1101,14 @@ def build_and_run_p8_serial_window(
         # R44 (G102_O3_INPUTS_DESIGN step 5): write this cutoff's O3 inputs before the native preflight freezes the
         # input identity, in their own transaction; idempotent on retry, never fails the window (O3 stays BLOCKED).
         produce_o3_inputs(provider, native_candidate, role=APP_ROLE)
+    _stop_checkpoint(stop_requested, "O3_INPUTS")
     native_preflight = PostgresAdvancedOptionsNativeInputLoader(
         provider,
         native_candidate,
     ).preflight()
     if native_preflight.status is not NativeInputPlanStatus.READY:
         raise AdvancedOptionsNativePreflightBlocked(native_preflight)
+    _stop_checkpoint(stop_requested, "NATIVE_PREFLIGHT")
     native_plan = freeze_advanced_options_native_input_plan(
         native_candidate,
         native_preflight,
@@ -1090,7 +1138,7 @@ def build_and_run_p8_serial_window(
         control.manifest_sha256,
         control.slot_set_sha256,
         _flow_runtime_policy_sha256(
-            provider,
+            reads,
             flow_environment,
             control,
             source_flow,
@@ -1102,7 +1150,7 @@ def build_and_run_p8_serial_window(
         code_sha256=input_candidate.producer_build_sha256,
         native_inputs_loader=None,
         evidence_builder=_evidence_builder(
-            provider,
+            reads,
             reference,
             rolling,
             marks,
@@ -1211,6 +1259,8 @@ def build_and_run_p8_serial_window(
             catalog_version=STAGE_CATALOG_VERSION_V4,
             parallel_lanes=False,
         )
+    # G102 R90: the last point before anything claims the window.
+    _stop_checkpoint(stop_requested, "BEFORE_CLAIM")
     # OPTIONS_ACQUIRE needs REFERENCE ready for this cohort, and no resident role
     # reports it. This attempt has just built and verified its reference state.
     repository.upsert_readiness(
@@ -1227,10 +1277,18 @@ def build_and_run_p8_serial_window(
     # --- G106 O1 tuning (Nov 18): REALTIME_V3_OPTIONS_ALERT_CONTEXT (OFF = nothing). After the window's run: the gamma /
     # delta context of the O1 / OS items the lanes noted, logged; one read-only read; never raises. ---
     record_options_alert_context(
-        provider, session_date=control.session_date, cutoff=cutoff,
+        reads, session_date=control.session_date, cutoff=cutoff,
         equity_cutoff=binding.equity_input.equity_cutoff, window_id=str(binding.window_id),
     )
     # --- end G106 alert context ---
+    # --- G106 D11 V-TERM (Nov 18 night): REALTIME_V3_VTERM (OFF = nothing). RECORD: one VTERM_RECORD line per window
+    # (7d / 30d ATM IV per underlying from the A2 IV summary read, inversion flag at > 1.3), after the run, read bounded
+    # by 2 s; never raises (VTERM_RECORD_FAILED). No alert, no write. ---
+    record_vterm(
+        provider, session_date=control.session_date, cutoff=cutoff,
+        underlyings=tuple(control.universe.option_underlyings), window_id=str(binding.window_id),
+    )
+    # --- end G106 D11 ---
     if started.enabled != frozenset(runners):
         raise RuntimeError("P8 serial stage membership changed")
     return {

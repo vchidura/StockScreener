@@ -80,6 +80,12 @@ from .advanced_options_stock_same_day import (
     allocate_with_stock_same_day,
     parse_stock_same_day_mode,
 )
+from .advanced_options_same_day_admission import (
+    SAME_DAY_ADMISSION_SETTING,
+    SameDayAdmissionMode,
+    allocate_with_same_day_admission,
+    parse_same_day_admission_mode,
+)
 from .advanced_options_lifecycle import (
     AdvancedOptionsPreparationClaim,
     AdvancedOptionsPreparationExecutor,
@@ -332,6 +338,7 @@ class PostgresAutomaticOptionsPreparationExecutor(
         slot_side_balance: SlotSideBalanceMode | str = SlotSideBalanceMode.OFF,
         slot_selection: SlotSelectionMode | str = SlotSelectionMode.OFF,
         stock_same_day: StockSameDayMode | str = StockSameDayMode.OFF,
+        same_day_admission: SameDayAdmissionMode | str = SameDayAdmissionMode.OFF,
     ) -> None:
         # G106 AL8: REALTIME_V3_OPTIONS_SLOT_SIDE_BALANCE (OFF / RECORD / ON); anything else, or not OFF with a
         # non-v4 admission profile, refuses the configuration (the lifecycle service does not start).
@@ -372,6 +379,19 @@ class PostgresAutomaticOptionsPreparationExecutor(
                 f"{STOCK_SAME_DAY_SETTING} requires the v4 admission profile"
             )
         self._stock_same_day = stock_same_day
+        # G106 0DTE admission: REALTIME_V3_OPTIONS_SAME_DAY_ADMISSION (OFF / RECORD / ON); anything else, or not OFF
+        # with a non-v4 admission profile, refuses the configuration (the lifecycle service does not start).
+        same_day_admission = parse_same_day_admission_mode(same_day_admission)
+        if (
+            same_day_admission is not SameDayAdmissionMode.OFF
+            and admission_profile_version
+            != V4_ACTIVITY_MOMENTUM_PROFILE_VERSION
+        ):
+            raise ValueError(
+                "automatic Options preparation configuration is invalid: "
+                f"{SAME_DAY_ADMISSION_SETTING} requires the v4 admission profile"
+            )
+        self._same_day_admission = same_day_admission
         if (
             not isinstance(provider, V2ConnectionProvider)
             or not api_key.strip()
@@ -1262,53 +1282,98 @@ class PostgresAutomaticOptionsPreparationExecutor(
             resolution=resolution,
             priority_order=self._underlying_priority_order(claim),
         )
-        # G106 AL8: OFF = this call alone (today's allocation); RECORD = the same allocation, the balanced one only
-        # logged; ON = the balanced allocation.
-        # G106 D5 stock same-day (REALTIME_V3_OPTIONS_STOCK_SAME_DAY): OFF = the AL8 call alone, as it was; RECORD /
-        # ON = `_stock_same_day_allocation` (the same AL8 call, the single-stock same-day rule logged or used).
-        stock_same_day = getattr(
+
+        def allocate_resolved(
+            resolution,
+            resolution_arguments,
+            allocation_arguments,
+            emit=None,
+            previous=None,
+        ):
+            # The allocation of one resolution: AL8 / D5 stock same-day, then AL11, each under its own switch. `emit`
+            # (None = each helper's own print) receives their log lines; `previous` (None = AL11 reads it) loads the
+            # previous session's chain (G106 0DTE admission: its two runs share one read).
+            lines = {} if emit is None else {"emit": emit}
+            # G106 AL8: OFF = this call alone (today's allocation); RECORD = the same allocation, the balanced one
+            # only logged; ON = the balanced allocation.
+            # G106 D5 stock same-day (REALTIME_V3_OPTIONS_STOCK_SAME_DAY): OFF = the AL8 call alone, as it was;
+            # RECORD / ON = `_stock_same_day_allocation` (the same AL8 call, the single-stock same-day rule logged or
+            # used).
+            stock_same_day = getattr(
+                self,
+                "_stock_same_day",
+                StockSameDayMode.OFF,
+            )
+            if stock_same_day is StockSameDayMode.OFF:
+                allocation = allocate_with_side_balance(
+                    allocate_activity_momentum,
+                    mode=getattr(
+                        self,
+                        "_slot_side_balance",
+                        SlotSideBalanceMode.OFF,
+                    ),
+                    profile=profile,
+                    resolution=resolution,
+                    session_date=claim.session_date,
+                    arguments=allocation_arguments,
+                    **lines,
+                )
+            else:
+                allocation = self._stock_same_day_allocation(
+                    claim,
+                    stock_same_day,
+                    profile=profile,
+                    resolution=resolution,
+                    allocation_arguments=allocation_arguments,
+                    emit=emit,
+                )
+            # G106 AL11: OFF = the allocation above untouched (no read, no second allocation); RECORD = the same, the
+            # previous-session-volume selection only logged; ON = that selection's allocation (today's on any
+            # failure).
+            slot_selection = getattr(
+                self,
+                "_slot_selection",
+                SlotSelectionMode.OFF,
+            )
+            if slot_selection is not SlotSelectionMode.OFF:
+                allocation = self._slot_selection_allocation(
+                    claim,
+                    slot_selection,
+                    allocation=allocation,
+                    profile=profile,
+                    resolution=resolution,
+                    candidates=candidates,
+                    resolution_arguments=resolution_arguments,
+                    allocation_arguments=allocation_arguments,
+                    emit=emit,
+                    previous=previous,
+                )
+            return allocation
+
+        # G106 0DTE admission (REALTIME_V3_OPTIONS_SAME_DAY_ADMISSION): OFF = `allocate_resolved` on the resolution
+        # above, as it was; RECORD / ON = `_same_day_admission_allocation` (today's run, and the run on a resolution
+        # that applies the DTE-0 criterion's spread / strike limits, logged or used).
+        same_day_admission = getattr(
             self,
-            "_stock_same_day",
-            StockSameDayMode.OFF,
+            "_same_day_admission",
+            SameDayAdmissionMode.OFF,
         )
-        if stock_same_day is StockSameDayMode.OFF:
-            allocation = allocate_with_side_balance(
-                allocate_activity_momentum,
-                mode=getattr(
-                    self,
-                    "_slot_side_balance",
-                    SlotSideBalanceMode.OFF,
-                ),
-                profile=profile,
-                resolution=resolution,
-                session_date=claim.session_date,
-                arguments=allocation_arguments,
+        if same_day_admission is SameDayAdmissionMode.OFF:
+            allocation = allocate_resolved(
+                resolution,
+                resolution_arguments,
+                allocation_arguments,
             )
         else:
-            allocation = self._stock_same_day_allocation(
+            allocation = self._same_day_admission_allocation(
                 claim,
-                stock_same_day,
-                profile=profile,
-                resolution=resolution,
-                allocation_arguments=allocation_arguments,
-            )
-        # G106 AL11: OFF = the allocation above untouched (no read, no second allocation); RECORD = the same, the
-        # previous-session-volume selection only logged; ON = that selection's allocation (today's on any failure).
-        slot_selection = getattr(
-            self,
-            "_slot_selection",
-            SlotSelectionMode.OFF,
-        )
-        if slot_selection is not SlotSelectionMode.OFF:
-            allocation = self._slot_selection_allocation(
-                claim,
-                slot_selection,
-                allocation=allocation,
+                same_day_admission,
                 profile=profile,
                 resolution=resolution,
                 candidates=candidates,
                 resolution_arguments=resolution_arguments,
                 allocation_arguments=allocation_arguments,
+                allocate_resolved=allocate_resolved,
             )
         selected = set(allocation.selected_contract_tickers)
         if not selected:
@@ -1351,6 +1416,84 @@ class PostgresAutomaticOptionsPreparationExecutor(
         filtered["semantic_sha256"] = canonical_sha256(filtered)
         return filtered, allocation
 
+    def _same_day_admission_allocation(
+        self,
+        claim,
+        mode,
+        *,
+        profile,
+        resolution,
+        candidates,
+        resolution_arguments,
+        allocation_arguments,
+        allocate_resolved,
+    ):
+        """G106 0DTE admission (advanced_options_same_day_admission): today's run (`resolution` as resolved) and the
+        run on the same candidates resolved with `same_day_admission_limits=True` (AL11's restricted re-resolution
+        too), each through `allocate_resolved` (AL8 / D5 / AL11), the previous-session chain read at most once."""
+        cache: list = []
+
+        def previous():
+            if not cache:
+                try:
+                    cache.append((self._load_previous_session_chain(claim), None))
+                except Exception as error:  # noqa: BLE001 - AL11 reports it; the second run sees the same
+                    cache.append((None, error))
+            chain, error = cache[0]
+            if error is not None:
+                raise error
+            return chain
+
+        def run(limits, emit):
+            if not limits:
+                return resolution, allocate_resolved(
+                    resolution,
+                    resolution_arguments,
+                    allocation_arguments,
+                    emit=emit,
+                    previous=previous,
+                )
+            limited_arguments = {
+                **resolution_arguments,
+                "same_day_admission_limits": True,
+            }
+            limited = resolve_activity_momentum_selection(
+                profile,
+                session_date=claim.session_date,
+                candidates=candidates,
+                enabled_strategies=self._enabled_strategies,
+                **limited_arguments,
+            )
+            return limited, allocate_resolved(
+                limited,
+                limited_arguments,
+                {
+                    **allocation_arguments,
+                    "groups": limited.groups,
+                    "resolution": limited,
+                },
+                emit=emit,
+                previous=previous,
+            )
+
+        return allocate_with_same_day_admission(
+            mode=mode,
+            profile=profile,
+            session_date=claim.session_date,
+            run=run,
+        )
+
+    def _load_previous_session_chain(self, claim):
+        with self._provider.transaction(
+            APP_ROLE,
+            read_only=True,
+        ) as unit:
+            return load_previous_session_chain(
+                unit.cursor,
+                session_date=claim.session_date,
+                underlyings=claim.option_underlyings,
+            )
+
     def _stock_same_day_allocation(
         self,
         claim,
@@ -1359,10 +1502,12 @@ class PostgresAutomaticOptionsPreparationExecutor(
         profile,
         resolution,
         allocation_arguments,
+        emit=None,
     ):
         """G106 D5 follow-up (advanced_options_stock_same_day): today's allocation through the AL8 helper (its lines
         once), with the single-stock same-day rule (`stock_same_day=True`) logged (RECORD) or used (ON)."""
         side_mode = getattr(self, "_slot_side_balance", SlotSideBalanceMode.OFF)
+        lines = {} if emit is None else {"emit": emit}
 
         def allocate_used(arguments):
             return allocate_with_side_balance(
@@ -1372,6 +1517,7 @@ class PostgresAutomaticOptionsPreparationExecutor(
                 resolution=resolution,
                 session_date=claim.session_date,
                 arguments=arguments,
+                **lines,
             )
 
         def allocate_plain(arguments):
@@ -1388,6 +1534,7 @@ class PostgresAutomaticOptionsPreparationExecutor(
             arguments=allocation_arguments,
             allocate_used=allocate_used,
             allocate_plain=allocate_plain,
+            **lines,
         )
 
     def _slot_selection_allocation(
@@ -1401,9 +1548,12 @@ class PostgresAutomaticOptionsPreparationExecutor(
         candidates,
         resolution_arguments,
         allocation_arguments,
+        emit=None,
+        previous=None,
     ):
         """G106 AL11 (advanced_options_slot_selection): the rule's set, allocated by the same V4 allocation over the
-        chosen candidates only; AL8 ON keeps its side balance flag. Reads the previous session's close chain once."""
+        chosen candidates only; AL8 ON keeps its side balance flag. Reads the previous session's close chain once
+        (`previous`, when given, loads it instead: the 0DTE admission's two runs share one read)."""
         side_balance = (
             getattr(self, "_slot_side_balance", SlotSideBalanceMode.OFF)
             is SlotSideBalanceMode.ON
@@ -1436,16 +1586,9 @@ class PostgresAutomaticOptionsPreparationExecutor(
                 arguments["side_balance"] = True
             return allocate_activity_momentum(profile, **arguments)
 
-        def previous():
-            with self._provider.transaction(
-                APP_ROLE,
-                read_only=True,
-            ) as unit:
-                return load_previous_session_chain(
-                    unit.cursor,
-                    session_date=claim.session_date,
-                    underlyings=claim.option_underlyings,
-                )
+        if previous is None:
+            def previous():
+                return self._load_previous_session_chain(claim)
 
         return allocate_with_slot_selection(
             mode=mode,
@@ -1458,6 +1601,7 @@ class PostgresAutomaticOptionsPreparationExecutor(
             previous=previous,
             resolve=resolve,
             allocate=allocate,
+            **({} if emit is None else {"emit": emit}),
         )
 
     def _activate_session(self, claim):

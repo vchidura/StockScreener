@@ -71,7 +71,25 @@ P8_EXECUTION_BUNDLE_MAX_BYTES = 1_048_576
 P8_HEARTBEAT_INTERVAL_SECONDS = 10
 P8_SERVICE_LEASE_SECONDS = 30
 P8_ROLE_STOP_SECONDS = 60
+# G102 R90 (Nov 18 night): with REALTIME_V3_WINDOW_SAFE_STOP=ON the WINDOW role gets up to 170 s after a stop
+# (inside its 180 s compose stop grace) to finish a window it has already claimed; unclaimed attempts end at once.
+# OFF (default): 60 s as before for every role.
+P8_WINDOW_CLAIMED_STOP_SECONDS = 170
 P8_ROLE_STOP_POLL_SECONDS = 5
+
+
+def _role_stop_seconds(kind, environment) -> int:
+    if kind is not AdvancedOptionsProcessKind.WINDOW:
+        return P8_ROLE_STOP_SECONDS
+    from .advanced_options_p8_window import window_safe_stop_enabled
+
+    return (
+        P8_WINDOW_CLAIMED_STOP_SECONDS
+        if window_safe_stop_enabled(environment)
+        else P8_ROLE_STOP_SECONDS
+    )
+
+
 P8_EFFECT_DENIALS = {
     "dispatch": False,
     "delivery": False,
@@ -2239,7 +2257,17 @@ def run_p8_docker_service(
         # B14a (Nov 6): at the 21:05 decision stop all four roles outlived a 10 s join (one ingress pass writes the
         # session row and snapshots the journal) and restarted with an error. Wait up to P8_ROLE_STOP_SECONDS,
         # renewing the lease so the role's last writes keep their owner epoch.
-        stop_deadline = time.monotonic() + P8_ROLE_STOP_SECONDS
+        stop_seconds = _role_stop_seconds(kind, service_environment)
+        if stop_seconds != P8_ROLE_STOP_SECONDS:
+            # G102 R90 (WINDOW with REALTIME_V3_WINDOW_SAFE_STOP=ON only): when the service loop saw the stop.
+            print(json.dumps({
+                "event": "p8_window_service_stop",
+                "kind": kind.value,
+                "observed_at": _utc(clock(), "clock").isoformat(),
+                "role_alive": role_thread.is_alive(),
+                "bound_seconds": stop_seconds,
+            }, sort_keys=True), flush=True)
+        stop_deadline = time.monotonic() + stop_seconds
         while role_thread.is_alive() and time.monotonic() < stop_deadline:
             role_thread.join(timeout=P8_ROLE_STOP_POLL_SECONDS)
             if role_thread.is_alive():

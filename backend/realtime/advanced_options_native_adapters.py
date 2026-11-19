@@ -47,6 +47,7 @@ from .advanced_options_o1_liquidity_floor import (
 )
 from .advanced_options_o1_gates import O1GateRun
 from .advanced_options_alert_context import note_o1_alert_context, note_os_alert_context  # G106 alert context
+from .advanced_options_os_debit_vertical import log_os_debit_vertical_record  # G106 D7 (Nov 18 night)
 from .contracts import canonical_sha256
 from .detector_adapters import (
     run_o1_adapter,
@@ -103,6 +104,10 @@ class AdvancedOptionsLaneInputs:
     # G106 AL5 (REALTIME_V3_OS_PARTICIPATION RECORD/ON): what OS policy v2 decided for this lane, logged by the
     # executor once per window. Never part of any identity or comparison; None when the switch is OFF.
     record: object | None = field(default=None, compare=False)
+    # G106 D7 (REALTIME_V3_OS_DEBIT_VERTICAL RECORD, Nov 18 night): the debit vertical each OS invocation would carry
+    # (`advanced_options_os_debit_vertical.OSDebitVerticalLane`), logged by the executor. Never part of any identity
+    # or comparison; None when the switch is OFF.
+    os_vertical: object | None = field(default=None, compare=False)
 
     def __post_init__(self) -> None:
         reasons = tuple(
@@ -687,6 +692,8 @@ def build_advanced_os_executor(
         blocked = _blocked_or_none(context, detector, inputs)
         if blocked is not None:
             _log_os_participation(inputs.record, ())
+            # G106 D7 (REALTIME_V3_OS_DEBIT_VERTICAL RECORD; OFF: os_vertical is None, nothing logged); never raises.
+            log_os_debit_vertical_record(detector.value, context.cutoff, inputs.os_vertical, ())
             return blocked
         evaluations = []
         for invocation in inputs.invocations:
@@ -743,6 +750,8 @@ def build_advanced_os_executor(
         # --- G106 O1 tuning (Nov 18): REALTIME_V3_OPTIONS_ALERT_CONTEXT (OFF = nothing); notes only, never raises ---
         note_os_alert_context(detector.value, context.cutoff, evaluations, inputs.record)
         # --- end G106 alert context ---
+        # G106 D7 (REALTIME_V3_OS_DEBIT_VERTICAL RECORD; OFF: os_vertical is None, nothing logged); never raises.
+        log_os_debit_vertical_record(detector.value, context.cutoff, inputs.os_vertical, evaluations)
         return AdvancedOptionsNativeLaneResult(
             NativeLaneState.COMPLETE,
             (),

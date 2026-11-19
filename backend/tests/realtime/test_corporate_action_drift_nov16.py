@@ -27,10 +27,10 @@ def _action(payload="p1", source_key="k1", received_at=T0):
     }
 
 
-def _coverage(response="h1", received_at=T0, window_end=date(2027, 11, 12)):
+def _coverage(response="h1", received_at=T0, window_end=date(2027, 11, 12), count=0):
     return {
         "coverage_id": uuid4(), "security_id": SECURITY, "action_type": "SPLIT", "window_start": date(2025, 9, 30),
-        "window_end": window_end, "response_action_count": 0, "response_sha256": response,
+        "window_end": window_end, "response_action_count": count, "response_sha256": response,
         "payload_sha256": "c" * 64, "received_at": received_at,
     }
 
@@ -66,7 +66,9 @@ def test_coverage_content_keeps_the_latest_response_only():
     old = _coverage(received_at=T0)
     recheck = _coverage(received_at=T0 + timedelta(days=3), window_end=date(2027, 11, 13))
     assert corporate_action_coverage_content([old]) == corporate_action_coverage_content([recheck, old])
-    changed = _coverage(response="h2", received_at=T0 + timedelta(days=3))
+    # R84b: a response with no actions has no content to change; a split in the response (its action not loaded
+    # here, so the response hash stands in) is a change.
+    changed = _coverage(response="h2", received_at=T0 + timedelta(days=3), count=1)
     assert corporate_action_coverage_content([old]) != corporate_action_coverage_content([changed, old])
 
 
@@ -79,5 +81,6 @@ def test_daily_products_identity_survives_identical_rechecks():
     assert daily_products_input_sha256(before, MODE_JOB, 1) == daily_products_input_sha256(after, MODE_JOB, 1)
     changed = _inputs([_action(payload="p2")], [_coverage()])
     assert daily_products_input_sha256(before, MODE_JOB, 1) != daily_products_input_sha256(changed, MODE_JOB, 1)
-    new_split = _inputs([_action()], [_coverage(response="h2", received_at=T0 + timedelta(days=3)), _coverage()])
+    new_split = _inputs([_action()], [_coverage(response="h2", received_at=T0 + timedelta(days=3), count=1),
+                                      _coverage()])
     assert daily_products_input_sha256(before, MODE_JOB, 1) != daily_products_input_sha256(new_split, MODE_JOB, 1)

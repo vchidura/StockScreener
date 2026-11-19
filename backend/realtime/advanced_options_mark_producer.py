@@ -38,6 +38,7 @@ from .option_portal_repository import (
     persist_realtime_quote_evidence_cursor,
 )
 from .option_source_flow import OptionSourceFlowIdentity
+from .advanced_options_window_snapshot import snapshot_then_write, window_input_snapshot_enabled  # G102 R93
 
 
 ADVANCED_NBBO_MARK_PLAN_VERSION = "advanced-options-nbbo-mark-plan-v1"
@@ -905,13 +906,35 @@ class PostgresAdvancedOptionsMarkProducer:
         ) as unit:
             return self._assemble(unit)
 
+    @staticmethod
+    def _unblocked(result) -> AdvancedOptionsMarkPreflight:
+        if result.status is AdvancedOptionsMarkStatus.BLOCKED:
+            raise AdvancedOptionsMarkPreflightBlocked(result)
+        return result
+
     def produce(self) -> tuple[RealtimeQuoteEvidence, ...]:
         if not self._plan.frozen:
             raise ValueError(
                 "Advanced Options mark PLAN is not frozen by preflight"
             )
+        # G102 R93: REALTIME_V3_WINDOW_INPUT_SNAPSHOT=ON assembles in a REPEATABLE READ READ ONLY snapshot and keeps
+        # SERIALIZABLE for the write only; OFF (default) runs the loop below exactly as before.
+        snapshot = window_input_snapshot_enabled()
         for attempt in range(1, self._maximum_attempts + 1):
             try:
+                if snapshot:
+                    return snapshot_then_write(
+                        self._provider,
+                        APP_ROLE,
+                        lambda unit: self._unblocked(self._assemble(unit)),
+                        lambda unit, result: tuple(
+                            persist_realtime_quote_evidence_cursor(
+                                unit.cursor,
+                                mark,
+                            )
+                            for mark in result.marks
+                        ),
+                    )
                 with self._provider.transaction(
                     APP_ROLE,
                     isolation_level="SERIALIZABLE",

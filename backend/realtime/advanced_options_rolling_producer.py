@@ -61,6 +61,7 @@ from .option_source_flow import (
     CANONICAL_OPTION_FLOW_OWNER,
     OptionSourceFlowIdentity,
 )
+from .advanced_options_window_snapshot import snapshot_then_write, window_input_snapshot_enabled  # G102 R93
 
 
 ROLLING_PRODUCER_VERSION = "advanced-options-rolling-producer-v1"
@@ -2268,9 +2269,30 @@ class PostgresAdvancedOptionsRollingProducer:
         ) as unit:
             return self._assemble(unit)
 
+    def _ready(self, result) -> AdvancedOptionsRollingProducerPreflight:
+        if (
+            result.status is not RollingProducerStatus.READY
+            or result.state is None
+        ):
+            raise AdvancedOptionsRollingPreflightBlocked(result)
+        return result
+
     def produce(self) -> AdvancedOptionsRollingState:
+        # G102 R93: REALTIME_V3_WINDOW_INPUT_SNAPSHOT=ON assembles in a REPEATABLE READ READ ONLY snapshot and keeps
+        # SERIALIZABLE for the write only; OFF (default) runs the loop below exactly as before.
+        snapshot = window_input_snapshot_enabled()
         for attempt in range(1, self._maximum_attempts + 1):
             try:
+                if snapshot:
+                    return snapshot_then_write(
+                        self._provider,
+                        APP_ROLE,
+                        lambda unit: self._ready(self._assemble(unit)),
+                        lambda unit, result: persist_advanced_options_rolling_state_cursor(
+                            unit.cursor,
+                            result.state,
+                        ),
+                    )
                 with self._provider.transaction(
                     APP_ROLE,
                     isolation_level="SERIALIZABLE",

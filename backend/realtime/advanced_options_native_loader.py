@@ -78,6 +78,12 @@ from .advanced_options_os_participation import (
     signal_view,
 )
 from .advanced_options_producers import AdvancedOptionsProducerPlan
+from .advanced_options_window_snapshot import window_input_snapshot_enabled  # G102 R93
+from .advanced_options_os_debit_vertical import (  # G106 D7 (Nov 18 night)
+    OSDebitVerticalMode,
+    attach_os_debit_verticals,
+    os_debit_vertical_mode,
+)
 from .advanced_options_reference_state import AdvancedOptionsReferenceState
 from .advanced_options_rolling_state import AdvancedOptionsRollingState
 from .contracts import canonical_sha256
@@ -894,6 +900,7 @@ def _load_o1(
     cursor,
     plan: AdvancedOptionsNativeInputPlan,
     evidence: list[AdvancedOptionsNativeInputEvidence],
+    vertical_out: dict | None = None,
 ) -> tuple[AdvancedOptionsLaneInputs, object]:
     cursor.execute(
         "SELECT event.event_id::text,event.event_time,contract.contract_id,"
@@ -965,6 +972,9 @@ def _load_o1(
     if vertical_mode is not O1DebitVerticalMode.OFF and rows:
         vertical_policy = o1_debit_vertical_policy()
         vertical_inputs, vertical_inputs_reason = load_o1_vertical_inputs_guarded(cursor, plan)
+        if vertical_out is not None and vertical_inputs is not None:
+            # G106 D7 (RECORD only): the OS debit-vertical record reuses these inputs instead of reading them again.
+            vertical_out["inputs"] = vertical_inputs
     # G106 AL7: REALTIME_V3_O1_AGGRESSOR_SIDE (OFF = today: nothing read). An invalid value raises here, so the window
     # fails loudly. RECORD/ON: one guarded read of the session's stored prints of the contracts at O1's ratio.
     aggressor_mode = o1_aggressor_side_mode()
@@ -1873,7 +1883,14 @@ def assemble_advanced_options_native_inputs_cursor(
         plan,
         evidence,
     )
-    o1, o1_identity = _load_o1(cursor, plan, evidence)
+    # G106 D7: REALTIME_V3_OS_DEBIT_VERTICAL (OFF = today: nothing captured, nothing read). Invalid value: raises.
+    os_vertical_mode = os_debit_vertical_mode()
+    o1_vertical: dict | None = None
+    if os_vertical_mode is OSDebitVerticalMode.OFF:
+        o1, o1_identity = _load_o1(cursor, plan, evidence)
+    else:
+        o1_vertical = {}
+        o1, o1_identity = _load_o1(cursor, plan, evidence, vertical_out=o1_vertical)
     # G106 AL5: REALTIME_V3_OS_PARTICIPATION (OFF = today: nothing captured, nothing read). Invalid value: raises.
     os_mode = os_participation_mode()
     os_captured = (
@@ -1906,6 +1923,13 @@ def assemble_advanced_options_native_inputs_cursor(
             {DetectorFamily.OS1: (os1, os1_identity), DetectorFamily.OS2: (os2, os2_identity)},
             os_captured,
         )
+    if o1_vertical is not None:
+        # G106 D7 RECORD: each OS invocation's debit vertical on the lane (`os_vertical`, never in an identity: the
+        # identities above are already computed); a guarded read, never raises.
+        attached = attach_os_debit_verticals(
+            cursor, plan, {DetectorFamily.OS1: os1, DetectorFamily.OS2: os2}, o1_vertical=o1_vertical,
+        )
+        os1, os2 = attached[DetectorFamily.OS1], attached[DetectorFamily.OS2]
     o3, o3_identity, o3_accepted_unavailable = _load_o3(
         cursor,
         plan,
@@ -2047,12 +2071,19 @@ class PostgresAdvancedOptionsNativeInputLoader:
             raise ValueError(
                 "Advanced Options native input PLAN is not frozen by preflight"
             )
+        # G102 R93: REALTIME_V3_WINDOW_INPUT_SNAPSHOT=ON reads the lanes' inputs in a REPEATABLE READ READ ONLY snapshot
+        # (no SIRead predicate locks); OFF (default) keeps SERIALIZABLE READ ONLY as before.
+        isolation = (
+            "REPEATABLE READ"
+            if window_input_snapshot_enabled()
+            else "SERIALIZABLE"
+        )
         for attempt in range(1, self._maximum_attempts + 1):
             try:
                 with self._provider.transaction(
                     APP_ROLE,
                     read_only=True,
-                    isolation_level="SERIALIZABLE",
+                    isolation_level=isolation,
                 ) as unit:
                     result = self._assemble(unit)
                     if result.status is NativeInputPlanStatus.BLOCKED:

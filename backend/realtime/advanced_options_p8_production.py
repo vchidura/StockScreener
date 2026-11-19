@@ -447,7 +447,9 @@ def run_v3_serial_window(
     bundle,
     environment,
     dependency_evidence,
+    stop_requested=None,
 ):
+    # G102 R90: `stop_requested` (REALTIME_V3_WINDOW_SAFE_STOP=ON only) goes to the pre-stage checkpoints.
     from .advanced_journal_registry import (
         load_advanced_journal_registration_cursor,
     )
@@ -644,6 +646,7 @@ def run_v3_serial_window(
             )
         ),
         window_cutoff=cycle_authority.options_cutoff,
+        stop_requested=stop_requested,
     )
 
 

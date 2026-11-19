@@ -10,6 +10,7 @@ import signal
 import subprocess
 import sys
 import threading
+import time
 from datetime import date, datetime, timezone
 from pathlib import Path
 from uuid import UUID
@@ -353,6 +354,38 @@ def parse_args(argv=None):
     return args
 
 
+def relayed_stop_handler(stop, active_stop, *, poll_seconds: float = 0.05, done=None):
+    """G102 R90 (Nov 18 night, REALTIME_V3_WINDOW_SAFE_STOP=ON): a stop signal handler that takes no lock.
+
+    Found on a reproduction of the window service (the real container wrapper and this entry, database stubbed): the
+    wrapper ends its child with SIGTERM twice (its own handler, then its main loop), and today's handler calls
+    `Event.set()`. When the second SIGTERM lands while the first handler is inside `Event.set()` (holding the
+    condition's lock), the second handler blocks on that same lock in the same thread: the main thread deadlocks, the
+    stop never reaches the role, which keeps running windows until Docker kills it at the end of the grace (Nov 16 14:48:
+    E:14:45 started at 14:50 and was killed at 14:51:05). 5 of 27 stops of an idle service hung this way.
+
+    The handler here only appends the signal number to a list (no lock); a daemon thread sets `stop` and the current
+    session's event within `poll_seconds`, from normal thread context, for as long as the process lives (a session
+    started just after the signal is stopped too). Returns (handler, thread)."""
+    seen: list = []
+
+    def handler(signum=None, _frame=None):
+        seen.append(signum)
+
+    def relay():
+        while done is None or not done.is_set():
+            if seen:
+                stop.set()
+                current = active_stop[0]
+                if current is not None and not current.is_set():
+                    current.set()
+            time.sleep(poll_seconds)
+
+    thread = threading.Thread(target=relay, name="advanced-options-stop-relay", daemon=True)
+    thread.start()
+    return handler, thread
+
+
 def _docker_service_main(argv) -> int | None:
     values = list(sys.argv[1:] if argv is None else argv)
     service_mode = "--docker-service-kind" in values
@@ -455,6 +488,19 @@ def _docker_service_main(argv) -> int | None:
         f0dte_mode()
         f0dte_policy()
         # --- G106 D5 F0DTE END
+        # --- Nov 18 night (stream W): REALTIME_V3_WINDOW_INPUT_SNAPSHOT (G102 R93, OFF / ON),
+        # REALTIME_V3_WINDOW_SAFE_STOP (G102 R90, OFF / ON), REALTIME_V3_VTERM (G106 D11, OFF / RECORD),
+        # REALTIME_V3_OS_DEBIT_VERTICAL (G106 D7, OFF / RECORD): an invalid value stops the window service here.
+        from realtime.advanced_options_os_debit_vertical import os_debit_vertical_mode
+        from realtime.advanced_options_p8_window import window_safe_stop_enabled
+        from realtime.advanced_options_vterm import prepare_vterm
+        from realtime.advanced_options_window_snapshot import window_input_snapshot_enabled
+
+        window_input_snapshot_enabled()
+        window_safe_stop_enabled()
+        prepare_vterm()
+        os_debit_vertical_mode()
+        # --- end Nov 18 night
     provider = None
     pool = None
     if args.state_source == POSTGRES_STATE_SOURCE:
@@ -470,8 +516,16 @@ def _docker_service_main(argv) -> int | None:
                     if active_stop[0] is not None:
                         active_stop[0].set()
 
-                signal.signal(signal.SIGINT, request_stop)
-                signal.signal(signal.SIGTERM, request_stop)
+                # G102 R90 (Nov 18 night): REALTIME_V3_WINDOW_SAFE_STOP=ON on the window service: the handler only
+                # records the signal and a relay thread sets the events (see relayed_stop_handler); OFF as before.
+                signal_handler = request_stop
+                if kind is AdvancedOptionsProcessKind.WINDOW:
+                    from realtime.advanced_options_p8_window import window_safe_stop_enabled
+
+                    if window_safe_stop_enabled():
+                        signal_handler, _relay = relayed_stop_handler(stop, active_stop)
+                signal.signal(signal.SIGINT, signal_handler)
+                signal.signal(signal.SIGTERM, signal_handler)
                 while not stop.is_set():
                     session_stop = threading.Event()
                     active_stop[0] = session_stop

@@ -7,7 +7,8 @@ fix is reported WOULD_ACT with the action named. Acting needs both ``REALTIME_V2
 
 Checks (all read-only, one REPEATABLE READ snapshot):
 - WINDOW_PAST_DEADLINE (R32): windows still PENDING or RUNNING after their deadline with no live lease. Options windows:
-  action MARK_MISSED (the only action with an ACT path). Equity windows: reported only (the B20 sweep owns them).
+  action MARK_MISSED (the only action with an ACT path). Equity windows: reported only. Both kinds are closed by the R99
+  close-hour sweep (`realtime/window_sweep.py`, `scripts/run_realtime_v2_self_heal.py --window-sweep`, once per session).
 - WINDOW_FAILED: each failed window today with its stage reasons.
 - FEATURE_BREAKER (R21 layer 4): the last N Options windows failed for the same optional feature (O1 package selection,
   breadth, OS lanes). Action DISABLE_FEATURE_FOR_SESSION, record-only (no runtime switch exists yet, see FUTURE).
@@ -124,7 +125,7 @@ def check_windows_past_deadline(cursor, now: datetime) -> list[Finding]:
             "WINDOW_PAST_DEADLINE", "ERROR", f"{len(equity)} Equity windows PENDING/RUNNING past their deadline",
             False, "EQUITY", "NONE",
             {"windows": [f"{key} {state}" for _id, key, state, _c, _d in equity[:30]],
-             "note": "the Equity scheduler's missed-window sweep (B20) owns these"},
+             "note": "closed by the R99 close-hour window sweep (--window-sweep), not by this pass"},
         ))
     return findings
 

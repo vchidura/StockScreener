@@ -26,21 +26,23 @@ def _security(cursor):
     return str(security_id)
 
 
-def _revision(cursor, security_id, *, payload=P1, source_key="k1", at=T0):
+def _revision(cursor, security_id, *, payload=P1, source_key="k1", at=T0, cash="0.26"):
     cursor.execute(
         "INSERT INTO ref.corporate_action_revisions(action_id,security_id,ticker,action_type,effective_date,ex_date,"
         "cash_amount,source,source_key,observed_at,received_at,payload_sha256,raw_payload) VALUES"
-        "(%s,%s,'AAPL','DIVIDEND',%s,%s,0.26,'massive',%s,%s,%s,%s,%s)",
-        (str(uuid4()), security_id, date(2026, 11, 10), date(2026, 11, 10), source_key, at, at, payload,
+        "(%s,%s,'AAPL','DIVIDEND',%s,%s,%s,'massive',%s,%s,%s,%s,%s)",
+        (str(uuid4()), security_id, date(2026, 11, 10), date(2026, 11, 10), cash, source_key, at, at, payload,
          Json({"payload": payload})))
 
 
-def _coverage(cursor, security_id, *, action_type="SPLIT", response=H1, at=T0, window_end=date(2027, 11, 12)):
+def _coverage(cursor, security_id, *, action_type="SPLIT", response=H1, at=T0, window_end=date(2027, 11, 12),
+              count=0):
     cursor.execute(
         "INSERT INTO ref.corporate_action_coverage(coverage_id,security_id,action_type,window_start,window_end,source,"
         "source_key,response_action_count,response_sha256,observed_at,received_at,payload_sha256) VALUES"
-        "(%s,%s,%s,%s,%s,'massive',%s,0,%s,%s,%s,%s)",
-        (str(uuid4()), security_id, action_type, date(2025, 9, 30), window_end, f"cov:{uuid4()}", response, at, at, C))
+        "(%s,%s,%s,%s,%s,'massive',%s,%s,%s,%s,%s,%s)",
+        (str(uuid4()), security_id, action_type, date(2025, 9, 30), window_end, f"cov:{uuid4()}", count, response, at,
+         at, C))
 
 
 def _drift(cursor, ids, *, single=False):
@@ -77,12 +79,15 @@ def test_identical_rechecks_are_not_drift_and_real_changes_are():
                 assert _case(connection, cursor, "same_many", identical, ids=[known]) is False
                 assert _case(connection, cursor, "same_one", identical, ids=known, single=True) is False
 
-                assert _case(connection, cursor, "payload", lambda: _revision(cursor, known, payload=P2, at=later),
-                             ids=[known]) is True
+                # R84b: a new payload is a change when its content changes (here the cash amount); a new payload
+                # with the same content is not (test_corporate_action_drift_r84b_v2_db.py).
+                assert _case(connection, cursor, "payload",
+                             lambda: _revision(cursor, known, payload=P2, cash="0.27", at=later), ids=[known]) is True
                 assert _case(connection, cursor, "new_key", lambda: _revision(cursor, known, source_key="k2", at=later),
                              ids=known, single=True) is True
-                assert _case(connection, cursor, "response", lambda: _coverage(cursor, known, response=H2, at=later),
-                             ids=[known]) is True
+                # R84b: a response that now holds an action (its revision not written with it) is a change.
+                assert _case(connection, cursor, "response",
+                             lambda: _coverage(cursor, known, response=H2, at=later, count=1), ids=[known]) is True
                 # No coverage known for the security at publication: its first coverage is new evidence.
                 assert _case(connection, cursor, "first", lambda: _coverage(cursor, fresh, at=later),
                              ids=[known, fresh]) is True

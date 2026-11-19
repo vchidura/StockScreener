@@ -102,6 +102,8 @@ SESSION_BOUND_COMPONENTS = frozenset({
     "options-p8-window",
 })
 OFF_HOURS_SLEEP_ENVIRONMENT = "REALTIME_V3_OFF_HOURS_SLEEP"
+# G102 R90 (Nov 18 night): ON = a fenced child gets one SIGTERM on a stop (see run_fenced_child); unset/OFF = two.
+STOP_CHILD_ONCE_ENVIRONMENT = "REALTIME_V2_STOP_CHILD_ONCE"
 SLEEP_POLL_SECONDS = 60
 # Unfinished work may hold a role awake past its window, but not indefinitely.
 MAXIMUM_SLEEP_HOLD = timedelta(hours=2)
@@ -299,6 +301,16 @@ def run_session_bound_child(
     return 0
 
 
+def stop_child_once_enabled(environment) -> bool:
+    """`REALTIME_V2_STOP_CHILD_ONCE` (G102 R90); unset or blank is OFF. Anything but OFF or ON raises, so the role
+    refuses to start rather than run silently OFF."""
+    raw = environment.get(STOP_CHILD_ONCE_ENVIRONMENT)
+    value = str(raw or "").strip().upper() or "OFF"
+    if value not in ("OFF", "ON"):
+        raise ValueError(f"{STOP_CHILD_ONCE_ENVIRONMENT} must be OFF or ON, not {raw!r}")
+    return value == "ON"
+
+
 def requested_stop_exit_code(returncode, stop_signal):
     """G102 stack stop (Nov 13): the wrapper ends its child with SIGTERM when it is itself stopped by a signal; a child
     without a SIGTERM handler (Options lifecycle, market-state) then ends by that signal (returncode -15), which
@@ -365,6 +377,18 @@ def run_fenced_child(
     )
     process = None
     stop_signals = []
+    # G102 R90 (Nov 18 night): REALTIME_V2_STOP_CHILD_ONCE=ON ends the child with ONE SIGTERM. Today the handler below
+    # and the loop's stop branch each send one, microseconds apart; a child whose handler calls Event.set() (most of
+    # them: `lambda *_: stop.set()`) deadlocks when the second lands inside the first one's Event.set() (reproduced on
+    # the Options window service, 5 of 27 stops hung). OFF (default, unset): two as before.
+    stop_child_once = stop_child_once_enabled(environment)
+    child_terminated = []
+
+    def terminate_child():
+        if stop_child_once and child_terminated:
+            return
+        child_terminated.append(True)
+        process.terminate()
 
     def request_stop(signum=None, _frame=None):
         # R43 (Nov 11): say why a fenced role stops (a signal here; a lost lease is logged by the heartbeat).
@@ -374,7 +398,7 @@ def run_fenced_child(
                   file=sys.stderr, flush=True)
         stop.set()
         if process is not None and process.poll() is None:
-            process.terminate()
+            terminate_child()
 
     prior_int = signal.getsignal(signal.SIGINT)
     prior_term = signal.getsignal(signal.SIGTERM)
@@ -392,7 +416,7 @@ def run_fenced_child(
         while process.poll() is None:
             if stop.wait(0.5):
                 if process.poll() is None:
-                    process.terminate()
+                    terminate_child()
                 break
             checked_at = utc_clock()
             if next_sleep_check is None or checked_at < next_sleep_check:

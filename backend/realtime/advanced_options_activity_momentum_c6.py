@@ -2875,6 +2875,7 @@ def _shortlist_activity_momentum_candidates(
     ] = (),
     same_day_enabled: bool | None = None,
     short_delta_override: Decimal | None = None,
+    same_day_admission_limits: bool = False,
 ) -> tuple[
     tuple[ActivityMomentumCandidate, ...],
     int,
@@ -2883,6 +2884,8 @@ def _shortlist_activity_momentum_candidates(
     tuple[ActivityMomentumGroup, ...],
     tuple[ActivityMomentumShortExpiryEvidence, ...],
 ]:
+    if type(same_day_admission_limits) is not bool:
+        raise TypeError("same_day_admission_limits must be boolean")
     selected = tuple(sorted(
         candidates,
         key=lambda row: row.contract_ticker,
@@ -3082,6 +3085,16 @@ def _shortlist_activity_momentum_candidates(
             < criterion.minimum_prior_open_interest
         ):
             reason = "ROLE_OPEN_INTEREST_LIMIT"
+        if (
+            reason is None
+            and same_day_admission_limits
+            and profile.version
+            in _V3_FAMILY_PROFILE_VERSIONS
+            and dte == 0
+        ):
+            # G106 0DTE admission (REALTIME_V3_OPTIONS_SAME_DAY_ADMISSION ON): the DTE-0 branch above ends at its
+            # last-trading checks; the criterion's own role limits apply to a same-day contract too.
+            reason = role_admission_limit_reason(candidate, criterion)
         if reason is not None:
             rejected[reason] += 1
             continue
@@ -3859,6 +3872,7 @@ def resolve_activity_momentum_selection(
     ] = (),
     same_day_enabled: bool | None = None,
     short_delta_override: Decimal | None = None,
+    same_day_admission_limits: bool = False,
 ) -> ActivityMomentumResolution:
     selected = tuple(sorted(
         candidates,
@@ -3901,6 +3915,7 @@ def resolve_activity_momentum_selection(
             or calendars
             or same_day_enabled is not None
             or short_delta_override is not None
+            or same_day_admission_limits is not False
         ):
             raise ValueError(
                 "legacy activity/momentum selection inputs changed"
@@ -3937,6 +3952,7 @@ def resolve_activity_momentum_selection(
             expiry_calendars=calendars,
             same_day_enabled=same_day_enabled,
             short_delta_override=short_delta_override,
+            same_day_admission_limits=same_day_admission_limits,
         )
         coverage_groups = (
             ()
@@ -5361,6 +5377,61 @@ def _v4_fill_product_buckets_side_balanced(
             taken += cost
             by_side[other] += cost
     return used
+
+
+def role_admission_limit_reason(
+    candidate: ActivityMomentumCandidate,
+    criterion: ActivityMomentumSelectionCriterion,
+) -> str | None:
+    """The criterion's role limits in the admission chain's order (spread, spot, strike distance, completed-session
+    volume, prior OI); None when the candidate passes. G106 0DTE admission: the shortlist applies them to a DTE-0
+    contract too when `same_day_admission_limits` is set (the same checks the chain applies to every other DTE)."""
+    if (
+        candidate.relative_spread is None
+        or candidate.relative_spread
+        > criterion.maximum_relative_spread
+    ):
+        return "ROLE_SPREAD_LIMIT"
+    if candidate.spot is None:
+        return "SPOT_UNAVAILABLE_FOR_STRIKE_FILTER"
+    if (
+        abs(candidate.strike - candidate.spot)
+        / candidate.spot
+        > criterion.maximum_moneyness_fraction
+    ):
+        return "ROLE_STRIKE_DISTANCE_LIMIT"
+    if (
+        candidate.completed_session_volume is not None
+        and candidate.completed_session_volume
+        < criterion.minimum_completed_session_volume
+    ):
+        return "ROLE_VOLUME_LIMIT"
+    if (
+        criterion.minimum_prior_open_interest is not None
+        and candidate.prior_open_interest is not None
+        and candidate.prior_open_interest
+        < criterion.minimum_prior_open_interest
+    ):
+        return "ROLE_OPEN_INTEREST_LIMIT"
+    return None
+
+
+def same_day_admission_limit_reason(
+    candidate: ActivityMomentumCandidate,
+    profile: ActivityMomentumProfile,
+    session_date: date,
+) -> str | None:
+    """For a DTE-0 candidate: the reason the profile's DTE-0 criterion refuses it under the G106 0DTE admission
+    (`role_admission_limit_reason`), else None (also None for any other DTE or without a DTE-0 criterion)."""
+    if candidate.dte_for(session_date) != 0:
+        return None
+    criterion = next(
+        (row for row in profile.selection_criteria if row.minimum_dte <= 0 <= row.maximum_dte),
+        None,
+    )
+    if criterion is None:
+        return None
+    return role_admission_limit_reason(candidate, criterion)
 
 
 # G106 D5 follow-up (Nov 18): single-stock same-day contracts on every expiry day (switch and record:

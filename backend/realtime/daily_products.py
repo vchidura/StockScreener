@@ -161,12 +161,15 @@ def daily_products_input_sha256(inputs, mode: str, sessions: int = 5) -> str:
     not by row ids and arrival times. The nightly coverage refresh re-inserts identical revisions and re-checks coverage
     with an unchanged provider response; by row identity every refresh was a new input, so each scheduler restart
     recomputed the previous session's products (Nov 16: source generation 20 -> 21 -> 22 with nothing changed). The
-    identity format changes once with this: the first run after the deploy computes again, then refreshes keep it."""
+    identity format changes once with this: the first run after the deploy computes again, then refreshes keep it.
+    Nov 18 (R84b): content without the raw payload hash (a provider re-sending an action with fields added keeps it);
+    the identity format changes once more with that deploy."""
     return canonical_sha256(dict(
         version=DAILY_PRODUCTS_VERSION, mode=mode, products=[list(item) for item in products_for(mode, sessions)],
         cohort_id=inputs.cohort_id, provider_tier=inputs.provider_tier, session=inputs.session,
         source_manifest_sha256=inputs.source_manifest_sha256, members=inputs.members,
-        actions=corporate_action_content(inputs.actions), coverage=corporate_action_coverage_content(inputs.coverage),
+        actions=corporate_action_content(inputs.actions),
+        coverage=corporate_action_coverage_content(inputs.coverage, inputs.actions),
         bar_lineage=inputs_bar_lineage_sha256(inputs),
         source_lineage=getattr(inputs, "source_lineage", "LOADED"),
     ))

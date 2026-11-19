@@ -50,6 +50,7 @@ from .contracts import canonical_json, canonical_sha256
 from .database_access_v2 import APP_ROLE, V2ConnectionProvider
 from .equity_history import equity_history_coordinates, load_equity_history_cursor
 from .reference_repository import load_dividend_reference_cursor
+from .advanced_options_window_snapshot import snapshot_then_write, window_input_snapshot_enabled  # G102 R93
 
 
 REFERENCE_PRODUCER_VERSION = "advanced-options-reference-producer-v1"
@@ -86,6 +87,18 @@ class ReferenceProducerStatus(str, Enum):
     BLOCKED = "BLOCKED"
 
 
+# R52.1 (Nov 18): reason codes an AVAILABLE evidence row may carry. They report a usable but degraded input in the stored
+# evidence (so the preflight identity shows it, and changes only when one is present) and block nothing: neither
+# reason-code collector (the preflight's `reason_codes`, the opening loader's `missing`) nor the READY decision counts
+# them. An UNAVAILABLE row still needs a blocking code. TREASURY_CURVE_STALE: R52's latest stored curve, older than the
+# expected one (up to TREASURY_CURVE_MAXIMUM_STALE_SESSIONS), is used.
+ADVISORY_REASON_CODES = frozenset({"TREASURY_CURVE_STALE"})
+
+
+def _blocking_reasons(reasons) -> tuple[str, ...]:
+    return tuple(reason for reason in reasons if reason not in ADVISORY_REASON_CODES)
+
+
 @dataclass(frozen=True, slots=True)
 class AdvancedOptionsReferenceProducerEvidence:
     member_kind: str
@@ -109,10 +122,10 @@ class AdvancedOptionsReferenceProducerEvidence:
             raise ValueError("reference producer evidence identity is invalid")
         if (
             self.availability is ReferenceAvailability.AVAILABLE
-            and reasons
+            and _blocking_reasons(reasons)
         ) or (
             self.availability is ReferenceAvailability.UNAVAILABLE
-            and not reasons
+            and not _blocking_reasons(reasons)
         ):
             raise ValueError("reference producer evidence availability is invalid")
         observed = (
@@ -208,11 +221,12 @@ class AdvancedOptionsReferenceProducerPreflight:
 
     @property
     def reason_codes(self) -> tuple[str, ...]:
+        """The blocking codes (advisory ones stay in the evidence only, R52.1)."""
         return tuple(sorted({
             reason
             for row in self.evidence
             if not _accepted_unavailable_metric(row)
-            for reason in row.reason_codes
+            for reason in _blocking_reasons(row.reason_codes)
         }))
 
 
@@ -1009,6 +1023,8 @@ def _load_treasury_curve(
         observed_at=max(row.source_observed_at for row in curve),
         known_at=plan.known_at,
         valid_until=plan.valid_until,
+        # R52.1: the stale curve is stored with its advisory code; on a normal day the row is unchanged.
+        reason_codes=("TREASURY_CURVE_STALE",) if sessions_behind else (),
     ))
     return curve, rate_date
 
@@ -1583,7 +1599,7 @@ def load_opening_reference_inputs_cursor(
         reason
         for row in evidence
         if not _accepted_unavailable_metric(row)
-        for reason in row.reason_codes
+        for reason in _blocking_reasons(row.reason_codes)
     }))
     if metric_missing or valuation_missing or not curve:
         return (), (), (), missing or ("REFERENCE_INPUTS_INCOMPLETE",)
@@ -1715,9 +1731,30 @@ class PostgresAdvancedOptionsReferenceProducer:
         ) as unit:
             return self._assemble(unit)
 
+    def _ready(self, result) -> AdvancedOptionsReferenceProducerPreflight:
+        if (
+            result.status is not ReferenceProducerStatus.READY
+            or result.state is None
+        ):
+            raise AdvancedOptionsReferencePreflightBlocked(result)
+        return result
+
     def produce(self) -> AdvancedOptionsReferenceState:
+        # G102 R93: REALTIME_V3_WINDOW_INPUT_SNAPSHOT=ON assembles in a REPEATABLE READ READ ONLY snapshot and keeps
+        # SERIALIZABLE for the write only; OFF (default) runs the loop below exactly as before.
+        snapshot = window_input_snapshot_enabled()
         for attempt in range(1, self._maximum_attempts + 1):
             try:
+                if snapshot:
+                    return snapshot_then_write(
+                        self._provider,
+                        APP_ROLE,
+                        lambda unit: self._ready(self._assemble(unit)),
+                        lambda unit, result: persist_advanced_options_reference_state_cursor(
+                            unit.cursor,
+                            result.state,
+                        ),
+                    )
                 with self._provider.transaction(
                     APP_ROLE,
                     isolation_level="SERIALIZABLE",
