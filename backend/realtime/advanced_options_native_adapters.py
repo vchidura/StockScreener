@@ -45,6 +45,7 @@ from .advanced_options_o1_liquidity_floor import (
     o1_liquidity_floor_mode,
     o1_liquidity_floor_policy,
 )
+from .advanced_options_o1_episodes import O1EpisodeRun
 from .advanced_options_o1_gates import O1GateRun
 from .advanced_options_alert_context import note_o1_alert_context, note_os_alert_context  # G106 alert context
 from .advanced_options_os_debit_vertical import log_os_debit_vertical_record  # G106 D7 (Nov 18 night)
@@ -108,6 +109,10 @@ class AdvancedOptionsLaneInputs:
     # (`advanced_options_os_debit_vertical.OSDebitVerticalLane`), logged by the executor. Never part of any identity
     # or comparison; None when the switch is OFF.
     os_vertical: object | None = field(default=None, compare=False)
+    # G106 O1 episodes (REALTIME_V3_O1_EPISODES RECORD/ON, Nov 19): the session's episode inputs
+    # (`advanced_options_o1_episodes.O1EpisodeInputs`) for the O1 executor's rule. In the O1 input identity only under ON;
+    # never compared; None when the switch is OFF.
+    o1_episodes: object | None = field(default=None, compare=False)
 
     def __post_init__(self) -> None:
         reasons = tuple(
@@ -610,6 +615,13 @@ def build_advanced_o1_executor(
         _log_o1_liquidity_floor_record(context, floor_mode, floor_entries, floor_failures, floor_policy)
         if gates is not None:
             gates.log(context.cutoff, O1_PACKAGE_SELECTION_ENABLED)  # never raises
+        # --- G106 O1 episodes (Nov 19): REALTIME_V3_O1_EPISODES (OFF = no object: today's path, byte for byte). After
+        # every gate: RECORD logs one O1_EPISODES_RECORD line; ON also makes a new O1 alert the episode rule folds an
+        # OBSERVATION without a package. Never raises. ---
+        episodes = O1EpisodeRun.for_window(inputs.o1_episodes)
+        if episodes is not None:
+            evaluations = episodes.apply(evaluations, context.cutoff)
+        # --- end G106 O1 episodes ---
         # --- G106 O1 tuning (Nov 18): REALTIME_V3_OPTIONS_ALERT_CONTEXT (OFF = nothing); notes only, never raises ---
         note_o1_alert_context(context.cutoff, evaluations, inputs.invocations)
         # --- end G106 alert context ---

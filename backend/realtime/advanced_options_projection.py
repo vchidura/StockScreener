@@ -3379,6 +3379,12 @@ def persist_advanced_options_projection_cursor(
             alert_rows=alerts["alert_rows"],
             evaluations=batch.cycle.evaluations,
         )
+    # G106 O1 episodes (REALTIME_V3_O1_EPISODES=ON only; OFF / RECORD queue nothing, so no SQL): this window's
+    # `o1_episode` blocks onto the opening alerts, after the session alerts (same transaction). Never raises.
+    from .advanced_options_o1_episodes import apply_pending_o1_episode_blocks_cursor, pending_o1_episode_blocks
+
+    if pending_o1_episode_blocks():
+        apply_pending_o1_episode_blocks_cursor(cursor, cutoff=batch.cycle.receipt.cutoff)
 
 
 OPTIONS_SESSION_ALERT_NAMESPACE = uuid5(NAMESPACE_URL, "stockscreener:options-session-alert:v1")

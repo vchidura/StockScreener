@@ -479,6 +479,12 @@ def _docker_service_main(argv) -> int | None:
         o1_min_dte_policy()
         o1_aggressor_side_mode()
         o1_aggressor_side_policy()
+        # G106 O1 episodes (Nov 19): REALTIME_V3_O1_EPISODES (OFF / RECORD / ON) and its thresholds
+        # (REALTIME_V3_O1_EPISODES_MIN_GAP_MINUTES / _PREMIUM_MULTIPLE_PCT / _MAX_ALERTS / _INVALIDATION_BP).
+        from realtime.advanced_options_o1_episodes import o1_episode_policy, o1_episodes_mode
+
+        o1_episodes_mode()
+        o1_episode_policy()
         # G106 O1 tuning (Nov 18): REALTIME_V3_O1_AGGRESSOR_POLICY (STRICT / CONTRADICTION_ONLY) is read by
         # o1_aggressor_side_policy() above; REALTIME_V3_OPTIONS_ALERT_CONTEXT (OFF / RECORD), RECORD loads the page's
         # exposure modules here.

@@ -62,6 +62,7 @@ from .advanced_options_o1_gates import (
     o1_aggressor_side_mode,
     o1_aggressor_side_policy,
 )
+from .advanced_options_o1_episodes import O1EpisodesMode, load_o1_episode_inputs_guarded, o1_episodes_mode
 from .advanced_options_o3_inputs import o3_inputs_enabled
 from .advanced_options_os_participation import (
     EXTENDED_5M_BARS,
@@ -992,6 +993,18 @@ def _load_o1(
     aggressor_prints = None
     if aggressor_mode is not O1GateMode.OFF and rows:
         aggressor_prints = load_o1_aggressor_prints_guarded(cursor, plan, rows)
+    # G106 O1 episodes: REALTIME_V3_O1_EPISODES (OFF = today: nothing read). An invalid value raises here, so the window
+    # fails loudly. RECORD/ON: one guarded read for the executor's episode rule (the session's stored O1 alerts, the
+    # premium of their trades and of this window's, the 1m bars of their underlyings known by the cutoff); every window,
+    # with or without O1 events, so the window's line always says the session's episode state.
+    episodes_mode = o1_episodes_mode()
+    episode_inputs = None
+    if episodes_mode is not O1EpisodesMode.OFF:
+        episode_inputs = load_o1_episode_inputs_guarded(
+            cursor, session_date=plan.control_plane.session_date, cutoff=plan.cutoff,
+            window_event_ids=(str(row["event_id"]) for row in rows),
+            window_underlyers=(str(row["underlyer"]) for row in rows),
+        )
     calendar = OptionExchangeCalendar()
     invocations = []
     rejected: dict[str, int] = {}
@@ -1112,6 +1125,12 @@ def _load_o1(
             (*item, None if row.aggressor is None else row.aggressor.identity())
             for item, row in zip(identity, invocations)
         )
+    if episodes_mode is O1EpisodesMode.ON:
+        # G106 O1 episodes ON: the session's episode inputs decide selection, so they join the input identity (OFF /
+        # RECORD: unchanged).
+        identity = (*identity, ("O1_EPISODES", episode_inputs.identity()))
+    if episode_inputs is not None:
+        return AdvancedOptionsLaneInputs(tuple(invocations), o1_episodes=episode_inputs), identity
     return AdvancedOptionsLaneInputs(tuple(invocations)), identity
 
 
