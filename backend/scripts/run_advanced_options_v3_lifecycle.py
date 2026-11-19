@@ -48,6 +48,7 @@ from realtime.advanced_options_slot_side_balance import (  # noqa: E402
 from realtime.advanced_options_slot_selection import (  # noqa: E402
     log_slot_selection_setting,
     slot_selection_mode,
+    slot_selection_policy,
 )
 from realtime.advanced_options_stock_same_day import (  # noqa: E402
     log_stock_same_day_setting,
@@ -335,6 +336,8 @@ def main(argv=None) -> int:
     # G106 AL11: REALTIME_V3_OPTIONS_SLOT_SELECTION (OFF / RECORD / ON, unset = OFF); an invalid value raises here and
     # the service does not start.
     slot_selection = slot_selection_mode(environment)
+    # G106 AL11 v3: REALTIME_V3_OPTIONS_SLOT_SELECTION_POLICY (v2 / v3, unset = v2); an invalid value raises here.
+    selection_policy = slot_selection_policy(environment)
     # G106 D5 follow-up: REALTIME_V3_OPTIONS_STOCK_SAME_DAY (OFF / RECORD / ON, unset = OFF); an invalid value raises
     # here and the service does not start.
     stock_same_day = stock_same_day_mode(environment)
@@ -419,11 +422,12 @@ def main(argv=None) -> int:
         ),
         slot_side_balance=slot_side_balance,
         slot_selection=slot_selection,
+        slot_selection_policy=selection_policy,
         stock_same_day=stock_same_day,
         same_day_admission=same_day_admission,
     )
     log_slot_side_balance_setting(slot_side_balance)
-    log_slot_selection_setting(slot_selection)
+    log_slot_selection_setting(slot_selection, selection_policy)
     log_stock_same_day_setting(stock_same_day)
     log_same_day_admission_setting(same_day_admission)
     owner_id = uuid4()

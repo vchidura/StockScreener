@@ -470,6 +470,12 @@ def _log_o1_debit_vertical_record(context, entries) -> None:
             "contract": "o1-debit-vertical-record-v1", "mode": mode.value, "status": "RECORD_FAILED",
             "reason": f"{type(error).__name__}: {error}"[:200],
         })
+    # G106 AL2 follow-up (Nov 19): REALTIME_V3_O1DV_MARK_TOLERANCE=RECORD adds one O1_DEBIT_VERTICAL_MARKS_RECORD line
+    # (the same events' verticals with 5 s / 15 s quote marks); OFF: nothing. Never raises.
+    from .advanced_options_o1_debit_vertical import o1_debit_vertical_policy
+    from .advanced_options_o1dv_mark_tolerance import log_window_o1dv_marks_record
+
+    log_window_o1dv_marks_record(context.cutoff, entries, vertical_mode=mode, policy_loader=o1_debit_vertical_policy)
 
 
 def _log_o1_liquidity_floor_record(context, mode, entries, failures, policy=None) -> None:

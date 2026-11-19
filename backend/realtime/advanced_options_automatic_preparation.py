@@ -73,6 +73,7 @@ from .advanced_options_slot_selection import (
     allocate_with_slot_selection,
     load_previous_session_chain,
     parse_slot_selection_mode,
+    parse_slot_selection_policy,
 )
 from .advanced_options_stock_same_day import (
     STOCK_SAME_DAY_SETTING,
@@ -339,6 +340,7 @@ class PostgresAutomaticOptionsPreparationExecutor(
         slot_selection: SlotSelectionMode | str = SlotSelectionMode.OFF,
         stock_same_day: StockSameDayMode | str = StockSameDayMode.OFF,
         same_day_admission: SameDayAdmissionMode | str = SameDayAdmissionMode.OFF,
+        slot_selection_policy=None,
     ) -> None:
         # G106 AL8: REALTIME_V3_OPTIONS_SLOT_SIDE_BALANCE (OFF / RECORD / ON); anything else, or not OFF with a
         # non-v4 admission profile, refuses the configuration (the lifecycle service does not start).
@@ -366,6 +368,8 @@ class PostgresAutomaticOptionsPreparationExecutor(
                 f"{SLOT_SELECTION_SETTING} requires the v4 admission profile"
             )
         self._slot_selection = slot_selection
+        # G106 AL11 v3: REALTIME_V3_OPTIONS_SLOT_SELECTION_POLICY (None / v2 = the v2 rule, v3); invalid refuses.
+        self._slot_selection_policy = parse_slot_selection_policy(slot_selection_policy)
         # G106 D5 follow-up: REALTIME_V3_OPTIONS_STOCK_SAME_DAY (OFF / RECORD / ON); anything else, or not OFF with a
         # non-v4 admission profile, refuses the configuration (the lifecycle service does not start).
         stock_same_day = parse_stock_same_day_mode(stock_same_day)
@@ -1602,6 +1606,7 @@ class PostgresAutomaticOptionsPreparationExecutor(
             resolve=resolve,
             allocate=allocate,
             **({} if emit is None else {"emit": emit}),
+            policy=getattr(self, "_slot_selection_policy", None),
         )
 
     def _activate_session(self, claim):

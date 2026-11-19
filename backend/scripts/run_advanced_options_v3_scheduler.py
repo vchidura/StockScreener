@@ -32,6 +32,18 @@ from realtime.advanced_options_levels import (  # noqa: E402
     options_levels_mode,
     start_options_levels,
 )
+from realtime.advanced_options_levels_stable import (  # noqa: E402
+    levels_stable_mode,
+    start_levels_stable,
+)
+from realtime.advanced_options_oi_change import (  # noqa: E402
+    oi_change_mode,
+    start_oi_change,
+)
+from realtime.advanced_options_regime import (  # noqa: E402
+    regime_mode,
+    start_regime,
+)
 from realtime.advanced_options_slot_rotation import (  # noqa: E402
     slot_rotation_mode,
     start_slot_rotation,
@@ -66,6 +78,12 @@ def parse_args(argv=None):
     slot_rotation_mode()
     # G106 levels: an invalid REALTIME_V3_OPTIONS_LEVELS stops the scheduler at start as well.
     options_levels_mode()
+    # G106 D15 stable walls and D8 OI change: an invalid REALTIME_V3_OPTIONS_LEVELS_STABLE or
+    # REALTIME_V3_OPTIONS_OI_CHANGE (only OFF or RECORD) stops the scheduler at start as well.
+    levels_stable_mode()
+    oi_change_mode()
+    # G106 D16: an invalid REALTIME_V3_REGIME (only OFF or RECORD) stops the scheduler at start as well.
+    regime_mode()
     # G106 H1: an invalid REALTIME_V3_OPTIONS_BREADTH_DAILY_SNAPSHOT (only OFF or ON) stops the scheduler at start too.
     breadth_daily_snapshot_mode()
     return args
@@ -87,7 +105,17 @@ def main(argv=None):
     # G106 AL10 phase 1: None when OFF (no line, nothing runs); RECORD / ON log their start lines here.
     slot_rotation = start_slot_rotation(slot_rotation_mode())
     # G106 levels: None when OFF (no line, nothing runs); RECORD / ON log their start lines here.
-    levels = start_options_levels(options_levels_mode())
+    # G106 D15 stable walls and D16 regime: None when OFF (no line, and the levels recorder is started exactly as
+    # before when both are OFF).
+    levels_extras = {
+        key: value for key, value in (
+            ("stable", start_levels_stable(levels_stable_mode(), levels_mode=options_levels_mode())),
+            ("regime", start_regime(regime_mode(), levels_mode=options_levels_mode())),
+        ) if value is not None
+    }
+    levels = start_options_levels(options_levels_mode(), **levels_extras)
+    # G106 D8 / G102 R51 matched OI change: None when OFF (no line, nothing runs).
+    oi_change = start_oi_change(oi_change_mode())
     stop = threading.Event()
     signal.signal(signal.SIGINT, lambda *_: stop.set())
     signal.signal(signal.SIGTERM, lambda *_: stop.set())
@@ -114,7 +142,7 @@ def main(argv=None):
                 result = run_continuous_options_schedule_cycle(
                     provider, session_date=lifecycle.processing_session_date,
                     api_key=api_key, skipped_receipts=frozenset(skipped),
-                    slot_rotation=slot_rotation, levels=levels,
+                    slot_rotation=slot_rotation, levels=levels, oi_change=oi_change,
                 )
             except Exception as error:  # noqa: BLE001 - reported, retried, bounded
                 failures += 1

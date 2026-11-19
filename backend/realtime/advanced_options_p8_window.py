@@ -80,6 +80,10 @@ from .advanced_options_rolling_producer import (
 )
 from .advanced_options_f0dte import is_f0dte_payload, run_f0dte_window  # G106 D5 F0DTE
 from .advanced_options_vterm import record_vterm  # G106 D11 V-TERM (Nov 18 night)
+from .advanced_options_o1dv_mark_tolerance import (  # G106 AL2 follow-up (Nov 19)
+    o1dv_mark_tolerance_mode,
+    publish_o1dv_window_quotes,
+)
 from .advanced_options_window_snapshot import window_input_reads  # G102 R93 (Nov 18 night)
 from .advanced_options_o3_inputs import o3_inputs_enabled
 from .advanced_options_o3_producer import produce_o3_inputs
@@ -1033,6 +1037,16 @@ def build_and_run_p8_serial_window(
                    context={"window_id": str(binding.window_id), "cutoff": cutoff.isoformat(),
                             "count": len(baseline_incomplete)})
         unmarked_instrument_ids = tuple(sorted({*unmarked_instrument_ids, *baseline_incomplete}))
+    # --- G106 AL2 follow-up (Nov 19): REALTIME_V3_O1DV_MARK_TOLERANCE (OFF = nothing). RECORD: the journal quote heads at
+    # the barrier of the contracts the marks left out (this window's V3-1.5 read, or one made here when
+    # REALTIME_V3_MARKS_AT_CUTOFF is OFF), for O1_DEBIT_VERTICAL_MARKS_RECORD only; never raises. ---
+    publish_o1dv_window_quotes(
+        mode=o1dv_mark_tolerance_mode(), cohort_id=control.cohort_id, cutoff=cutoff, cutoff_read=cutoff_read,
+        cutoff_status=cutoff_status, read=lambda: _window_cutoff_quotes(flow_environment, binding, barrier_offset),
+        selected_ids=(row.instrument_id for row in binding.enrollment.activity_selection.contracts),
+        marked_ids=marked, source_flow=source_flow, session_date=control.session_date,
+    )
+    # --- end G106 AL2 follow-up ---
     if rolling.degraded_reason_codes:
         _LOGGER.warning(
             "advanced_options_window_degraded window_id=%s reasons=%s "

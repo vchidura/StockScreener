@@ -448,6 +448,10 @@ def _docker_service_main(argv) -> int | None:
         from realtime.advanced_options_o1_debit_vertical import o1_debit_vertical_mode, o1_debit_vertical_policy
 
         o1_debit_vertical_mode()
+        # G106 AL2 follow-up (Nov 19): likewise REALTIME_V3_O1DV_MARK_TOLERANCE (OFF / RECORD).
+        from realtime.advanced_options_o1dv_mark_tolerance import o1dv_mark_tolerance_mode
+
+        o1dv_mark_tolerance_mode()
         # G102 R87: likewise REALTIME_V3_O1_LIQUIDITY_FLOOR (OFF / RECORD / ON), and (Nov 17) the thresholds of both
         # liquidity rules from the environment (REALTIME_V3_O1_LIQUIDITY_FLOOR_MIN_*, REALTIME_V3_O1_DEBIT_VERTICAL_LEG_
         # MIN_*): a value that is not a non-negative integer stops the service here. Read once per process: the

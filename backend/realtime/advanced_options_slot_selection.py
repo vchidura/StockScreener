@@ -45,6 +45,23 @@ today's allocation gave it, 24 at 16 names, the same budget and shard limits):
 The set is then allocated by the normal V4 allocation over the chosen candidates only (groups, roles, buckets, AL8 side
 balance flag, allocation hash as usual); a name the allocation would not fully keep falls back to today's picks and the
 allocation runs once more.
+
+Policy v3 (Nov 19 2026, `REALTIME_V3_OPTIONS_SLOT_SELECTION_POLICY` on the same service: unset / blank / `v2` = the
+v2 rule above byte for byte, `v3` = this, anything else and the lifecycle service refuses to start). Cause: on Nov 18
+the v2 rule held more premium and volume on every name but fewer O1-ready legs (28 vs 51) and one fewer O1 leg with a
+vertical partner (20 vs 21): its previous-volume ranking dropped nearly every SPY / QQQ / IWM leg that reached 3x its
+open interest (1 vs 18), mostly 1-2 DTE contracts. v3 keeps v2's ranking and, on the protected products (index ETFs
+and single stocks: replayed on Nov 10-18, protecting the index ETFs only still lost O1-ready legs on Nov 13 and 18),
+first keeps from today's picks (`SLOT_SELECTION_POLICY_V3`):
+(a) the legs predicted O1-ready from the 3x OI rule's pre-open inputs (prior OI from the capture, the previous session's
+    volume): DTE 1-60 outside the flow-excluded DTEs, prior OI >= 100, previous volume >= 1x prior OI at DTE <= 7 (the
+    near weeklies turn their open interest over in a day or two) or >= 3x beyond;
+(b) for each of them, the nearest further-OTM leg of the same expiry and side in today's picks with a width of 0.5%-10%
+    of spot and prior OI >= 250 and previous volume >= 100 (the debit vertical's partner);
+at most `protect_maximum_share_of_target` of the name's slots, best previous volume first. Then today's 0DTE count and
+the v2 pool fill the rest under the same shortlist bounds. RECORD lines carry the policy's version and hash; a v3
+underlying line also lists the protected legs (and why) and the v2 picks it differs from (`v2_minus_v3` /
+`v3_minus_v2`), so the v2 set can be rebuilt from the lines.
 """
 from __future__ import annotations
 
@@ -88,6 +105,27 @@ SLOT_SELECTION_POLICY = MappingProxyType({
     "side_balance": "WHEN_REALTIME_V3_OPTIONS_SLOT_SIDE_BALANCE_IS_ON",
 })
 SLOT_SELECTION_POLICY_SHA256 = canonical_sha256(dict(SLOT_SELECTION_POLICY))
+# G106 AL11 v3 (Nov 19): which rule the selection runs; unset / blank / v2 = SLOT_SELECTION_POLICY above, unchanged.
+SLOT_SELECTION_POLICY_SETTING = "REALTIME_V3_OPTIONS_SLOT_SELECTION_POLICY"
+SLOT_SELECTION_POLICY_V3 = MappingProxyType({
+    **SLOT_SELECTION_POLICY,
+    "version": "options-slot-selection-v3",
+    "protect": "TODAYS_PREDICTED_O1_READY_AND_THEIR_VERTICAL_PARTNERS",
+    "protect_products": ("DAILY_EXPIRY", "WEEKLY_EXPIRY"),
+    "protect_maximum_share_of_target": "0.5",
+    "o1_ready_minimum_dte": 1,
+    "o1_ready_maximum_dte": 60,
+    "o1_ready_minimum_prior_open_interest": 100,
+    "o1_ready_short_dte": 7,
+    "o1_ready_short_dte_previous_volume_to_oi": "1",
+    "o1_ready_previous_volume_to_oi": "3",
+    "partner_minimum_width_fraction": "0.005",
+    "partner_maximum_width_fraction": "0.10",
+    "partner_minimum_prior_open_interest": 250,
+    "partner_minimum_previous_volume": 100,
+})
+SLOT_SELECTION_POLICY_V3_SHA256 = canonical_sha256(dict(SLOT_SELECTION_POLICY_V3))
+SLOT_SELECTION_POLICIES = MappingProxyType({"v2": SLOT_SELECTION_POLICY, "v3": SLOT_SELECTION_POLICY_V3})
 _MINIMUM_ABS_DELTA = Decimal(SLOT_SELECTION_POLICY["minimum_abs_delta"])
 _MAXIMUM_ABS_DELTA = Decimal(SLOT_SELECTION_POLICY["maximum_abs_delta"])
 # Docker splits a log line over 16 KiB: one line per underlying (24 contracts each way at most).
@@ -116,6 +154,27 @@ def parse_slot_selection_mode(raw: object) -> SlotSelectionMode:
         return SlotSelectionMode(value)
     except ValueError:
         raise ValueError(f"{SLOT_SELECTION_SETTING} must be OFF, RECORD or ON, not {raw!r}") from None
+
+
+def parse_slot_selection_policy(raw: object) -> Mapping[str, object]:
+    """`REALTIME_V3_OPTIONS_SLOT_SELECTION_POLICY`: unset / blank / `v2` (or its version name) = v2, `v3` (or its
+    version name) = v3, any case. Anything else raises (the lifecycle service does not start)."""
+    if isinstance(raw, Mapping):
+        if any(raw is policy for policy in SLOT_SELECTION_POLICIES.values()):
+            return raw
+        raise ValueError(f"{SLOT_SELECTION_POLICY_SETTING} must be v2 or v3")
+    if raw is not None and not isinstance(raw, str):
+        raise ValueError(f"{SLOT_SELECTION_POLICY_SETTING} must be v2 or v3, not {raw!r}")
+    value = (raw or "").strip().lower() or "v2"
+    for key, policy in SLOT_SELECTION_POLICIES.items():
+        if value in (key, str(policy["version"])):
+            return policy
+    raise ValueError(f"{SLOT_SELECTION_POLICY_SETTING} must be v2 or v3, not {raw!r}")
+
+
+def slot_selection_policy(environ: Mapping[str, str] | None = None) -> Mapping[str, object]:
+    """The policy the lifecycle's selection runs (read once at start)."""
+    return parse_slot_selection_policy((os.environ if environ is None else environ).get(SLOT_SELECTION_POLICY_SETTING))
 
 
 def _print_line(event: str, document: Mapping[str, object]) -> None:
@@ -279,6 +338,75 @@ def _pick(ranked: list, count: int, chosen: list, *, balance: bool, admit: Calla
     return picks
 
 
+def predicted_o1_ready(row: ActivityMomentumCandidate, previous: PreviousSessionChain, session_date: date,
+                       policy: Mapping[str, object] = SLOT_SELECTION_POLICY_V3) -> bool:
+    """v3 (a): the 3x OI rule's pre-open inputs say this leg is likely to trade 3x its open interest today."""
+    dte = row.dte_for(session_date)
+    if not int(policy["o1_ready_minimum_dte"]) <= dte <= int(policy["o1_ready_maximum_dte"]) \
+            or dte in _FLOW_EXCLUDED_DTES:
+        return False
+    open_interest = row.prior_open_interest
+    if open_interest is None or open_interest < int(policy["o1_ready_minimum_prior_open_interest"]):
+        return False
+    ratio = Decimal(str(
+        policy["o1_ready_short_dte_previous_volume_to_oi"] if dte <= int(policy["o1_ready_short_dte"])
+        else policy["o1_ready_previous_volume_to_oi"]
+    ))
+    return int(previous.volumes.get(row.contract_ticker, 0)) >= ratio * open_interest
+
+
+def vertical_partner(leg: ActivityMomentumCandidate, rows: Iterable[ActivityMomentumCandidate],
+                     previous: PreviousSessionChain,
+                     policy: Mapping[str, object] = SLOT_SELECTION_POLICY_V3) -> ActivityMomentumCandidate | None:
+    """v3 (b): the nearest further-OTM leg of the same expiry and side among `rows` within the debit vertical's width
+    band (of spot) and liquid on the pre-open inputs; None when there is none."""
+    if leg.spot is None or leg.spot <= 0:
+        return None
+    call = leg.option_side is OptionSide.CALL
+    further = sorted(
+        (row for row in rows
+         if row.contract_ticker != leg.contract_ticker and row.expiration == leg.expiration
+         and row.option_side is leg.option_side and (row.strike > leg.strike if call else row.strike < leg.strike)),
+        key=lambda row: (abs(row.strike - leg.strike), row.contract_ticker),
+    )
+    minimum = Decimal(str(policy["partner_minimum_width_fraction"]))
+    maximum = Decimal(str(policy["partner_maximum_width_fraction"]))
+    for row in further:
+        width = abs(row.strike - leg.strike) / leg.spot
+        if width < minimum:
+            continue
+        if width > maximum:
+            break
+        volume = int(previous.volumes.get(row.contract_ticker, 0))
+        if (int(row.prior_open_interest or 0) >= int(policy["partner_minimum_prior_open_interest"])
+                and volume >= int(policy["partner_minimum_previous_volume"])):
+            return row
+    return None
+
+
+def protected_legs(today: Iterable[ActivityMomentumCandidate], *, target: int, previous: PreviousSessionChain,
+                   session_date: date, policy: Mapping[str, object] = SLOT_SELECTION_POLICY_V3,
+                   ) -> list[tuple[ActivityMomentumCandidate, str]]:
+    """v3 (a) + (b) over today's picks of one name: (leg, O1_READY | PARTNER), O1-ready legs by the v2 score, each
+    followed by its partner; at most the policy's share of `target`."""
+    today = list(today)
+    cap = int(Decimal(target) * Decimal(str(policy["protect_maximum_share_of_target"])))
+    out: list[tuple[ActivityMomentumCandidate, str]] = []
+    taken: set[str] = set()
+    for leg in sorted((row for row in today if predicted_o1_ready(row, previous, session_date, policy)),
+                      key=lambda row: _score(row, previous)):
+        if len(out) >= cap:
+            break
+        if leg.contract_ticker not in taken:
+            out.append((leg, "O1_READY"))
+            taken.add(leg.contract_ticker)
+        partner = vertical_partner(leg, today, previous, policy)
+        if partner is not None and partner.contract_ticker not in taken and len(out) < cap:
+            out.append((partner, "PARTNER"))
+            taken.add(partner.contract_ticker)
+    return out
+
+
 @dataclass
 class UnderlyingPlan:
     underlying: str
@@ -289,6 +417,9 @@ class UnderlyingPlan:
     reason: str | None = None
     topped_up: int = 0
     same_day: int = 0
+    # v3 only: the protected legs (ticker, why) and the v2 rule's picks for the same name (None under v2).
+    protected: tuple[tuple[str, str], ...] = ()
+    v2_chosen: tuple[str, ...] | None = None
 
     @property
     def applied(self) -> bool:
@@ -301,6 +432,7 @@ class SlotSelectionPlan:
     side_balance: bool
     previous: PreviousSessionChain | None
     underlyings: dict[str, UnderlyingPlan] = field(default_factory=dict)
+    policy: Mapping[str, object] = field(default_factory=lambda: SLOT_SELECTION_POLICY)
 
     @property
     def chosen(self) -> frozenset[str]:
@@ -326,8 +458,11 @@ def plan_slot_selection(
     session_date: date,
     previous: PreviousSessionChain | None,
     side_balance: bool,
+    policy: Mapping[str, object] | None = None,
 ) -> SlotSelectionPlan:
-    """Rules 1-6 per underlying of today's allocation; a pure function of its inputs."""
+    """Rules 1-6 per underlying of today's allocation (v3: after the protected legs); a pure function of its inputs."""
+    policy = parse_slot_selection_policy(SLOT_SELECTION_POLICY if policy is None else policy)
+    v3 = policy is SLOT_SELECTION_POLICY_V3
     off_rows = _selected_rows(off)
     by_underlying: dict[str, list[ActivityMomentumCandidate]] = {}
     for row in candidates:
@@ -338,7 +473,7 @@ def plan_slot_selection(
         for row in group.candidates:
             if len(group.candidates) == 1 and row.dte_for(session_date) == 0:
                 admitted_same_day.setdefault(row.underlying, []).append(row)
-    plan = SlotSelectionPlan(session_date=session_date, side_balance=side_balance, previous=previous)
+    plan = SlotSelectionPlan(session_date=session_date, side_balance=side_balance, previous=previous, policy=policy)
     for underlying in sorted({row.underlying for row in off_rows.values()}):
         today = sorted(
             (row for row in off_rows.values() if row.underlying == underlying),
@@ -380,24 +515,43 @@ def plan_slot_selection(
             )
             return used < criterion.shortlist_limit_per_side
 
-        picks: list[ActivityMomentumCandidate] = []
-        # Nov 18 (user): every product keeps today's 0DTE count (v1 kept 2 per index ETF, single stocks 0).
-        quota = sum(1 for row in today if row.dte_for(session_date) == 0)
-        if quota and product in SLOT_SELECTION_POLICY["same_day_products"]:
-            same_day = sorted(
-                {row.contract_ticker: row for row in admitted_same_day.get(underlying, ())}.values(),
-                key=lambda row: _score(row, previous),
-            )
-            picks = _pick(same_day, min(quota, entry.target), [], balance=True, admit=admit)
-            entry.same_day = len(picks)
-        picks = _pick(pool, entry.target, picks, balance=side_balance, admit=admit)
-        if len(picks) < entry.target:
-            taken = {row.contract_ticker for row in picks}
-            extra = sorted((row for row in today if row.contract_ticker not in taken),
-                           key=lambda row: _score(row, previous))
-            before = len(picks)
-            picks = _pick(extra, entry.target, picks, balance=False, admit=admit)
-            entry.topped_up = len(picks) - before
+        def rule_picks(start: list) -> tuple[list, int, int]:
+            """Today's 0DTE count, then the pool, then today's picks as top-up, after `start` (v3's protected legs).
+            Returns (picks, 0DTE picks, topped up)."""
+            picks = list(start)
+            same_day_count = topped_up = 0
+            # Nov 18 (user): every product keeps today's 0DTE count (v1 kept 2 per index ETF, single stocks 0).
+            quota = sum(1 for row in today if row.dte_for(session_date) == 0)
+            if quota and product in policy["same_day_products"]:
+                same_day = sorted(
+                    {row.contract_ticker: row for row in admitted_same_day.get(underlying, ())}.values(),
+                    key=lambda row: _score(row, previous),
+                )
+                # Calls and puts alternate among the 0DTE picks themselves (protected legs do not tilt them); the
+                # shortlist bound still counts every pick so far.
+                same_day_picks = _pick(same_day, min(quota, entry.target - len(picks)), [], balance=True,
+                                       admit=lambda chosen, row: admit(list(start) + chosen, row))
+                picks += same_day_picks
+                same_day_count = len(same_day_picks)
+            picks = _pick(pool, entry.target, picks, balance=side_balance, admit=admit)
+            if len(picks) < entry.target:
+                taken = {row.contract_ticker for row in picks}
+                extra = sorted((row for row in today if row.contract_ticker not in taken),
+                               key=lambda row: _score(row, previous))
+                before = len(picks)
+                picks = _pick(extra, entry.target, picks, balance=False, admit=admit)
+                topped_up = len(picks) - before
+            return picks, same_day_count, topped_up
+
+        protected: list[tuple[ActivityMomentumCandidate, str]] = []
+        if v3:
+            v2_picks, _, _ = rule_picks([])
+            entry.v2_chosen = tuple(sorted(row.contract_ticker for row in v2_picks[: entry.target]))
+            if product in policy["protect_products"]:
+                protected = protected_legs(today, target=entry.target, previous=previous, session_date=session_date,
+                                           policy=policy)
+            entry.protected = tuple((row.contract_ticker, why) for row, why in protected)
+        picks, entry.same_day, entry.topped_up = rule_picks([row for row, _ in protected])
         entry.chosen = tuple(sorted(row.contract_ticker for row in picks[: entry.target]))
     return plan
 
@@ -429,6 +583,7 @@ def allocate_slot_selection(
             entry.chosen = entry.off
             entry.topped_up = 0
             entry.same_day = 0
+            entry.protected = ()
     raise AssertionError("unreachable")
 
 
@@ -492,12 +647,14 @@ def slot_selection_documents(
     by_ticker = {row.contract_ticker: row for row in candidates}
     session_date = plan.session_date
     previous = plan.previous
+    policy = plan.policy
+    v3 = policy is SLOT_SELECTION_POLICY_V3
     common = {
         "mode": mode.value,
         "applied": mode is SlotSelectionMode.ON,
         "session_date": str(session_date),
-        "policy_version": SLOT_SELECTION_POLICY["version"],
-        "policy_sha256": SLOT_SELECTION_POLICY_SHA256,
+        "policy_version": policy["version"],
+        "policy_sha256": SLOT_SELECTION_POLICY_V3_SHA256 if v3 else SLOT_SELECTION_POLICY_SHA256,
         "side_balance": plan.side_balance,
         "off_allocation_sha256": off.allocation_sha256,
         "selection_allocation_sha256": selected.allocation_sha256,
@@ -520,6 +677,17 @@ def slot_selection_documents(
         totals["dropped"] += len(dropped)
         totals["topped_up"] += entry.topped_up
         totals["same_day"] += entry.same_day
+        extra: dict[str, object] = {}
+        if v3:
+            why = Counter(reason for _, reason in entry.protected)
+            totals["protected_o1_ready"] += why["O1_READY"]
+            totals["protected_partner"] += why["PARTNER"]
+            v2_chosen = set(entry.chosen if entry.v2_chosen is None else entry.v2_chosen)
+            extra = {
+                "protected": [[ticker, reason] for ticker, reason in entry.protected],
+                "v2_minus_v3": sorted(v2_chosen - set(entry.chosen)),
+                "v3_minus_v2": sorted(set(entry.chosen) - v2_chosen),
+            }
         lines.append({
             **common,
             "part": "underlying",
@@ -545,6 +713,7 @@ def slot_selection_documents(
                       for ticker in added[:_CONTRACT_LIST_LIMIT] if ticker in by_ticker],
             "dropped": [_contract(by_ticker[ticker], session_date, previous)
                         for ticker in dropped[:_CONTRACT_LIST_LIMIT] if ticker in by_ticker],
+            **extra,
         })
     summary = {
         **common,
@@ -573,8 +742,10 @@ def slot_selection_documents(
             "off": _coverage(off_all, previous, None),
             "selection": _coverage(new_all, previous, None),
         },
-        "policy": dict(SLOT_SELECTION_POLICY),
+        "policy": dict(policy),
     }
+    if v3:
+        summary["protected"] = {"o1_ready": totals["protected_o1_ready"], "partner": totals["protected_partner"]}
     return [summary, *lines]
 
 
@@ -592,11 +763,14 @@ def allocate_with_slot_selection(
     resolve: Callable[[tuple[ActivityMomentumCandidate, ...]], object],
     allocate: Callable[[object], ActivityMomentumAllocation],
     emit: Callable[[str, Mapping[str, object]], None] = _print_line,
+    policy: Mapping[str, object] | str | None = None,
 ) -> ActivityMomentumAllocation:
     """The lifecycle's allocation under the switch. `used` is today's (after AL8). OFF: `used`, nothing else (no read,
     no call). RECORD: `used`; the rule's allocation is computed and logged only. ON: the rule's allocation, or `used`
-    when the rule fails (logged). Never raises once the mode is valid and the profile is v4."""
+    when the rule fails (logged). Never raises once the mode is valid and the profile is v4. `policy`: v2 (None, the
+    default) or v3 (`parse_slot_selection_policy`); an invalid one raises."""
     mode = parse_slot_selection_mode(mode)
+    policy = parse_slot_selection_policy(policy)
     if mode is SlotSelectionMode.OFF:
         return used
     if profile.version != V4_ACTIVITY_MOMENTUM_PROFILE_VERSION:
@@ -621,6 +795,7 @@ def allocate_with_slot_selection(
             session_date=session_date,
             previous=chain,
             side_balance=side_balance,
+            policy=policy,
         )
         selection = (
             used
@@ -645,13 +820,15 @@ def allocate_with_slot_selection(
     return selection if mode is SlotSelectionMode.ON else used
 
 
-def log_slot_selection_setting(mode: SlotSelectionMode) -> None:
+def log_slot_selection_setting(mode: SlotSelectionMode, policy: Mapping[str, object] | None = None) -> None:
     """One start line on the lifecycle service (the operator's check right after the deploy)."""
     try:
+        policy = SLOT_SELECTION_POLICY if policy is None else policy
         _print_line(SLOT_SELECTION_SETTING_EVENT, {
             "mode": mode.value,
             "setting": SLOT_SELECTION_SETTING,
-            "policy_version": SLOT_SELECTION_POLICY["version"],
+            "policy_version": policy["version"],
+            **({} if policy is SLOT_SELECTION_POLICY else {"policy_setting": SLOT_SELECTION_POLICY_SETTING}),
         })
     except Exception:  # noqa: BLE001
         pass

@@ -259,11 +259,13 @@ def run_continuous_options_schedule_cycle(
     skipped_receipts=frozenset(),
     slot_rotation=None,
     levels=None,
+    oi_change=None,
 ):
     """`skipped_receipts`: Equity INPUT_READY receipt ids this process already skipped as stale (G74); the cycle
     waits for the next Equity window instead of replaying them. `slot_rotation`: the G106 AL10 recorder
     (`advanced_options_slot_rotation.start_slot_rotation`), None when the switch is OFF. `levels`: the G106 levels
-    recorder (`advanced_options_levels.start_options_levels`), None when the switch is OFF."""
+    recorder (`advanced_options_levels.start_options_levels`), None when the switch is OFF. `oi_change`: the G106 D8
+    matched open interest change recorder (`advanced_options_oi_change.start_oi_change`), None when the switch is OFF."""
     with provider.transaction(APP_ROLE) as unit:
         unit.cursor.execute(
             "SELECT pg_try_advisory_xact_lock(hashtextextended(%s,0))",
@@ -275,6 +277,7 @@ def run_continuous_options_schedule_cycle(
             provider, session_date=session_date, api_key=api_key,
             clock=clock, transport_factory=transport_factory,
             skipped_receipts=frozenset(skipped_receipts), slot_rotation=slot_rotation, levels=levels,
+            oi_change=oi_change,
         )
 
 
@@ -287,7 +290,7 @@ def _stale_skip(receipt, reason):
 
 def _run_schedule_cycle(
     provider, *, session_date, api_key, clock, transport_factory, skipped_receipts=frozenset(), slot_rotation=None,
-    levels=None,
+    levels=None, oi_change=None,
 ):
     from scripts.run_advanced_options_v3_production import _authorize_window
 
@@ -440,6 +443,13 @@ def _run_schedule_cycle(
         )
         if recorded is not None:
             result["levels"] = recorded
+    if oi_change is not None:
+        changed = _record_oi_change(
+            oi_change, provider, acquisition=acquisition, equity_cutoff=receipt[1], window_id=target_window_id,
+            breadth=breadth,
+        )
+        if changed is not None:
+            result["oi_change"] = changed
     return result
 
 
@@ -464,6 +474,19 @@ def _record_levels(recorder, provider, *, acquisition, equity_cutoff, window_id,
         return recorder.record_window(
             provider, session_date=acquisition.authority.session_date, equity_cutoff=equity_cutoff,
             window_id=str(window_id), breadth=breadth,
+        )
+    except Exception as error:  # noqa: BLE001 - the recorder never raises; this only guards the call itself
+        return {"status": "FAILED", "reason": f"{type(error).__name__}: {str(error)[:160]}"}
+
+
+def _record_oi_change(recorder, provider, *, acquisition, equity_cutoff, window_id, breadth):
+    """G106 D8 / G102 R51 (RECORD only): once per session, after the first chain capture, the watched contracts' open
+    interest against the previous session's close snapshot (one short read-only transaction), logged. It never changes
+    the window and never fails the cycle; None on the session's other windows."""
+    try:
+        return recorder.record_window(
+            provider, session_date=acquisition.authority.session_date, equity_cutoff=equity_cutoff,
+            window_id=str(window_id), watched=acquisition.contract_tickers, breadth=breadth,
         )
     except Exception as error:  # noqa: BLE001 - the recorder never raises; this only guards the call itself
         return {"status": "FAILED", "reason": f"{type(error).__name__}: {str(error)[:160]}"}

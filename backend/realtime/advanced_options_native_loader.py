@@ -79,6 +79,12 @@ from .advanced_options_os_participation import (
 )
 from .advanced_options_producers import AdvancedOptionsProducerPlan
 from .advanced_options_window_snapshot import window_input_snapshot_enabled  # G102 R93
+from .advanced_options_o1dv_mark_tolerance import (  # G106 AL2 follow-up (Nov 19): O1DV marks RECORD
+    O1DVMarkToleranceMode,
+    o1dv_mark_tolerance_mode,
+    record_event_tolerance,
+    tolerance_inputs,
+)
 from .advanced_options_os_debit_vertical import (  # G106 D7 (Nov 18 night)
     OSDebitVerticalMode,
     attach_os_debit_verticals,
@@ -975,6 +981,11 @@ def _load_o1(
         if vertical_out is not None and vertical_inputs is not None:
             # G106 D7 (RECORD only): the OS debit-vertical record reuses these inputs instead of reading them again.
             vertical_out["inputs"] = vertical_inputs
+    # G106 AL2 follow-up (Nov 19): REALTIME_V3_O1DV_MARK_TOLERANCE (OFF = nothing). RECORD: each evaluated event's
+    # vertical is built again with the window's 5 s / 15 s journal quote marks, for O1_DEBIT_VERTICAL_MARKS_RECORD only.
+    vertical_tolerance = None
+    if vertical_policy is not None and o1dv_mark_tolerance_mode() is O1DVMarkToleranceMode.RECORD:
+        vertical_tolerance = tolerance_inputs(vertical_inputs, plan)
     # G106 AL7: REALTIME_V3_O1_AGGRESSOR_SIDE (OFF = today: nothing read). An invalid value raises here, so the window
     # fails loudly. RECORD/ON: one guarded read of the session's stored prints of the contracts at O1's ratio.
     aggressor_mode = o1_aggressor_side_mode()
@@ -1061,6 +1072,9 @@ def _load_o1(
                 )
                 if vertical_package is not None:
                     package = vertical_package
+                if vertical_tolerance is not None:
+                    record_event_tolerance(event_id, row, vertical_outcome, vertical_inputs, plan, vertical_policy,
+                                           vertical_tolerance)
         invocations.append(AdvancedO1Invocation(
             event_id,
             source,

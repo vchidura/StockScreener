@@ -21,6 +21,11 @@ the regime / wall / flip / pin rules of the levels study need (`docs/g106`, D15)
        and one DEGRADED fault at start |
 Anything else (any case accepted for the three) and the scheduler refuses to start.
 
+Two RECORD lanes ride on this recorder (each OFF by default, and then nothing here changes): the stable walls
+(`advanced_options_levels_stable`, `REALTIME_V3_OPTIONS_LEVELS_STABLE`: one more line per name and per window from the
+same chains, no extra SQL) and the regime label (`advanced_options_regime`, `REALTIME_V3_REGIME`: one more short
+read-only transaction and one line per window).
+
 Dealer side is not observable: the page's convention DEALER_LONG_CALLS_SHORT_PUTS is a stated hypothesis. Under it
 both calls and puts add positive dealer delta, so net DEX is never negative; its call / put split (`dex_tilt`) is the
 part that moves. Recording never fails the cycle: any error logs `OPTIONS_LEVELS_RECORD_FAILED {reason}` and one
@@ -383,9 +388,16 @@ class OptionsLevelsRecorder:
         emit: Callable[[str, Mapping[str, object]], None] = _print_line,
         fault: Callable[..., object] = emit_fault,
         levels: Callable[[object], dict] = levels_document,
+        stable=None,
+        regime=None,
     ) -> None:
         self.mode = parse_options_levels_mode(mode)
         self._emit, self._fault, self._levels = emit, fault, levels
+        # G106 D15 stable walls (`advanced_options_levels_stable.StableLevels`, REALTIME_V3_OPTIONS_LEVELS_STABLE) and
+        # G106 D16 regime (`advanced_options_regime.RegimeRecorder`, REALTIME_V3_REGIME): None when their switch is OFF,
+        # and then nothing below changes.
+        self._stable = stable
+        self._regime = regime
 
     def start(self) -> None:
         """The start lines (RECORD and ON only). Never raises."""
@@ -452,12 +464,17 @@ class OptionsLevelsRecorder:
         compute_started = time.monotonic()
         recorded, unavailable, failed = [], dict(read.unavailable), dict(read.errors)
         regimes: dict[str, list[str]] = {}
+        if self._stable is not None:
+            self._stable_begin(session_date)
+        regime_documents: dict[str, Mapping[str, object]] = {}
         for name in sorted(read.chains):
             name_started = time.monotonic()
             try:
                 document = self._levels(read.chains[name])
             except Exception as error:  # noqa: BLE001 - this name only
                 failed[name] = f"COMPUTE: {type(error).__name__}: {error}"[:200]
+                if self._stable is not None:
+                    self._record_stable(head, name, None, {"available": False, "reason": "LEVELS_FAILED"})
                 continue
             document = {**head, "underlying": name, **document,
                         "ms": round((time.monotonic() - name_started) * 1000.0, 1)}
@@ -467,6 +484,10 @@ class OptionsLevelsRecorder:
             else:
                 unavailable[name] = str(document.get("reason"))
             self._emit(LEVELS_RECORD_EVENT, document)
+            if self._stable is not None:
+                self._record_stable(head, name, read.chains[name], document)
+            if self._regime is not None:
+                regime_documents[name] = document
         for name, reason in sorted(read.unavailable.items()):
             self._emit(LEVELS_RECORD_EVENT, {**head, "underlying": name, "available": False, "reason": reason})
         for name, reason in sorted(failed.items()):
@@ -484,6 +505,10 @@ class OptionsLevelsRecorder:
             "seconds": round(time.monotonic() - started, 3),
         }
         self._emit(LEVELS_WINDOW_EVENT, summary)
+        if self._stable is not None:
+            self._record_stable_window(head)
+        if self._regime is not None:
+            self._record_regime(provider, head, session_date, regime_documents, read.chains)
         if failed:
             self._safe_fault(
                 kind="OPTIONS_LEVELS_NAME_FAILED", severity="DEGRADED", recoverable=True, action="SKIP_NAME",
@@ -493,6 +518,50 @@ class OptionsLevelsRecorder:
             )
         return {"status": "RECORDED", "mode": self.mode.value, "applied": False, "complete": len(read.complete),
                 "recorded": len(recorded), "failed": len(failed), "seconds": summary["seconds"]}
+
+    # ---- G106 D15 stable walls (only with a tracker; never fails the levels line, the window or the cycle) -----------
+
+    def _stable_begin(self, session_date) -> None:
+        try:
+            self._stable.begin_window(session_date)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _record_stable(self, head, name, chain, document) -> None:
+        from .advanced_options_levels_stable import STABLE_RECORD_EVENT, VERSION as STABLE_VERSION
+
+        try:
+            stable = self._stable.observe(name, chain, document)
+        except Exception as error:  # noqa: BLE001 - this name only
+            stable = {"underlying": name, "available": False, "reason": "FAILED",
+                      "error": f"{type(error).__name__}: {error}"[:200]}
+            try:
+                self._stable.failed(name, error)
+            except Exception:  # noqa: BLE001
+                pass
+        self._safe_emit(STABLE_RECORD_EVENT, {**head, "mode": "RECORD", "levels_mode": self.mode.value,
+                                              "version": STABLE_VERSION, **stable})
+
+    def _record_stable_window(self, head) -> None:
+        from .advanced_options_levels_stable import STABLE_WINDOW_EVENT
+
+        try:
+            summary = self._stable.window_summary()
+        except Exception as error:  # noqa: BLE001
+            summary = {"error": f"{type(error).__name__}: {error}"[:200]}
+        self._safe_emit(STABLE_WINDOW_EVENT, {**head, "mode": "RECORD", "levels_mode": self.mode.value, **summary})
+
+    def _record_regime(self, provider, head, session_date, documents, chains) -> None:
+        """G106 D16 (only with a recorder): the window's regime line; never fails the levels lines or the window."""
+        from .advanced_options_regime import REGIME_RECORD_EVENT, VERSION as REGIME_VERSION
+
+        try:
+            document = self._regime.record(provider, head=head, session_date=session_date, documents=documents,
+                                           chains=chains)
+        except Exception as error:  # noqa: BLE001
+            document = {**head, "mode": "RECORD", "version": REGIME_VERSION, "status": "FAILED",
+                        "error": f"{type(error).__name__}: {error}"[:200]}
+        self._safe_emit(REGIME_RECORD_EVENT, {**document, "levels_mode": self.mode.value})
 
     def _failed(self, reason, detail, *, session_date, equity_cutoff, window_id) -> None:
         cutoff = _moment(equity_cutoff)
